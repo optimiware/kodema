@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +47,15 @@ func TestBrainOpenCodeConfigDisablesLocalTools(t *testing.T) {
 	bad := strings.Replace(string(raw), `"bash": false`, `"bash": true`, 1)
 	if err := ValidateBrainOpenCodeConfig([]byte(bad)); err == nil {
 		t.Fatal("ValidateBrainOpenCodeConfig accepted config with bash enabled")
+	}
+	// Allowing bash in permission map must also be rejected.
+	badPerm := strings.Replace(string(raw), `"bash": "deny"`, `"bash": "allow"`, 1)
+	if err := ValidateBrainOpenCodeConfig([]byte(badPerm)); err == nil {
+		t.Fatal("ValidateBrainOpenCodeConfig accepted config with bash permission=allow")
+	}
+	// Omitting permission map entirely must be rejected.
+	if err := ValidateBrainOpenCodeConfig([]byte(`{"tools":{"bash":false,"write":false,"edit":false,"read":false,"glob":false,"grep":false}}`)); err == nil {
+		t.Fatal("ValidateBrainOpenCodeConfig accepted config missing permission map")
 	}
 	if err := ValidateBrainOpenCodeConfig([]byte(`{"tools":{}}`)); err == nil {
 		t.Fatal("ValidateBrainOpenCodeConfig accepted empty tools map")
@@ -152,8 +164,17 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 	}
 	defer func() { _ = realSrv.Shutdown(context.Background()) }()
 
-	// Fake Kodema public API handler for pipeline.start, execution.inspect,
-	// execution.logs.read, and execution.cancel.
+	parsedBase, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", baseURL, err)
+	}
+	boundPort, err := strconv.Atoi(parsedBase.Port())
+	if err != nil {
+		t.Fatalf("Atoi port %q: %v", parsedBase.Port(), err)
+	}
+
+	// Fake Kodema public API handler for secret.write, secret.delete,
+	// pipeline.start, execution.inspect, execution.logs.read, and execution.cancel.
 	var mu sync.Mutex
 	var startedYAML string
 	execState := "running"
@@ -161,12 +182,37 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 	var execFailure *api.ExecutionFailure
 	cancelCalls := 0
 	inspectAfterCancel := 0
+	writtenSecrets := map[string]string{}
+	deletedSecrets := map[string]int{}
+	logPagesServed := 0
+
+	const realSandboxActionID = "act-sandbox-1"
 
 	handler := testAPIHandlerFunc(func(_ context.Context, inv api.Invocation) (api.Result, error) {
 		codec := publicCodecs[inv.Operation]
 		mu.Lock()
 		defer mu.Unlock()
 		switch inv.Operation {
+		case OperationSecretWrite:
+			var req api.SecretWriteRequest
+			if err := json.Unmarshal(inv.Request.Input, &req); err != nil {
+				return api.Result{}, err
+			}
+			writtenSecrets[req.SecretID] = req.Value
+			body, _ := codec.EncodeResult(api.SecretWriteResult{
+				SecretID: "sec-" + req.SecretID,
+				Name:     req.SecretID,
+				Version:  1,
+			})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case OperationSecretDelete:
+			var req api.SecretDeleteRequest
+			if err := json.Unmarshal(inv.Request.Input, &req); err != nil {
+				return api.Result{}, err
+			}
+			deletedSecrets[req.SecretID]++
+			body, _ := codec.EncodeResult(api.SecretDeleteResult{Version: 2})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
 		case OperationPipelineStart:
 			var req api.PipelineStartRequest
 			_ = json.Unmarshal(inv.Request.Input, &req)
@@ -174,13 +220,39 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 			body, _ := codec.EncodeResult(api.PipelineStartResult{ExecutionID: "exec-sbox-1", Version: 1})
 			return api.Result{Operation: inv.Operation, Body: body}, nil
 		case OperationExecutionLogsRead:
-			body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
-				Chunks: []api.LogChunk{{
-					ActionID: "sandbox",
-					Stream:   "stdout",
-					Data:     []byte("booting...\n" + sandboxReadyLinePrefix + baseURL + "\n"),
-				}},
-			})
+			var req api.ExecutionLogsReadRequest
+			if err := json.Unmarshal(inv.Request.Input, &req); err != nil {
+				return api.Result{}, err
+			}
+			// Strictly reject hardcoded action name "sandbox"; require server ActionID!
+			if req.ActionID != realSandboxActionID {
+				return api.Result{}, &api.Error{Code: api.CodeNotFound, Message: fmt.Sprintf("unknown action_id %q", req.ActionID)}
+			}
+			logPagesServed++
+			if req.Page == nil || req.Page.Cursor == "" {
+				// Page 1: verbose git clone output with NextCursor pointing to page 2.
+				body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
+					Chunks: []api.LogChunk{{
+						ActionID: realSandboxActionID,
+						Stream:   "stdout",
+						Data:     []byte("Cloning into '/workspace'...\nReceiving objects: 100%\n"),
+					}},
+					NextCursor: "cursor-page-2",
+				})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			}
+			if req.Page.Cursor == "cursor-page-2" {
+				// Page 2: announces KODEMA_SANDBOX_ENDPOINT.
+				body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
+					Chunks: []api.LogChunk{{
+						ActionID: realSandboxActionID,
+						Stream:   "stdout",
+						Data:     []byte("booting...\n" + sandboxReadyLinePrefix + baseURL + "\n"),
+					}},
+				})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			}
+			body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{})
 			return api.Result{Operation: inv.Operation, Body: body}, nil
 		case OperationInspect:
 			if cancelCalls > 0 {
@@ -197,8 +269,16 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 				State:         execState,
 				Version:       execVersion,
 				CurrentAction: 0,
-				Failure:       execFailure,
-				Cleanup:       api.ExecutionCleanup{State: "none"},
+				Actions: []api.ExecutionAction{{
+					ActionID: realSandboxActionID,
+					Index:    0,
+					Name:     "sandbox",
+					Kind:     "container",
+					State:    "running",
+					Version:  1,
+				}},
+				Failure: execFailure,
+				Cleanup: api.ExecutionCleanup{State: "none"},
 			})
 			return api.Result{Operation: inv.Operation, Body: body}, nil
 		case OperationExecutionCancel:
@@ -212,12 +292,13 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 	})
 
 	mgr, err := NewKodemaExecutionSandboxManager(KodemaExecutionSandboxConfig{
-		TenantID:       id.TenantID("tenant-1"),
-		ProjectID:      id.ProjectID("project-1"),
-		Handler:        handler,
-		ReadyTimeout:   5 * time.Second,
-		HealthInterval: 30 * time.Millisecond,
-		StopTimeout:    5 * time.Second,
+		TenantID:               id.TenantID("tenant-1"),
+		ProjectID:              id.ProjectID("project-1"),
+		Handler:                handler,
+		AllowLoopbackEndpoints: true,
+		ReadyTimeout:           5 * time.Second,
+		HealthInterval:         30 * time.Millisecond,
+		StopTimeout:            5 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewKodemaExecutionSandboxManager: %v", err)
@@ -236,7 +317,7 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 		Caches:      []string{"go-mod", "go-build"},
 		Memory:      "2Gi",
 		CPU:         "2",
-		Port:        8090,
+		Port:        boundPort,
 	})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
@@ -244,15 +325,34 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 
 	mu.Lock()
 	yamlCopy := startedYAML
+	pages := logPagesServed
+	secCount := len(writtenSecrets)
+	var firstSecretName string
+	for k := range writtenSecrets {
+		firstSecretName = k
+	}
 	mu.Unlock()
+
+	if pages < 2 {
+		t.Fatalf("expected multi-page log pagination (>=2 reads), got %d", pages)
+	}
+	if secCount != 1 {
+		t.Fatalf("expected 1 ephemeral project secret written, got %d", secCount)
+	}
+	if strings.Contains(yamlCopy, lease.BearerToken) {
+		t.Fatalf("generated sandbox pipeline YAML leaked raw bearer token!\n%s", yamlCopy)
+	}
 	for _, want := range []string{
 		`image: "golang:1.24"`,
+		`secrets:`,
+		`- "` + firstSecretName + `"`,
 		`- "go-mod"`,
 		`- "go-build"`,
 		`memory: "2Gi"`,
 		`cpu: "2"`,
 		`/kodema/bin/kodema sandbox serve`,
-		`--token-file /tmp/kodema-sandbox.token`,
+		`--token-file /kodema/secrets/` + firstSecretName,
+		`--token-env ` + firstSecretName,
 	} {
 		if !strings.Contains(yamlCopy, want) {
 			t.Errorf("generated sandbox pipeline YAML missing %q:\n%s", want, yamlCopy)
@@ -262,16 +362,20 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 		t.Fatalf("unexpected lease: %+v", lease)
 	}
 
-	// Verify Release invokes execution.cancel and waits for confirmed stop.
+	// Verify Release invokes execution.cancel, waits for confirmed stop, and deletes the ephemeral secret.
 	if err := mgr.Release(context.Background(), lease); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 	mu.Lock()
 	gotCancels := cancelCalls
 	gotState := execState
+	gotSecretDel := deletedSecrets[firstSecretName]
 	mu.Unlock()
 	if gotCancels != 1 || gotState != "cancelled" {
 		t.Fatalf("Release did not confirm stop: cancelCalls=%d state=%q", gotCancels, gotState)
+	}
+	if gotSecretDel != 1 {
+		t.Fatalf("Release did not delete ephemeral secret %q: delete calls=%d", firstSecretName, gotSecretDel)
 	}
 
 	// Now verify mid-turn OOM termination closes lease.Done with diagnostic error.
@@ -290,6 +394,7 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 		ExecutionID: "exec-parent-2",
 		ActionID:    "act-2",
 		Image:       "golang:1.24",
+		Port:        boundPort,
 	})
 	if err != nil {
 		t.Fatalf("Acquire 2: %v", err)
@@ -309,6 +414,368 @@ func TestKodemaExecutionSandboxManagerAcquireWatchAndConfirmedStop(t *testing.T)
 	}
 	if err := lease2.Err(); !errors.Is(err, ErrOpenCodeSandboxTerminated) || !strings.Contains(err.Error(), "OOMKilled") {
 		t.Fatalf("lease2.Err() = %v; want ErrOpenCodeSandboxTerminated with OOMKilled", err)
+	}
+}
+
+func TestSandboxEndpointSSRFValidationAndRedirectRejection(t *testing.T) {
+	badCases := []struct {
+		name          string
+		raw           string
+		port          int
+		allowLoopback bool
+	}{
+		{"dns hostname", "http://evil.example.com:8090", 8090, false},
+		{"localhost hostname", "http://localhost:8090", 8090, true},
+		{"loopback v4 denied by default", "http://127.0.0.1:8090", 8090, false},
+		{"loopback v6 denied by default", "http://[::1]:8090", 8090, false},
+		{"ipv4-mapped loopback denied", "http://[::ffff:127.0.0.1]:8090", 8090, false},
+		{"cloud metadata 169.254.169.254", "http://169.254.169.254:8090", 8090, true},
+		{"ipv4-mapped cloud metadata", "http://[::ffff:169.254.169.254]:8090", 8090, true},
+		{"ipv6 link-local", "http://[fe80::1]:8090", 8090, true},
+		{"unspecified v4", "http://0.0.0.0:8090", 8090, true},
+		{"unspecified v6", "http://[::]:8090", 8090, true},
+		{"multicast", "http://224.0.0.1:8090", 8090, true},
+		{"wrong port", "http://10.0.0.5:8080", 8090, false},
+		{"missing port", "http://10.0.0.5", 8090, false},
+		{"userinfo present", "http://user:pass@10.0.0.5:8090", 8090, false},
+		{"non-empty path", "http://10.0.0.5:8090/mcp", 8090, false},
+		{"root slash path", "http://10.0.0.5:8090/", 8090, false},
+		{"query present", "http://10.0.0.5:8090?foo=bar", 8090, false},
+		{"fragment present", "http://10.0.0.5:8090#frag", 8090, false},
+		{"https scheme rejected", "https://10.0.0.5:8090", 8090, false},
+		{"control char", "http://10.0.0.5:8090\r\n", 8090, false},
+	}
+	for _, tc := range badCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := validateSandboxEndpointURL(tc.raw, tc.port, tc.allowLoopback); err == nil {
+				t.Fatalf("validateSandboxEndpointURL(%q) unexpectedly accepted %q", tc.raw, got)
+			}
+		})
+	}
+
+	// Valid pod IPv4, pod IPv6, and explicit allowLoopback must pass.
+	if got, err := validateSandboxEndpointURL("http://10.244.1.12:8090", 8090, false); err != nil || got != "http://10.244.1.12:8090" {
+		t.Fatalf("valid pod IPv4 = (%q, %v)", got, err)
+	}
+	if got, err := validateSandboxEndpointURL("http://[fd00::12]:8090", 8090, false); err != nil || got != "http://[fd00::12]:8090" {
+		t.Fatalf("valid pod IPv6 = (%q, %v)", got, err)
+	}
+	if got, err := validateSandboxEndpointURL("http://127.0.0.1:8090", 8090, true); err != nil || got != "http://127.0.0.1:8090" {
+		t.Fatalf("explicit loopback = (%q, %v)", got, err)
+	}
+
+	// Verify HTTP 302 redirect on /healthz is refused (never followed).
+	var targetHits atomic.Int32
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer targetSrv.Close()
+
+	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, targetSrv.URL+"/healthz", http.StatusFound)
+	}))
+	defer redirectSrv.Close()
+
+	mgr, err := NewKodemaExecutionSandboxManager(KodemaExecutionSandboxConfig{
+		TenantID:               "tenant-1",
+		ProjectID:              "project-1",
+		Handler:                testAPIHandlerFunc(func(context.Context, api.Invocation) (api.Result, error) { return api.Result{}, nil }),
+		AllowLoopbackEndpoints: true,
+	})
+	if err != nil {
+		t.Fatalf("NewKodemaExecutionSandboxManager: %v", err)
+	}
+	if err := mgr.probeHealthz(context.Background(), redirectSrv.URL+"/healthz"); err == nil {
+		t.Fatal("probeHealthz followed HTTP 302 redirect and succeeded")
+	}
+	if targetHits.Load() != 0 {
+		t.Fatalf("redirect target was hit %d times; want 0", targetHits.Load())
+	}
+}
+
+func TestBuildSandboxPipelineYAMLSecurityAndTimeoutClamping(t *testing.T) {
+	baseReq := OpenCodeSandboxRequest{
+		TenantID:    "tenant-1",
+		ProjectID:   "project-1",
+		TaskID:      "task-1",
+		ExecutionID: "exec-1",
+		ActionID:    "act-1",
+		Image:       "golang:1.24",
+		Repository:  "app/backend",
+		BaseRef:     "refs/heads/main",
+		WorkBranch:  "refs/heads/work/task-1",
+		Port:        8090,
+	}
+
+	// Valid YAML uses Kodema secret mount, never embeds raw token, never falls back to 127.0.0.1,
+	// fails fast on missing KODEMA_GIT_URL/git, and passes `--` with full refspecs to git.
+	yamlBytes, err := BuildSandboxPipelineYAML(baseReq, "KODEMA_SBOX_TOK_0123456789ABCDEF")
+	if err != nil {
+		t.Fatalf("BuildSandboxPipelineYAML: %v", err)
+	}
+	y := string(yamlBytes)
+	if strings.Contains(y, "127.0.0.1") {
+		t.Fatalf("default BuildSandboxPipelineYAML must not fall back to 127.0.0.1:\n%s", y)
+	}
+	if strings.Contains(y, "kodsbox.") {
+		t.Fatalf("BuildSandboxPipelineYAML must never contain a raw bearer token:\n%s", y)
+	}
+	for _, want := range []string{
+		`secrets:`,
+		`- "KODEMA_SBOX_TOK_0123456789ABCDEF"`,
+		`--token-file /kodema/secrets/KODEMA_SBOX_TOK_0123456789ABCDEF`,
+		`--token-env KODEMA_SBOX_TOK_0123456789ABCDEF`,
+		`git ls-remote --exit-code --heads -- origin 'refs/heads/work/task-1'`,
+		`git fetch --no-tags -- origin 'refs/heads/main'`,
+		`KODEMA_GIT_URL is not set`,
+		`git binary is not available`,
+		`failed to determine non-loopback pod IP`,
+	} {
+		if !strings.Contains(y, want) {
+			t.Errorf("YAML missing %q:\n%s", want, y)
+		}
+	}
+
+	// Timeout clamping: < 1m clamps to 1m0s; > 30d clamps to 720h0m0s.
+	shortReq := baseReq
+	shortReq.Timeout = 15 * time.Second
+	shortYAML, err := BuildSandboxPipelineYAML(shortReq, "KODEMA_SBOX_TOK_ABCDEF0123456789")
+	if err != nil {
+		t.Fatalf("BuildSandboxPipelineYAML short timeout: %v", err)
+	}
+	if !strings.Contains(string(shortYAML), "timeout: 1m0s") {
+		t.Fatalf("short timeout not clamped to 1m0s:\n%s", string(shortYAML))
+	}
+
+	longReq := baseReq
+	longReq.Timeout = 45 * 24 * time.Hour
+	longYAML, err := BuildSandboxPipelineYAML(longReq, "KODEMA_SBOX_TOK_ABCDEF0123456789")
+	if err != nil {
+		t.Fatalf("BuildSandboxPipelineYAML long timeout: %v", err)
+	}
+	if !strings.Contains(string(longYAML), "timeout: 720h0m0s") {
+		t.Fatalf("long timeout not clamped to 720h0m0s:\n%s", string(longYAML))
+	}
+
+	// Git flag injection via refs/heads/--upload-pack=sh and malicious TaskID must be refused.
+	badReqs := []struct {
+		name   string
+		mutate func(*OpenCodeSandboxRequest)
+		secret string
+	}{
+		{"base_ref flag injection", func(r *OpenCodeSandboxRequest) { r.BaseRef = "refs/heads/--upload-pack=sh" }, "KODEMA_SBOX_TOK_1"},
+		{"work_branch flag injection", func(r *OpenCodeSandboxRequest) { r.WorkBranch = "refs/heads/--upload-pack=sh" }, "KODEMA_SBOX_TOK_1"},
+		{"base_ref equals sign", func(r *OpenCodeSandboxRequest) { r.BaseRef = "refs/heads/a=b" }, "KODEMA_SBOX_TOK_1"},
+		{"malicious task_id flag", func(r *OpenCodeSandboxRequest) { r.TaskID = "--upload-pack=sh"; r.WorkBranch = "" }, "KODEMA_SBOX_TOK_1"},
+		{"malicious task_id traversal", func(r *OpenCodeSandboxRequest) { r.TaskID = "../escape"; r.WorkBranch = "" }, "KODEMA_SBOX_TOK_1"},
+		{"control char in image", func(r *OpenCodeSandboxRequest) { r.Image = "golang:1.24\nevil" }, "KODEMA_SBOX_TOK_1"},
+		{"control char in repo", func(r *OpenCodeSandboxRequest) { r.Repository = "app/repo\n" }, "KODEMA_SBOX_TOK_1"},
+		{"raw bearer token passed as secret name", func(*OpenCodeSandboxRequest) {}, "kodsbox.0123456789abcdef"},
+	}
+	for _, tc := range badReqs {
+		t.Run(tc.name, func(t *testing.T) {
+			req := baseReq
+			tc.mutate(&req)
+			if _, err := BuildSandboxPipelineYAML(req, tc.secret); err == nil {
+				t.Fatalf("BuildSandboxPipelineYAML unexpectedly accepted %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestKodemaExecutionSandboxManagerRetryGetsDistinctIdempotencyKey(t *testing.T) {
+	// Start a real sandbox server for the second attempt.
+	ws := t.TempDir()
+	realSrv, err := sandbox.NewServer(sandbox.Config{
+		ListenAddr:   "127.0.0.1:0",
+		WorkspaceDir: ws,
+		Token:        "kodsbox.retrytesttoken0123456789abcdef01",
+	})
+	if err != nil {
+		t.Fatalf("sandbox.NewServer: %v", err)
+	}
+	srvCtx, cancelSrv := context.WithCancel(context.Background())
+	defer cancelSrv()
+	baseURL, err := realSrv.Start(srvCtx)
+	if err != nil {
+		t.Fatalf("realSrv.Start: %v", err)
+	}
+	defer func() { _ = realSrv.Shutdown(context.Background()) }()
+	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(baseURL, "http://"))
+	boundPort, _ := strconv.Atoi(portStr)
+
+	var mu sync.Mutex
+	seenStartKeys := map[string]bool{}
+	startAttempts := 0
+	deletedSecrets := map[string]int{}
+	writtenSecrets := []string{}
+
+	handler := testAPIHandlerFunc(func(_ context.Context, inv api.Invocation) (api.Result, error) {
+		codec := publicCodecs[inv.Operation]
+		mu.Lock()
+		defer mu.Unlock()
+		switch inv.Operation {
+		case OperationSecretWrite:
+			var req api.SecretWriteRequest
+			_ = json.Unmarshal(inv.Request.Input, &req)
+			writtenSecrets = append(writtenSecrets, req.SecretID)
+			body, _ := codec.EncodeResult(api.SecretWriteResult{SecretID: "sec-" + req.SecretID, Name: req.SecretID, Version: 1})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case OperationSecretDelete:
+			var req api.SecretDeleteRequest
+			_ = json.Unmarshal(inv.Request.Input, &req)
+			deletedSecrets[req.SecretID]++
+			body, _ := codec.EncodeResult(api.SecretDeleteResult{Version: 2})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case OperationPipelineStart:
+			if seenStartKeys[inv.Request.IdempotencyKey] {
+				return api.Result{}, &api.Error{Code: api.CodeChangedIdempotencyContent, Message: "reused idempotency key with changed content"}
+			}
+			seenStartKeys[inv.Request.IdempotencyKey] = true
+			startAttempts++
+			if startAttempts == 1 {
+				return api.Result{}, errors.New("transient control-plane failure")
+			}
+			body, _ := codec.EncodeResult(api.PipelineStartResult{ExecutionID: "exec-retry-2", Version: 1})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case OperationInspect:
+			body, _ := codec.EncodeResult(api.ExecutionInspectResult{
+				ExecutionID:   "exec-retry-2",
+				State:         "running",
+				Version:       1,
+				CurrentAction: 0,
+				Actions: []api.ExecutionAction{{
+					ActionID: "act-retry-sbox",
+					Index:    0,
+					Name:     "sandbox",
+					Kind:     "container",
+					State:    "running",
+					Version:  1,
+				}},
+				Cleanup: api.ExecutionCleanup{State: "none"},
+			})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case OperationExecutionLogsRead:
+			body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
+				Chunks: []api.LogChunk{{
+					ActionID: "act-retry-sbox",
+					Stream:   "stdout",
+					Data:     []byte(sandboxReadyLinePrefix + baseURL + "\n"),
+				}},
+			})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case OperationExecutionCancel:
+			body, _ := codec.EncodeResult(api.ExecutionCancelResult{ExecutionVersion: 2})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		default:
+			return api.Result{}, fmt.Errorf("unexpected op %s", inv.Operation)
+		}
+	})
+
+	mgr, err := NewKodemaExecutionSandboxManager(KodemaExecutionSandboxConfig{
+		TenantID:               "tenant-1",
+		ProjectID:              "project-1",
+		Handler:                handler,
+		AllowLoopbackEndpoints: true,
+		ReadyTimeout:           5 * time.Second,
+		HealthInterval:         30 * time.Millisecond,
+		StopTimeout:            2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewKodemaExecutionSandboxManager: %v", err)
+	}
+
+	req := OpenCodeSandboxRequest{
+		TenantID:    "tenant-1",
+		ProjectID:   "project-1",
+		TaskID:      "task-retry",
+		ExecutionID: "exec-parent-retry",
+		ActionID:    "act-parent-retry",
+		Image:       "golang:1.24",
+		Port:        boundPort,
+	}
+
+	// Attempt 1 fails transiently; its ephemeral secret must be cleaned up.
+	if _, err := mgr.Acquire(context.Background(), req); err == nil {
+		t.Fatal("first Acquire unexpectedly succeeded")
+	}
+	mu.Lock()
+	firstSecret := writtenSecrets[0]
+	firstDeleted := deletedSecrets[firstSecret]
+	mu.Unlock()
+	if firstDeleted != 1 {
+		t.Fatalf("failed Acquire did not clean up ephemeral secret %q (deletes=%d)", firstSecret, firstDeleted)
+	}
+
+	// Attempt 2 with the exact same (ExecutionID, ActionID, TaskID) gets a fresh idempotency key and succeeds.
+	lease, err := mgr.Acquire(context.Background(), req)
+	if err != nil {
+		t.Fatalf("retry Acquire failed: %v", err)
+	}
+	if lease.ExecutionID != "exec-retry-2" {
+		t.Fatalf("retry lease ExecutionID = %q; want exec-retry-2", lease.ExecutionID)
+	}
+	if len(seenStartKeys) != 2 {
+		t.Fatalf("expected 2 distinct pipeline.start idempotency keys, got %d", len(seenStartKeys))
+	}
+}
+
+func TestCommitAndPushViaSandboxMCPPreservesPushStderrAndValidatesSHA(t *testing.T) {
+	// 1. Failing git push must preserve stderr diagnostics in the returned error.
+	ws := t.TempDir()
+	runGitCmd(t, ws, "init")
+	if err := os.WriteFile(filepath.Join(ws, "a.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	runGitCmd(t, ws, "add", "a.txt")
+	runGitCmd(t, ws, "-c", "user.name=T", "-c", "user.email=t@t", "commit", "-m", "init")
+	// Point origin at a nonexistent path so `git push` fails with diagnostic stderr.
+	runGitCmd(t, ws, "remote", "add", "origin", filepath.Join(t.TempDir(), "does-not-exist.git"))
+
+	tok, err := sandbox.GenerateBearerToken()
+	if err != nil {
+		t.Fatalf("GenerateBearerToken: %v", err)
+	}
+	srv, err := sandbox.NewServer(sandbox.Config{
+		ListenAddr:   "127.0.0.1:0",
+		WorkspaceDir: ws,
+		Token:        tok,
+	})
+	if err != nil {
+		t.Fatalf("sandbox.NewServer: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	baseURL, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("srv.Start: %v", err)
+	}
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+
+	_, err = CommitAndPushViaSandboxMCP(
+		context.Background(),
+		OpenCodeSandboxLease{EndpointURL: baseURL + "/mcp", BearerToken: tok},
+		"app/backend",
+		"task-1",
+		"test commit",
+		nil,
+	)
+	if err == nil {
+		t.Fatal("CommitAndPushViaSandboxMCP unexpectedly succeeded against missing remote")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist.git") && !strings.Contains(err.Error(), "fatal:") {
+		t.Fatalf("expected git push stderr diagnostics in error, got: %v", err)
+	}
+
+	// 2. Non-40-char-hex SHA must be rejected by isValidCommitSHA.
+	for _, bad := range []string{"", "abc123", strings.Repeat("g", 40), strings.Repeat("A", 40), strings.Repeat("a", 39), strings.Repeat("a", 41)} {
+		if isValidCommitSHA(bad) {
+			t.Errorf("isValidCommitSHA(%q) = true; want false", bad)
+		}
+	}
+	if !isValidCommitSHA("0123456789abcdef0123456789abcdef01234567") {
+		t.Error("isValidCommitSHA rejected valid 40-char lowercase hex SHA")
 	}
 }
 

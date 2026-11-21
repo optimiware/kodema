@@ -407,10 +407,16 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 				return 2
 			}
 		}
-		usePerTurnRouting := *perTurnProxyRouting || (execMode == services.OpenCodeExecutionModeBrain && strings.TrimSpace(*llmProxyListen) != "")
-		if strings.TrimSpace(*llmProxyListen) != "" && !usePerTurnRouting && *maxConcurrency > 1 {
-			usage(stderr, "opencode service with --llm-proxy-listen requires --max-concurrency <= 1")
-			return 2
+		usePerTurnRouting := *perTurnProxyRouting
+		effectiveMaxConcurrency := *maxConcurrency
+		if strings.TrimSpace(*llmProxyListen) != "" && !usePerTurnRouting {
+			if effectiveMaxConcurrency > 1 {
+				usage(stderr, "opencode service with --llm-proxy-listen requires --max-concurrency <= 1 unless --per-turn-proxy-routing is enabled")
+				return 2
+			}
+			if effectiveMaxConcurrency <= 0 {
+				effectiveMaxConcurrency = 1
+			}
 		}
 		var defaultCaches []string
 		for _, part := range strings.Split(*sandboxCachesRaw, ",") {
@@ -451,7 +457,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			Model:               *model,
 			Agent:               *agent,
 			RescanInterval:      *rescan,
-			MaxConcurrentTurns:  *maxConcurrency,
+			MaxConcurrentTurns:  effectiveMaxConcurrency,
 			Transport:           transport,
 		}
 		if err := servicesapp.RunOpenCode(ctx, config); err != nil {

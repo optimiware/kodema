@@ -1,10 +1,14 @@
 package sandbox
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -15,14 +19,16 @@ import (
 var ErrPathEscape = errors.New("path escapes workspace jail")
 
 // WorkspaceJail confines all file operations strictly inside a canonicalized
-// workspace root directory.
+// workspace root directory backed by Go's kernel-enforced os.Root
+// (openat2 RESOLVE_BENEATH on Linux).
 type WorkspaceJail struct {
 	root     string
 	origRoot string
+	osRoot   *os.Root
 }
 
 // NewWorkspaceJail canonicalizes dir with filepath.Abs and filepath.EvalSymlinks
-// and verifies it exists and is a directory.
+// and opens an os.Root handle enforcing kernel-level containment beneath it.
 func NewWorkspaceJail(dir string) (*WorkspaceJail, error) {
 	trimmed := strings.TrimSpace(dir)
 	if trimmed == "" {
@@ -39,17 +45,32 @@ func NewWorkspaceJail(dir string) (*WorkspaceJail, error) {
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize workspace directory %q: %w", absDir, err)
 	}
-	info, err := os.Stat(realDir)
+	osRoot, err := os.OpenRoot(realDir)
 	if err != nil {
+		return nil, fmt.Errorf("open workspace root %q: %w", realDir, err)
+	}
+	info, err := osRoot.Stat(".")
+	if err != nil {
+		_ = osRoot.Close()
 		return nil, fmt.Errorf("stat workspace directory %q: %w", realDir, err)
 	}
 	if !info.IsDir() {
+		_ = osRoot.Close()
 		return nil, fmt.Errorf("workspace path %q is not a directory", realDir)
 	}
 	return &WorkspaceJail{
 		root:     filepath.Clean(realDir),
 		origRoot: filepath.Clean(absDir),
+		osRoot:   osRoot,
 	}, nil
+}
+
+// Close releases the underlying os.Root file descriptor.
+func (j *WorkspaceJail) Close() error {
+	if j == nil || j.osRoot == nil {
+		return nil
+	}
+	return j.osRoot.Close()
 }
 
 // Root returns the canonical workspace root path.
@@ -57,81 +78,22 @@ func (j *WorkspaceJail) Root() string {
 	return j.root
 }
 
-// Rel returns the workspace-relative slash path for an already-jailed path.
-func (j *WorkspaceJail) Rel(resolved string) string {
-	rel, err := filepath.Rel(j.root, resolved)
-	if err != nil {
-		return resolved
-	}
-	return filepath.ToSlash(rel)
-}
-
-// ResolveFile resolves a non-empty file path strictly inside the workspace.
-// When allowMissing is false, the target must exist and must not traverse or
-// terminate in a symlink that escapes the workspace.
-func (j *WorkspaceJail) ResolveFile(rawPath string, allowMissing bool) (string, error) {
-	if strings.TrimSpace(rawPath) == "" {
-		return "", errors.New("path is required")
-	}
-	return j.resolveJailedPath(rawPath, allowMissing, false)
-}
-
-// ResolveForWrite resolves a target path for writing or editing. It refuses
-// empty paths, workspace root itself, NUL bytes, traversal, escaping ancestor
-// symlinks, and any symlink (valid or broken) at the final target path.
-func (j *WorkspaceJail) ResolveForWrite(rawPath string) (string, error) {
-	if strings.TrimSpace(rawPath) == "" {
-		return "", errors.New("path is required")
-	}
-	resolved, err := j.resolveJailedPath(rawPath, true, true)
-	if err != nil {
-		return "", err
-	}
-	if resolved == j.root {
-		return "", errors.New("cannot write to workspace root directory")
-	}
-	return resolved, nil
-}
-
-// ResolveDir resolves an optional directory path (empty or "." means workspace
-// root) strictly inside the workspace and verifies it is a directory.
-func (j *WorkspaceJail) ResolveDir(rawPath string) (string, error) {
-	if strings.TrimSpace(rawPath) == "" || strings.TrimSpace(rawPath) == "." {
-		return j.root, nil
-	}
-	resolved, err := j.resolveJailedPath(rawPath, false, false)
-	if err != nil {
-		return "", err
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", err
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("path %q is not a directory", rawPath)
-	}
-	return resolved, nil
-}
-
-// ResolveExisting resolves an optional path (empty or "." means workspace root)
-// to an existing file or directory strictly inside the workspace.
-func (j *WorkspaceJail) ResolveExisting(rawPath string) (string, error) {
-	if strings.TrimSpace(rawPath) == "" || strings.TrimSpace(rawPath) == "." {
-		return j.root, nil
-	}
-	return j.resolveJailedPath(rawPath, false, false)
-}
-
-// resolveJailedPath validates rawPath against NUL bytes, traversal, outside
-// absolute paths, and symlink escapes by walking every path component and
-// verifying EvalSymlinks containment on the deepest existing ancestor and
-// target itself.
-func (j *WorkspaceJail) resolveJailedPath(rawPath string, allowMissing bool, refuseTargetSymlink bool) (string, error) {
+// NormalizeRelPath validates rawPath and converts it to a clean slash-separated
+// relative path suitable for os.Root operations. It strictly rejects NUL bytes,
+// backslashes, outside absolute paths, and any ".." traversal segment (never
+// lexically popping ".." across potentially non-existent or symlinked segments).
+func (j *WorkspaceJail) NormalizeRelPath(rawPath string, allowRoot bool) (string, error) {
 	if strings.ContainsRune(rawPath, 0) {
 		return "", fmt.Errorf("%w: path contains NUL byte", ErrPathEscape)
 	}
-	if rawPath == "" {
-		return "", errors.New("path is empty")
+	if strings.TrimSpace(rawPath) == "" {
+		if allowRoot {
+			return ".", nil
+		}
+		return "", errors.New("path is required")
+	}
+	if strings.ContainsRune(rawPath, '\\') {
+		return "", fmt.Errorf("%w: path contains invalid separator", ErrPathEscape)
 	}
 
 	relInput, err := j.toRelativeInput(rawPath)
@@ -139,106 +101,35 @@ func (j *WorkspaceJail) resolveJailedPath(rawPath string, allowMissing bool, ref
 		return "", err
 	}
 	if relInput == "" || relInput == "." {
-		return j.root, nil
+		if allowRoot {
+			return ".", nil
+		}
+		return "", errors.New("cannot target workspace root directory")
 	}
 
-	// Split raw relative path without collapsing symlinks first, so sequences
-	// like "symlink_to_etc/../passwd" cannot hide an escaping component.
-	rawSegments := strings.Split(filepath.ToSlash(relInput), "/")
-	cur := j.root
-	for idx, seg := range rawSegments {
+	rawSegments := strings.Split(relInput, "/")
+	parts := make([]string, 0, len(rawSegments))
+	for _, seg := range rawSegments {
 		if seg == "" || seg == "." {
 			continue
 		}
 		if seg == ".." {
-			// Verify cur before popping, and refuse popping above workspace root.
-			if cur == j.root || !isWithinRoot(j.root, cur) {
-				return "", fmt.Errorf("%w: traversal outside workspace", ErrPathEscape)
-			}
-			cur = filepath.Dir(cur)
-			if !isWithinRoot(j.root, cur) {
-				return "", fmt.Errorf("%w: traversal outside workspace", ErrPathEscape)
-			}
-			continue
+			return "", fmt.Errorf("%w: traversal outside workspace", ErrPathEscape)
 		}
-
-		next := filepath.Join(cur, seg)
-		if !isWithinRoot(j.root, next) {
-			return "", fmt.Errorf("%w: path leaves workspace root", ErrPathEscape)
+		parts = append(parts, seg)
+	}
+	if len(parts) == 0 {
+		if allowRoot {
+			return ".", nil
 		}
-
-		info, lstatErr := os.Lstat(next)
-		if lstatErr != nil {
-			if !os.IsNotExist(lstatErr) {
-				return "", fmt.Errorf("inspect path component: %w", lstatErr)
-			}
-			if !allowMissing {
-				return "", os.ErrNotExist
-			}
-			// Deepest existing ancestor is cur; verify its canonical path is
-			// strictly contained inside j.root.
-			resolvedCur, evalErr := filepath.EvalSymlinks(cur)
-			if evalErr != nil {
-				return "", fmt.Errorf("%w: cannot verify ancestor directory: %v", ErrPathEscape, evalErr)
-			}
-			resolvedCur = filepath.Clean(resolvedCur)
-			if !isWithinRoot(j.root, resolvedCur) {
-				return "", fmt.Errorf("%w: ancestor symlink escapes workspace", ErrPathEscape)
-			}
-			// Process remaining non-existent segments strictly without leaving j.root.
-			out := resolvedCur
-			for _, rem := range rawSegments[idx:] {
-				if rem == "" || rem == "." {
-					continue
-				}
-				if rem == ".." {
-					if out == j.root || !isWithinRoot(j.root, out) {
-						return "", fmt.Errorf("%w: traversal outside workspace", ErrPathEscape)
-					}
-					out = filepath.Dir(out)
-					if !isWithinRoot(j.root, out) {
-						return "", fmt.Errorf("%w: traversal outside workspace", ErrPathEscape)
-					}
-					continue
-				}
-				out = filepath.Join(out, rem)
-				if !isWithinRoot(j.root, out) {
-					return "", fmt.Errorf("%w: path leaves workspace root", ErrPathEscape)
-				}
-			}
-			return out, nil
-		}
-
-		isLast := isLastNonTrivialSegment(rawSegments[idx+1:])
-		if info.Mode()&os.ModeSymlink != 0 {
-			if refuseTargetSymlink && isLast {
-				return "", fmt.Errorf("%w: refusing to write through symlink", ErrPathEscape)
-			}
-			resolvedNext, evalErr := filepath.EvalSymlinks(next)
-			if evalErr != nil {
-				// Broken symlink (could point to /etc/nonexistent or /kodema/secrets/new).
-				return "", fmt.Errorf("%w: broken or unreadable symlink", ErrPathEscape)
-			}
-			resolvedNext = filepath.Clean(resolvedNext)
-			if !isWithinRoot(j.root, resolvedNext) {
-				return "", fmt.Errorf("%w: symlink target escapes workspace", ErrPathEscape)
-			}
-			cur = resolvedNext
-			continue
-		}
-		cur = next
+		return "", errors.New("cannot target workspace root directory")
 	}
 
-	// Final canonical check on existing target.
-	resolvedFinal, err := filepath.EvalSymlinks(cur)
-	if err != nil {
-		return "", fmt.Errorf("%w: cannot canonicalize target: %v", ErrPathEscape, err)
+	rel := strings.Join(parts, "/")
+	if !fs.ValidPath(rel) {
+		return "", fmt.Errorf("%w: invalid relative path", ErrPathEscape)
 	}
-	resolvedFinal = filepath.Clean(resolvedFinal)
-	if !isWithinRoot(j.root, resolvedFinal) {
-		return "", fmt.Errorf("%w: target escapes workspace", ErrPathEscape)
-	}
-	return resolvedFinal, nil
+	return rel, nil
 }
 
 func (j *WorkspaceJail) toRelativeInput(rawPath string) (string, error) {
@@ -246,8 +137,8 @@ func (j *WorkspaceJail) toRelativeInput(rawPath string) (string, error) {
 		return rawPath, nil
 	}
 	// Strip either canonical root or original (pre-EvalSymlinks) root prefix
-	// without collapsing ".." segments first, so symlink escapes inside an
-	// absolute workspace path are still caught component by component.
+	// without collapsing ".." segments first, so traversal inside an absolute
+	// workspace path is always rejected.
 	slashRaw := filepath.ToSlash(rawPath)
 	for _, base := range []string{filepath.ToSlash(j.root), filepath.ToSlash(j.origRoot)} {
 		if base == "" {
@@ -264,15 +155,6 @@ func (j *WorkspaceJail) toRelativeInput(rawPath string) (string, error) {
 	return "", fmt.Errorf("%w: absolute path %q is outside workspace", ErrPathEscape, rawPath)
 }
 
-func isLastNonTrivialSegment(rest []string) bool {
-	for _, seg := range rest {
-		if seg != "" && seg != "." {
-			return false
-		}
-	}
-	return true
-}
-
 // isWithinRoot returns true iff candidate equals root or is strictly below root.
 func isWithinRoot(root, candidate string) bool {
 	root = filepath.Clean(root)
@@ -287,18 +169,56 @@ func isWithinRoot(root, candidate string) bool {
 	return strings.HasPrefix(candidate, prefix)
 }
 
-// SafeOpenRead opens an already-jailed canonical regular file with O_NOFOLLOW
-// and verifies it is a regular file within the workspace.
-func (j *WorkspaceJail) SafeOpenRead(canonicalPath string) (*os.File, os.FileInfo, error) {
-	if !isWithinRoot(j.root, canonicalPath) {
-		return nil, nil, fmt.Errorf("%w: path outside workspace", ErrPathEscape)
+func wrapRootErr(err error) error {
+	if err == nil {
+		return nil
 	}
-	f, err := os.OpenFile(canonicalPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, ErrPathEscape) {
+		return err
+	}
+	if errors.Is(err, syscall.ELOOP) || strings.Contains(err.Error(), "escapes from parent") {
+		return fmt.Errorf("%w: %v", ErrPathEscape, err)
+	}
+	return err
+}
+
+// OpenRead opens an existing regular file strictly beneath the os.Root jail.
+// When refuseTargetSymlink is true, symlinks at the final path component are
+// explicitly rejected with ErrPathEscape (enforced via Lstat + O_NOFOLLOW).
+func (j *WorkspaceJail) OpenRead(rawPath string, refuseTargetSymlink bool) (*os.File, os.FileInfo, string, error) {
+	rel, err := j.NormalizeRelPath(rawPath, false)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return nil, nil, fmt.Errorf("%w: refused symlink on open", ErrPathEscape)
+		return nil, nil, "", err
+	}
+	f, info, err := j.openReadRel(rel, refuseTargetSymlink)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return f, info, rel, nil
+}
+
+func (j *WorkspaceJail) openReadRel(rel string, refuseTargetSymlink bool) (*os.File, os.FileInfo, error) {
+	if !fs.ValidPath(rel) || rel == "." {
+		return nil, nil, fmt.Errorf("%w: invalid relative file path", ErrPathEscape)
+	}
+	var (
+		f   *os.File
+		err error
+	)
+	if refuseTargetSymlink {
+		linfo, lerr := j.osRoot.Lstat(rel)
+		if lerr != nil {
+			return nil, nil, wrapRootErr(lerr)
 		}
-		return nil, nil, err
+		if linfo.Mode()&os.ModeSymlink != 0 {
+			return nil, nil, fmt.Errorf("%w: refusing to open symlink target", ErrPathEscape)
+		}
+		f, err = j.osRoot.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	} else {
+		f, err = j.osRoot.Open(rel)
+	}
+	if err != nil {
+		return nil, nil, wrapRootErr(err)
 	}
 	info, err := f.Stat()
 	if err != nil {
@@ -312,84 +232,79 @@ func (j *WorkspaceJail) SafeOpenRead(canonicalPath string) (*os.File, os.FileInf
 	return f, info, nil
 }
 
-// EnsureParentDirs creates missing parent directories strictly inside the
-// workspace jail, verifying every existing component is a real directory
-// (never crossing a symlink escaping the workspace).
-func (j *WorkspaceJail) EnsureParentDirs(targetPath string) (string, error) {
-	if !isWithinRoot(j.root, targetPath) {
-		return "", fmt.Errorf("%w: target outside workspace", ErrPathEscape)
+// StatExisting validates rawPath (empty or "." means workspace root) and stats
+// it strictly through os.Root.
+func (j *WorkspaceJail) StatExisting(rawPath string) (string, os.FileInfo, error) {
+	rel, err := j.NormalizeRelPath(rawPath, true)
+	if err != nil {
+		return "", nil, err
 	}
-	parent := filepath.Dir(targetPath)
-	rel, err := filepath.Rel(j.root, parent)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("%w: parent outside workspace", ErrPathEscape)
+	info, err := j.osRoot.Stat(rel)
+	if err != nil {
+		return "", nil, wrapRootErr(err)
+	}
+	return rel, info, nil
+}
+
+// ResolveDirRel resolves an optional directory path (empty or "." means
+// workspace root) strictly through os.Root and verifies it is a directory.
+func (j *WorkspaceJail) ResolveDirRel(rawPath string) (string, error) {
+	rel, info, err := j.StatExisting(rawPath)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("path %q is not a directory", rawPath)
+	}
+	return rel, nil
+}
+
+// ResolveWorkdir validates an optional working directory for child command
+// execution through os.Root and returns its host directory path beneath j.root.
+func (j *WorkspaceJail) ResolveWorkdir(rawPath string) (string, error) {
+	rel, err := j.ResolveDirRel(rawPath)
+	if err != nil {
+		return "", err
 	}
 	if rel == "." {
 		return j.root, nil
 	}
-	cur := j.root
-	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
-		if seg == "" || seg == "." {
-			continue
-		}
-		if seg == ".." {
-			return "", fmt.Errorf("%w: traversal in parent", ErrPathEscape)
-		}
-		next := filepath.Join(cur, seg)
-		info, lstatErr := os.Lstat(next)
-		if lstatErr != nil {
-			if !os.IsNotExist(lstatErr) {
-				return "", lstatErr
-			}
-			if err := os.Mkdir(next, 0o755); err != nil && !os.IsExist(err) {
-				return "", fmt.Errorf("create directory %q: %w", seg, err)
-			}
-			cur = next
-			continue
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			resolved, evalErr := filepath.EvalSymlinks(next)
-			if evalErr != nil || !isWithinRoot(j.root, resolved) {
-				return "", fmt.Errorf("%w: parent symlink escapes workspace", ErrPathEscape)
-			}
-			rInfo, statErr := os.Stat(resolved)
-			if statErr != nil || !rInfo.IsDir() {
-				return "", errors.New("parent path is not a directory")
-			}
-			cur = resolved
-			continue
-		}
-		if !info.IsDir() {
-			return "", fmt.Errorf("parent component %q is not a directory", seg)
-		}
-		cur = next
-	}
-	resolvedParent, err := filepath.EvalSymlinks(cur)
-	if err != nil || !isWithinRoot(j.root, resolvedParent) {
-		return "", fmt.Errorf("%w: verified parent escapes workspace", ErrPathEscape)
-	}
-	return filepath.Clean(resolvedParent), nil
+	return filepath.Join(j.root, filepath.FromSlash(rel)), nil
 }
 
-// AtomicWrite writes data atomically to canonicalTarget via a temp file in the
-// verified canonical parent directory and rename. Refuses if the target is a
-// symlink or directory.
-func (j *WorkspaceJail) AtomicWrite(canonicalTarget string, data []byte) error {
-	parentDir, err := j.EnsureParentDirs(canonicalTarget)
+// AtomicWrite validates rawPath and writes data atomically inside os.Root via
+// a temp file in the target's parent directory and rename. Refuses if the
+// target is a symlink, directory, or workspace root.
+func (j *WorkspaceJail) AtomicWrite(rawPath string, data []byte) (string, error) {
+	rel, err := j.NormalizeRelPath(rawPath, false)
 	if err != nil {
-		return err
+		return "", err
 	}
-	base := filepath.Base(canonicalTarget)
-	if base == "" || base == "." || base == ".." || strings.ContainsRune(base, filepath.Separator) {
+	if err := j.AtomicWriteRel(rel, data); err != nil {
+		return "", err
+	}
+	return rel, nil
+}
+
+// AtomicWriteRel writes data atomically to an already-normalized relative path
+// strictly inside os.Root.
+func (j *WorkspaceJail) AtomicWriteRel(rel string, data []byte) error {
+	if !fs.ValidPath(rel) || rel == "." {
+		return fmt.Errorf("%w: invalid target path", ErrPathEscape)
+	}
+	base := path.Base(rel)
+	if base == "" || base == "." || base == ".." {
 		return fmt.Errorf("%w: invalid target filename", ErrPathEscape)
 	}
-	finalTarget := filepath.Join(parentDir, base)
-	if !isWithinRoot(j.root, finalTarget) {
-		return fmt.Errorf("%w: target outside workspace", ErrPathEscape)
+	parent := path.Dir(rel)
+	if parent != "." {
+		if err := j.osRoot.MkdirAll(parent, 0o755); err != nil {
+			return wrapRootErr(fmt.Errorf("create parent directories: %w", err))
+		}
 	}
 
 	mode := os.FileMode(0o644)
-	if info, err := os.Lstat(finalTarget); err == nil {
+	if info, err := j.osRoot.Lstat(rel); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: refusing to overwrite symlink target", ErrPathEscape)
 		}
@@ -397,19 +312,28 @@ func (j *WorkspaceJail) AtomicWrite(canonicalTarget string, data []byte) error {
 			return errors.New("cannot write to a directory")
 		}
 		mode = info.Mode().Perm()
-	} else if !os.IsNotExist(err) {
-		return err
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return wrapRootErr(err)
 	}
 
-	tmp, err := os.CreateTemp(parentDir, ".kodema-write-*")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return fmt.Errorf("generate temp filename: %w", err)
 	}
-	tmpName := tmp.Name()
+	tmpBase := ".kodema-write-" + hex.EncodeToString(suffix[:])
+	tmpRel := tmpBase
+	if parent != "." {
+		tmpRel = parent + "/" + tmpBase
+	}
+
+	tmp, err := j.osRoot.OpenFile(tmpRel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return wrapRootErr(fmt.Errorf("create temp file: %w", err))
+	}
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = os.Remove(tmpName)
+			_ = j.osRoot.Remove(tmpRel)
 		}
 	}()
 
@@ -429,18 +353,20 @@ func (j *WorkspaceJail) AtomicWrite(canonicalTarget string, data []byte) error {
 		return err
 	}
 
-	// Re-check target immediately before rename to narrow TOCTOU window.
-	if info, err := os.Lstat(finalTarget); err == nil {
+	// Re-check target immediately before rename via os.Root.Lstat.
+	if info, err := j.osRoot.Lstat(rel); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: target became a symlink before rename", ErrPathEscape)
 		}
 		if info.IsDir() {
 			return errors.New("target became a directory")
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return wrapRootErr(err)
 	}
 
-	if err := os.Rename(tmpName, finalTarget); err != nil {
-		return fmt.Errorf("install written file: %w", err)
+	if err := j.osRoot.Rename(tmpRel, rel); err != nil {
+		return wrapRootErr(fmt.Errorf("install written file: %w", err))
 	}
 	cleanup = false
 	return nil

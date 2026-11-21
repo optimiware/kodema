@@ -22,6 +22,8 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel"
 	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
+	shellruntime "github.com/optimiware/kodema/internal/shell/runtime"
+	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
 // tenantRuntime routes every Kernel runtime operation to the adapter of the
@@ -67,22 +69,28 @@ func newTenantRuntime(scopes executionScopeReader, tenants []ProductionTenant) (
 	return runtime, nil
 }
 
-// adapter resolves the one tenant runtime that owns the execution. Nothing is
-// called before the durable fact is read and matched.
-func (runtime *tenantRuntime) adapter(ctx context.Context, executionID id.ExecutionID) (kernelengine.Runtime, error) {
+// adapter resolves the one tenant runtime that owns the execution and its
+// durable tenancy scope. Nothing is called before the durable fact is read and
+// matched.
+func (runtime *tenantRuntime) adapterForScope(ctx context.Context, executionID id.ExecutionID) (kernelengine.Runtime, tenancy.Scope, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, tenancy.Scope{}, err
 	}
 	scope, err := runtime.scopes.ExecutionScope(ctx, executionID)
 	if err != nil {
-		return nil, err
+		return nil, tenancy.Scope{}, err
 	}
 	adapter, ok := runtime.tenants[scope.TenantID]
 	if !ok {
-		return nil, fault.New(fault.Forbidden,
+		return nil, tenancy.Scope{}, fault.New(fault.Forbidden,
 			"execution tenant is not served by this installation")
 	}
-	return adapter, nil
+	return adapter, scope, nil
+}
+
+func (runtime *tenantRuntime) adapter(ctx context.Context, executionID id.ExecutionID) (kernelengine.Runtime, error) {
+	adapter, _, err := runtime.adapterForScope(ctx, executionID)
+	return adapter, err
 }
 
 // Capabilities is the safe intersection of every served tenant adapter's
@@ -135,9 +143,12 @@ func intersectNames(first, second []string) []string {
 }
 
 func (runtime *tenantRuntime) Prepare(ctx context.Context, request kernelengine.PrepareRequest) (kernelengine.Preparation, error) {
-	adapter, err := runtime.adapter(ctx, request.Identity.ExecutionID)
+	adapter, scope, err := runtime.adapterForScope(ctx, request.Identity.ExecutionID)
 	if err != nil {
 		return kernelengine.Preparation{}, err
+	}
+	if shellruntime.ExecutionProject(ctx) == "" && scope.ProjectID != "" {
+		ctx = shellruntime.WithExecutionProject(ctx, scope.ProjectID)
 	}
 	return adapter.Prepare(ctx, request)
 }

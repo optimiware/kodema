@@ -9,6 +9,7 @@ import (
 	"github.com/optimiware/kodema/internal/installation"
 	"github.com/optimiware/kodema/internal/kernel"
 	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
+	shellruntime "github.com/optimiware/kodema/internal/shell/runtime"
 )
 
 // closePolicy records what a graceful composition close does with the workloads
@@ -81,11 +82,12 @@ func (runtime *trackedRuntime) Capabilities(ctx context.Context) (kernelengine.C
 
 func (runtime *trackedRuntime) Prepare(ctx context.Context, request kernelengine.PrepareRequest) (kernelengine.Preparation, error) {
 	if runtime.activation != nil {
-		prepared, err := runtime.activation.prepare(ctx, request)
+		prepared, projectID, err := runtime.activation.prepare(ctx, request)
 		if err != nil {
 			return kernelengine.Preparation{}, err
 		}
 		request = prepared
+		ctx = shellruntime.WithExecutionProject(ctx, projectID)
 	}
 	prepared, err := runtime.inner.Prepare(ctx, request)
 	if err == nil && runtime.activation != nil {

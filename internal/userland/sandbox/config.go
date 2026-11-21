@@ -27,6 +27,8 @@ const (
 	DefaultWorkspaceDir = "/workspace"
 	// DefaultTokenEnv is the default environment variable holding the bearer token.
 	DefaultTokenEnv = "KODEMA_SANDBOX_TOKEN"
+	// DefaultTokenFileEnv is the environment variable naming a token file path.
+	DefaultTokenFileEnv = "KODEMA_SANDBOX_TOKEN_FILE"
 
 	// DefaultMaxCmdTimeout bounds a single bash tool execution when not configured.
 	DefaultMaxCmdTimeout = 5 * time.Minute
@@ -73,6 +75,12 @@ type TokenConfig struct {
 	// GenerateTokenFile generates a fresh 256-bit random bearer token and
 	// writes it atomically with 0600 permissions to this path.
 	GenerateTokenFile string
+	// WorkspaceDir, when non-empty, rejects TokenFile and GenerateTokenFile if
+	// they resolve inside the workspace directory.
+	WorkspaceDir string
+	// UnlinkTokenFile unlinks TokenFile immediately after reading it into memory
+	// so no child `bash` process can read it from disk.
+	UnlinkTokenFile bool
 	// LookupEnv optionally overrides os.LookupEnv (for tests).
 	LookupEnv func(string) (string, bool)
 }
@@ -121,14 +129,29 @@ func ResolveToken(cfg TokenConfig) (string, error) {
 	}
 
 	if tokenFile != "" {
-		tok, err := readTokenFile(tokenFile)
+		if inside, err := pathWithinWorkspace(cfg.WorkspaceDir, tokenFile); err != nil {
+			return "", err
+		} else if inside {
+			return "", errors.New("sandbox token-file must not reside inside workspace directory")
+		}
+		tok, err := readTokenFile(tokenFile, cfg.UnlinkTokenFile)
 		if err != nil {
 			return "", err
+		}
+		if cfg.UnlinkTokenFile {
+			if err := os.Remove(tokenFile); err != nil {
+				return "", fmt.Errorf("unlink sandbox token file: %w", err)
+			}
 		}
 		return tok, nil
 	}
 
 	if genFile != "" {
+		if inside, err := pathWithinWorkspace(cfg.WorkspaceDir, genFile); err != nil {
+			return "", err
+		} else if inside {
+			return "", errors.New("sandbox generate-token-file must not reside inside workspace directory")
+		}
 		tok, err := GenerateBearerToken()
 		if err != nil {
 			return "", err
@@ -165,8 +188,50 @@ func GenerateBearerToken() (string, error) {
 	return "kodsbox." + hex.EncodeToString(raw[:]), nil
 }
 
-func readTokenFile(path string) (string, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+func pathWithinWorkspace(workspaceDir, candidate string) (bool, error) {
+	wsTrim := strings.TrimSpace(workspaceDir)
+	if wsTrim == "" {
+		return false, nil
+	}
+	if strings.ContainsRune(candidate, 0) {
+		return false, errors.New("token file path contains NUL byte")
+	}
+	absWS, err := filepath.Abs(filepath.Clean(wsTrim))
+	if err != nil {
+		return false, fmt.Errorf("resolve workspace directory: %w", err)
+	}
+	realWS := absWS
+	if evalWS, err := filepath.EvalSymlinks(absWS); err == nil {
+		realWS = filepath.Clean(evalWS)
+	}
+
+	absCand, err := filepath.Abs(filepath.Clean(candidate))
+	if err != nil {
+		return false, fmt.Errorf("resolve token file path: %w", err)
+	}
+	if isWithinRoot(absWS, absCand) || isWithinRoot(realWS, absCand) {
+		return true, nil
+	}
+	if evalCand, err := filepath.EvalSymlinks(absCand); err == nil {
+		evalCand = filepath.Clean(evalCand)
+		if isWithinRoot(absWS, evalCand) || isWithinRoot(realWS, evalCand) {
+			return true, nil
+		}
+	} else if evalDir, err := filepath.EvalSymlinks(filepath.Dir(absCand)); err == nil {
+		resolved := filepath.Join(filepath.Clean(evalDir), filepath.Base(absCand))
+		if isWithinRoot(absWS, resolved) || isWithinRoot(realWS, resolved) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func readTokenFile(path string, noFollow bool) (string, error) {
+	flags := os.O_RDONLY
+	if noFollow {
+		flags |= syscall.O_NOFOLLOW
+	}
+	f, err := os.OpenFile(path, flags, 0)
 	if err != nil {
 		return "", fmt.Errorf("open sandbox token file: %w", err)
 	}

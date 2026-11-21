@@ -124,11 +124,12 @@ func GenerateBrainOpenCodeConfig(cfg OpenCodeBrainConfig, proxyBaseURL, localAPI
 }
 
 // ValidateBrainOpenCodeConfig verifies that an `opencode.json` policy document
-// explicitly disables all local shell and filesystem tools required for Option 2
-// Brain mode.
+// explicitly disables all local shell and filesystem tools (in both `tools` and
+// `permission`) required for Option 2 Brain mode.
 func ValidateBrainOpenCodeConfig(data []byte) error {
 	var parsed struct {
-		Tools map[string]bool `json:"tools"`
+		Tools      map[string]bool   `json:"tools"`
+		Permission map[string]string `json:"permission"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return fmt.Errorf("decode opencode brain config: %w", err)
@@ -136,10 +137,17 @@ func ValidateBrainOpenCodeConfig(data []byte) error {
 	if len(parsed.Tools) == 0 {
 		return fmt.Errorf("opencode brain config must explicitly disable local tools")
 	}
+	if len(parsed.Permission) == 0 {
+		return fmt.Errorf("opencode brain config must explicitly deny local tool permissions")
+	}
 	for _, required := range DefaultBrainDisabledLocalTools {
 		enabled, present := parsed.Tools[required]
 		if !present || enabled {
 			return fmt.Errorf("opencode brain config must disable local tool %q (got present=%v enabled=%v)", required, present, enabled)
+		}
+		perm, permPresent := parsed.Permission[required]
+		if !permPresent || perm != "deny" {
+			return fmt.Errorf("opencode brain config must deny permission for local tool %q (got present=%v value=%q)", required, permPresent, perm)
 		}
 	}
 	return nil

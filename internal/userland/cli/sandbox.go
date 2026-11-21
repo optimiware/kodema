@@ -63,9 +63,10 @@ func runSandboxServe(ctx context.Context, args []string, ports Ports, deps Comma
 	flags.SetOutput(ports.Err)
 	listen := flags.String("listen", envDefault("KODEMA_SANDBOX_LISTEN", sandbox.DefaultListenAddr), "HTTP listen address (e.g. 127.0.0.1:8090 or 0.0.0.0:8090)")
 	workspace := flags.String("workspace", envDefault("KODEMA_SANDBOX_WORKSPACE", sandbox.DefaultWorkspaceDir), "workspace root directory to jail")
-	tokenFile := flags.String("token-file", envDefault("KODEMA_SANDBOX_TOKEN_FILE", ""), "file containing the sandbox bearer token")
+	tokenFile := flags.String("token-file", envDefault(sandbox.DefaultTokenFileEnv, ""), "file containing the sandbox bearer token")
 	tokenEnv := flags.String("token-env", sandbox.DefaultTokenEnv, "environment variable containing the sandbox bearer token")
 	generateTokenFile := flags.String("generate-token-file", "", "generate a fresh 256-bit bearer token and write it with 0600 permissions to this path")
+	unlinkTokenFile := flags.Bool("unlink-token-file", false, "unlink --token-file immediately after reading it into memory")
 	maxCmdTimeout := flags.Duration("max-cmd-timeout", sandbox.DefaultMaxCmdTimeout, "maximum timeout for a single bash tool call")
 	maxOutputBytes := flags.Int("max-output-bytes", sandbox.DefaultMaxOutputBytes, "maximum stdout/stderr bytes captured per bash tool call")
 	maxFileBytes := flags.Int64("max-file-bytes", sandbox.DefaultMaxFileBytes, "maximum file size in bytes for read_file/write_file/edit_file/grep")
@@ -81,6 +82,8 @@ func runSandboxServe(ctx context.Context, args []string, ports Ports, deps Comma
 		TokenFile:         *tokenFile,
 		TokenEnv:          *tokenEnv,
 		GenerateTokenFile: *generateTokenFile,
+		WorkspaceDir:      *workspace,
+		UnlinkTokenFile:   *unlinkTokenFile,
 		LookupEnv:         envLookup,
 	})
 	if err != nil {

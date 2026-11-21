@@ -12,6 +12,7 @@ import (
 	"github.com/optimiware/kodema/internal/kernel/definition"
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/kernel/script"
+	"github.com/optimiware/kodema/internal/shell/runtime"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -785,6 +786,69 @@ func testJobScript(t *testing.T, command []string) string {
 	}
 	t.Fatalf("job command = %v; want a fail-fast -e/-c invocation", command)
 	return ""
+}
+
+func TestJobPodLabelsEmitProjectAndSandboxRole(t *testing.T) {
+	t.Run("regular workload carries tenant and project without sandbox role", func(t *testing.T) {
+		fake, _, adapter := testSetup(t)
+		req := testPrepareRequest()
+		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
+		if _, err := adapter.Prepare(ctx, req); err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if _, err := adapter.Start(ctx, engine.StartRequest{
+			Identity:    req.Identity,
+			WorkspaceID: req.WorkspaceID,
+		}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		if got := job.Spec.PodLabels[LabelTenant]; got != string(testTenant()) {
+			t.Fatalf("PodLabels[%s] = %q; want %q", LabelTenant, got, testTenant())
+		}
+		if got := job.Spec.PodLabels[LabelProject]; got != "project-alpha" {
+			t.Fatalf("PodLabels[%s] = %q; want project-alpha", LabelProject, got)
+		}
+		if got, ok := job.Spec.PodLabels[LabelRole]; ok {
+			t.Fatalf("regular workload unexpectedly carried %s=%q", LabelRole, got)
+		}
+	})
+
+	t.Run("sandbox workload carries tenant, project, and role=sandbox", func(t *testing.T) {
+		fake, _, adapter := testSetup(t)
+		req := testPrepareRequest()
+		req.ActionName = "sandbox"
+		req.Container.Commands = []string{"exec /kodema/bin/kodema sandbox serve --listen 0.0.0.0:8090 --workspace /workspace --token-file /kodema/secrets/KODEMA_SBOX_TOK_1"}
+		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
+		if _, err := adapter.Prepare(ctx, req); err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if _, err := adapter.Start(ctx, engine.StartRequest{
+			Identity:    req.Identity,
+			WorkspaceID: req.WorkspaceID,
+		}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		for key, want := range map[string]string{
+			LabelTenant:  string(testTenant()),
+			LabelProject: "project-alpha",
+			LabelRole:    RoleSandbox,
+		} {
+			if got := job.Labels[key]; got != want {
+				t.Errorf("Job.Labels[%s] = %q; want %q", key, got, want)
+			}
+			if got := job.Spec.PodLabels[key]; got != want {
+				t.Errorf("Job.Spec.PodLabels[%s] = %q; want %q", key, got, want)
+			}
+		}
+	})
 }
 
 func testEnvValue(env []EnvVar, name string) (string, bool) {

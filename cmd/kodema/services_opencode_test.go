@@ -132,4 +132,38 @@ func TestServicesOpenCodeBrainModeFlagsValidation(t *testing.T) {
 			t.Fatalf("stderr = %q", stderr.String())
 		}
 	})
+
+	t.Run("brain mode refuses multi-turn concurrency with llm-proxy-listen unless per-turn-proxy-routing is explicit", func(t *testing.T) {
+		var stderr lockedBuffer
+		args := append(append([]string(nil), base...),
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+			"--llm-proxy-listen", "127.0.0.1:0",
+			"--max-concurrency", "2",
+		)
+		code := runServicesEntry(context.Background(), args, &lockedBuffer{}, &stderr)
+		if code != 2 {
+			t.Fatalf("exit code = %d; want 2 (stderr=%q)", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "--max-concurrency <= 1") {
+			t.Fatalf("stderr = %q; want --max-concurrency <= 1 refusal", stderr.String())
+		}
+	})
+
+	t.Run("brain mode allows multi-turn concurrency when per-turn-proxy-routing is explicitly enabled", func(t *testing.T) {
+		var stderr lockedBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		args := append(append([]string(nil), base...),
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+			"--llm-proxy-listen", "127.0.0.1:0",
+			"--per-turn-proxy-routing=true",
+			"--max-concurrency", "2",
+		)
+		code := runServicesEntry(ctx, args, &lockedBuffer{}, &stderr)
+		if code == 2 {
+			t.Fatalf("explicit --per-turn-proxy-routing=true was unexpectedly refused as usage error (stderr=%q)", stderr.String())
+		}
+	})
 }

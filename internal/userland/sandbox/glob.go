@@ -3,6 +3,7 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -72,27 +73,29 @@ func matchGlobstar(pattern, relPath string) (bool, error) {
 	return match(0, 0), nil
 }
 
-// walkJailedFiles traverses baseDir strictly inside jail, visiting regular
-// files in deterministic lexicographical order. Symlinks escaping jail.Root()
-// or broken symlinks are skipped; in-workspace directory symlinks are guarded
-// against cycles. Returning errStopWalk terminates traversal cleanly.
+// walkJailedFiles traverses startRel strictly inside j.osRoot, visiting regular
+// files in deterministic lexicographical order. Symlinks are skipped cleanly
+// without ever escaping os.Root or entering cycles. Returning errStopWalk
+// terminates traversal cleanly.
 var errStopWalk = errors.New("stop walk")
 
-func (j *WorkspaceJail) walkJailedFiles(baseDir string, fn func(absPath, relPath string, info os.FileInfo) error) error {
-	visitedDirs := make(map[string]bool)
+func (j *WorkspaceJail) walkJailedFiles(startRel string, fn func(relFromRoot, relFromStart string, info os.FileInfo) error) error {
+	if startRel == "" {
+		startRel = "."
+	}
+	if !fs.ValidPath(startRel) {
+		return fmt.Errorf("%w: invalid walk root", ErrPathEscape)
+	}
 
-	var walk func(realDir, relPrefix string) error
-	walk = func(realDir, relPrefix string) error {
-		if !isWithinRoot(j.root, realDir) {
-			return nil
-		}
-		if visitedDirs[realDir] {
-			return nil
-		}
-		visitedDirs[realDir] = true
-
-		entries, err := os.ReadDir(realDir)
+	var walk func(dirRel, relPrefix string) error
+	walk = func(dirRel, relPrefix string) error {
+		dirFile, err := j.osRoot.Open(dirRel)
 		if err != nil {
+			return nil
+		}
+		entries, readErr := dirFile.ReadDir(-1)
+		_ = dirFile.Close()
+		if readErr != nil {
 			return nil
 		}
 		sort.Slice(entries, func(a, b int) bool {
@@ -101,54 +104,38 @@ func (j *WorkspaceJail) walkJailedFiles(baseDir string, fn func(absPath, relPath
 
 		for _, entry := range entries {
 			name := entry.Name()
-			childPath := filepath.Join(realDir, name)
-			childRel := name
-			if relPrefix != "" {
-				childRel = relPrefix + "/" + name
-			}
-
-			linfo, err := os.Lstat(childPath)
-			if err != nil {
+			if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
 				continue
 			}
+			childRel := name
+			if dirRel != "." {
+				childRel = dirRel + "/" + name
+			}
+			childFromStart := name
+			if relPrefix != "" {
+				childFromStart = relPrefix + "/" + name
+			}
 
+			// Skip symlinks strictly (both via DirEntry type and os.Root.Lstat).
+			if entry.Type()&fs.ModeSymlink != 0 {
+				continue
+			}
+			linfo, lerr := j.osRoot.Lstat(childRel)
+			if lerr != nil {
+				continue
+			}
 			if linfo.Mode()&os.ModeSymlink != 0 {
-				resolved, evalErr := filepath.EvalSymlinks(childPath)
-				if evalErr != nil {
-					// Skip broken symlinks.
-					continue
-				}
-				resolved = filepath.Clean(resolved)
-				if !isWithinRoot(j.root, resolved) {
-					// Skip symlinks escaping workspace jail!
-					continue
-				}
-				rinfo, statErr := os.Stat(resolved)
-				if statErr != nil {
-					continue
-				}
-				if rinfo.IsDir() {
-					if err := walk(resolved, childRel); err != nil {
-						return err
-					}
-					continue
-				}
-				if rinfo.Mode().IsRegular() {
-					if err := fn(resolved, childRel, rinfo); err != nil {
-						return err
-					}
-				}
 				continue
 			}
 
 			if linfo.IsDir() {
-				if err := walk(childPath, childRel); err != nil {
+				if err := walk(childRel, childFromStart); err != nil {
 					return err
 				}
 				continue
 			}
 			if linfo.Mode().IsRegular() {
-				if err := fn(childPath, childRel, linfo); err != nil {
+				if err := fn(childRel, childFromStart, linfo); err != nil {
 					return err
 				}
 			}
@@ -156,7 +143,7 @@ func (j *WorkspaceJail) walkJailedFiles(baseDir string, fn func(absPath, relPath
 		return nil
 	}
 
-	err := walk(baseDir, "")
+	err := walk(startRel, "")
 	if errors.Is(err, errStopWalk) {
 		return nil
 	}

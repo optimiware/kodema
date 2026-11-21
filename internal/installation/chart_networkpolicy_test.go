@@ -436,3 +436,107 @@ func TestOpenCodeBrainSchemaValidation(t *testing.T) {
 		t.Fatal("schema accepted opencodeBrain privileged sandboxPort 80")
 	}
 }
+
+// TestOpenCodeBrainSandboxSelectorsMatchRuntimeKubeLabels cross-checks every
+// sandbox podSelector label key/value in workloads-opencode-brain.yaml against
+// the exact exported constants and manifest emitters in
+// internal/shell/runtime/kube/{api,manifest}.go so NetworkPolicy selectors and
+// real Kubernetes workload pod labels can never drift out of sync.
+func TestOpenCodeBrainSandboxSelectorsMatchRuntimeKubeLabels(t *testing.T) {
+	kubeAPI := readText(t, filepath.Join(repoRoot(t), "internal", "shell", "runtime", "kube", "api.go"))
+	kubeManifest := readText(t, filepath.Join(repoRoot(t), "internal", "shell", "runtime", "kube", "manifest.go"))
+	template := readText(t, chartPath(t, "templates", "workloads-opencode-brain.yaml"))
+
+	readConst := func(name string) string {
+		t.Helper()
+		re := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(name) + `[ \t]*=[ \t]*"([^"]+)"[ \t]*$`)
+		m := re.FindStringSubmatch(kubeAPI)
+		if m == nil {
+			t.Fatalf("internal/shell/runtime/kube/api.go missing constant %s", name)
+		}
+		return m[1]
+	}
+
+	tenantKey := readConst("LabelTenant")
+	projectKey := readConst("LabelProject")
+	roleKey := readConst("LabelRole")
+	roleSandbox := readConst("RoleSandbox")
+
+	// Verify manifest.go actually emits every one of those labels onto Job/Pod labels.
+	for _, wantRef := range []string{
+		"LabelTenant:",
+		"labels[LabelProject]",
+		"labels[LabelRole]",
+		"maps.Copy(podLabels, labels)",
+		"PodLabels:",
+	} {
+		if !strings.Contains(kubeManifest, wantRef) {
+			t.Fatalf("internal/shell/runtime/kube/manifest.go missing expected pod label emission %q", wantRef)
+		}
+	}
+
+	// Verify both the Brain egress sandbox podSelector AND the Sandbox ingress
+	// top-level podSelector select strictly using the exact runtime labels.
+	parts := strings.Split(template, "\n---\n")
+	if len(parts) != 3 {
+		t.Fatalf("workloads-opencode-brain.yaml sections = %d; want 3", len(parts))
+	}
+	brainDoc, sandboxDoc := parts[1], parts[2]
+
+	// Extract every podSelector -> matchLabels block strictly by indentation.
+	lines := strings.Split(brainDoc+"\n"+sandboxDoc, "\n")
+	matchedSandboxBlocks := 0
+	kvRe := regexp.MustCompile(`^([ \t]*)([^:\s]+):[ \t]*(.+?)[ \t]*$`)
+	allowedSandboxKeys := map[string]bool{
+		tenantKey:  true,
+		projectKey: true,
+		roleKey:    true,
+	}
+	indentOf := func(s string) int {
+		return len(s) - len(strings.TrimLeft(s, " \t"))
+	}
+	for i := 0; i+1 < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "podSelector:" {
+			continue
+		}
+		if strings.TrimSpace(lines[i+1]) != "matchLabels:" {
+			continue
+		}
+		matchIndent := indentOf(lines[i+1])
+		seenKeys := map[string]string{}
+		for j := i + 2; j < len(lines); j++ {
+			trimmed := strings.TrimSpace(lines[j])
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if indentOf(lines[j]) <= matchIndent {
+				break
+			}
+			kv := kvRe.FindStringSubmatch(lines[j])
+			if kv == nil {
+				continue
+			}
+			seenKeys[kv[2]] = kv[3]
+		}
+		if _, isSandbox := seenKeys[roleKey]; !isSandbox {
+			continue
+		}
+		matchedSandboxBlocks++
+		for key := range seenKeys {
+			if !allowedSandboxKeys[key] {
+				t.Errorf("sandbox podSelector references label key %q which is not emitted by internal/shell/runtime/kube", key)
+			}
+		}
+		for reqKey := range allowedSandboxKeys {
+			if _, ok := seenKeys[reqKey]; !ok {
+				t.Errorf("sandbox podSelector missing required runtime label key %q (got keys: %v)", reqKey, seenKeys)
+			}
+		}
+		if gotRole := strings.Trim(seenKeys[roleKey], `"'`); gotRole != roleSandbox {
+			t.Errorf("sandbox podSelector %s = %q; want kube.RoleSandbox (%q)", roleKey, gotRole, roleSandbox)
+		}
+	}
+	if matchedSandboxBlocks != 2 {
+		t.Fatalf("matched %d sandbox podSelector blocks in workloads-opencode-brain.yaml; want 2 (Brain egress + Sandbox ingress)", matchedSandboxBlocks)
+	}
+}

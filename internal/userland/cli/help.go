@@ -838,7 +838,7 @@ Flags:
   serve   kodema sandbox serve [--listen <addr>] [--workspace <dir>] [--token-file <path> | --generate-token-file <path>]`,
 	},
 	"sandbox serve": {
-		usage:   "kodema sandbox serve [--listen <addr>] [--workspace <dir>] [--token-file <path>] [--token-env <var>] [--generate-token-file <path>] [--max-cmd-timeout <dur>] [--max-output-bytes <n>] [--max-file-bytes <n>]",
+		usage:   "kodema sandbox serve [--listen <addr>] [--workspace <dir>] [--token-file <path>] [--unlink-token-file] [--token-env <var>] [--generate-token-file <path>] [--max-cmd-timeout <dur>] [--max-output-bytes <n>] [--max-file-bytes <n>]",
 		summary: "Serve /workspace-jailed read_file, write_file, edit_file, glob, grep, and bash MCP tools over authenticated HTTP",
 		description: `Starts a Streamable HTTP MCP JSON-RPC 2.0 server at POST /mcp (and GET /healthz)
 confined strictly to --workspace (default: /workspace). Requires Bearer token
@@ -849,9 +849,10 @@ with 0600 permissions). Fails closed if no token is configured.
 Flags:
   --listen <addr>              Listen address (default: 127.0.0.1:8090)
   --workspace <dir>            Canonicalized jailed workspace directory (default: /workspace)
-  --token-file <path>          Read bearer token from file
+  --token-file <path>          Read bearer token from file (must be outside --workspace)
+  --unlink-token-file          Unlink --token-file immediately after reading it into memory
   --token-env <var>            Environment variable holding bearer token (default: KODEMA_SANDBOX_TOKEN)
-  --generate-token-file <path> Generate a fresh 256-bit random token (0600) at path
+  --generate-token-file <path> Generate a fresh 256-bit random token (0600) at path (must be outside --workspace)
   --max-cmd-timeout <dur>      Maximum bash command timeout (default: 5m)
   --max-output-bytes <n>       Maximum stdout/stderr bytes captured per bash call (default: 262144)
   --max-file-bytes <n>         Maximum file size in bytes (default: 4194304)`,

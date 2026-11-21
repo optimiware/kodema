@@ -21,6 +21,7 @@ import (
 	"github.com/optimiware/kodema/internal/kernel/definition"
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/kernel/script"
+	"github.com/optimiware/kodema/internal/shell/runtime"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -214,10 +215,19 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 		}
 	}
 
+	var projectID id.ProjectID
+	if candidate := runtime.ExecutionProject(ctx); candidate != "" {
+		if _, err := id.ParseProjectID(string(candidate)); err == nil && validKubeLabelValue(string(candidate)) {
+			projectID = candidate
+		}
+	}
+
 	prepared := preparedWorkload{
 		identity:   request.Identity,
 		digest:     digest,
 		workspace:  request.WorkspaceID,
+		project:    projectID,
+		role:       workloadRole(request),
 		actionName: request.ActionName,
 		taskID:     request.TaskID,
 		container: containerDeclaration{

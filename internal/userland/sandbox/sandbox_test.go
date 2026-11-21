@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -424,8 +426,159 @@ func TestWorkspaceJailBlocksTraversalsAndSymlinkEscapes(t *testing.T) {
 	}
 }
 
+func TestWorkspaceJailBlocksMissingParentPopSymlinkEscape(t *testing.T) {
+	srv, cli, _, _ := startTestServer(t, nil)
+	ctx := context.Background()
+	ws := srv.WorkspaceRoot()
+
+	outsideDir := t.TempDir()
+	outsideSecret := filepath.Join(outsideDir, "secret")
+	if err := os.WriteFile(outsideSecret, []byte("TOP_SECRET_ORACLE_DATA\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile outside secret: %v", err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(ws, "dirlink")); err != nil {
+		t.Fatalf("Symlink dirlink: %v", err)
+	}
+
+	const bypassPath = "missing/../dirlink/secret"
+
+	// Direct WorkspaceJail assertions: must return ErrPathEscape on read and write.
+	if _, _, _, err := srv.jail.OpenRead(bypassPath, false); !errors.Is(err, ErrPathEscape) {
+		t.Fatalf("OpenRead(%q, false) err = %v; want ErrPathEscape", bypassPath, err)
+	}
+	if _, _, _, err := srv.jail.OpenRead(bypassPath, true); !errors.Is(err, ErrPathEscape) {
+		t.Fatalf("OpenRead(%q, true) err = %v; want ErrPathEscape", bypassPath, err)
+	}
+	if _, err := srv.jail.AtomicWrite(bypassPath, []byte("pwned")); !errors.Is(err, ErrPathEscape) {
+		t.Fatalf("AtomicWrite(%q) err = %v; want ErrPathEscape", bypassPath, err)
+	}
+
+	// End-to-end MCP tool assertions: read_file, write_file, edit_file must all fail with ErrPathEscape.
+	rRes, err := cli.CallTool(ctx, "read_file", map[string]any{"path": bypassPath})
+	if err != nil {
+		t.Fatalf("read_file rpc error: %v", err)
+	}
+	if !rRes.IsError || !strings.Contains(rRes.FirstText(), ErrPathEscape.Error()) {
+		t.Fatalf("read_file(%q) = %+v; want ErrPathEscape error", bypassPath, rRes)
+	}
+
+	wRes, err := cli.CallTool(ctx, "write_file", map[string]any{"path": bypassPath, "content": "pwned"})
+	if err != nil {
+		t.Fatalf("write_file rpc error: %v", err)
+	}
+	if !wRes.IsError || !strings.Contains(wRes.FirstText(), ErrPathEscape.Error()) {
+		t.Fatalf("write_file(%q) = %+v; want ErrPathEscape error", bypassPath, wRes)
+	}
+
+	eRes, err := cli.CallTool(ctx, "edit_file", map[string]any{
+		"path":       bypassPath,
+		"old_string": "TOP_SECRET_ORACLE_DATA",
+		"new_string": "HACKED",
+	})
+	if err != nil {
+		t.Fatalf("edit_file rpc error: %v", err)
+	}
+	if !eRes.IsError || !strings.Contains(eRes.FirstText(), ErrPathEscape.Error()) {
+		t.Fatalf("edit_file(%q) = %+v; want ErrPathEscape error", bypassPath, eRes)
+	}
+
+	// Confirm the outside secret was never modified.
+	if got, _ := os.ReadFile(outsideSecret); string(got) != "TOP_SECRET_ORACLE_DATA\n" {
+		t.Fatalf("outside secret modified: %q", string(got))
+	}
+}
+
+func TestResolveTokenRejectsWorkspacePathAndUnlinksTokenFile(t *testing.T) {
+	ws := t.TempDir()
+	wsTok := filepath.Join(ws, "tok")
+	tok, err := GenerateBearerToken()
+	if err != nil {
+		t.Fatalf("GenerateBearerToken: %v", err)
+	}
+	if err := os.WriteFile(wsTok, []byte(tok+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Run("rejects token-file inside workspace", func(t *testing.T) {
+		if _, err := ResolveToken(TokenConfig{TokenFile: wsTok, WorkspaceDir: ws}); err == nil {
+			t.Fatal("ResolveToken accepted token-file inside workspace")
+		}
+	})
+
+	t.Run("rejects symlink token-file targeting workspace", func(t *testing.T) {
+		linkPath := filepath.Join(t.TempDir(), "link-to-ws-tok")
+		if err := os.Symlink(wsTok, linkPath); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+		if _, err := ResolveToken(TokenConfig{TokenFile: linkPath, WorkspaceDir: ws}); err == nil {
+			t.Fatal("ResolveToken accepted symlink token-file pointing into workspace")
+		}
+	})
+
+	t.Run("rejects generate-token-file inside workspace", func(t *testing.T) {
+		if _, err := ResolveToken(TokenConfig{
+			GenerateTokenFile: filepath.Join(ws, "nested", "gen.tok"),
+			WorkspaceDir:      ws,
+		}); err == nil {
+			t.Fatal("ResolveToken accepted generate-token-file inside workspace")
+		}
+	})
+
+	t.Run("unlinks token-file immediately when UnlinkTokenFile is true", func(t *testing.T) {
+		outTok := filepath.Join(t.TempDir(), "ephemeral.tok")
+		if err := os.WriteFile(outTok, []byte(tok+"\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		got, err := ResolveToken(TokenConfig{
+			TokenFile:       outTok,
+			WorkspaceDir:    ws,
+			UnlinkTokenFile: true,
+		})
+		if err != nil {
+			t.Fatalf("ResolveToken unlink: %v", err)
+		}
+		if got != tok {
+			t.Fatal("token mismatch")
+		}
+		if _, err := os.Stat(outTok); !os.IsNotExist(err) {
+			t.Fatalf("expected unlinked token file to be removed, stat err = %v", err)
+		}
+	})
+}
+
+func TestBashTimeoutValidatesNonFiniteAndClampsOverflow(t *testing.T) {
+	srv, cli, _, _ := startTestServer(t, func(c *Config) {
+		c.MaxCmdTimeout = 2 * time.Second
+	})
+	if srv.httpServer.IdleTimeout != 60*time.Second {
+		t.Fatalf("httpServer.IdleTimeout = %s; want 60s", srv.httpServer.IdleTimeout)
+	}
+
+	// NaN and Inf must be rejected directly by toolBash (JSON cannot encode them,
+	// so test both overflow via JSON and NaN/Inf via internal call helper).
+	hugeRes, err := cli.CallTool(context.Background(), "bash", map[string]any{
+		"command":         "echo ok",
+		"timeout_seconds": 1e15,
+	})
+	if err != nil || hugeRes.IsError || !strings.Contains(hugeRes.FirstText(), "ok") {
+		t.Fatalf("bash with huge timeout_seconds failed: err=%v res=%+v", err, hugeRes)
+	}
+
+	// Verify clamp logic on non-finite floats directly via helper.
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := clampBashTimeout(bad, time.Second, 2*time.Second); err == nil {
+			t.Fatalf("clampBashTimeout(%v) unexpectedly succeeded", bad)
+		}
+	}
+	got, err := clampBashTimeout(1e15, time.Second, 2*time.Second)
+	if err != nil || got != 2*time.Second {
+		t.Fatalf("clampBashTimeout(1e15) = (%s, %v); want (2s, nil)", got, err)
+	}
+}
+
 func TestBashStripsSandboxTokenAndPreservesGitAndCacheEnv(t *testing.T) {
 	t.Setenv("KODEMA_SANDBOX_TOKEN", "kodsbox.supersecrettokenvalue1234567890")
+	t.Setenv("KODEMA_SANDBOX_TOKEN_FILE", "/tmp/secret-sandbox.token")
 	t.Setenv("CUSTOM_SANDBOX_TOK", "kodsbox.customsecrettokenvalue1234567890")
 	t.Setenv("KODEMA_GIT_URL", "https://git.kodema.local")
 	t.Setenv("GIT_CONFIG_COUNT", "1")
@@ -436,16 +589,16 @@ func TestBashStripsSandboxTokenAndPreservesGitAndCacheEnv(t *testing.T) {
 	})
 
 	res, err := cli.CallTool(context.Background(), "bash", map[string]any{
-		"command": `printf "tok1=%s\ntok2=%s\ngit=%s\ngitcfg=%s\ncache=%s\n" "${KODEMA_SANDBOX_TOKEN:-}" "${CUSTOM_SANDBOX_TOK:-}" "${KODEMA_GIT_URL:-}" "${GIT_CONFIG_COUNT:-}" "${GOMODCACHE:-}"`,
+		"command": `printf "tok1=%s\ntok2=%s\ntokfile=%s\ngit=%s\ngitcfg=%s\ncache=%s\n" "${KODEMA_SANDBOX_TOKEN:-}" "${CUSTOM_SANDBOX_TOK:-}" "${KODEMA_SANDBOX_TOKEN_FILE:-}" "${KODEMA_GIT_URL:-}" "${GIT_CONFIG_COUNT:-}" "${GOMODCACHE:-}"`,
 	})
 	if err != nil || res.IsError {
 		t.Fatalf("bash failed: err=%v res=%+v", err, res)
 	}
 	out := res.FirstText()
-	if strings.Contains(out, "supersecrettokenvalue") || strings.Contains(out, "customsecrettokenvalue") {
-		t.Fatalf("bash leaked sandbox token in environment: %q", out)
+	if strings.Contains(out, "supersecrettokenvalue") || strings.Contains(out, "customsecrettokenvalue") || strings.Contains(out, "secret-sandbox.token") {
+		t.Fatalf("bash leaked sandbox token or token file in environment: %q", out)
 	}
-	if !strings.Contains(out, "tok1=\n") || !strings.Contains(out, "tok2=\n") {
+	if !strings.Contains(out, "tok1=\n") || !strings.Contains(out, "tok2=\n") || !strings.Contains(out, "tokfile=\n") {
 		t.Fatalf("expected stripped token env vars to be empty: %q", out)
 	}
 	for _, want := range []string{"git=https://git.kodema.local", "gitcfg=1", "cache=/kodema/cache/go-mod"} {

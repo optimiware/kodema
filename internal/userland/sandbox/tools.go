@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -191,11 +192,7 @@ func (s *Server) toolReadFile(raw json.RawMessage) ToolCallResult {
 	if args.Offset < 0 || args.Limit < 0 {
 		return errorResult(errors.New("offset and limit must not be negative"))
 	}
-	resolved, err := s.jail.ResolveFile(args.Path, false)
-	if err != nil {
-		return errorResult(err)
-	}
-	f, _, err := s.jail.SafeOpenRead(resolved)
+	f, _, _, err := s.jail.OpenRead(args.Path, false)
 	if err != nil {
 		return errorResult(err)
 	}
@@ -244,14 +241,11 @@ func (s *Server) toolWriteFile(raw json.RawMessage) ToolCallResult {
 	if int64(len(args.Content)) > s.cfg.MaxFileBytes {
 		return errorResult(fmt.Errorf("content exceeds maximum file size of %d bytes", s.cfg.MaxFileBytes))
 	}
-	target, err := s.jail.ResolveForWrite(args.Path)
+	rel, err := s.jail.AtomicWrite(args.Path, []byte(args.Content))
 	if err != nil {
 		return errorResult(err)
 	}
-	if err := s.jail.AtomicWrite(target, []byte(args.Content)); err != nil {
-		return errorResult(err)
-	}
-	return textResult(fmt.Sprintf("wrote %d bytes to %s", len(args.Content), s.jail.Rel(target)))
+	return textResult(fmt.Sprintf("wrote %d bytes to %s", len(args.Content), rel))
 }
 
 func (s *Server) toolEditFile(raw json.RawMessage) ToolCallResult {
@@ -270,12 +264,8 @@ func (s *Server) toolEditFile(raw json.RawMessage) ToolCallResult {
 	if args.OldString == args.NewString {
 		return errorResult(errors.New("new_string must differ from old_string"))
 	}
-	// Resolve with refuseTargetSymlink=true AND allowMissing=false via ResolveForWrite + existence check.
-	target, err := s.jail.ResolveForWrite(args.Path)
-	if err != nil {
-		return errorResult(err)
-	}
-	f, _, err := s.jail.SafeOpenRead(target)
+	// Resolve with allowMissing=false AND refuseTargetSymlink=true strictly through os.Root.
+	f, _, rel, err := s.jail.OpenRead(args.Path, true)
 	if err != nil {
 		return errorResult(err)
 	}
@@ -309,10 +299,10 @@ func (s *Server) toolEditFile(raw json.RawMessage) ToolCallResult {
 	if int64(len(updated)) > s.cfg.MaxFileBytes {
 		return errorResult(fmt.Errorf("edited file exceeds maximum file size of %d bytes", s.cfg.MaxFileBytes))
 	}
-	if err := s.jail.AtomicWrite(target, []byte(updated)); err != nil {
+	if err := s.jail.AtomicWriteRel(rel, []byte(updated)); err != nil {
 		return errorResult(err)
 	}
-	return textResult(fmt.Sprintf("replaced %d occurrence(s) in %s", replaced, s.jail.Rel(target)))
+	return textResult(fmt.Sprintf("replaced %d occurrence(s) in %s", replaced, rel))
 }
 
 func (s *Server) toolGlob(raw json.RawMessage) ToolCallResult {
@@ -340,7 +330,7 @@ func (s *Server) toolGlob(raw json.RawMessage) ToolCallResult {
 		return errorResult(err)
 	}
 
-	baseDir, err := s.jail.ResolveDir(args.Path)
+	baseRel, err := s.jail.ResolveDirRel(args.Path)
 	if err != nil {
 		return errorResult(err)
 	}
@@ -352,8 +342,8 @@ func (s *Server) toolGlob(raw json.RawMessage) ToolCallResult {
 
 	var matches []string
 	truncated := false
-	err = s.jail.walkJailedFiles(baseDir, func(absPath, relPath string, _ os.FileInfo) error {
-		matched, matchErr := matchGlobstar(args.Pattern, relPath)
+	err = s.jail.walkJailedFiles(baseRel, func(relFromRoot, relFromStart string, _ os.FileInfo) error {
+		matched, matchErr := matchGlobstar(args.Pattern, relFromStart)
 		if matchErr != nil {
 			return matchErr
 		}
@@ -364,7 +354,7 @@ func (s *Server) toolGlob(raw json.RawMessage) ToolCallResult {
 			truncated = true
 			return errStopWalk
 		}
-		matches = append(matches, s.jail.Rel(absPath))
+		matches = append(matches, relFromRoot)
 		return nil
 	})
 	if err != nil {
@@ -420,7 +410,7 @@ func (s *Server) toolGrep(raw json.RawMessage) ToolCallResult {
 		return errorResult(fmt.Errorf("invalid grep pattern: %w", err))
 	}
 
-	target, err := s.jail.ResolveExisting(args.Path)
+	targetRel, targetInfo, err := s.jail.StatExisting(args.Path)
 	if err != nil {
 		return errorResult(err)
 	}
@@ -432,7 +422,7 @@ func (s *Server) toolGrep(raw json.RawMessage) ToolCallResult {
 	var results []string
 	truncated := false
 
-	scanFile := func(absPath, relFromBase string) error {
+	scanFile := func(relFromRoot, relFromBase string) error {
 		if args.Include != "" {
 			matchedBase, _ := matchGlobstar(args.Include, path.Base(relFromBase))
 			matchedFull, _ := matchGlobstar(args.Include, relFromBase)
@@ -440,7 +430,7 @@ func (s *Server) toolGrep(raw json.RawMessage) ToolCallResult {
 				return nil
 			}
 		}
-		f, info, openErr := s.jail.SafeOpenRead(absPath)
+		f, info, openErr := s.jail.openReadRel(relFromRoot, false)
 		if openErr != nil {
 			return nil
 		}
@@ -453,7 +443,7 @@ func (s *Server) toolGrep(raw json.RawMessage) ToolCallResult {
 			return nil
 		}
 
-		displayPath := s.jail.Rel(absPath)
+		displayPath := relFromRoot
 		scanner := bufio.NewScanner(bytes.NewReader(data))
 		// Allow scanning lines up to MaxFileBytes (bounded).
 		maxBuf := min(int(s.cfg.MaxFileBytes)+1, 4<<20)
@@ -477,16 +467,12 @@ func (s *Server) toolGrep(raw json.RawMessage) ToolCallResult {
 		return nil
 	}
 
-	info, err := os.Stat(target)
-	if err != nil {
-		return errorResult(err)
-	}
-	if info.IsDir() {
-		err = s.jail.walkJailedFiles(target, func(absPath, relPath string, _ os.FileInfo) error {
-			return scanFile(absPath, relPath)
+	if targetInfo.IsDir() {
+		err = s.jail.walkJailedFiles(targetRel, func(relFromRoot, relFromStart string, _ os.FileInfo) error {
+			return scanFile(relFromRoot, relFromStart)
 		})
 	} else {
-		err = scanFile(target, filepath.Base(target))
+		err = scanFile(targetRel, path.Base(targetRel))
 		if errors.Is(err, errStopWalk) {
 			err = nil
 		}
@@ -519,22 +505,14 @@ func (s *Server) toolBash(ctx context.Context, raw json.RawMessage) ToolCallResu
 	if strings.ContainsRune(args.Command, 0) {
 		return errorResult(errors.New("command contains NUL byte"))
 	}
-	if args.TimeoutSeconds < 0 {
-		return errorResult(errors.New("timeout_seconds must not be negative"))
-	}
-
-	workdir, err := s.jail.ResolveDir(args.Workdir)
+	timeout, err := clampBashTimeout(args.TimeoutSeconds, s.cfg.DefaultCmdTimeout, s.cfg.MaxCmdTimeout)
 	if err != nil {
 		return errorResult(err)
 	}
 
-	timeout := s.cfg.DefaultCmdTimeout
-	if args.TimeoutSeconds > 0 {
-		requested := time.Duration(args.TimeoutSeconds * float64(time.Second))
-		if requested <= 0 {
-			requested = 100 * time.Millisecond
-		}
-		timeout = min(requested, s.cfg.MaxCmdTimeout)
+	workdir, err := s.jail.ResolveWorkdir(args.Workdir)
+	if err != nil {
+		return errorResult(err)
 	}
 
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -629,6 +607,28 @@ func (s *Server) toolBash(ctx context.Context, raw json.RawMessage) ToolCallResu
 	return res
 }
 
+func clampBashTimeout(timeoutSeconds float64, defaultTimeout, maxTimeout time.Duration) (time.Duration, error) {
+	if math.IsNaN(timeoutSeconds) || math.IsInf(timeoutSeconds, 0) {
+		return 0, errors.New("timeout_seconds must be a finite number")
+	}
+	if timeoutSeconds < 0 {
+		return 0, errors.New("timeout_seconds must not be negative")
+	}
+	if timeoutSeconds == 0 {
+		return defaultTimeout, nil
+	}
+	maxSec := maxTimeout.Seconds()
+	clampedSec := timeoutSeconds
+	if clampedSec > maxSec {
+		clampedSec = maxSec
+	}
+	requested := time.Duration(clampedSec * float64(time.Second))
+	if requested < 100*time.Millisecond {
+		requested = 100 * time.Millisecond
+	}
+	return min(requested, maxTimeout), nil
+}
+
 func (s *Server) resolveShell() string {
 	if strings.TrimSpace(s.cfg.ShellPath) != "" {
 		return s.cfg.ShellPath
@@ -641,8 +641,9 @@ func (s *Server) resolveShell() string {
 
 // sanitizedBashEnv preserves /kodema/cache/*, $KODEMA_GIT_URL, GIT_CONFIG_*,
 // PATH, and standard toolchain env vars while strictly stripping
-// KODEMA_SANDBOX_TOKEN and any custom --token-env so untrusted shell commands
-// can never read or leak the sandbox MCP bearer token.
+// KODEMA_SANDBOX_TOKEN, KODEMA_SANDBOX_TOKEN_FILE, and any custom --token-env
+// so untrusted shell commands can never read or leak the sandbox MCP bearer
+// token.
 func (s *Server) sanitizedBashEnv() []string {
 	raw := os.Environ()
 	out := make([]string, 0, len(raw))
@@ -651,7 +652,7 @@ func (s *Server) sanitizedBashEnv() []string {
 		if !ok {
 			continue
 		}
-		if name == DefaultTokenEnv || name == s.cfg.TokenEnv {
+		if name == DefaultTokenEnv || name == DefaultTokenFileEnv || name == s.cfg.TokenEnv {
 			continue
 		}
 		out = append(out, kv)

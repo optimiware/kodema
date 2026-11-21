@@ -63,6 +63,7 @@ func NewServer(cfg Config) (*Server, error) {
 	s.httpServer = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 		BaseContext: func(net.Listener) context.Context {
 			return s.runCtx
 		},
@@ -165,6 +166,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	err := srv.Shutdown(graceCtx)
 	// Final sweep in case a process spawned right before Shutdown closed listeners.
 	s.killAllActivePGIDs()
+	if closeErr := s.jail.Close(); err == nil {
+		err = closeErr
+	}
 	return err
 }
 

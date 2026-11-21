@@ -108,6 +108,8 @@ const (
 	OperationPipelineStart     = "pipeline.start"
 	OperationExecutionCancel   = "execution.cancel"
 	OperationExecutionLogsRead = "execution.logs.read"
+	OperationSecretWrite       = "secret.write"
+	OperationSecretDelete      = "secret.delete"
 )
 
 // ErrOpenCodeBudgetExceeded signals that the LLM proxy rejected a turn call
@@ -272,11 +274,16 @@ func validOpenCodeRef(value string) bool {
 	if strings.HasPrefix(value, "-") || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") {
 		return false
 	}
-	if strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.ContainsAny(value, " \t\r\n\x00*?[]\\~^:") {
+	for i := 0; i < len(value); i++ {
+		if value[i] <= 0x20 || value[i] == 0x7f {
+			return false
+		}
+	}
+	if strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.ContainsAny(value, " \t\r\n\x00*?[]\\~^:=") {
 		return false
 	}
 	for _, seg := range strings.Split(value, "/") {
-		if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") || strings.HasSuffix(seg, ".lock") {
+		if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") || strings.HasPrefix(seg, "-") || strings.HasSuffix(seg, ".lock") {
 			return false
 		}
 	}
@@ -502,20 +509,21 @@ type OpenCodeBrainConfig struct {
 // OpenCodeSandboxRequest describes one ephemeral per-task toolchain sandbox
 // requested by the OpenCode Brain service.
 type OpenCodeSandboxRequest struct {
-	TenantID    id.TenantID
-	ProjectID   id.ProjectID
-	TaskID      string
-	ExecutionID string
-	ActionID    string
-	Image       string
-	Repository  string
-	BaseRef     string
-	WorkBranch  string // refs/heads/work/<task-id>
-	Caches      []string
-	Memory      string
-	CPU         string
-	Port        int
-	Timeout     time.Duration
+	TenantID      id.TenantID
+	ProjectID     id.ProjectID
+	TaskID        string
+	ExecutionID   string
+	ActionID      string
+	Image         string
+	Repository    string
+	BaseRef       string
+	WorkBranch    string // refs/heads/work/<task-id>
+	Caches        []string
+	Memory        string
+	CPU           string
+	Port          int
+	Timeout       time.Duration
+	AllowLoopback bool
 }
 
 // OpenCodeSandboxLease represents one live ephemeral sandbox attached to a turn.
