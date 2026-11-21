@@ -34,6 +34,9 @@ const (
 	KindResponder ServiceKind = "responder"
 	// KindMergeCoordinator serializes merges per repository/ref.
 	KindMergeCoordinator ServiceKind = "merge_coordinator"
+	// KindOpenCode runs a per-project OpenCode brain service with persistent
+	// task sessions, isolated local Git worktrees, and attributed LLM calls.
+	KindOpenCode ServiceKind = "opencode"
 )
 
 // serviceKinds is the declaration order.
@@ -43,6 +46,7 @@ var serviceKinds = []ServiceKind{
 	KindTimer,
 	KindResponder,
 	KindMergeCoordinator,
+	KindOpenCode,
 }
 
 // Valid reports whether the kind is one of the declared kinds.

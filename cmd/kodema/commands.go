@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
@@ -42,6 +44,12 @@ var runAuthApp = authapp.Run
 // newPublicTransport builds the public HTTP transport used by the Git and agent
 // processes. The mounted credential file is read on every attempt.
 func newPublicTransport(baseURL, credentialFile string) (*client.HTTPTransport, error) {
+	return newPublicTransportWithCA(baseURL, credentialFile, "")
+}
+
+// newPublicTransportWithCA builds the public HTTP transport with an optional
+// PEM CA bundle file.
+func newPublicTransportWithCA(baseURL, credentialFile, caFile string) (*client.HTTPTransport, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, fmt.Errorf("a public base URL is required")
 	}
@@ -52,9 +60,27 @@ func newPublicTransport(baseURL, credentialFile string) (*client.HTTPTransport, 
 	if err := retry.Validate(); err != nil {
 		return nil, err
 	}
+	rt := http.DefaultTransport
+	if trimmedCA := strings.TrimSpace(caFile); trimmedCA != "" {
+		pemData, err := os.ReadFile(trimmedCA)
+		if err != nil {
+			return nil, fmt.Errorf("read CA bundle %q: %w", trimmedCA, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemData) {
+			return nil, fmt.Errorf("CA bundle %q contains no valid PEM certificates", trimmedCA)
+		}
+		if base, ok := http.DefaultTransport.(*http.Transport); ok {
+			cloned := base.Clone()
+			cloned.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+			rt = cloned
+		} else {
+			rt = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}
+		}
+	}
 	return &client.HTTPTransport{
 		BaseURL:      baseURL,
-		RoundTripper: http.DefaultTransport,
+		RoundTripper: rt,
 		Source:       client.FileCredentialSource{Path: credentialFile},
 		Retry:        retry,
 	}, nil
@@ -295,10 +321,16 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	project := flags.String("project", envOr("KODEMA_SERVICE_PROJECT", ""), "project identity")
 	baseURL := flags.String("base-url", envOr("KODEMA_BASE_URL", ""), "public base URL")
 	credentialFile := flags.String("credential-file", envOr("KODEMA_CREDENTIAL_FILE", ""), "mounted service credential file")
+	caFile := flags.String("ca-file", envOr("KODEMA_CA_FILE", ""), "optional PEM CA bundle for HTTPS")
 	schedule := flags.Duration("schedule", envDuration("KODEMA_SERVICE_SCHEDULE", 0), "timer schedule")
 	rescan := flags.Duration("rescan", envDuration("KODEMA_SERVICE_RESCAN", 30*time.Second), "rescan interval")
-	stateDir := flags.String("state-dir", envOr("KODEMA_SERVICE_STATE_DIR", ""), "merge coordinator durable state directory")
-	gitURL := flags.String("git-url", envOr("KODEMA_SERVICE_GIT_URL", ""), "merge coordinator Git base URL")
+	stateDir := flags.String("state-dir", envOr("KODEMA_SERVICE_STATE_DIR", ""), "durable local state directory")
+	gitURL := flags.String("git-url", envOr("KODEMA_SERVICE_GIT_URL", ""), "Git base URL")
+	opencodeURL := flags.String("opencode-url", envOr("KODEMA_OPENCODE_URL", ""), "opencode serve HTTP URL")
+	llmProxyListen := flags.String("llm-proxy-listen", envOr("KODEMA_OPENCODE_LLM_PROXY_LISTEN", ""), "optional loopback listen address for the attributed LLM reverse proxy")
+	model := flags.String("model", envOr("KODEMA_OPENCODE_MODEL", ""), "optional default OpenCode model")
+	agent := flags.String("agent", envOr("KODEMA_OPENCODE_AGENT", ""), "optional default OpenCode agent")
+	maxConcurrency := flags.Int("max-concurrency", 4, "maximum concurrent OpenCode turns")
 	message := flags.String("message", envOr("KODEMA_EMAIL_MESSAGE", ""), "one RFC822 message file, or - for stdin")
 	pipeline := flags.String("pipeline", envOr("KODEMA_EMAIL_PIPELINE", ""), "email intake pipeline identity")
 	if err := flags.Parse(args); err != nil {
@@ -321,7 +353,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 		usage(stderr, fmt.Sprintf("unknown service kind %q", *kind))
 		return 2
 	}
-	transport, err := newPublicTransport(*baseURL, *credentialFile)
+	transport, err := newPublicTransportWithCA(*baseURL, *credentialFile, *caFile)
 	if err != nil {
 		usage(stderr, err.Error())
 		return 2
@@ -342,6 +374,34 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			Transport:      transport,
 		}
 		if err := servicesapp.RunMergeCoordinator(ctx, config); err != nil {
+			fmt.Fprintf(stderr, "kodema: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if services.ServiceKind(*kind) == services.KindOpenCode {
+		if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*gitURL) == "" || strings.TrimSpace(*opencodeURL) == "" {
+			usage(stderr, "opencode service requires --state-dir, --git-url and --opencode-url")
+			return 2
+		}
+		config := servicesapp.OpenCodeConfig{
+			ServiceID:          id.PrincipalID(*service),
+			TenantID:           id.TenantID(*tenant),
+			ProjectID:          id.ProjectID(*project),
+			StateDirectory:     *stateDir,
+			BaseURL:            *baseURL,
+			CAFile:             *caFile,
+			GitURL:             *gitURL,
+			CredentialFile:     *credentialFile,
+			OpenCodeURL:        *opencodeURL,
+			ProxyListen:        *llmProxyListen,
+			Model:              *model,
+			Agent:              *agent,
+			RescanInterval:     *rescan,
+			MaxConcurrentTurns: *maxConcurrency,
+			Transport:          transport,
+		}
+		if err := servicesapp.RunOpenCode(ctx, config); err != nil {
 			fmt.Fprintf(stderr, "kodema: %v\n", err)
 			return 1
 		}
