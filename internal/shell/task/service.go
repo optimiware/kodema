@@ -1147,20 +1147,6 @@ func (service *Service) Complete(ctx context.Context, command CompleteCommand) (
 	if current.State == StateOpen && known && !predecessor.State.Terminal() {
 		return CompleteResult{}, fault.New(fault.VersionConflict, fmt.Sprintf("cannot complete task while current execution %q is %q", predecessor.ID, predecessor.State))
 	}
-	authority := []authorize.AuthorityRead{
-		membership,
-		newAuthorityRead(operation, requires, authorize.CheckTaskVersion, command.Scope, command.Actor.ID, "", command.ExpectedLifecycleVersion),
-	}
-	unit := CompleteUnit{
-		Owner:                    command.Scope,
-		TaskID:                   command.TaskID,
-		ExpectedLifecycleVersion: command.ExpectedLifecycleVersion,
-		Reason:                   command.Reason,
-	}
-	if known {
-		unit.ExpectedExecutionVersion = predecessor.Version
-		authority = append(authority, newAuthorityRead(operation, requires, authorize.CheckExecutionVersion, command.Scope, command.Actor.ID, string(current.CurrentExecution), predecessor.Version))
-	}
 	record, audit, err := service.operationRecord(command.Scope, command.Actor.ID, string(operation), command.CallerKey, command.Content, now, "", nil)
 	if err != nil {
 		return CompleteResult{}, err
@@ -1170,12 +1156,53 @@ func (service *Service) Complete(ctx context.Context, command CompleteCommand) (
 	if err != nil {
 		return CompleteResult{}, err
 	}
-	unit.Receipt = record
-	unit.Audit = []event.Audit{audit}
-	unit.Events = []event.Envelope{completed}
-	unit.Authority = authority
-	unit.PostCommit = []event.PostCommitEffect{{Kind: event.PostPublishEvent}}
-	return service.completes.Complete(ctx, unit)
+	const maxTerminalPredecessorRetries = 3
+	for attempt := 0; ; attempt++ {
+		authority := []authorize.AuthorityRead{
+			membership,
+			newAuthorityRead(operation, requires, authorize.CheckTaskVersion, command.Scope, command.Actor.ID, "", command.ExpectedLifecycleVersion),
+		}
+		unit := CompleteUnit{
+			Owner:                    command.Scope,
+			TaskID:                   command.TaskID,
+			ExpectedLifecycleVersion: command.ExpectedLifecycleVersion,
+			Reason:                   command.Reason,
+			Receipt:                  record,
+			Audit:                    []event.Audit{audit},
+			Events:                   []event.Envelope{completed},
+			PostCommit:               []event.PostCommitEffect{{Kind: event.PostPublishEvent}},
+		}
+		if known {
+			unit.ExpectedExecutionVersion = predecessor.Version
+			authority = append(authority, newAuthorityRead(operation, requires, authorize.CheckExecutionVersion, command.Scope, command.Actor.ID, string(current.CurrentExecution), predecessor.Version))
+		}
+		unit.Authority = authority
+		result, err := service.completes.Complete(ctx, unit)
+		if err == nil || attempt >= maxTerminalPredecessorRetries || !known || !predecessor.State.Terminal() {
+			return result, err
+		}
+		if class, ok := fault.ClassOf(err); !ok || class != fault.VersionConflict {
+			return CompleteResult{}, err
+		}
+		// An already-terminal predecessor can still advance its execution
+		// version during background post-terminal cleanup (for example
+		// workspace cleanup transitioning pending -> succeeded). Retry with
+		// the refreshed execution version only when the task itself stayed
+		// open at the caller's expected lifecycle version and the same
+		// terminal predecessor actually advanced.
+		rereadTask, taskErr := service.reader.Get(ctx, command.Scope, command.TaskID)
+		if taskErr != nil || rereadTask.Scope != command.Scope || rereadTask.State != StateOpen ||
+			rereadTask.LifecycleVersion != command.ExpectedLifecycleVersion ||
+			rereadTask.CurrentExecution != current.CurrentExecution {
+			return CompleteResult{}, err
+		}
+		rereadPred, rereadKnown, predErr := service.predecessor(ctx, command.Scope, current.CurrentExecution)
+		if predErr != nil || !rereadKnown || rereadPred.ID != predecessor.ID ||
+			!rereadPred.State.Terminal() || rereadPred.Version == predecessor.Version {
+			return CompleteResult{}, err
+		}
+		predecessor = rereadPred
+	}
 }
 
 // Progress applies one current-only execution observation. Only a success of

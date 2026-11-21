@@ -737,6 +737,12 @@ func (ports *fakePorts) setCancel(fn func(task.CancelUnit) (task.CancelResult, e
 	ports.cancelFn = fn
 }
 
+func (ports *fakePorts) setComplete(fn func(task.CompleteUnit) (task.CompleteResult, error)) {
+	ports.mu.Lock()
+	defer ports.mu.Unlock()
+	ports.completeFn = fn
+}
+
 func cloneTask(value task.Task) task.Task {
 	cloned := value
 	if value.Metadata != nil {

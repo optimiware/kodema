@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1
+
+Fixed:
+
+- **Eliminate spurious `version_conflict` on `task.complete` during post-terminal cleanup:**
+  `task.Service.Complete` now retries with the refreshed execution version
+  (preserving `CheckExecutionVersion` and the store's atomic execution lock)
+  when an already-terminal current execution advances its version due to
+  background post-terminal cleanup while the task stays open at the caller's
+  expected lifecycle version.
+
 ## 0.8.0
 
 Changed:
