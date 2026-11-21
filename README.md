@@ -59,12 +59,12 @@ container action is given the same things:
 
 | A harness needs | Kodema provides |
 |---|---|
-| The code | `/workspace`, shared by the actions of one execution and kept across approval waits. |
-| The task | `/kodema/task/` (`title`, `description`, `metadata.json`, `spec.json`) and `/kodema/task.json` (the task's conversation), with the inputs and the outputs of earlier actions as files. |
-| An identity | `/kodema/secrets/KODEMA_TOKEN`, an execution credential that is revoked while the execution waits for a decision and when it ends. |
-| Tools | `/kodema/bin/kodema`, on `PATH` on both Kubernetes and Podman. Git authenticates as the execution when the workload Git endpoint is configured; write declared outputs as files to `/kodema/outputs/<action>`. |
-| A model | The optional model proxy. The harness points `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL` at Kodema and sends the execution credential as its API key; the provider key stays in the control plane. |
-| A person | A question on its task, addressed to a role or a service. The reply starts a fresh execution with the whole conversation. |
+| The code | `/workspace`, shared by the actions of one execution and kept across approval waits, plus optional non-authoritative named dependency caches (`caches: [...]`) mounted at `/kodema/cache/<name>` per project. |
+| The task | `/kodema/task/` (`title`, `description`, `metadata.json`, `spec.json`), `/kodema/task.json` (the task's conversation), inputs/earlier outputs as files, and the project-scoped immutable KV store (`kodema kv put` / `kodema kv get`, `kv:sha256:...`, up to 16 MiB) for large specs, plans, and review reports. |
+| An identity | `/kodema/secrets/KODEMA_TOKEN`, an execution credential that is renewed automatically during long runs and revoked while the execution waits for a decision or ends. |
+| Tools | `/kodema/bin/kodema`, on `PATH` on both Kubernetes and Podman (`harness exec`, `kv`, `sandbox serve`, `docs`, `context`, `output push`, `git credential`). Git authenticates as the execution automatically when the workload Git endpoint is configured. |
+| A model | The native credential-injecting LLM proxy (`/llm/<provider>/*`) with live token/USD budgets (`budget: {max_tokens, max_cost_usd}`). Wrap any harness with `kodema harness exec -- <cmd>` for rotation-safe loopback proxying and zero CA boilerplate; provider keys stay in the control plane. |
+| A person | Planned `request` gates (`pass`, `revise`, or `fail`, minting immutable cross-execution Decision IDs on `pass`), or unplanned `task.ask` / `task.reply` conversation handoffs across fresh executions. |
 
 ```yaml
 inputs: [repository, target_ref, expected_base]
@@ -166,6 +166,50 @@ execution execution-a917c44ec73787377abaf074c6b6b61f succeeded
 The [quickstart](docs/runbooks/quickstart.md) continues with approvals, tasks,
 sign-in, Git and MCP.
 
+### Connect your AI harness as PM & Orchestrator (zero local app builds)
+
+The fastest way to build software with Kodema is to use your everyday AI harness
+(Claude Code, Codex, OpenCode, or Cursor) as **PM & Orchestrator** while Kodema
+runs all coding, verification, review, and protected Git merges inside isolated
+containers or agentic services—with **zero Kubernetes setup and zero local app
+builds**:
+
+1. **Start Kodema locally with Podman:**
+   ```sh
+   kodema up
+   source ~/.kodema/instances/default/env.sh
+   ```
+2. **Store LLM provider key(s) in the control plane:**
+   ```sh
+   kodema secret set ANTHROPIC_API_KEY   # or OPENAI_API_KEY, OPENCODE_API_KEY
+   ```
+   Provider keys stay inside Kodema's control plane; workload containers and
+   agentic services call Kodema's LLM proxy without ever holding raw keys.
+3. **Connect your harness over MCP and install Kodema's embedded docs skill:**
+   ```sh
+   kodema mcp install claude              # or codex, opencode, cursor (--print to preview)
+   kodema docs install --target agents    # or claude, opencode, all
+   ```
+4. **Collaborate with your harness as PM & Orchestrator:**
+   Shape specs, tasks, and pipelines with your harness instead of editing app
+   code or running builds on your laptop. Your harness drives Kodema over MCP
+   (`task_create`, `pipeline_apply`, `pipeline_start`, `kv_put`/`kv_get`,
+   `execution_inspect`, `execution_logs_read`, `task_reply`,
+   `execution_request_resolve` with `pass|revise|fail`, and `task_complete`).
+5. **Graduate smoothly to 24/7 automation:**
+   The exact same tasks, KV artifacts, and pipelines move unchanged from
+   interactive harness orchestration to always-on `kodsvc.` services:
+   - **Per-project OpenCode service (Option 1 — worktrees):**
+     `kodema services --kind opencode --mode worktree`
+   - **Brain/Hands split (Option 2 — ephemeral stock-image MCP sandboxes):**
+     `kodema services --kind opencode --mode brain` + `kodema sandbox serve`
+   - **Serialized merge coordinator with cross-execution Decision IDs:**
+     `kodema services --kind merge_coordinator`
+
+See the tested [Agentic SDLC examples](examples/agentic-sdlc/README.md) and the
+[LLM proxy & harnesses runbook](docs/runbooks/llm-proxy-harnesses.md) for
+complete pipelines and service configurations.
+
 ### Other ways to install
 
 Without the script: download the `kodema` archive for your system and
@@ -207,7 +251,9 @@ Then follow the [Podman bundle runbook](docs/runbooks/podman-quickstart.md) to
 |---|---|
 | [KODEMA.md](KODEMA.md) | The product specification and acceptance criteria. It governs on conflict. |
 | [docs/README.md](docs/README.md) | Detailed specifications and runbooks. |
-| [docs/runbooks/quickstart.md](docs/runbooks/quickstart.md) | A local Kodema with `kodema up`, and a first pipeline with `kodema run`. |
+| [docs/runbooks/quickstart.md](docs/runbooks/quickstart.md) | A local Kodema with `kodema up`, connecting your AI harness over MCP, and a first pipeline with `kodema run`. |
+| [docs/runbooks/llm-proxy-harnesses.md](docs/runbooks/llm-proxy-harnesses.md) | `kodema harness exec`, LLM budgets, attributed `kodsvc.` proxy, and Option 1 / Option 2 OpenCode services. |
+| [examples/agentic-sdlc/README.md](examples/agentic-sdlc/README.md) | Tested end-to-end Agentic SDLC pipelines (in-container harness, Option 1 worktrees, Option 2 Brain/Hands). |
 | [docs/runbooks/podman-quickstart.md](docs/runbooks/podman-quickstart.md) | The Podman bundle: the single-host test installation the release smoke runs on. |
 | [docs/runbooks/production-deployment.md](docs/runbooks/production-deployment.md) | Deployment on Kubernetes (Scaleway, AWS, GCP). |
 | [docs/runbooks/release.md](docs/runbooks/release.md) | How a version is built and published. |

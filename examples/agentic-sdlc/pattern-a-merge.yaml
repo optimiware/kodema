@@ -1,0 +1,38 @@
+# Pattern A (Stage 3 of 3): Serialized Cross-Execution Merge via Decision ID
+#
+# Passes the immutable `decision_id` minted by Stage 2's `review` action to
+# `service/merge-coordinator` (`kodema services --kind merge_coordinator`).
+#
+# The merge coordinator serializes updates to `target_ref` and pushes with
+# `-o kodema.decision_id=<decision_id>` (and `-o kodema.approved_base` /
+# `-o kodema.approved_candidate` when the repo enables
+# `option approve-rebase.refs/heads/main = disjoint` in `admin/conf/git.conf`).
+#
+# Keeping `completes_task: false` lets a post-merge step or orchestrator call
+# `kodema task complete <task-id>` explicitly once release checks finish.
+inputs:
+  - repository
+  - target_ref
+  - base
+  - candidate
+  - decision_id
+completes_task: false
+actions:
+  - name: merge
+    request: service/merge-coordinator
+    timeout: 1h
+    subject:
+      repository:
+        from: inputs.repository
+      ref:
+        from: inputs.target_ref
+      base:
+        from: inputs.base
+      candidate:
+        from: inputs.candidate
+      decision_id:
+        from: inputs.decision_id
+    outputs:
+      - base
+      - candidate
+      - output

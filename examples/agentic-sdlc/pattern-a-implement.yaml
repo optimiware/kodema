@@ -1,0 +1,47 @@
+# Pattern A (Stage 1 of 3): In-Container Harness Implementation
+#
+# Uses `kodema harness exec -- <cmd>` (rotation-safe loopback LLM proxy, zero CA
+# boilerplate), named non-authoritative caches (`/kodema/cache/go-mod`,
+# `/kodema/cache/go-build`), active execution/action LLM budgets, immutable KV
+# handoffs (`kodema kv get` / `kodema kv put`), and `completes_task: false` so
+# Stage 2 (verify + review) and Stage 3 (merge) continue on the same task.
+inputs:
+  - repository
+  - base_ref
+  - spec_key
+completes_task: false
+budget:
+  max_tokens: 300000
+  max_cost_usd: 5.0
+actions:
+  - name: implement
+    image: registry.example.com/kodema/opencode-harness@sha256:6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b
+    timeout: 30m
+    caches:
+      - go-mod
+      - go-build
+    budget:
+      max_tokens: 250000
+      max_cost_usd: 4.0
+    env:
+      GOMODCACHE: /kodema/cache/go-mod
+      GOCACHE: /kodema/cache/go-build
+    resources:
+      memory: 4Gi
+      cpu: "2"
+    outputs:
+      - branch
+      - base
+      - candidate
+      - summary_key
+    commands:
+      - git clone "$KODEMA_GIT_URL/$(cat /kodema/inputs/repository)" /workspace/repo
+      - git -C /workspace/repo fetch origin "$(cat /kodema/inputs/base_ref)"
+      - git -C /workspace/repo checkout -B "work/$KODEMA_TASK" FETCH_HEAD
+      - git -C /workspace/repo rev-parse HEAD > /kodema/outputs/implement/base
+      - kodema kv get "$(cat /kodema/inputs/spec_key)" --out /workspace/spec.md
+      - cd /workspace/repo && kodema harness exec -- opencode run "Implement /workspace/spec.md and verify unit tests pass"
+      - git -C /workspace/repo push --force-with-lease origin "HEAD:refs/heads/work/$KODEMA_TASK"
+      - printf 'refs/heads/work/%s\n' "$KODEMA_TASK" > /kodema/outputs/implement/branch
+      - git -C /workspace/repo rev-parse HEAD > /kodema/outputs/implement/candidate
+      - git -C /workspace/repo diff --stat "$(cat /kodema/outputs/implement/base)"..HEAD | kodema kv put --content-type text/plain > /kodema/outputs/implement/summary_key

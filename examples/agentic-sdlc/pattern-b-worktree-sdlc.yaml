@@ -1,0 +1,107 @@
+# Pattern B: Option 1 Per-Project OpenCode Service (`--mode worktree`)
+#
+# Dispatches `plan`, `implement`, and `ai_review` turns to a persistent
+# per-project OpenCode service (`kodema services --kind opencode --mode worktree`),
+# which maintains durable `task_id -> opencode_session_id` mappings, isolated
+# per-task Git worktrees (`refs/heads/work/<task-id>`), KV handoffs, and
+# attributed `kodsvc.` LLM proxy calls (requiring no `engineer` role).
+#
+# Deterministic tests run in an ordinary container action with named caches,
+# followed by a 3-way human `role/reviewer` gate that mints an immutable
+# `decision_id` for cross-execution merge via `pattern-a-merge.yaml`.
+inputs:
+  - repository
+  - resource_id
+  - target_ref
+  - expected_base
+completes_task: false
+budget:
+  max_tokens: 400000
+  max_cost_usd: 8.0
+actions:
+  - name: plan
+    request: service/opencode-shop
+    timeout: 15m
+    subject:
+      mode: plan
+      repository:
+        from: inputs.repository
+      base_ref:
+        from: inputs.target_ref
+    outputs:
+      - plan_key
+      - session_id
+
+  - name: implement
+    request: service/opencode-shop
+    timeout: 30m
+    subject:
+      mode: implement
+      repository:
+        from: inputs.repository
+      base_ref:
+        from: inputs.target_ref
+      plan_key:
+        from: plan.outputs.plan_key
+    outputs:
+      - branch
+      - candidate
+      - summary_key
+      - session_id
+
+  - name: verify
+    image: registry.example.com/kodema/go-toolchain@sha256:44575cf5b28512d75644bf54a517dcef304ff809fd511747621b4d64f19aac66
+    timeout: 20m
+    caches:
+      - go-mod
+      - go-build
+    env:
+      GOMODCACHE: /kodema/cache/go-mod
+      GOCACHE: /kodema/cache/go-build
+    outputs:
+      - report_key
+    commands:
+      - git clone "$KODEMA_GIT_URL/$(cat /kodema/inputs/repository)" /workspace/repo
+      - git -C /workspace/repo fetch origin "$(cat /kodema/outputs/implement/branch)"
+      - git -C /workspace/repo checkout --detach "$(cat /kodema/outputs/implement/candidate)"
+      - cd /workspace/repo && go test -race ./... | tee /workspace/test-report.txt
+      - kodema kv put /workspace/test-report.txt --content-type text/plain > /kodema/outputs/verify/report_key
+
+  - name: ai-review
+    request: service/opencode-shop
+    timeout: 15m
+    subject:
+      mode: ai_review
+      repository:
+        from: inputs.repository
+      base_ref:
+        from: inputs.target_ref
+      plan_key:
+        from: plan.outputs.plan_key
+    outputs:
+      - review_key
+      - session_id
+
+  - name: review
+    request: role/reviewer
+    timeout: 72h
+    outputs:
+      - notes
+    subject:
+      operation: git.ref.update
+      resource:
+        from: inputs.resource_id
+      ref:
+        from: inputs.target_ref
+      expected_base:
+        from: inputs.expected_base
+      candidate:
+        from: implement.outputs.candidate
+      plan_key:
+        from: plan.outputs.plan_key
+      summary_key:
+        from: implement.outputs.summary_key
+      report_key:
+        from: verify.outputs.report_key
+      review_key:
+        from: ai-review.outputs.review_key

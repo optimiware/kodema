@@ -1,6 +1,6 @@
-# Native LLM proxy and coding-harness recipes
+# Native LLM proxy, coding harnesses, and agentic services
 
-Kodema includes a streaming, credential-injecting LLM proxy (`/llm/{provider}/*`) so external coding harnesses (**OpenCode**, **Claude Code**, **Codex**, **Pi**) run inside workload containers with **zero raw provider API keys mounted into containers**.
+Kodema includes a streaming, credential-injecting LLM proxy (`/llm/{provider}/*`) with live token/USD budget enforcement so external coding harnesses (**OpenCode**, **Claude Code**, **Codex**, **Pi**) and long-lived project **agentic services** run with **zero raw provider API keys exposed to workloads or agent pods**.
 
 ## How it works
 
@@ -23,7 +23,7 @@ Kodema includes a streaming, credential-injecting LLM proxy (`/llm/{provider}/*`
    | `opencode` | `KODEMA_LLM_OPENCODE_BASE_URL` | `${KODEMA_URL}/llm/opencode/v1` | `https://opencode.ai/inference/openai/v1` | `OPENCODE_API_KEY` |
    | Custom (`<slug>`) | `KODEMA_LLM_<SLUG>_BASE_URL` | `${KODEMA_URL}/llm/<slug>/v1` (or `/llm/<slug>` for `x-api-key`) | Configured `base_url` | Configured `secret_name` |
 
-5. Inside the container, the harness authenticates with `/kodema/secrets/KODEMA_TOKEN` and trusts `$KODEMA_CA_FILE`. Kodema verifies the active execution and action deadline, strips the workload token, injects the provider credential inside the Shell, streams SSE responses chunk-by-chunk, and records per-execution token usage in `model_usage`.
+5. Inside container actions, wrap your harness command with **`kodema harness exec -- <cmd>`** (recommended) so Kodema handles TLS CA trust and live `KODEMA_TOKEN` rotation automatically. Kodema verifies the active execution and action deadline, enforces active LLM budgets, strips the caller credential, injects the provider secret inside the Shell, streams SSE responses chunk-by-chunk, and records per-execution token usage in `model_usage`.
 
 ## Custom OpenAI-compatible providers
 
@@ -39,29 +39,33 @@ Store the matching project secret (`kodema secret set OPENROUTER_API_KEY` or `ko
 
 For `kodema serve`, pass `--models-file /path/to/models.json` (or `KODEMA_MODELS_FILE`) or repeatable `--llm-provider <name>=<base_url>[,secret=<NAME>][,auth=<Authorization|x-api-key>][,tenant=<TENANT>][,project=<PROJECT>]`.
 
-## Harness recipes
+## Recommended in-container pattern: `kodema harness exec -- <cmd>`
 
-All four recipes authenticate with `/kodema/secrets/KODEMA_TOKEN`, trust `$KODEMA_CA_FILE`, and declare **no** provider keys in `secrets: [...]`. See also [`examples/pipelines/external-harness.yaml`](../../examples/pipelines/external-harness.yaml).
+`kodema harness exec` is built into `/kodema/bin/kodema` (on `PATH` inside every container action). It starts an ephemeral loopback-only HTTP reverse proxy (`127.0.0.1:0`) for the lifetime of the child command:
+
+- Trusts `$KODEMA_CA_FILE` (or `--ca-file`) on the upstream hop to `$KODEMA_URL`—eliminating `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, and `CURL_CA_BUNDLE` boilerplate for LLM calls.
+- Re-reads `/kodema/secrets/KODEMA_TOKEN` (or `--token-file`) **fresh on every upstream request**, so live controller token rotations during long coding runs never cause `401` errors.
+- Generates a random per-invocation local dummy API key, validates it on loopback requests, and exports `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `OPENCODE_BASE_URL`, `OPENCODE_API_KEY`, `KODEMA_HARNESS_PROXY_URL`, and rewritten `KODEMA_LLM_<NAME>_BASE_URL` variables to the child process.
+
+Combine `kodema harness exec` with **named non-authoritative caches** (`caches: [...]` mounted at `/kodema/cache/<name>`) and **active LLM budgets** (`budget: {max_tokens, max_cost_usd}`):
 
 ### OpenCode
 
 ```yaml
+budget:
+  max_tokens: 250000
 actions:
   - name: opencode
     image: registry.example.com/kodema/opencode-harness@sha256:0000000000000000000000000000000000000000000000000000000000000000
     timeout: 30m
+    caches: [go-mod, go-build]
+    budget:
+      max_tokens: 200000
+    env:
+      GOMODCACHE: /kodema/cache/go-mod
+      GOCACHE: /kodema/cache/go-build
     commands:
-      - |
-        if [ -n "${KODEMA_CA_FILE:-}" ]; then
-          export NODE_EXTRA_CA_CERTS="$KODEMA_CA_FILE"
-          export SSL_CERT_FILE="$KODEMA_CA_FILE"
-          export CURL_CA_BUNDLE="$KODEMA_CA_FILE"
-          export GIT_SSL_CAINFO="$KODEMA_CA_FILE"
-        fi
-        export OPENAI_BASE_URL="${KODEMA_LLM_OPENCODE_BASE_URL:-${KODEMA_URL}/llm/opencode/v1}"
-        IFS= read -r OPENAI_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$OPENAI_API_KEY" ]
-        export OPENAI_API_KEY
-        opencode run "Implement the requested task and verify tests pass"
+      - kodema harness exec -- opencode run "Implement /kodema/task/spec.json and verify tests pass"
 ```
 
 ### Claude Code
@@ -71,18 +75,10 @@ actions:
   - name: claude
     image: registry.example.com/kodema/claude-harness@sha256:0000000000000000000000000000000000000000000000000000000000000000
     timeout: 30m
+    budget:
+      max_tokens: 200000
     commands:
-      - |
-        if [ -n "${KODEMA_CA_FILE:-}" ]; then
-          export NODE_EXTRA_CA_CERTS="$KODEMA_CA_FILE"
-          export SSL_CERT_FILE="$KODEMA_CA_FILE"
-          export CURL_CA_BUNDLE="$KODEMA_CA_FILE"
-          export GIT_SSL_CAINFO="$KODEMA_CA_FILE"
-        fi
-        export ANTHROPIC_BASE_URL="${KODEMA_LLM_ANTHROPIC_BASE_URL:-${KODEMA_URL}/llm/anthropic}"
-        IFS= read -r ANTHROPIC_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$ANTHROPIC_API_KEY" ]
-        export ANTHROPIC_API_KEY
-        claude -p "Implement the requested task and verify tests pass" --dangerously-skip-permissions
+      - kodema harness exec -- claude -p "Implement /kodema/task/spec.json and verify tests pass" --dangerously-skip-permissions
 ```
 
 ### Codex
@@ -93,17 +89,7 @@ actions:
     image: registry.example.com/kodema/codex-harness@sha256:0000000000000000000000000000000000000000000000000000000000000000
     timeout: 30m
     commands:
-      - |
-        if [ -n "${KODEMA_CA_FILE:-}" ]; then
-          export NODE_EXTRA_CA_CERTS="$KODEMA_CA_FILE"
-          export SSL_CERT_FILE="$KODEMA_CA_FILE"
-          export CURL_CA_BUNDLE="$KODEMA_CA_FILE"
-          export GIT_SSL_CAINFO="$KODEMA_CA_FILE"
-        fi
-        export OPENAI_BASE_URL="${KODEMA_LLM_OPENAI_BASE_URL:-${KODEMA_URL}/llm/openai/v1}"
-        IFS= read -r OPENAI_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$OPENAI_API_KEY" ]
-        export OPENAI_API_KEY
-        codex exec "Implement the requested task and verify tests pass"
+      - kodema harness exec -- codex exec "Implement /kodema/task/spec.json and verify tests pass"
 ```
 
 ### Pi
@@ -114,24 +100,24 @@ actions:
     image: registry.example.com/kodema/pi-harness@sha256:0000000000000000000000000000000000000000000000000000000000000000
     timeout: 30m
     commands:
-      - |
-        if [ -n "${KODEMA_CA_FILE:-}" ]; then
-          export NODE_EXTRA_CA_CERTS="$KODEMA_CA_FILE"
-          export SSL_CERT_FILE="$KODEMA_CA_FILE"
-          export CURL_CA_BUNDLE="$KODEMA_CA_FILE"
-          export GIT_SSL_CAINFO="$KODEMA_CA_FILE"
-        fi
-        export ANTHROPIC_BASE_URL="${KODEMA_LLM_ANTHROPIC_BASE_URL:-${KODEMA_URL}/llm/anthropic}"
-        export OPENAI_BASE_URL="${KODEMA_LLM_OPENAI_BASE_URL:-${KODEMA_URL}/llm/openai/v1}"
-        IFS= read -r ANTHROPIC_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$ANTHROPIC_API_KEY" ]
-        IFS= read -r OPENAI_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$OPENAI_API_KEY" ]
-        export ANTHROPIC_API_KEY OPENAI_API_KEY
-        pi -p "Implement the requested task and verify tests pass"
+      - kodema harness exec -- pi -p "Implement /kodema/task/spec.json and verify tests pass"
 ```
+
+See also [`examples/pipelines/external-harness.yaml`](../../examples/pipelines/external-harness.yaml) and the full tested multi-stage examples in [`examples/agentic-sdlc/README.md`](../../examples/agentic-sdlc/README.md).
+
+## Active LLM token and cost budgets
+
+Active budgets are enforced **live inside the LLM proxy** before dialing upstream across three scopes:
+
+1. **Per-action:** `budget: {max_tokens, max_cost_usd}` on a container action.
+2. **Per-execution:** top-level `budget: {max_tokens, max_cost_usd}` on a pipeline (combined with installation defaults in `models.json`; the stricter bound applies).
+3. **Per-task:** installation default task budget accumulated across all sibling executions of the same task.
+
+When any active limit is reached or exceeded, Kodema immediately rejects the call with HTTP `429` (`budget_exceeded`) and records a `model.budget.exceeded` event. Cost budgets (`max_cost_usd`) fail closed if a model has no configured pricing rate in `models.json`.
 
 ## Minimal coding-harness base image
 
-Use this `Containerfile` to build a small, reproducible coding-harness base image with `node`, `git`, `jq`, `curl`, `ca-certificates`, OpenCode, and a native-proxy environment helper:
+With `kodema harness exec` injected automatically via `/kodema/bin/kodema`, a coding-harness container image needs **no custom proxy shell wrapper**:
 
 ```dockerfile
 FROM docker.io/library/node:22-bookworm-slim
@@ -140,31 +126,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g opencode-ai
-
-RUN cat <<'EOF' > /usr/local/bin/kodema-proxy-env.sh
-#!/bin/sh
-if [ -r /kodema/secrets/KODEMA_TOKEN ]; then
-  IFS= read -r ANTHROPIC_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$ANTHROPIC_API_KEY" ]
-  IFS= read -r OPENAI_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$OPENAI_API_KEY" ]
-  IFS= read -r OPENCODE_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$OPENCODE_API_KEY" ]
-  export ANTHROPIC_API_KEY OPENAI_API_KEY OPENCODE_API_KEY
-fi
-if [ -n "${KODEMA_LLM_ANTHROPIC_BASE_URL:-}" ]; then
-  export ANTHROPIC_BASE_URL="$KODEMA_LLM_ANTHROPIC_BASE_URL"
-fi
-if [ -n "${KODEMA_LLM_OPENCODE_BASE_URL:-}" ]; then
-  export OPENAI_BASE_URL="$KODEMA_LLM_OPENCODE_BASE_URL"
-elif [ -n "${KODEMA_LLM_OPENAI_BASE_URL:-}" ]; then
-  export OPENAI_BASE_URL="$KODEMA_LLM_OPENAI_BASE_URL"
-fi
-if [ -n "${KODEMA_CA_FILE:-}" ]; then
-  export NODE_EXTRA_CA_CERTS="$KODEMA_CA_FILE"
-  export SSL_CERT_FILE="$KODEMA_CA_FILE"
-  export CURL_CA_BUNDLE="$KODEMA_CA_FILE"
-  export GIT_SSL_CAINFO="$KODEMA_CA_FILE"
-fi
-EOF
-RUN chmod 0755 /usr/local/bin/kodema-proxy-env.sh
 ```
 
 Build and pin the digest before referencing it in a pipeline:
@@ -173,9 +134,85 @@ Build and pin the digest before referencing it in a pipeline:
 podman build -t localhost/kodema-opencode-harness:latest -f Containerfile .
 ```
 
+## Attributed `kodsvc.` LLM proxy for agentic services
+
+Long-lived userland agentic services authenticate with a project service account token (`kodsvc.`) instead of an execution token (`kodex.`). To invoke `/llm/{provider}/*`, the service must send both attribution headers:
+
+- `X-Kodema-Execution: <execution-id>`
+- `X-Kodema-Action: <action-id>`
+
+Before dialing upstream, Kodema verifies that the service account is enabled in scope and that the named execution and `request: service/<id>` action are active and assigned to that exact service account. Kodema strips both headers and the `kodsvc.` token before forwarding, enforces active execution/task LLM budgets (`429` / `budget_exceeded`), records usage under the execution's `model_usage`, and terminates open streams if the execution is cancelled or passes its action deadline.
+
+## Agentic Service Option 1: Per-project OpenCode service (`--mode worktree`)
+
+Option 1 runs a persistent per-project OpenCode service (`kodema services --kind opencode --mode worktree`, the default mode) that answers explicit `request: service/<id>` pipeline actions using durable per-task sessions and hardened local Git worktrees:
+
+```sh
+kodema services --kind opencode \
+  --mode worktree \
+  --service opencode-shop \
+  --tenant tenant-local \
+  --project project-local \
+  --base-url "$KODEMA_URL" \
+  --ca-file "$KODEMA_CA_FILE" \
+  --credential-file /path/to/opencode-shop.token \
+  --state-dir /var/lib/kodema/opencode-shop \
+  --git-url "$KODEMA_GIT_URL" \
+  --opencode-url http://127.0.0.1:4096 \
+  --llm-proxy-listen 127.0.0.1:18080 \
+  --per-turn-proxy-routing \
+  --max-concurrency 4
+```
+
+How Option 1 works:
+
+- **Minimal service-account role:** Option 1 worktree mode requires **no `engineer` role** (`roles: []` can read project state/KV, call the attributed LLM proxy, and settle `service/<id>` requests). Grant the service ID `RW+ refs/heads/work/` in `admin/conf/git.conf`.
+- **Durable task-to-session mapping:** Persists `task_id -> opencode_session_id` and per-action checkpoints under `--state-dir` so `plan`, `implement`, `fix`, `revise`, and `ai_review` turns share session continuity across retries and stages without double-pushing.
+- **Hardened per-task Git worktrees:** Prepares an isolated worktree per task checked out on `refs/heads/work/<task-id>` from `base_ref` (default `refs/heads/main`), commits changes, pushes to Git, stores long outputs in KV (`summary_key`, `plan_key`, `review_key`), and settles the request action with declared outputs (`branch`, `candidate`, `summary_key`, `plan_key`, `review_key`, `session_id`).
+- **Live SSE cancellation:** Subscribes to the project event stream and invokes OpenCode `AbortSession` immediately when an execution is cancelled.
+- **Concurrent turns:** Static loopback proxy routing (`--llm-proxy-listen` without `--per-turn-proxy-routing`) enforces `--max-concurrency <= 1`. Pass `--per-turn-proxy-routing` (routing calls via `/turn/{exec}/{action}/llm/*`) to run multiple concurrent turns cleanly.
+
+## Agentic Service Option 2: Brain/Hands split (`--mode brain` + `kodema sandbox serve`)
+
+Option 2 separates LLM reasoning and persistent sessions (**Brain**) from build/test tool execution (**Hands**) so the Brain pod never executes local shell commands or mutates local files, and every task runs inside an ephemeral stock toolchain image (`golang:1.24`, `node:22`, `python:3.12`, etc.):
+
+1. **`kodema sandbox serve` (Hands):** Compiled into `/kodema/bin/kodema` using pure Go standard library—zero custom agent images required. Serves Streamable HTTP MCP JSON-RPC 2.0 at `POST /mcp` (plus `GET /healthz`) jailed strictly to `/workspace` via `os.Root`:
+   - 6 jailed tools: `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`.
+   - Constant-time Bearer token auth (`--token-file` + `--unlink-token-file`, `--token-env` defaulting to `KODEMA_SANDBOX_TOKEN`, or `--generate-token-file`), failing closed when no token is configured.
+   - Strips token env vars/files before launching child `bash` processes and kills entire process groups on timeout or cancellation (`--max-cmd-timeout`, `--max-output-bytes`, `--max-file-bytes`).
+2. **OpenCode Brain (`--mode brain`):** Disables all built-in local shell/filesystem tools (`bash`, `write`, `edit`, `read`, `glob`, `grep`) in OpenCode config and attaches ephemeral per-task sandboxes created through Kodema's public API (`KodemaExecutionSandboxManager`):
+
+```sh
+kodema services --kind opencode \
+  --mode brain \
+  --service opencode-shop \
+  --tenant tenant-local \
+  --project project-local \
+  --base-url "$KODEMA_URL" \
+  --ca-file "$KODEMA_CA_FILE" \
+  --credential-file /path/to/opencode-shop.token \
+  --state-dir /var/lib/kodema/opencode-shop \
+  --opencode-url http://127.0.0.1:4096 \
+  --llm-proxy-listen 127.0.0.1:18080 \
+  --per-turn-proxy-routing \
+  --sandbox-default-image docker.io/library/golang:1.24 \
+  --sandbox-caches go-mod,go-build \
+  --sandbox-port 8090 \
+  --sandbox-memory 2Gi \
+  --sandbox-cpu 2
+```
+
+Key Option 2 characteristics:
+
+- **Role requirement difference vs Option 1:** Brain mode's service account **requires the `engineer` role** so `KodemaExecutionSandboxManager` can invoke `pipeline.start` (spawning inline sandbox executions), `execution.cancel` (teardown), and `secret.write`/`secret.delete` (delivering ephemeral `KODEMA_SBOX_TOK_*` per-sandbox Bearer tokens out-of-band, never embedded in YAML or `/kodema/script`). Option 1 worktree mode requires **no `engineer` role**.
+- **Sandbox-free reasoning turns:** Non-coding modes (`plan`, `ai_review`) without `sandbox_image` execute directly in Brain without launching a sandbox container.
+- **Polyglot concurrent turns:** With `--per-turn-proxy-routing`, one pipeline (or concurrent tasks) can specify `sandbox_image: docker.io/library/golang:1.24` with `sandbox_caches: go-mod,go-build` for a Go backend stage and `sandbox_image: docker.io/library/node:22` with `sandbox_caches: npm` for a Node frontend stage—using stock upstream images.
+- **Fault containment & cancellation teardown:** If a sandbox container crashes or is OOM-killed mid-turn, the Brain pod stays healthy, aborts only that turn (`ErrOpenCodeSandboxTerminated`), cancels the sandbox execution, and deletes the ephemeral token secret. Cancelling the parent execution tears down both the OpenCode session and the sandbox.
+- **Kubernetes NetworkPolicies (Helm):** Enable `opencodeBrain` in `deploy/charts/kodema/values.yaml` (rendered by `deploy/charts/kodema/templates/workloads-opencode-brain.yaml`) to isolate Brain and sandbox pods strictly by `(tenant, project)`: Brain pods deny all ingress and egress only to DNS, the Kodema API, and matching `kodema.dev/role: sandbox` pods on `sandboxPort`; sandbox pods accept ingress only from that exact project's Brain pod and cannot reach each other or Brain session storage. See [`examples/agentic-sdlc/opencode-brain-values.yaml`](../../examples/agentic-sdlc/opencode-brain-values.yaml).
+
 ## Inspecting per-execution token usage
 
-Every proxied LLM call is attributed to the execution ID in `model_usage` and returned by `execution.inspect` (REST and MCP):
+Every proxied LLM call (both `kodex.` workloads and attributed `kodsvc.` services) is attributed to the execution ID in `model_usage` and returned by `execution.inspect` (REST and MCP):
 
 ```sh
 kodema inspect <execution-id>

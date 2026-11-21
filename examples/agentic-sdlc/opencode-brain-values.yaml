@@ -1,0 +1,19 @@
+# Helm values snippet enabling tenant/project-isolated NetworkPolicies for
+# Option 2 OpenCode Brain <-> Ephemeral Sandbox (`kodema sandbox serve`).
+#
+# Apply alongside your base deployment values with:
+#   helm upgrade --install kodema deploy/charts/kodema -f values.yaml -f opencode-brain-values.yaml
+tenants:
+  - tenant-a
+
+opencodeBrain:
+  enabled: true
+  sandboxPort: 8090
+  projects:
+    - name: shop-brain
+      tenant: tenant-a
+      project: shop
+      # Optional namespace where the Brain pod runs (defaults to the Helm release namespace).
+      namespace: ""
+      # Optional per-project sandbox MCP port override (1024-65535).
+      sandboxPort: 8090
