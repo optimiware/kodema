@@ -242,16 +242,21 @@ func (s *Shard) Run(ctx context.Context, spec RunSpec) (*Container, error) {
 			break
 		}
 		runErr = err
-		if attempt == attempts || ctx.Err() != nil || !isTransientPortBindError(err, res.Stderr) {
+		if !isTransientPortBindError(err, res.Stderr) {
 			break
 		}
 		// Rootless Podman selects an ephemeral host port for -p 127.0.0.1::<port>
 		// and passes it to rootlessport; under high concurrency another process
 		// can claim that port in the TOCTOU window, leaving a created container.
-		// Remove any partial container and retry so Podman allocates a fresh port.
+		// Always remove any partial container (even on the final attempt or after
+		// ctx cancellation) so Shard.Close()/network rm never leaks it.
+		cleanupCtx := context.WithoutCancel(ctx)
+		_, _ = s.Podman.run(cleanupCtx, s.Podman.stopLimit, "rm", "--force", "--volumes", spec.Name)
+		if attempt == attempts || ctx.Err() != nil {
+			break
+		}
 		s.Podman.Logf("harness: retrying podman run for %s after transient port bind conflict (attempt %d/%d): %v",
 			spec.Name, attempt, attempts, err)
-		_, _ = s.Podman.run(ctx, s.Podman.stopLimit, "rm", "--force", "--volumes", spec.Name)
 	}
 	if runErr != nil {
 		return nil, fmt.Errorf("harness: run %s: %w", image, runErr)
@@ -271,10 +276,10 @@ func (s *Shard) Run(ctx context.Context, spec RunSpec) (*Container, error) {
 // isTransientPortBindError reports whether a podman run failure is an
 // ephemeral host-port allocation collision from rootlessport.
 func isTransientPortBindError(err error, stderr []byte) bool {
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "address already in use") {
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "bind: address already in use") {
 		return true
 	}
-	return strings.Contains(strings.ToLower(string(stderr)), "address already in use")
+	return strings.Contains(strings.ToLower(string(stderr)), "bind: address already in use")
 }
 
 // resolveRunImage returns the immutable reference Run must start. A tag is
