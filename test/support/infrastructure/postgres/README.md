@@ -274,6 +274,8 @@ component `TestMain` runs `GoldenCoverageError(nil)` after the suite unless a
 | model_usage | gateway UsageRecord.Unit | TestGatewayUsageAndContentRowsOnPostgreSQL |
 | content_records | gateway StoreContentRecorder | TestGatewayUsageAndContentRowsOnPostgreSQL |
 | event_consumptions | trigger Complete | TestTriggersAdapterOnPostgreSQL |
+| approval_decisions | request Resolve (pass) | TestRequestResolveWholeRowsOnPostgreSQL |
+| kv_objects | kv Put | TestMigration0010KVStoreUpgradeRLSAndRoundTripOnPostgreSQL |
 
 ### Observer guarantees
 
@@ -331,9 +333,9 @@ a changed written table set cannot leave the documentation stale.
 | `pipeline.apply` | audit, events, pipelines, receipts |
 | `pipeline.delete` | audit, events, pipelines, receipts |
 | `pipeline.update` | audit, events, pipelines, receipts |
-| `request.resolve` | actions, audit, cleanup, events, executions, receipts |
+| `request.resolve` | actions, approval_decisions, audit, cleanup, events, executions, receipts |
 | `request.resolve.fail` | actions, audit, cleanup, events, executions, receipts |
-| `request.resolve.pass.nonlast` | actions, audit, events, executions, receipts |
+| `request.resolve.pass.nonlast` | actions, approval_decisions, audit, events, executions, receipts |
 | `secret.delete` | audit, events, receipts, secrets |
 | `secret.write` | audit, events, receipts, secrets |
 | `task.ask` | actions, audit, cleanup, events, executions, receipts, task_messages, tasks |

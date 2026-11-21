@@ -548,6 +548,104 @@ func TestShardRunPassesThroughImmutableReference(t *testing.T) {
 	}
 }
 
+func TestShardRunRetriesTransientPortBindConflict(t *testing.T) {
+	runner := &fakeRunner{}
+	runAttempts := 0
+	runner.fn = func(ctx context.Context, cmd Command) (Result, error) {
+		if len(cmd.Args) > 0 && cmd.Args[0] == "run" {
+			runAttempts++
+			if runAttempts == 1 {
+				stderr := []byte("Error: rootlessport listen tcp 127.0.0.1:39025: bind: address already in use\n")
+				return Result{Stderr: stderr, ExitCode: 126}, fmt.Errorf("harness: podman run failed: exit status 126: %s", strings.TrimSpace(string(stderr)))
+			}
+			return Result{Stdout: []byte("container-id\n")}, nil
+		}
+		return Result{}, nil
+	}
+	podman := NewPodman(WithRunner(runner))
+	shard := NewShard(t, WithPodman(podman), WithShardTimeout(time.Minute))
+
+	pinned := "docker.io/library/postgres@sha256:" + strings.Repeat("c", 64)
+	container, err := shard.Run(shard.Context(), RunSpec{
+		Image: pinned,
+		Name:  "pg-port-retry",
+		Ports: []Port{{Container: 5432}},
+	})
+	if err != nil {
+		t.Fatalf("Run after transient port bind conflict: %v", err)
+	}
+	if container.Name != "pg-port-retry" {
+		t.Fatalf("container name = %q, want pg-port-retry", container.Name)
+	}
+	if runAttempts != 2 {
+		t.Fatalf("run attempts = %d, want 2", runAttempts)
+	}
+	calls := runner.snapshot()
+	rmIdx := indexOfCall(calls, "rm")
+	if rmIdx < 0 || !hasArgSequence(calls[rmIdx].Args, "rm", "--force", "--volumes", "pg-port-retry") {
+		t.Fatalf("expected cleanup rm between retries, got calls: %v", calls)
+	}
+}
+
+func TestShardRunCleansUpPartialContainerWhenPortBindRetriesExhausted(t *testing.T) {
+	runner := &fakeRunner{}
+	runAttempts := 0
+	rmCount := 0
+	runner.fn = func(ctx context.Context, cmd Command) (Result, error) {
+		if len(cmd.Args) > 0 && cmd.Args[0] == "run" {
+			runAttempts++
+			stderr := []byte("Error: rootlessport listen tcp 127.0.0.1:39025: bind: address already in use\n")
+			return Result{Stderr: stderr, ExitCode: 126}, fmt.Errorf("harness: podman run failed: exit status 126: %s", strings.TrimSpace(string(stderr)))
+		}
+		if len(cmd.Args) > 0 && cmd.Args[0] == "rm" && hasArgSequence(cmd.Args, "rm", "--force", "--volumes", "pg-port-exhausted") {
+			rmCount++
+		}
+		return Result{}, nil
+	}
+	podman := NewPodman(WithRunner(runner))
+	shard := NewShard(t, WithPodman(podman), WithShardTimeout(time.Minute))
+
+	pinned := "docker.io/library/postgres@sha256:" + strings.Repeat("e", 64)
+	if _, err := shard.Run(shard.Context(), RunSpec{
+		Image: pinned,
+		Name:  "pg-port-exhausted",
+		Ports: []Port{{Container: 5432}},
+	}); err == nil {
+		t.Fatal("expected exhausted port-bind retries to fail")
+	}
+	if runAttempts != 3 {
+		t.Fatalf("run attempts = %d, want 3", runAttempts)
+	}
+	if rmCount != 3 {
+		t.Fatalf("partial container cleanup rm calls = %d, want 3 (including final attempt)", rmCount)
+	}
+}
+
+func TestShardRunDoesNotRetryNonPortBindFailure(t *testing.T) {
+	runner := &fakeRunner{}
+	runAttempts := 0
+	runner.fn = func(ctx context.Context, cmd Command) (Result, error) {
+		if len(cmd.Args) > 0 && cmd.Args[0] == "run" {
+			runAttempts++
+			return Result{Stderr: []byte("Error: OCI runtime error"), ExitCode: 126}, errors.New("exit status 126: OCI runtime error")
+		}
+		return Result{}, nil
+	}
+	podman := NewPodman(WithRunner(runner))
+	shard := NewShard(t, WithPodman(podman), WithShardTimeout(time.Minute))
+
+	pinned := "docker.io/library/postgres@sha256:" + strings.Repeat("d", 64)
+	if _, err := shard.Run(shard.Context(), RunSpec{
+		Image: pinned,
+		Ports: []Port{{Container: 5432}},
+	}); err == nil {
+		t.Fatal("expected non-port-bind run failure")
+	}
+	if runAttempts != 1 {
+		t.Fatalf("run attempts = %d, want 1 (no retry on non-port-bind error)", runAttempts)
+	}
+}
+
 func TestWaitReadySucceedsImmediately(t *testing.T) {
 	clock := newFakeClock()
 	calls := 0

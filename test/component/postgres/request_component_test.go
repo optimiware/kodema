@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1322,7 +1323,10 @@ func TestObservedResolveFailOnPostgreSQL(t *testing.T) {
 	// cleanup progress and action.transition events by their hash-derived ids.
 	env.requireEvent(t, ctx, eventWant{
 		id: resolveIDs.event, typ: "request.resolved", subject: string(executionID), version: 2,
-		principal: "principal-1", data: pgtest.NullValue,
+		principal: "principal-1",
+		data: pgtest.GoldenJSONOf(map[string]any{
+			"action_id": string(actionID), "decision": "fail", "actor": "principal-1",
+		}),
 	})
 	env.requireEvent(t, ctx, eventWant{
 		id:  "event-7fad9a4bfd5c7a823b204d8e55285d3328cf3d4527760a5059bd937967d365cb",
@@ -1394,8 +1398,15 @@ func TestObservedResolvePassNonLastOnPostgreSQL(t *testing.T) {
 	command.ExpectedExecutionVersion = 3
 	command.ExpectedActionVersion = 2
 	resolveIDs := env.nextCommitIDs()
-	if _, err := env.request.Resolve(ctx, command); err != nil {
+	resolved, err := env.request.Resolve(ctx, command)
+	if err != nil {
 		t.Fatalf("resolve non-last: %v%s", err, pgtest.CauseText(err))
+	}
+	if !strings.HasPrefix(string(resolved.DecisionID), "dec_") {
+		t.Fatalf("resolved.DecisionID = %q; want dec_ prefix", resolved.DecisionID)
+	}
+	if _, err := id.ParseDecisionID(string(resolved.DecisionID)); err != nil {
+		t.Fatalf("resolved.DecisionID %q invalid: %v", resolved.DecisionID, err)
 	}
 	document, err := snapshotdoc.Encode(snapshotdoc.Admitted{Snapshot: snapshot, Actions: actions})
 	if err != nil {
@@ -1421,15 +1432,23 @@ func TestObservedResolvePassNonLastOnPostgreSQL(t *testing.T) {
 		"workload_id": pgtest.NullValue, "launch_state": "not_issued", "launch_key": pgtest.NullValue,
 		"observation": pgtest.NullValue, "activated_at": pgtest.NullValue, "answer_provenance": pgtest.NullValue,
 	})
+	env.shard.RequireGoldenRow(t, ctx, env.runtime, env.scope, "approval_decisions", map[string]any{"id": string(resolved.DecisionID)}, map[string]any{
+		"id": string(resolved.DecisionID), "tenant_id": "tenant-1", "project_id": "project-1",
+		"task_id": pgtest.NullValue, "execution_id": string(executionID), "action_id": string(actionID),
+		"assignment": "role/engineer", "operation": pgtest.NullValue, "resource_id": pgtest.NullValue,
+		"subject":  `{"ref":{"kind":"literal","literal":"refs/heads/main"}}`,
+		"approver": "principal-1", "resolved_at": env.now, "expires_at": env.now.Add(request.DefaultDecisionTTL),
+		"revoked_at": pgtest.NullValue, "revoked_reason": pgtest.NullValue, "version": int64(1),
+	})
 	// derived: the result carries the expected versions plus one: execution
-	// 3->4 and action 2->3 (store/units/execution/request.go Resolve).
+	// 3->4 and action 2->3, plus the minted decision_id (store/units/execution/request.go Resolve).
 	env.shard.RequireGoldenRow(t, ctx, env.runtime, env.scope, "receipts", map[string]any{"id": resolveIDs.receipt}, map[string]any{
 		"id": resolveIDs.receipt, "tenant_id": "tenant-1", "project_id": "project-1",
 		"principal_id": "principal-1", "operation": "execution.request.resolve",
 		"caller_key":     string(executionID) + "/" + string(actionID),
 		"content_sha256": pgtest.ContentSHA256(t, resolveReceiptContent(request.DecisionPass)),
 		"result": pgtest.GoldenJSONOf(request.ResolveResult{
-			ExecutionVersion: 4, ActionVersion: 3, Decision: request.DecisionPass,
+			ExecutionVersion: 4, ActionVersion: 3, Decision: request.DecisionPass, DecisionID: resolved.DecisionID,
 		}),
 		"completed_at": env.now, "execution_id": string(executionID),
 		"snapshot_sha256": pgtest.NullValue, "created_at": env.now,
@@ -1444,12 +1463,16 @@ func TestObservedResolvePassNonLastOnPostgreSQL(t *testing.T) {
 	// the execution stays running.
 	env.requireEvent(t, ctx, eventWant{
 		id: resolveIDs.event, typ: "request.resolved", subject: string(executionID), version: 3,
-		principal: "principal-1", data: pgtest.NullValue,
+		principal: "principal-1",
+		data: pgtest.GoldenJSONOf(map[string]any{
+			"action_id": string(actionID), "decision": "pass", "actor": "principal-1",
+			"decision_id": string(resolved.DecisionID),
+		}),
 	})
 	env.requireEvent(t, ctx, eventWant{
 		id:  "event-854315a020e5ffc9b3e9f1559c0787266a62a6d7e9bbd9979b35200195b06f6e",
 		typ: "action.transition", subject: string(actionID), version: 3, principal: lifecycleProducer,
 		data: lifecycleActionData(actionID, 0, "request", "running", "succeeded", 3),
 	})
-	observer.Finish(map[string]int{"executions": 1, "actions": 1, "receipts": 1, "audit": 1, "events": 2})
+	observer.Finish(map[string]int{"executions": 1, "actions": 1, "approval_decisions": 1, "receipts": 1, "audit": 1, "events": 2})
 }

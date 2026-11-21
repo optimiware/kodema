@@ -700,6 +700,14 @@ func requireProtectedGoldenRequest(t *testing.T, item api.InboxItem, evidence pr
 // retried.
 func resolveProtectedGoldenRequest(t *testing.T, fixture *gitHarness, evidence protectedGoldenEvidence, initial api.ExecutionAction) {
 	t.Helper()
+	resolveProtectedGoldenRequestWith(t, fixture, evidence, initial, false)
+}
+
+// resolveProtectedGoldenRequestWith answers one running request with the exact
+// human pass, optionally setting AllowStale for fixtures whose subject
+// expected_base intentionally trails the current ref head.
+func resolveProtectedGoldenRequestWith(t *testing.T, fixture *gitHarness, evidence protectedGoldenEvidence, initial api.ExecutionAction, allowStale bool) {
+	t.Helper()
 	for range 30 {
 		current := inspectProtectedGoldenExecution(t, fixture, evidence.reviewerToken, evidence.executionID)
 		if current.State != "running" {
@@ -711,6 +719,7 @@ func resolveProtectedGoldenRequest(t *testing.T, fixture *gitHarness, evidence p
 			ActionID:              action.ActionID,
 			ExpectedActionVersion: action.Version,
 			Decision:              "pass",
+			AllowStale:            allowStale,
 		}, &current.Version, "resolve-protected-golden-path")
 		if publicError.Code == api.CodeVersionConflict {
 			continue

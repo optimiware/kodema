@@ -119,7 +119,12 @@ func TestProtectedFactoryRejectsMismatchedApprovalSubject(t *testing.T) {
 				assignment:              "role/reviewer",
 				respondent:              protectedSubjectAnsweredByReviewer,
 				probeReplacementSubject: testCase.probeReplacementSubject,
-				allowStale:              testCase.field == "ref" || testCase.field == "expected_base",
+				// Mutating ref, expected_base, or resource intentionally
+				// produces a git.ref.update subject whose expected_base does
+				// not match the target resource/ref's current head, so pass
+				// AllowStale to let the genuine human pass commit and leave
+				// the refusal to managed-hook verification.
+				allowStale: testCase.field == "ref" || testCase.field == "expected_base" || testCase.field == "resource",
 			})
 			assertProtectedSubjectRefusal(t, evidence, testCase.field)
 			if testCase.probeReplacementSubject && evidence.replacementSubjectErr.Code != api.CodeInvalidInput {

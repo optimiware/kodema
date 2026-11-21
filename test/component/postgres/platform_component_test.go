@@ -226,7 +226,7 @@ func TestRealVerifierAndReporterOnPostgreSQL(t *testing.T) {
 		"binding_id": "binding-1", "resource_id": "resource-1", "operation": "git.ref.update",
 		"subject":            `{"fields":[{"name":"ref","kind":"string","value":"refs/heads/main"}]}`,
 		"requested_approval": pgtest.NullValue, "result": "approved", "approved": false,
-		"created_at": pgtest.FixtureTime,
+		"decision_id": pgtest.NullValue, "created_at": pgtest.FixtureTime,
 	})
 	verifyObserver.Finish(map[string]int{"verifications": 1})
 
@@ -277,7 +277,7 @@ func TestRealVerifierAndReporterOnPostgreSQL(t *testing.T) {
 		"binding_id": "binding-1", "resource_id": "resource-1", "operation": "git.ref.update",
 		"subject":            `{"fields":[{"name":"ref","kind":"string","value":"refs/heads/main"}]}`,
 		"requested_approval": pgtest.NullValue, "result": "approved", "approved": false,
-		"created_at": pgtest.FixtureTime,
+		"decision_id": pgtest.NullValue, "created_at": pgtest.FixtureTime,
 	})
 	shard.RequireGoldenRow(t, ctx, scopedDB(t, shard), platformScope(), "receipts", map[string]any{"id": "receipt-with-intent"}, map[string]any{
 		"id": "receipt-with-intent", "tenant_id": "tenant-1", "project_id": "project-1",

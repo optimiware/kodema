@@ -229,8 +229,37 @@ func (s *Shard) Run(ctx context.Context, spec RunSpec) (*Container, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.Podman.run(ctx, s.Podman.operationLimit, args...); err != nil {
-		return nil, fmt.Errorf("harness: run %s: %w", image, err)
+	const maxPortBindAttempts = 3
+	attempts := 1
+	if len(spec.Ports) > 0 {
+		attempts = maxPortBindAttempts
+	}
+	var runErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		res, err := s.Podman.run(ctx, s.Podman.operationLimit, args...)
+		if err == nil {
+			runErr = nil
+			break
+		}
+		runErr = err
+		if !isTransientPortBindError(err, res.Stderr) {
+			break
+		}
+		// Rootless Podman selects an ephemeral host port for -p 127.0.0.1::<port>
+		// and passes it to rootlessport; under high concurrency another process
+		// can claim that port in the TOCTOU window, leaving a created container.
+		// Always remove any partial container (even on the final attempt or after
+		// ctx cancellation) so Shard.Close()/network rm never leaks it.
+		cleanupCtx := context.WithoutCancel(ctx)
+		_, _ = s.Podman.run(cleanupCtx, s.Podman.stopLimit, "rm", "--force", "--volumes", spec.Name)
+		if attempt == attempts || ctx.Err() != nil {
+			break
+		}
+		s.Podman.Logf("harness: retrying podman run for %s after transient port bind conflict (attempt %d/%d): %v",
+			spec.Name, attempt, attempts, err)
+	}
+	if runErr != nil {
+		return nil, fmt.Errorf("harness: run %s: %w", image, runErr)
 	}
 	container := &Container{
 		Name:    spec.Name,
@@ -242,6 +271,15 @@ func (s *Shard) Run(ctx context.Context, spec RunSpec) (*Container, error) {
 	s.containers = append(s.containers, container)
 	s.mu.Unlock()
 	return container, nil
+}
+
+// isTransientPortBindError reports whether a podman run failure is an
+// ephemeral host-port allocation collision from rootlessport.
+func isTransientPortBindError(err error, stderr []byte) bool {
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "bind: address already in use") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(string(stderr)), "bind: address already in use")
 }
 
 // resolveRunImage returns the immutable reference Run must start. A tag is

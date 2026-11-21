@@ -121,6 +121,21 @@ func TestMigration0010KVStoreUpgradeRLSAndRoundTripOnPostgreSQL(t *testing.T) {
 	if resUTF8.Existed || resUTF8.Metadata.Key != kv.KeyFor(utf8Payload) {
 		t.Fatalf("kv.Put UTF-8 result = %+v", resUTF8)
 	}
+	utf8RowID, err := kv.RowID(scopeA, resUTF8.Metadata.Key)
+	if err != nil {
+		t.Fatalf("kv.RowID: %v", err)
+	}
+	shard.RequireGoldenRow(t, ctx, runtime, scopeA, "kv_objects", map[string]any{"id": utf8RowID}, map[string]any{
+		"id":           utf8RowID,
+		"tenant_id":    string(scopeA.TenantID),
+		"project_id":   string(scopeA.ProjectID),
+		"key":          string(resUTF8.Metadata.Key),
+		"content_type": "text/markdown; charset=utf-8",
+		"size_bytes":   int64(len(utf8Payload)),
+		"data":         utf8Payload,
+		"created_by":   string(engA.ID),
+		"created_at":   now,
+	})
 
 	resUTF8Again, err := kvSvc.Put(ctx, kv.PutCommand{
 		Scope:       scopeA,
