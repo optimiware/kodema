@@ -263,13 +263,60 @@ trailing newline removed from each value. A refused value fails the action;
 its message is in `kodema logs <execution-id> --action source --stream stderr`.
 Commands start in `/workspace`, which the actions of one execution share.
 
-## Connect an MCP client
+## Onboard your AI harness as PM & Orchestrator (zero local app builds)
 
-```sh
-kodema mcp install claude --print     # or cursor, codex, opencode; without --print it writes the client's config
-```
+The fastest way to build software on Kodema is to connect your everyday user
+harness (**Claude Code**, **Codex**, **OpenCode**, or **Cursor**) to your local
+`kodema up` instance and collaborate with it as your **PM & Orchestrator**:
 
-Connecting over MCP automatically provides Kodema instructions during `initialize`, plus version-locked guides via MCP resources (`kodema://docs/*`) and prompts (`kodema-docs`, `kodema-workload`, `kodema-pipelines`, ...).
+1. **Store LLM provider key(s) in Kodema's control plane** so workload
+   containers and agentic services call Kodema's LLM proxy without ever holding
+   raw provider API keys:
+
+   ```sh
+   printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin
+   # or OPENAI_API_KEY / OPENCODE_API_KEY, or --value-file <path>
+   ```
+
+2. **Connect your harness via MCP and install Kodema's embedded docs skill:**
+
+   ```sh
+   kodema mcp install claude              # or cursor, codex, opencode (--print to preview)
+   kodema docs install --target agents    # or claude, opencode, all
+   ```
+
+   Connecting over MCP automatically provides Kodema PM/Orchestrator
+   instructions during `initialize`, plus version-locked guides via MCP
+   resources (`kodema://docs/*`) and prompts (`kodema-docs`, `kodema-workload`,
+   `kodema-pipelines`, `kodema-agentic-services`, ...).
+
+3. **Collaborate with your harness without local app builds:**
+   Instead of writing application code on your laptop or running local builds,
+   work with your harness to clarify requirements and orchestrate delivery
+   through Kodema MCP tools:
+   - Store specs and design plans in the project KV store (`kv_put` / `kv_get`,
+     returning immutable `kv:sha256:...` keys).
+   - Apply pipelines (`pipeline_apply`) and create/start multi-stage tasks
+     (`task_create`, `task_create_and_start`, `task_start` with
+     `completes_task: false`).
+   - Inspect runs, token usage, and logs (`execution_inspect`,
+     `execution_logs_read`), answer agent questions (`task_reply`), resolve
+     review gates (`execution_request_resolve` with `pass`, `revise`, or
+     `fail`), and close finished work (`task_complete`).
+
+4. **Graduate smoothly to 24/7 automation:**
+   The exact same tasks, KV keys, and pipelines transition directly from
+   interactive harness orchestration to always-on `kodsvc.` services:
+   - Per-project OpenCode service (Option 1 — isolated Git worktrees):
+     `kodema services --kind opencode --mode worktree`
+   - Brain/Hands split (Option 2 — ephemeral stock-image MCP sandboxes):
+     `kodema services --kind opencode --mode brain` + `kodema sandbox serve`
+   - Serialized merge coordinator with cross-execution Decision IDs:
+     `kodema services --kind merge_coordinator`
+
+See [LLM proxy & agentic harnesses](llm-proxy-harnesses.md) and the tested
+[Agentic SDLC examples](../../examples/agentic-sdlc/README.md) for ready-to-run
+pipelines.
 
 ## Embedded docs and shared company context
 
@@ -278,6 +325,7 @@ Read Kodema's embedded documentation offline (including inside container steps) 
 ```sh
 kodema docs                                 # list topics
 kodema docs workload                        # container action contract
+kodema docs agentic-services                # Option 1 worktree & Option 2 Brain/Hands
 kodema docs install --target agents         # or claude, opencode, all
 ```
 

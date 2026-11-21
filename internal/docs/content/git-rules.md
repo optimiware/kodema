@@ -50,16 +50,28 @@ repo shop/deploy
   - `-` — explicit deny
 - **First-match wins** in declaration order: the first rule whose ref and principal match and whose permission covers the attempt allows; a matching `-` denies; no match refuses.
 - Refs match **exact** names, or by **prefix** when ending in `/` (for example `refs/heads/work/`). No regular expressions. Omitting a ref covers all refs.
-- Principals: `@admin`, `@engineer`, `@reviewer`, `@operator`, `@viewer`, `@execution` (running execution in scope), `@all` (every principal in scope), or explicit service-account IDs. There is no implicit Admin bypass.
+- Principals: `@admin`, `@engineer`, `@reviewer`, `@operator`, `@viewer`, `@execution` (running execution in scope), `@all` (every principal in scope), or explicit service-account IDs (for example `merge-coordinator` or `opencode-shop`). There is no implicit Admin bypass.
 - `option resource = <resource-id>` binds the repository stanza to its registered Kodema resource ID. Always preserve it when editing `conf/git.conf`.
 
 ### Approval-guarded refs (`option approve.<ref> = <role>`)
 
 When `option approve.<ref> = <role>` is set:
 
-- The `pre-receive` hook requires a **passed** `request: role/<role>` in the **same execution** that is pushing.
+- By default, the `pre-receive` hook requires a **passed** `request: role/<role>` in the **same execution** that is pushing.
 - That passed request's immutable subject must match `operation: git.ref.update`, `resource`, exact `ref`, `expected_base` (empty or all-zero OID for an unborn ref), and `candidate` commit OID.
-- Humans and service accounts carry no execution approval evidence, so they cannot push directly to approval-guarded refs. To land workstation changes, push to a `work/` branch and run an integration pipeline with a review gate.
+- Humans carry no approval evidence and cannot push directly to approval-guarded refs. To land workstation changes, push to a `work/` branch and run a review/integration pipeline.
+
+### Cross-execution approval Decision IDs (`-o kodema.decision_id=<id>`)
+
+When a `request: role/<role>` resolves with `decision: pass`, Kodema mints an immutable, project-scoped **`decision_id`** (returned by `execution.request.resolve` and exposed on `execution.inspect`). This decouples review from integration across separate executions or a serialized merge coordinator without weakening security:
+
+- `POST /api/v1/verify` accepts optional `decision_id` alongside `approval: role/<role>`. Kodema verifies that the recorded immutable decision belongs to the same tenant and project, is unrevoked and unexpired, was passed by an authorized `role/<role>` actor, matches exact `operation`, `resource`, and subject fields (`ref`, `expected_base`, `candidate`), and that the pushing actor is either an execution on the same execution/task or an enabled service holding an active assigned request on that execution/task.
+- In `kodema git serve`, a pushing execution or authorized service account (such as `service/merge-coordinator` granted `RW refs/heads/main = merge-coordinator`) supplies the Git push option:
+  ```sh
+  git push -o kodema.decision_id="$DECISION_ID" origin "$CANDIDATE:refs/heads/main"
+  ```
+- When delegating merges to `service/merge-coordinator` (`kodema services --kind merge_coordinator`), pass `decision_id` in the merge request's `subject` alongside `repository`, `ref`, `base`, and `candidate`; the merge coordinator forwards `-o kodema.decision_id=<id>` when pushing.
+- Cross-project, revoked, non-`pass`, or subject-mismatched Decision IDs are always refused.
 
 ### Opt-in disjoint rebase approval (`option approve-rebase.<ref> = disjoint`)
 
@@ -72,7 +84,7 @@ repo shop/web
     option resource                        = git-shop-web
     R                                      = @all
     RW+  refs/heads/work/                  = @engineer @execution
-    RW   refs/heads/main                   = @execution
+    RW   refs/heads/main                   = @execution merge-coordinator
     option approve.refs/heads/main         = reviewer
     option approve-rebase.refs/heads/main  = disjoint
 ```
@@ -81,10 +93,10 @@ Rules and security invariants:
 
 - `option approve-rebase.<ref> = disjoint` requires a covering `option approve.<ref> = <role>` rule in the same repository stanza; unknown modes, duplicate declarations, or dangling `approve-rebase` rules are rejected.
 - Without `option approve-rebase.<ref> = disjoint`, strict exact `(expected_base, candidate)` matching remains enforced even if push options are supplied.
-- To use disjoint rebase approval, the pushing execution rebases onto the moved target ref and pushes with both Git push options:
+- Note: `kodema services --kind merge_coordinator` serializes pushes to `target_ref` and forwards `-o kodema.decision_id=<id>` (refusing with base-moved if `target_ref` advanced past `base`). To use disjoint rebase approval with `kodema git serve`, a pushing execution or custom rebase-aware merge service rebases onto the moved target ref and pushes with both Git push options (optionally paired with `-o kodema.decision_id=<id>` for cross-execution approval):
   `-o kodema.approved_base=<40-hex-sha> -o kodema.approved_candidate=<40-hex-sha>`.
 - For non-creation, non-deletion updates when push options differ from `(old_oid, new_oid)`, `kodema git serve` enforces all of the following in `pre-receive`:
-  1. **Same-execution approval**: the pushing execution itself holds a passed `request: role/<role>` for `(operation: git.ref.update, resource, ref, expected_base: approved_base, candidate: approved_candidate)`.
+  1. **Verified approval**: either the pushing execution holds a passed `request: role/<role>` or the supplied `kodema.decision_id` verifies that approval for `(operation: git.ref.update, resource, ref, expected_base: approved_base, candidate: approved_candidate)`.
   2. **Commit validity & fast-forward ancestry**: `approved_base`, `approved_candidate`, `current_ref`, and `pushed` are existing commit objects; `approved_base` is a strict ancestor of `approved_candidate` and an ancestor of (or equal to) `current_ref`; and `current_ref` is a strict ancestor of `pushed` (fast-forward only).
   3. **Linear, merge-free commit series**: `approved_base..approved_candidate` and `current_ref..pushed` contain no merge commits and have identical commit counts.
   4. **Disjoint touched paths**: the union of all paths touched in `approved_base..approved_candidate` (and `current_ref..pushed`) is 100% disjoint from all paths modified in `approved_base..current_ref`, checked with `--no-renames` (covering both old and new paths on renames/deletes) and rejecting file/directory prefix collisions.

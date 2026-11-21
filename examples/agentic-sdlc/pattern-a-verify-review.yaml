@@ -1,0 +1,62 @@
+# Pattern A (Stage 2 of 3): Deterministic Verification and 3-Way Human Review
+#
+# Runs deterministic tests on the exact candidate commit using project-scoped
+# non-authoritative caches, publishes the test report to the immutable KV store,
+# and waits at `request: role/reviewer`.
+#
+# Reviewers settle the gate with one of three decisions:
+#   - `pass`:   succeeds this stage and mints an immutable `decision_id` usable
+#               by Stage 3 (`pattern-a-merge.yaml`) across executions.
+#   - `revise`: appends feedback to the task conversation and keeps the task
+#               open without alerting the `role/operator` failure inbox.
+#   - `fail`:   rejects the candidate and surfaces the task to `role/operator`.
+inputs:
+  - repository
+  - resource_id
+  - target_ref
+  - branch
+  - base
+  - candidate
+  - summary_key
+completes_task: false
+actions:
+  - name: verify
+    image: registry.example.com/kodema/go-toolchain@sha256:44575cf5b28512d75644bf54a517dcef304ff809fd511747621b4d64f19aac66
+    timeout: 20m
+    caches:
+      - go-mod
+      - go-build
+    env:
+      GOMODCACHE: /kodema/cache/go-mod
+      GOCACHE: /kodema/cache/go-build
+    resources:
+      memory: 2Gi
+      cpu: "2"
+    outputs:
+      - report_key
+    commands:
+      - git clone "$KODEMA_GIT_URL/$(cat /kodema/inputs/repository)" /workspace/repo
+      - git -C /workspace/repo fetch origin "$(cat /kodema/inputs/branch)"
+      - git -C /workspace/repo checkout --detach "$(cat /kodema/inputs/candidate)"
+      - cd /workspace/repo && go test -race ./... | tee /workspace/test-report.txt
+      - kodema kv put /workspace/test-report.txt --content-type text/plain > /kodema/outputs/verify/report_key
+
+  - name: review
+    request: role/reviewer
+    timeout: 72h
+    outputs:
+      - notes
+    subject:
+      operation: git.ref.update
+      resource:
+        from: inputs.resource_id
+      ref:
+        from: inputs.target_ref
+      expected_base:
+        from: inputs.base
+      candidate:
+        from: inputs.candidate
+      summary_key:
+        from: inputs.summary_key
+      report_key:
+        from: verify.outputs.report_key

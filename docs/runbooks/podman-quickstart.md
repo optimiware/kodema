@@ -10,7 +10,10 @@ local keyfile and the OAuthSonas development identity provider. The complete
 list of limitations is at the end of this page; read it before relying on the
 installation.
 
+> **Fastest local onboarding (zero bundle setup):** If you want to try Kodema locally with an AI harness (Claude Code, Codex, OpenCode, or Cursor) in minutes, start with `kodema up` in the [single-command quickstart](quickstart.md) instead of this Podman bundle.
+
 - Bundle: [`deploy/podman/`](../../deploy/podman/)
+- Single-command local quickstart (`kodema up`): [quickstart.md](quickstart.md)
 - Product behavior and environments: [KODEMA.md](../../KODEMA.md)
 - Release smoke: [release-smoke.md](release-smoke.md)
 
@@ -547,6 +550,43 @@ No script runs this walk-through. The full protected Git integration path
 (request, approval and a protected `git.ref.update` through a repository) is
 the release smoke scenario `TestReleaseSmoke/ProtectedTask`
 ([release-smoke.md](release-smoke.md)).
+
+## Connect your AI harness as PM & Orchestrator
+
+Once your Podman installation is running (whether via `kodema up` or this
+bundle), connect your everyday coding harness (**Claude Code**, **Codex**,
+**OpenCode**, or **Cursor**) to drive Kodema over MCP instead of building or
+editing application code directly on your laptop:
+
+1. **Configure LLM provider key(s)** in Kodema's control plane (for `kodema up`
+   or a server started with `--models-file` / `--llm-provider`):
+
+   ```sh
+   printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin
+   # or OPENAI_API_KEY / OPENCODE_API_KEY, or --value-file <path>
+   ```
+
+2. **Install the Kodema MCP bridge and embedded docs skill** for your harness:
+
+   ```sh
+   kodema mcp install claude              # or codex, opencode, cursor (--print to preview)
+   kodema docs install --target agents    # or claude, opencode, all
+   ```
+
+3. **Collaborate as PM & Orchestrator:** Your harness reads Kodema's MCP
+   `initialize` instructions and `kodema://docs/*` guides, stores specs/plans in
+   KV (`kv_put` / `kv_get`), applies pipelines (`pipeline_apply`), runs
+   multi-stage tasks (`task_create`, `task_create_and_start`, `task_start` with
+   `completes_task: false`), inspects logs and usage (`execution_inspect`,
+   `execution_logs_read`), settles 3-way review gates
+   (`execution_request_resolve` with `pass`, `revise`, or `fail`), and closes
+   completed work (`task_complete`).
+4. **Graduate to 24/7 automation:** Move the same pipelines unchanged onto
+   always-on `kodsvc.` services (`kodema services --kind opencode --mode worktree`,
+   `kodema services --kind opencode --mode brain` with `kodema sandbox serve`,
+   and `kodema services --kind merge_coordinator`). See
+   [llm-proxy-harnesses.md](llm-proxy-harnesses.md) and
+   [examples/agentic-sdlc/README.md](../../examples/agentic-sdlc/README.md).
 
 ## Re-run, upgrade and operate
 

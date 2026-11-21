@@ -19,7 +19,7 @@ const MIMETypeMarkdown = "text/markdown"
 
 // SkillDescription is the portable Agent Skill description for Kodema's
 // embedded product documentation skill.
-const SkillDescription = "Work with Kodema pipelines, container workloads, approvals, task handoffs, Git rules, and shared context repositories."
+const SkillDescription = "Orchestrate software delivery with Kodema: manage tasks, pipelines, KV artifacts, container harnesses, approvals, Git rules, and agentic services."
 
 // Topic is one embedded Kodema documentation document.
 type Topic struct {
@@ -49,16 +49,24 @@ var (
 
 	//go:embed content/context.md
 	contextMD string
+
+	//go:embed content/agentic-services.md
+	agenticServicesMD string
 )
 
-const coreModelSummary = `Kodema is an API-first, multi-tenant software factory running container pipelines and coding agents on Kubernetes or Podman.
+const coreModelSummary = `Kodema is an API-first, multi-tenant software factory running coding agents, container pipelines, and agentic services on Kubernetes or local Podman.
+
+Your role as a connected user harness (PM & Orchestrator):
+- When working on a Kodema project, act as the user's PM and Orchestrator: do NOT write application code directly on the user's laptop or run local builds/tests to deliver features.
+- Collaborate with the user to shape specs, tasks, and pipelines, then drive delivery through Kodema MCP tools: task_create / task_create_and_start / task_start / task_restart, pipeline_apply / pipeline_start, kv_put / kv_get (immutable kv:sha256:... specs, plans, and reviews), execution_inspect / execution_logs_read, task_reply, execution_request_resolve (pass | revise | fail), and task_complete.
+- Interactive orchestration uses the exact same pipelines and tasks that graduate to 24/7 kodsvc. automation (service/opencode-* in worktree or brain mode, and service/merge-coordinator).
 
 Core model:
-- A pipeline is an ordered list of actions (container or request); an execution runs a pipeline once with an immutable admission snapshot; a task is a conversation that starts executions.
-- Pipelines are managed only through the API (pipeline_apply / pipeline_start); there are no when-conditions, loops, parallel actions, or Git auto-sync.
-- Mutations require an idempotency_key (identical retries converge) and versioned updates require expected_version (re-read on version_conflict).
-- Planned human/service gates use request actions (role/<role> or service/<id>) and retain /workspace; unplanned questions use task_ask / task_reply across fresh executions after saving durable commits or digests.
-- Approval-guarded Git refs (option approve.<ref> in admin/conf/git.conf) require a passed request: role/<role> in the pushing execution matching exact operation, resource, ref, expected_base, and candidate.`
+- A pipeline is an ordered list of actions (container or request); an execution runs a pipeline once with an immutable admission snapshot; a task is a conversation (with optional parent_id) that starts executions.
+- Pipelines are managed only through the API (pipeline_apply / pipeline_start); there are no when-conditions, loops, parallel actions, or Git auto-sync. Container actions support named non-authoritative caches (/kodema/cache/<name>), active LLM budgets (budget.max_tokens / max_cost_usd), and "kodema harness exec -- <cmd>" for rotation-safe loopback LLM proxying.
+- Mutations require idempotency_key (identical retries converge) and versioned updates require expected_version (re-read on version_conflict).
+- Multi-stage SDLC pipelines set completes_task: false so intermediate stages leave the task open until explicit task_complete. Request actions support 3-way decisions (pass | revise | fail): revise appends feedback to the task without alerting the operator inbox, while pass mints an immutable decision_id usable across executions (-o kodema.decision_id=...) and with service/merge-coordinator.
+- Planned human/service gates use request actions (role/<role> or service/<id>) and retain /workspace; unplanned questions use task_ask / task_reply across fresh executions after saving durable commits or kv:sha256:... keys.`
 
 type topicSpec struct {
 	slug        string
@@ -103,6 +111,12 @@ var catalog = buildCatalog([]topicSpec{
 		title:       "Shared Company and Project Context",
 		description: "Company/project Git context repositories, Markdown skills, and kodema context pull.",
 		content:     contextMD,
+	},
+	{
+		slug:        "agentic-services",
+		title:       "Agentic Services (Option 1 Worktree & Option 2 Brain/Hands)",
+		description: "Attributed kodsvc. LLM proxy, OpenCode --mode worktree and --mode brain, kodema sandbox serve, and Helm NetworkPolicies.",
+		content:     agenticServicesMD,
 	},
 })
 

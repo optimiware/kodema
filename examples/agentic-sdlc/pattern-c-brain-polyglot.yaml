@@ -1,0 +1,116 @@
+# Pattern C: Option 2 Brain/Hands Split (`--mode brain` + `kodema sandbox serve`)
+#
+# Runs a lightweight OpenCode Brain pod (`kodema services --kind opencode --mode brain`)
+# with all local shell and filesystem tools disabled:
+#   1. `plan` runs directly in Brain with NO sandbox container (`sandbox_image` omitted).
+#   2. `implement-backend` dynamically spawns an ephemeral Go sandbox on stock
+#      `docker.io/library/golang:1.24` with `go-mod,go-build` caches via
+#      `/kodema/bin/kodema sandbox serve`.
+#   3. `implement-frontend` dynamically spawns an ephemeral Node sandbox on stock
+#      `docker.io/library/node:22` with `npm` cache on the same task session.
+#   4. `ai-review` runs sandbox-free directly in Brain.
+#   5. `review` gates protected Git integration on a human `role/reviewer` decision.
+#
+# Note: Brain mode's service account requires the `engineer` role (for inline
+# sandbox `pipeline.start`, `execution.cancel`, and ephemeral sandbox secrets).
+inputs:
+  - repository
+  - resource_id
+  - target_ref
+  - expected_base
+completes_task: false
+budget:
+  max_tokens: 500000
+  max_cost_usd: 10.0
+actions:
+  - name: plan
+    request: service/opencode-shop
+    timeout: 15m
+    subject:
+      mode: plan
+      repository:
+        from: inputs.repository
+      base_ref:
+        from: inputs.target_ref
+    outputs:
+      - plan_key
+      - session_id
+
+  - name: implement-backend
+    request: service/opencode-shop
+    timeout: 30m
+    subject:
+      mode: implement
+      repository:
+        from: inputs.repository
+      base_ref:
+        from: inputs.target_ref
+      plan_key:
+        from: plan.outputs.plan_key
+      sandbox_image: docker.io/library/golang:1.24
+      sandbox_caches: go-mod,go-build
+      sandbox_memory: 2Gi
+      sandbox_cpu: "2"
+    outputs:
+      - branch
+      - candidate
+      - summary_key
+      - session_id
+
+  - name: implement-frontend
+    request: service/opencode-shop
+    timeout: 30m
+    subject:
+      mode: implement
+      repository:
+        from: inputs.repository
+      base_ref:
+        from: implement-backend.outputs.branch
+      plan_key:
+        from: plan.outputs.plan_key
+      sandbox_image: docker.io/library/node:22
+      sandbox_caches: npm
+      sandbox_memory: 2Gi
+      sandbox_cpu: "2"
+    outputs:
+      - branch
+      - candidate
+      - summary_key
+      - session_id
+
+  - name: ai-review
+    request: service/opencode-shop
+    timeout: 15m
+    subject:
+      mode: ai_review
+      repository:
+        from: inputs.repository
+      base_ref:
+        from: inputs.target_ref
+      plan_key:
+        from: plan.outputs.plan_key
+    outputs:
+      - review_key
+      - session_id
+
+  - name: review
+    request: role/reviewer
+    timeout: 72h
+    outputs:
+      - notes
+    subject:
+      operation: git.ref.update
+      resource:
+        from: inputs.resource_id
+      ref:
+        from: inputs.target_ref
+      expected_base:
+        from: inputs.expected_base
+      candidate:
+        from: implement-frontend.outputs.candidate
+      plan_key:
+        from: plan.outputs.plan_key
+      summary_key:
+        from: implement-frontend.outputs.summary_key
+      review_key:
+        from: ai-review.outputs.review_key
