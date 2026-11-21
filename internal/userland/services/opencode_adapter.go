@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,21 +39,26 @@ type openCodeTaskLockEntry struct {
 // mappings and isolated per-task local Git worktrees, and aborts active
 // OpenCode sessions immediately on cancellation or timeout.
 type OpenCodeAdapter struct {
-	serviceID      id.PrincipalID
-	tenant         id.TenantID
-	project        id.ProjectID
-	handler        api.Handler
-	stream         client.EventStreamer
-	events         EventSource
-	opencode       OpenCodeClient
-	store          OpenCodeStateStore
-	worktrees      OpenCodeWorktreeManager
-	proxy          *OpenCodeLLMProxy
-	clock          Clock
-	rescan         time.Duration
-	maxConcurrency int
-	model          string
-	agent          string
+	serviceID           id.PrincipalID
+	tenant              id.TenantID
+	project             id.ProjectID
+	executionMode       OpenCodeExecutionMode
+	brain               OpenCodeBrainConfig
+	handler             api.Handler
+	stream              client.EventStreamer
+	events              EventSource
+	opencode            OpenCodeClient
+	store               OpenCodeStateStore
+	worktrees           OpenCodeWorktreeManager
+	sandboxes           OpenCodeSandboxManager
+	proxy               *OpenCodeLLMProxy
+	perTurnProxyRouting bool
+	sandboxRT           http.RoundTripper
+	clock               Clock
+	rescan              time.Duration
+	maxConcurrency      int
+	model               string
+	agent               string
 
 	turnSlots chan struct{}
 
@@ -70,10 +76,12 @@ type activeOpenCodeTurn struct {
 	taskID      string
 	cancel      context.CancelFunc
 
-	mu        sync.Mutex
-	sessionID string
-	aborted   bool
-	abortOnce sync.Once
+	mu           sync.Mutex
+	sessionID    string
+	aborted      bool
+	abortOnce    sync.Once
+	sandboxLease *OpenCodeSandboxLease
+	releaseOnce  sync.Once
 }
 
 func (t *activeOpenCodeTurn) setSessionID(sessionID string) {
@@ -86,6 +94,37 @@ func (t *activeOpenCodeTurn) getSessionID() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.sessionID
+}
+
+func (t *activeOpenCodeTurn) setSandboxLease(lease OpenCodeSandboxLease) {
+	t.mu.Lock()
+	copyLease := lease
+	t.sandboxLease = &copyLease
+	t.mu.Unlock()
+}
+
+func (t *activeOpenCodeTurn) getSandboxLease() (OpenCodeSandboxLease, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sandboxLease == nil {
+		return OpenCodeSandboxLease{}, false
+	}
+	return *t.sandboxLease, true
+}
+
+func (t *activeOpenCodeTurn) releaseSandbox(mgr OpenCodeSandboxManager) {
+	if mgr == nil {
+		return
+	}
+	lease, ok := t.getSandboxLease()
+	if !ok {
+		return
+	}
+	t.releaseOnce.Do(func() {
+		relCtx, cancel := context.WithTimeout(context.Background(), defaultSandboxStopTimeout)
+		defer cancel()
+		_ = mgr.Release(relCtx, lease)
+	})
 }
 
 func (t *activeOpenCodeTurn) abortSession(opencode OpenCodeClient) {
@@ -137,6 +176,24 @@ func NewOpenCodeAdapter(config OpenCodeAdapterConfig) (*OpenCodeAdapter, error) 
 	if config.RescanInterval < 0 {
 		return nil, fmt.Errorf("opencode adapter rescan interval is negative")
 	}
+	execMode := config.ExecutionMode
+	if execMode == "" {
+		execMode = OpenCodeExecutionModeWorktree
+	}
+	if !execMode.Valid() {
+		return nil, fmt.Errorf("opencode adapter execution mode %q is unsupported", execMode)
+	}
+	var brainCfg OpenCodeBrainConfig
+	if execMode == OpenCodeExecutionModeBrain {
+		if config.Sandboxes == nil {
+			return nil, fmt.Errorf("opencode brain mode requires a sandbox manager")
+		}
+		var err error
+		brainCfg, err = NormalizeBrainConfig(config.Brain)
+		if err != nil {
+			return nil, err
+		}
+	}
 	rescan := config.RescanInterval
 	if rescan == 0 {
 		rescan = defaultRescanInterval
@@ -151,25 +208,30 @@ func NewOpenCodeAdapter(config OpenCodeAdapterConfig) (*OpenCodeAdapter, error) 
 		maxConc = defaultOpenCodeMaxConcurrency
 	}
 	return &OpenCodeAdapter{
-		serviceID:      config.ServiceID,
-		tenant:         config.TenantID,
-		project:        config.ProjectID,
-		handler:        config.Handler,
-		stream:         config.Stream,
-		events:         config.Events,
-		opencode:       config.OpenCode,
-		store:          config.Store,
-		worktrees:      config.Worktrees,
-		proxy:          config.Proxy,
-		clock:          config.Clock,
-		rescan:         rescan,
-		maxConcurrency: maxConc,
-		model:          strings.TrimSpace(config.Model),
-		agent:          strings.TrimSpace(config.Agent),
-		turnSlots:      make(chan struct{}, maxConc),
-		active:         make(map[string]*activeOpenCodeTurn),
-		taskLocks:      make(map[string]*openCodeTaskLockEntry),
-		scanSignal:     make(chan struct{}, 1),
+		serviceID:           config.ServiceID,
+		tenant:              config.TenantID,
+		project:             config.ProjectID,
+		executionMode:       execMode,
+		brain:               brainCfg,
+		handler:             config.Handler,
+		stream:              config.Stream,
+		events:              config.Events,
+		opencode:            config.OpenCode,
+		store:               config.Store,
+		worktrees:           config.Worktrees,
+		sandboxes:           config.Sandboxes,
+		proxy:               config.Proxy,
+		perTurnProxyRouting: config.PerTurnProxyRouting,
+		sandboxRT:           config.SandboxRoundTripper,
+		clock:               config.Clock,
+		rescan:              rescan,
+		maxConcurrency:      maxConc,
+		model:               strings.TrimSpace(config.Model),
+		agent:               strings.TrimSpace(config.Agent),
+		turnSlots:           make(chan struct{}, maxConc),
+		active:              make(map[string]*activeOpenCodeTurn),
+		taskLocks:           make(map[string]*openCodeTaskLockEntry),
+		scanSignal:          make(chan struct{}, 1),
 	}, nil
 }
 
@@ -443,13 +505,27 @@ func (a *OpenCodeAdapter) triggerScan() {
 
 func (a *OpenCodeAdapter) cancelTurnsAsync(matched []*activeOpenCodeTurn) {
 	for _, t := range matched {
-		// Cancel turn context synchronously before spawning AbortSession so
-		// in-flight LLM proxy calls and git commands stop immediately.
+		// Cancel turn context synchronously before spawning AbortSession and
+		// sandbox termination so in-flight LLM proxy calls and git commands
+		// stop immediately.
 		t.cancel()
 		a.abortWG.Add(1)
 		go func(turn *activeOpenCodeTurn) {
 			defer a.abortWG.Done()
-			turn.abortSession(a.opencode)
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				turn.abortSession(a.opencode)
+			}()
+			if a.sandboxes != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					turn.releaseSandbox(a.sandboxes)
+				}()
+			}
+			wg.Wait()
 		}(t)
 	}
 }
@@ -639,46 +715,120 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		}
 	}
 
-	// 5. Serialize concurrent turns for the same task so worktree & OpenCode
-	// session state are never mutated concurrently, and ONLY register the turn
-	// with the local LLM proxy AFTER acquiring the task lock (unregistering in
-	// defer before releasing the task lock).
+	// 5. Serialize concurrent turns for the same task so worktree/sandbox &
+	// OpenCode session state are never mutated concurrently, and ONLY register
+	// the turn with the local LLM proxy AFTER acquiring the task lock
+	// (unregistering in defer before releasing the task lock).
 	releaseTask, err := a.acquireTaskLock(callCtx, taskID)
 	if err != nil {
 		return err
 	}
 	defer releaseTask()
 
-	unregisterProxy := a.proxy.RegisterTurn(callCtx, scanned.ExecutionID, scanned.ActionID)
+	turnRunCtx, cancelTurnRun := context.WithCancel(callCtx)
+	defer cancelTurnRun()
+
+	unregisterProxy := a.proxy.RegisterTurn(turnRunCtx, scanned.ExecutionID, scanned.ActionID)
 	defer unregisterProxy()
 
 	// 6. Fetch task spec/conversation and referenced KV blobs.
 	var taskInfo *api.TaskReadResult
 	if current.TaskID != "" {
-		readTask, taskErr := a.readTask(callCtx, current.TaskID)
+		readTask, taskErr := a.readTask(turnRunCtx, current.TaskID)
 		if taskErr == nil {
 			taskInfo = &readTask
 		}
 	}
 	var planContent, feedbackContent string
 	if subject.PlanKey != "" {
-		if obj, kvErr := a.kvGet(callCtx, subject.PlanKey); kvErr == nil {
+		if obj, kvErr := a.kvGet(turnRunCtx, subject.PlanKey); kvErr == nil {
 			planContent = truncateString(string(obj.Data), maxOpenCodePromptBlobBytes)
 		}
 	}
 	if subject.FeedbackKey != "" {
-		if obj, kvErr := a.kvGet(callCtx, subject.FeedbackKey); kvErr == nil {
+		if obj, kvErr := a.kvGet(turnRunCtx, subject.FeedbackKey); kvErr == nil {
 			feedbackContent = truncateString(string(obj.Data), maxOpenCodePromptBlobBytes)
 		}
 	}
 
-	// 7. Prepare isolated local Git worktree if a repository is named.
+	// 7. Prepare execution workspace:
+	//   - Option 1 (worktree mode): isolated local per-task Git worktree.
+	//   - Option 2 (brain mode): optional ephemeral per-task MCP sandbox
+	//     (omitted for non-coding modes when no sandbox_image is requested).
 	var checkout WorktreeCheckout
-	if subject.Repository != "" {
+	var sandboxLease OpenCodeSandboxLease
+	var hasSandbox bool
+	var sandboxErrMu sync.Mutex
+	var sandboxDeathErr error
+	setSandboxDeath := func(err error) {
+		sandboxErrMu.Lock()
+		if sandboxDeathErr == nil {
+			sandboxDeathErr = err
+		}
+		sandboxErrMu.Unlock()
+	}
+	getSandboxDeath := func() error {
+		sandboxErrMu.Lock()
+		defer sandboxErrMu.Unlock()
+		return sandboxDeathErr
+	}
+
+	if a.executionMode == OpenCodeExecutionModeBrain {
+		if subject.Repository != "" {
+			checkout = WorktreeCheckout{
+				Repository: subject.Repository,
+				TaskID:     taskID,
+				Branch:     "refs/heads/work/" + taskID,
+			}
+		}
+		if a.needsSandbox(subject) {
+			sandboxReq, reqErr := a.buildSandboxRequest(scanned, subject, taskID, remaining)
+			if reqErr != nil {
+				return reqErr
+			}
+			lease, acqErr := a.sandboxes.Acquire(turnRunCtx, sandboxReq)
+			if acqErr != nil {
+				if callCtx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("acquire ephemeral sandbox: %w", acqErr)
+			}
+			sandboxLease = lease
+			hasSandbox = true
+			turn.setSandboxLease(lease)
+			defer turn.releaseSandbox(a.sandboxes)
+
+			if lease.Done != nil {
+				watchStop := make(chan struct{})
+				defer close(watchStop)
+				go func() {
+					select {
+					case <-lease.Done:
+						var cause error
+						if lease.Err != nil {
+							cause = lease.Err()
+						}
+						if cause == nil {
+							cause = ErrOpenCodeSandboxTerminated
+						} else if !errors.Is(cause, ErrOpenCodeSandboxTerminated) {
+							cause = fmt.Errorf("%w: %v", ErrOpenCodeSandboxTerminated, cause)
+						}
+						setSandboxDeath(cause)
+						// Immediately cut off this turn's LLM proxy & in-flight
+						// SendMessage and abort ONLY this task's Brain session.
+						cancelTurnRun()
+						turn.abortSession(a.opencode)
+					case <-watchStop:
+					case <-turnRunCtx.Done():
+					}
+				}()
+			}
+		}
+	} else if subject.Repository != "" {
 		if a.worktrees == nil {
 			return fmt.Errorf("opencode request names repository %q but no worktree manager is configured", subject.Repository)
 		}
-		checkout, err = a.worktrees.Prepare(callCtx, subject.Repository, taskID, subject.BaseRef)
+		checkout, err = a.worktrees.Prepare(turnRunCtx, subject.Repository, taskID, subject.BaseRef)
 		if err != nil {
 			if callCtx.Err() != nil {
 				return nil
@@ -689,25 +839,62 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 
 	// 8. Reuse existing persistent OpenCode session for this task_id, or create
 	// and persist a new one atomically before sending the turn prompt.
-	sessionID, err := a.ensureTaskSession(callCtx, taskID, taskInfo, subject, checkout)
+	sessionID, err := a.ensureTaskSession(turnRunCtx, taskID, taskInfo, subject, checkout)
 	if err != nil {
+		if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
+			return a.handleSandboxFailure(callCtx, scanned, current, action, subject, taskID, "", deathErr)
+		}
 		if callCtx.Err() != nil {
 			return nil
 		}
 		return err
 	}
 	turn.setSessionID(sessionID)
+	if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
+		turn.abortSession(a.opencode)
+		return a.handleSandboxFailure(callCtx, scanned, current, action, subject, taskID, sessionID, deathErr)
+	}
 	if callCtx.Err() != nil {
 		turn.cancelAndAbort(a.opencode)
 		return nil
 	}
 
+	// 8b. In Brain mode with an active sandbox, attach the ephemeral sandbox
+	// MCP server to the OpenCode session and detach it cleanly on exit.
+	var mcpServers map[string]OpenCodeMCPServerConfig
+	if hasSandbox {
+		mcpCfg := OpenCodeMCPServerConfig{
+			Name:    "sandbox",
+			Type:    "remote",
+			URL:     sandboxLease.EndpointURL,
+			Headers: map[string]string{"Authorization": "Bearer " + sandboxLease.BearerToken},
+			Enabled: true,
+		}
+		mcpServers = map[string]OpenCodeMCPServerConfig{mcpCfg.Name: mcpCfg}
+		if mcpClient, ok := a.opencode.(OpenCodeMCPClient); ok {
+			if attachErr := mcpClient.AttachMCPServer(turnRunCtx, sessionID, mcpCfg); attachErr != nil {
+				if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
+					turn.abortSession(a.opencode)
+					return a.handleSandboxFailure(callCtx, scanned, current, action, subject, taskID, sessionID, deathErr)
+				}
+				if callCtx.Err() != nil {
+					turn.cancelAndAbort(a.opencode)
+					return nil
+				}
+				return fmt.Errorf("attach sandbox MCP server: %w", attachErr)
+			}
+			defer func() {
+				_ = mcpClient.DetachMCPServer(context.WithoutCancel(callCtx), sessionID, mcpCfg.Name)
+			}()
+		}
+	}
+
 	// 9. Publish best-effort started progress event.
-	a.publishProgress(callCtx, scanned.ExecutionID, scanned.ActionID, taskID, sessionID, string(subject.Mode), "started", "")
+	a.publishProgress(turnRunCtx, scanned.ExecutionID, scanned.ActionID, taskID, sessionID, string(subject.Mode), "started", "")
 
 	// 10. Build turn prompt and dispatch to OpenCode.
 	prompt := buildOpenCodePrompt(subject, taskInfo, current, checkout, planContent, feedbackContent)
-	resp, err := a.opencode.SendMessage(callCtx, sessionID, OpenCodeMessageRequest{
+	msgReq := OpenCodeMessageRequest{
 		Directory:   checkout.WorktreePath,
 		Prompt:      prompt,
 		Mode:        subject.Mode,
@@ -716,8 +903,25 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		ExecutionID: scanned.ExecutionID,
 		ActionID:    scanned.ActionID,
 		TaskID:      taskID,
-	})
+	}
+	if a.executionMode == OpenCodeExecutionModeBrain {
+		msgReq.Directory = ""
+		if hasSandbox {
+			msgReq.Directory = sandboxLease.WorkspaceDir
+			msgReq.MCPServers = mcpServers
+		}
+		msgReq.DisabledTools = append([]string(nil), a.brain.DisabledLocalTools...)
+	}
+	if a.perTurnProxyRouting {
+		msgReq.ProxyPathPrefix = fmt.Sprintf("/turn/%s/%s", scanned.ExecutionID, scanned.ActionID)
+	}
+
+	resp, err := a.opencode.SendMessage(turnRunCtx, sessionID, msgReq)
 	if err != nil {
+		if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
+			turn.abortSession(a.opencode)
+			return a.handleSandboxFailure(callCtx, scanned, current, action, subject, taskID, sessionID, deathErr)
+		}
 		if callCtx.Err() != nil {
 			turn.cancelAndAbort(a.opencode)
 			return nil
@@ -746,6 +950,10 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		a.publishProgress(context.WithoutCancel(callCtx), scanned.ExecutionID, scanned.ActionID, taskID, sessionID, string(subject.Mode), "failed", err.Error())
 		return err
 	}
+	if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
+		turn.abortSession(a.opencode)
+		return a.handleSandboxFailure(callCtx, scanned, current, action, subject, taskID, sessionID, deathErr)
+	}
 	if callCtx.Err() != nil {
 		turn.cancelAndAbort(a.opencode)
 		return nil
@@ -754,12 +962,55 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 	// 11. For coding modes, commit & push changes to refs/heads/work/<task-id>.
 	var branch, candidate string
 	var pushed bool
-	if subject.Mode.MutatesCode() && checkout.WorktreePath != "" {
+	if subject.Mode.MutatesCode() && a.executionMode == OpenCodeExecutionModeBrain && hasSandbox {
 		commitMsg := fmt.Sprintf("opencode(%s): %s", subject.Mode, taskID)
 		if taskInfo != nil && strings.TrimSpace(taskInfo.Title) != "" {
 			commitMsg = fmt.Sprintf("opencode(%s): %s (%s)", subject.Mode, strings.TrimSpace(taskInfo.Title), taskID)
 		}
-		pushRes, pushErr := a.worktrees.CommitAndPush(callCtx, checkout, commitMsg)
+		var pushRes WorktreePushResult
+		var pushErr error
+		if committer, ok := a.sandboxes.(OpenCodeSandboxCommitter); ok {
+			pushRes, pushErr = committer.CommitAndPush(turnRunCtx, sandboxLease, subject.Repository, taskID, commitMsg)
+		} else {
+			pushRes, pushErr = CommitAndPushViaSandboxMCP(turnRunCtx, sandboxLease, subject.Repository, taskID, commitMsg, a.sandboxRT)
+		}
+		if pushErr != nil {
+			if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
+				turn.abortSession(a.opencode)
+				return a.handleSandboxFailure(callCtx, scanned, current, action, subject, taskID, sessionID, deathErr)
+			}
+			if callCtx.Err() != nil {
+				turn.cancelAndAbort(a.opencode)
+				return nil
+			}
+			return fmt.Errorf("commit and push task branch from sandbox: %w", pushErr)
+		}
+		branch = pushRes.Branch
+		candidate = pushRes.Candidate
+		pushed = true
+
+		if err := a.store.SaveAction(context.WithoutCancel(callCtx), OpenCodeActionRecord{
+			TenantID:     a.tenant,
+			ProjectID:    a.project,
+			ExecutionID:  scanned.ExecutionID,
+			ActionID:     scanned.ActionID,
+			TaskID:       taskID,
+			SessionID:    sessionID,
+			Stage:        OpenCodeActionStagePushed,
+			ResponseText: resp.Text,
+			Branch:       branch,
+			Candidate:    candidate,
+			Pushed:       true,
+			UpdatedAt:    a.clock.Now(),
+		}); err != nil {
+			return fmt.Errorf("persist opencode pushed checkpoint: %w", err)
+		}
+	} else if subject.Mode.MutatesCode() && checkout.WorktreePath != "" {
+		commitMsg := fmt.Sprintf("opencode(%s): %s", subject.Mode, taskID)
+		if taskInfo != nil && strings.TrimSpace(taskInfo.Title) != "" {
+			commitMsg = fmt.Sprintf("opencode(%s): %s (%s)", subject.Mode, strings.TrimSpace(taskInfo.Title), taskID)
+		}
+		pushRes, pushErr := a.worktrees.CommitAndPush(turnRunCtx, checkout, commitMsg)
 		if pushErr != nil {
 			if callCtx.Err() != nil {
 				turn.cancelAndAbort(a.opencode)
@@ -794,6 +1045,90 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 	}
 
 	return a.finishTurnAfterPush(callCtx, scanned, current, action, subject, taskID, sessionID, branch, candidate, resp.Text, pushed)
+}
+
+func (a *OpenCodeAdapter) needsSandbox(subject OpenCodeSubject) bool {
+	if subject.Mode.MutatesCode() {
+		return true
+	}
+	return strings.TrimSpace(subject.SandboxImage) != ""
+}
+
+func (a *OpenCodeAdapter) buildSandboxRequest(
+	scanned api.InboxItem,
+	subject OpenCodeSubject,
+	taskID string,
+	timeout time.Duration,
+) (OpenCodeSandboxRequest, error) {
+	image := strings.TrimSpace(subject.SandboxImage)
+	if image == "" {
+		image = a.brain.DefaultSandboxImage
+	}
+	if image == "" {
+		return OpenCodeSandboxRequest{}, fmt.Errorf("opencode brain mode requires subject.sandbox_image or --sandbox-default-image for mode %q", subject.Mode)
+	}
+	caches := subject.SandboxCaches
+	if len(caches) == 0 && len(a.brain.DefaultSandboxCaches) > 0 {
+		caches = append([]string(nil), a.brain.DefaultSandboxCaches...)
+	}
+	mem := strings.TrimSpace(subject.SandboxMemory)
+	if mem == "" {
+		mem = a.brain.DefaultSandboxMemory
+	}
+	cpu := strings.TrimSpace(subject.SandboxCPU)
+	if cpu == "" {
+		cpu = a.brain.DefaultSandboxCPU
+	}
+	workBranch := ""
+	if subject.Repository != "" {
+		workBranch = "refs/heads/work/" + taskID
+	}
+	return OpenCodeSandboxRequest{
+		TenantID:    a.tenant,
+		ProjectID:   a.project,
+		TaskID:      taskID,
+		ExecutionID: scanned.ExecutionID,
+		ActionID:    scanned.ActionID,
+		Image:       image,
+		Repository:  subject.Repository,
+		BaseRef:     subject.BaseRef,
+		WorkBranch:  workBranch,
+		Caches:      caches,
+		Memory:      mem,
+		CPU:         cpu,
+		Port:        a.brain.SandboxPort,
+		Timeout:     timeout,
+	}, nil
+}
+
+func (a *OpenCodeAdapter) handleSandboxFailure(
+	callCtx context.Context,
+	scanned api.InboxItem,
+	current api.ExecutionInspectResult,
+	action api.ExecutionAction,
+	subject OpenCodeSubject,
+	taskID, sessionID string,
+	deathErr error,
+) error {
+	a.publishProgress(context.WithoutCancel(callCtx), scanned.ExecutionID, scanned.ActionID, taskID, sessionID, string(subject.Mode), "sandbox_failed", deathErr.Error())
+	note := truncateString("sandbox_terminated: "+deathErr.Error(), maxOpenCodeResolveNoteBytes)
+	if resolveErr := a.resolveRequest(callCtx, scanned, current, action, "fail", nil, note); resolveErr == nil {
+		if saveErr := a.store.SaveAction(context.WithoutCancel(callCtx), OpenCodeActionRecord{
+			TenantID:    a.tenant,
+			ProjectID:   a.project,
+			ExecutionID: scanned.ExecutionID,
+			ActionID:    scanned.ActionID,
+			TaskID:      taskID,
+			SessionID:   sessionID,
+			Stage:       OpenCodeActionStageResolved,
+			Resolved:    true,
+			UpdatedAt:   a.clock.Now(),
+		}); saveErr != nil {
+			return fmt.Errorf("persist opencode sandbox-terminated checkpoint: %w", saveErr)
+		}
+		return nil
+	}
+	return deathErr
 }
 
 func (a *OpenCodeAdapter) finishTurnAfterPush(

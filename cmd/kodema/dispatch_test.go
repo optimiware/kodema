@@ -41,6 +41,7 @@ func TestDispatchTable(t *testing.T) {
 		{"a client command", []string{"run", "hello.yaml"}, "client"},
 		{"client flags before the command", []string{"--server", "https://kodema.example", "whoami"}, "client"},
 		{"git credential", []string{"git", "credential", "get"}, "client"},
+		{"sandbox serve", []string{"sandbox", "serve"}, "client"},
 		{"help for a client command", []string{"help", "run"}, "client"},
 	}
 	for _, testCase := range cases {

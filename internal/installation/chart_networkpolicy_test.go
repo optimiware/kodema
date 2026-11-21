@@ -241,3 +241,198 @@ func TestNetworkPolicySchemaRequiresDefaultDeny(t *testing.T) {
 		t.Fatalf("schema refused defaultDeny:false for the wrong reason: %v", err)
 	}
 }
+
+// checkOpenCodeBrainNetworkPolicyTemplate verifies the opt-in Option 2
+// Brain <-> Sandbox MCP NetworkPolicy template:
+//   - gated on .Values.opencodeBrain.enabled and checks tenant membership,
+//   - Brain pod policy denies all ingress (ingress: []) and allows egress only
+//     to kube-dns, control-plane API ($apiPort), and matching tenant/project
+//     sandbox pods (kodema.dev/role: sandbox) on $sandboxPort,
+//   - Sandbox pod policy lives in kodema-tenant-{{ $tenant }}, declares only
+//     Ingress policyType (never widening sandbox egress or sandbox-to-sandbox
+//     traffic), and admits only the matching tenant/project Brain pod on $sandboxPort.
+func checkOpenCodeBrainNetworkPolicyTemplate(body string) error {
+	if !regexp.MustCompile(`if\s+\.Values\.opencodeBrain\.enabled`).MatchString(body) {
+		return fmt.Errorf("opencode brain network policy template is not gated by opencodeBrain.enabled")
+	}
+	if !regexp.MustCompile(`range\s+\$entry\s*:=\s*\$brain\.projects`).MatchString(body) {
+		return fmt.Errorf("opencode brain network policy template does not range over $brain.projects")
+	}
+	if !strings.Contains(body, `has $tenant $.Values.tenants`) {
+		return fmt.Errorf("opencode brain network policy template does not verify tenant membership in values.tenants")
+	}
+	if got := strings.Count(body, "kind: NetworkPolicy"); got != 2 {
+		return fmt.Errorf("opencode brain network policy template renders %d NetworkPolicy objects per entry, want 2 (brain + sandbox)", got)
+	}
+
+	// Split the two policy documents cleanly at the second manifest separator.
+	parts := strings.Split(body, "\n---\n")
+	if len(parts) != 3 {
+		return fmt.Errorf("opencode brain network policy template has %d YAML sections, want header + 2 NetworkPolicy manifests", len(parts))
+	}
+	brainDoc, sandboxDoc := parts[1], parts[2]
+
+	// Brain policy checks.
+	if !strings.Contains(brainDoc, "name: kodema-opencode-brain-{{ $name }}") {
+		return fmt.Errorf("brain policy missing expected name")
+	}
+	if !regexp.MustCompile(`(?m)^[ \t]*ingress:[ \t]*\[\][ \t]*$`).MatchString(brainDoc) {
+		return fmt.Errorf("brain policy must deny all ingress (ingress: []) so sandboxes cannot reach Brain session storage")
+	}
+	for _, want := range []string{
+		"app.kubernetes.io/component: opencode-brain",
+		"kodema.dev/tenant: {{ $tenant | quote }}",
+		"kodema.dev/project: {{ $project | quote }}",
+		"kubernetes.io/metadata.name: kodema-tenant-{{ $tenant }}",
+		"kodema.dev/role: sandbox",
+		"port: {{ $sandboxPort }}",
+		"port: {{ $apiPort }}",
+		"k8s-app: kube-dns",
+	} {
+		if !strings.Contains(brainDoc, want) {
+			return fmt.Errorf("brain policy missing required selector/rule %q", want)
+		}
+	}
+
+	// Sandbox policy checks.
+	if !strings.Contains(sandboxDoc, "name: kodema-opencode-sandbox-{{ $name }}") {
+		return fmt.Errorf("sandbox policy missing expected name")
+	}
+	if !regexp.MustCompile(`(?m)^[ \t]*namespace:[ \t]*kodema-tenant-\{\{[ \t]*\$tenant[ \t]*\}\}[ \t]*$`).MatchString(sandboxDoc) {
+		return fmt.Errorf("sandbox policy must live in kodema-tenant-{{ $tenant }}")
+	}
+	if regexp.MustCompile(`(?m)^[ \t]*-[ \t]*Egress[ \t]*$`).MatchString(sandboxDoc) || regexp.MustCompile(`(?m)^[ \t]*egress:`).MatchString(sandboxDoc) {
+		return fmt.Errorf("sandbox policy must not declare Egress rules (tenant default-deny owns sandbox egress)")
+	}
+	for _, want := range []string{
+		"kodema.dev/tenant: {{ $tenant | quote }}",
+		"kodema.dev/project: {{ $project | quote }}",
+		"kodema.dev/role: sandbox",
+		"kubernetes.io/metadata.name: {{ $brainNS | quote }}",
+		"app.kubernetes.io/component: opencode-brain",
+		"port: {{ $sandboxPort }}",
+	} {
+		if !strings.Contains(sandboxDoc, want) {
+			return fmt.Errorf("sandbox policy missing required isolation selector %q", want)
+		}
+	}
+	// Ensure sandbox policy ingress peer is NOT matching other sandbox pods!
+	if strings.Contains(sandboxDoc, "from:") {
+		_, fromBlock, _ := strings.Cut(sandboxDoc, "from:")
+		if strings.Contains(fromBlock, "kodema.dev/role: sandbox") {
+			return fmt.Errorf("sandbox policy ingress peer allows sandbox-to-sandbox traffic")
+		}
+	}
+	return nil
+}
+
+func TestOpenCodeBrainNetworkPolicyTemplateAndMutations(t *testing.T) {
+	body := readText(t, chartPath(t, "templates", "workloads-opencode-brain.yaml"))
+	if err := checkOpenCodeBrainNetworkPolicyTemplate(body); err != nil {
+		t.Fatalf("workloads-opencode-brain.yaml: %v", err)
+	}
+
+	// Verify tenant label matches runtime adapter's LabelTenant.
+	wantLabel := adapterTenantLabel(t)
+	requireOnlyTenantLabel(t, "templates/workloads-opencode-brain.yaml", body, wantLabel)
+
+	mutations := []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{
+			name: "allow ingress to Brain pod",
+			mutate: func(s string) string {
+				return strings.Replace(s, "ingress: []", "ingress:\n    - {}", 1)
+			},
+		},
+		{
+			name: "drop project scoping from sandbox selector",
+			mutate: func(s string) string {
+				return strings.ReplaceAll(s, "kodema.dev/project: {{ $project | quote }}", "")
+			},
+		},
+		{
+			name: "allow sandbox-to-sandbox ingress",
+			mutate: func(s string) string {
+				return strings.Replace(s, "app.kubernetes.io/component: opencode-brain\n              kodema.dev/tenant: {{ $tenant | quote }}\n              kodema.dev/project: {{ $project | quote }}", "kodema.dev/role: sandbox", 1)
+			},
+		},
+		{
+			name: "place sandbox policy in release namespace",
+			mutate: func(s string) string {
+				return strings.Replace(s, "namespace: kodema-tenant-{{ $tenant }}", "namespace: {{ $.Release.Namespace }}", 1)
+			},
+		},
+		{
+			name: "add egress rule to sandbox policy",
+			mutate: func(s string) string {
+				return s + "\n  egress:\n    - {}\n"
+			},
+		},
+	}
+	for _, m := range mutations {
+		t.Run(m.name, func(t *testing.T) {
+			mutated := m.mutate(body)
+			if mutated == body {
+				t.Fatalf("mutation %q did not change template", m.name)
+			}
+			if err := checkOpenCodeBrainNetworkPolicyTemplate(mutated); err == nil {
+				t.Fatalf("checker accepted mutation %q", m.name)
+			}
+		})
+	}
+}
+
+func TestOpenCodeBrainSchemaValidation(t *testing.T) {
+	schema := chartSchema(t)
+	properties := objectAt(t, schema["properties"], "schema.properties")
+	brain := objectAt(t, properties["opencodeBrain"], "schema.properties.opencodeBrain")
+	if allowed, ok := brain["additionalProperties"].(bool); !ok || allowed {
+		t.Errorf("opencodeBrain additionalProperties = %v, want false", brain["additionalProperties"])
+	}
+
+	// Enabled with a valid project entry must pass schema validation.
+	valid := fqdnValues([]any{})
+	valid["opencodeBrain"] = map[string]any{
+		"enabled":     true,
+		"sandboxPort": float64(8090),
+		"projects": []any{
+			map[string]any{
+				"name":    "app-brain",
+				"tenant":  "tenant-a",
+				"project": "project-a",
+			},
+		},
+	}
+	if err := validateAgainstSchema(schema, valid, "values"); err != nil {
+		t.Fatalf("schema refused valid opencodeBrain values: %v", err)
+	}
+
+	// Enabled with empty projects list must be refused.
+	emptyProjects := fqdnValues([]any{})
+	emptyProjects["opencodeBrain"] = map[string]any{
+		"enabled":  true,
+		"projects": []any{},
+	}
+	if err := validateAgainstSchema(schema, emptyProjects, "values"); err == nil {
+		t.Fatal("schema accepted opencodeBrain.enabled: true with empty projects")
+	}
+
+	// Privileged port (<1024) must be refused.
+	badPort := fqdnValues([]any{})
+	badPort["opencodeBrain"] = map[string]any{
+		"enabled":     true,
+		"sandboxPort": float64(80),
+		"projects": []any{
+			map[string]any{
+				"name":    "app-brain",
+				"tenant":  "tenant-a",
+				"project": "project-a",
+			},
+		},
+	}
+	if err := validateAgainstSchema(schema, badPort, "values"); err == nil {
+		t.Fatal("schema accepted opencodeBrain privileged sandboxPort 80")
+	}
+}

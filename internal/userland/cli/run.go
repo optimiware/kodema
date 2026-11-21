@@ -150,6 +150,8 @@ func RunWithDeps(ctx context.Context, config Config, args []string, ports Ports,
 		return runOutput(ctx, config, args[1:], ports, deps)
 	case "harness":
 		return runHarness(ctx, config, args[1:], ports, deps)
+	case "sandbox":
+		return runSandbox(ctx, args[1:], ports, deps)
 	case "version":
 		if hasHelpFlag(args[1:]) {
 			return runHelp(ports.Out, ports.Err, []string{"version"})

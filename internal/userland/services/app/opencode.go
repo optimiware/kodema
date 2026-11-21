@@ -23,6 +23,8 @@ type OpenCodeConfig struct {
 	ServiceID           id.PrincipalID
 	TenantID            id.TenantID
 	ProjectID           id.ProjectID
+	ExecutionMode       services.OpenCodeExecutionMode
+	Brain               services.OpenCodeBrainConfig
 	StateDirectory      string
 	BaseURL             string
 	CAFile              string
@@ -49,15 +51,18 @@ type OpenCodeConfig struct {
 	Events services.EventSource
 	// OpenCode overrides the default HTTP client targeting OpenCodeURL.
 	OpenCode services.OpenCodeClient
-	// Worktrees overrides the default local Git worktree manager.
+	// Worktrees overrides the default local Git worktree manager (worktree mode).
 	Worktrees services.OpenCodeWorktreeManager
+	// Sandboxes overrides the default KodemaExecutionSandboxManager (brain mode).
+	Sandboxes services.OpenCodeSandboxManager
 	// Store overrides the default FileOpenCodeStateStore.
 	Store services.OpenCodeStateStore
 	// Executor overrides the native OS Git command executor.
 	Executor services.GitCommandExecutor
 	// GitPath selects the git binary when Executor is nil.
 	GitPath string
-	// RoundTripper overrides the HTTP transport used for the local LLM proxy.
+	// RoundTripper overrides the HTTP transport used for the local LLM proxy
+	// and sandbox HTTP health/MCP calls.
 	RoundTripper http.RoundTripper
 	// Clock is the injected time boundary. Defaults to SystemClock.
 	Clock services.Clock
@@ -69,10 +74,17 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	execMode := config.ExecutionMode
+	if execMode == "" {
+		execMode = services.OpenCodeExecutionModeWorktree
+	}
+	if !execMode.Valid() {
+		return fmt.Errorf("opencode service execution mode %q is unsupported (want worktree or brain)", execMode)
+	}
 	if strings.TrimSpace(config.StateDirectory) == "" && config.Store == nil {
 		return fmt.Errorf("opencode service state directory is required")
 	}
-	if strings.TrimSpace(config.GitURL) == "" && config.Worktrees == nil {
+	if execMode == services.OpenCodeExecutionModeWorktree && strings.TrimSpace(config.GitURL) == "" && config.Worktrees == nil {
 		return fmt.Errorf("opencode service Git URL is required")
 	}
 	if strings.TrimSpace(config.OpenCodeURL) == "" && config.OpenCode == nil {
@@ -125,28 +137,57 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 		store = built
 	}
 
-	worktrees := config.Worktrees
-	if worktrees == nil {
-		executor := config.Executor
-		if executor == nil {
-			built, err := NewOSGitExecutor(OSGitExecutorConfig{GitPath: config.GitPath})
+	var worktrees services.OpenCodeWorktreeManager
+	var sandboxes services.OpenCodeSandboxManager
+	var sandboxRT http.RoundTripper
+
+	if execMode == services.OpenCodeExecutionModeBrain {
+		sandboxes = config.Sandboxes
+		sandboxRT = config.RoundTripper
+		if sandboxes == nil {
+			if sandboxRT == nil {
+				var err error
+				sandboxRT, err = httpRoundTripperWithCA(config.CAFile)
+				if err != nil {
+					return err
+				}
+			}
+			built, err := services.NewKodemaExecutionSandboxManager(services.KodemaExecutionSandboxConfig{
+				TenantID:     config.TenantID,
+				ProjectID:    config.ProjectID,
+				Handler:      handler,
+				Clock:        clock,
+				RoundTripper: sandboxRT,
+			})
 			if err != nil {
 				return err
 			}
-			executor = built
+			sandboxes = built
 		}
-		built, err := services.NewGitOpenCodeWorktreeManager(services.GitOpenCodeWorktreeConfig{
-			RemoteBaseURL:    config.GitURL,
-			StateDirectory:   stateDir,
-			CredentialFile:   config.CredentialFile,
-			CredentialHelper: config.CredentialHelper,
-			CAFile:           config.CAFile,
-			Executor:         executor,
-		})
-		if err != nil {
-			return err
+	} else {
+		worktrees = config.Worktrees
+		if worktrees == nil {
+			executor := config.Executor
+			if executor == nil {
+				built, err := NewOSGitExecutor(OSGitExecutorConfig{GitPath: config.GitPath})
+				if err != nil {
+					return err
+				}
+				executor = built
+			}
+			built, err := services.NewGitOpenCodeWorktreeManager(services.GitOpenCodeWorktreeConfig{
+				RemoteBaseURL:    config.GitURL,
+				StateDirectory:   stateDir,
+				CredentialFile:   config.CredentialFile,
+				CredentialHelper: config.CredentialHelper,
+				CAFile:           config.CAFile,
+				Executor:         executor,
+			})
+			if err != nil {
+				return err
+			}
+			worktrees = built
 		}
-		worktrees = built
 	}
 
 	opencodeClient := config.OpenCode
@@ -202,14 +243,18 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 		ServiceID:           config.ServiceID,
 		TenantID:            config.TenantID,
 		ProjectID:           config.ProjectID,
+		ExecutionMode:       execMode,
+		Brain:               config.Brain,
 		Handler:             handler,
 		Stream:              stream,
 		Events:              events,
 		OpenCode:            opencodeClient,
 		Store:               store,
 		Worktrees:           worktrees,
+		Sandboxes:           sandboxes,
 		Proxy:               proxy,
 		PerTurnProxyRouting: config.PerTurnProxyRouting,
+		SandboxRoundTripper: sandboxRT,
 		Clock:               clock,
 		RescanInterval:      config.RescanInterval,
 		MaxConcurrentTurns:  config.MaxConcurrentTurns,

@@ -67,3 +67,69 @@ func TestServicesOpenCodeRefusesMultiTurnConcurrencyWithStaticLLMProxy(t *testin
 		t.Fatalf("stderr = %q; want --max-concurrency <= 1 refusal", stderr.String())
 	}
 }
+
+func TestServicesOpenCodeBrainModeFlagsValidation(t *testing.T) {
+	credential := filepath.Join(t.TempDir(), "credential")
+	if err := os.WriteFile(credential, []byte("kodsvc.opencode-brain.tok"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	base := []string{
+		"--kind", "opencode",
+		"--mode", "brain",
+		"--service", "opencode-brain-1",
+		"--tenant", "tenant-1",
+		"--project", "project-1",
+		"--base-url", "http://127.0.0.1:1",
+		"--credential-file", credential,
+	}
+
+	t.Run("missing opencode-url fails with brain message", func(t *testing.T) {
+		var stderr lockedBuffer
+		args := append(append([]string(nil), base...), "--state-dir", t.TempDir())
+		code := runServicesEntry(context.Background(), args, &lockedBuffer{}, &stderr)
+		if code != 2 {
+			t.Fatalf("exit code = %d; want 2 (stderr=%q)", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "opencode brain service requires --state-dir and --opencode-url") {
+			t.Fatalf("stderr = %q", stderr.String())
+		}
+	})
+
+	t.Run("invalid mode refused", func(t *testing.T) {
+		var stderr lockedBuffer
+		args := []string{
+			"--kind", "opencode",
+			"--mode", "invalid-mode",
+			"--service", "opencode-brain-1",
+			"--tenant", "tenant-1",
+			"--project", "project-1",
+			"--base-url", "http://127.0.0.1:1",
+			"--credential-file", credential,
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+		}
+		code := runServicesEntry(context.Background(), args, &lockedBuffer{}, &stderr)
+		if code != 2 {
+			t.Fatalf("exit code = %d; want 2 (stderr=%q)", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "unsupported") {
+			t.Fatalf("stderr = %q", stderr.String())
+		}
+	})
+
+	t.Run("invalid sandbox-port refused", func(t *testing.T) {
+		var stderr lockedBuffer
+		args := append(append([]string(nil), base...),
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+			"--sandbox-port", "80",
+		)
+		code := runServicesEntry(context.Background(), args, &lockedBuffer{}, &stderr)
+		if code != 2 {
+			t.Fatalf("exit code = %d; want 2 (stderr=%q)", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "sandbox port") {
+			t.Fatalf("stderr = %q", stderr.String())
+		}
+	})
+}
