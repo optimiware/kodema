@@ -25,7 +25,7 @@ const (
 	DefaultAnthropicBaseURL = "https://api.anthropic.com"
 	// DefaultOpenCodeBaseURL is the built-in upstream base URL for OpenCode Zen
 	// (/llm/opencode/*).
-	DefaultOpenCodeBaseURL = "https://opencode.ai/inference/openai/v1"
+	DefaultOpenCodeBaseURL = "https://opencode.ai/zen/v1"
 )
 
 // LLMProviderSpec describes one streaming LLM proxy provider configured for a

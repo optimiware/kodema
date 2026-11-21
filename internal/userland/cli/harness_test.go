@@ -61,6 +61,9 @@ func TestHarnessExecHelperProcess(t *testing.T) {
 	case "print-env":
 		fmt.Printf("OPENAI_BASE_URL=%s\n", os.Getenv("OPENAI_BASE_URL"))
 		fmt.Printf("CUSTOM_ONLY=%s\n", os.Getenv("CUSTOM_ONLY"))
+		fmt.Printf("KODEMA_HARNESS_PROXY_URL=%s\n", os.Getenv("KODEMA_HARNESS_PROXY_URL"))
+		fmt.Printf("OPENCODE_API_KEY=%s\n", os.Getenv("OPENCODE_API_KEY"))
+		fmt.Printf("OPENCODE_CONFIG_CONTENT=%s\n", os.Getenv("OPENCODE_CONFIG_CONTENT"))
 		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
@@ -302,7 +305,9 @@ func runHarnessHelperProxyChecks() {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// 7. OpenCode call after token rotation.
+	// 7. OpenCode call after token rotation: both OpenAI-style Bearer and
+	//    Anthropic-style x-api-key on /llm/opencode/v1/messages (used by
+	//    `opencode run -m opencode/claude-sonnet-4-6`).
 	reqOC, _ := http.NewRequest(http.MethodPost, openCodeBase+"/chat/completions", strings.NewReader(`{"model":"opencode-1"}`))
 	reqOC.Header.Set("Authorization", "Bearer "+openCodeKey)
 	reqOC.Header.Set("Content-Type", "application/json")
@@ -316,6 +321,25 @@ func runHarnessHelperProxyChecks() {
 	if respOC.StatusCode != http.StatusOK || !strings.Contains(string(bodyOC), `"provider":"opencode"`) || !strings.Contains(string(bodyOC), `"token_gen":"v2"`) {
 		fmt.Fprintf(os.Stderr, "opencode post-rotation status=%d body=%s\n", respOC.StatusCode, string(bodyOC))
 		os.Exit(29)
+	}
+
+	reqOCMsg, _ := http.NewRequest(http.MethodPost, openCodeBase+"/messages", strings.NewReader(`{"model":"claude-sonnet-4-6"}`))
+	reqOCMsg.Header.Set("x-api-key", openCodeKey)
+	reqOCMsg.Header.Set("anthropic-version", "2023-06-01")
+	reqOCMsg.Header.Set("Content-Type", "application/json")
+	respOCMsg, err := httpClient.Do(reqOCMsg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "opencode messages request error: %v\n", err)
+		os.Exit(32)
+	}
+	bodyOCMsg, _ := io.ReadAll(respOCMsg.Body)
+	_ = respOCMsg.Body.Close()
+	if respOCMsg.StatusCode != http.StatusOK ||
+		!strings.Contains(string(bodyOCMsg), `"provider":"opencode"`) ||
+		!strings.Contains(string(bodyOCMsg), `"path":"/llm/opencode/v1/messages"`) ||
+		!strings.Contains(string(bodyOCMsg), `"token_gen":"v2"`) {
+		fmt.Fprintf(os.Stderr, "opencode messages status=%d body=%s\n", respOCMsg.StatusCode, string(bodyOCMsg))
+		os.Exit(33)
 	}
 
 	// 8. Custom provider call after token rotation.
@@ -531,8 +555,8 @@ func TestHarnessExec_TLSStreamingAndLiveTokenRotation(t *testing.T) {
 	if got := unauthorizedCt.Load(); got != 0 {
 		t.Fatalf("upstream saw %d unauthorized requests; want 0 (zero 401s across live token rotation)", got)
 	}
-	if got := upstreamCalls.Load(); got != 4 {
-		t.Fatalf("upstream calls = %d; want 4 (openai, anthropic, opencode, custom; rejected local requests must not hit upstream)", got)
+	if got := upstreamCalls.Load(); got != 5 {
+		t.Fatalf("upstream calls = %d; want 5 (openai, anthropic, opencode chat, opencode messages, custom; rejected local requests must not hit upstream)", got)
 	}
 }
 
@@ -853,6 +877,159 @@ func TestHarnessExec_SecurityAndEdgeCases(t *testing.T) {
 		}
 		if !strings.Contains(out.String(), "/llm/openai/custom-v2") {
 			t.Fatalf("child did not rewrite provider base URL from deps.Environ: %q", out.String())
+		}
+	})
+}
+
+func TestHarnessExec_OpenCodeConfigContentGenerationAndOverride(t *testing.T) {
+	parseEnvOutput := func(t *testing.T, raw string) map[string]string {
+		t.Helper()
+		vals := make(map[string]string)
+		for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+			if k, v, ok := strings.Cut(line, "="); ok {
+				vals[k] = v
+			}
+		}
+		return vals
+	}
+
+	t.Run("generates deterministic default OPENCODE_CONFIG_CONTENT targeting loopback proxy", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		code := cli.RunWithDeps(
+			context.Background(),
+			cli.Config{ServerURL: "https://kodema.example.test"},
+			[]string{"harness", "exec", "--", os.Args[0], "-test.run=^TestHarnessExecHelperProcess$"},
+			cli.Ports{Out: &out, Err: &errOut},
+			cli.CommandDeps{
+				Environ: func() []string {
+					return []string{
+						"KODEMA_TEST_HARNESS_HELPER=1",
+						"KODEMA_TEST_HARNESS_MODE=print-env",
+						"OPENCODE_CONFIG_CONTENT=",
+					}
+				},
+			},
+		)
+		if code != 0 {
+			t.Fatalf("exit code = %d; stderr=%q", code, errOut.String())
+		}
+		env := parseEnvOutput(t, out.String())
+		proxyOrigin := env["KODEMA_HARNESS_PROXY_URL"]
+		localKey := env["OPENCODE_API_KEY"]
+		cfgRaw := env["OPENCODE_CONFIG_CONTENT"]
+		if !strings.HasPrefix(proxyOrigin, "http://127.0.0.1:") {
+			t.Fatalf("KODEMA_HARNESS_PROXY_URL = %q; want loopback origin", proxyOrigin)
+		}
+		if cfgRaw == "" {
+			t.Fatalf("OPENCODE_CONFIG_CONTENT was empty; output=%q", out.String())
+		}
+		if localKey != "" && strings.Contains(cfgRaw, localKey) {
+			t.Fatalf("OPENCODE_CONFIG_CONTENT embedded raw local key: %s", cfgRaw)
+		}
+
+		var parsed struct {
+			Schema    string `json:"$schema"`
+			Providers map[string]struct {
+				Settings struct {
+					BaseURL string `json:"baseURL"`
+					APIKey  string `json:"apiKey"`
+				} `json:"settings"`
+			} `json:"providers"`
+		}
+		if err := json.Unmarshal([]byte(cfgRaw), &parsed); err != nil {
+			t.Fatalf("OPENCODE_CONFIG_CONTENT is not valid JSON (%q): %v", cfgRaw, err)
+		}
+		if parsed.Schema != "https://opencode.ai/config.json" {
+			t.Fatalf("$schema = %q; want https://opencode.ai/config.json", parsed.Schema)
+		}
+		wantProviders := map[string]struct {
+			baseURL string
+			apiKey  string
+		}{
+			"opencode":  {baseURL: proxyOrigin + "/llm/opencode/v1", apiKey: "{env:OPENCODE_API_KEY}"},
+			"openai":    {baseURL: proxyOrigin + "/llm/openai/v1", apiKey: "{env:OPENAI_API_KEY}"},
+			"anthropic": {baseURL: proxyOrigin + "/llm/anthropic/v1", apiKey: "{env:ANTHROPIC_API_KEY}"},
+		}
+		if len(parsed.Providers) != len(wantProviders) {
+			t.Fatalf("providers = %+v; want 3 built-in providers", parsed.Providers)
+		}
+		for name, want := range wantProviders {
+			got, ok := parsed.Providers[name]
+			if !ok {
+				t.Fatalf("missing provider %q in OPENCODE_CONFIG_CONTENT: %s", name, cfgRaw)
+			}
+			if got.Settings.BaseURL != want.baseURL || got.Settings.APIKey != want.apiKey {
+				t.Fatalf("provider %q settings = %+v; want baseURL=%q apiKey=%q", name, got.Settings, want.baseURL, want.apiKey)
+			}
+		}
+
+		// Verify deterministic marshaled field order.
+		wantExact := fmt.Sprintf(
+			`{"$schema":"https://opencode.ai/config.json","providers":{"opencode":{"settings":{"baseURL":"%s/llm/opencode/v1","apiKey":"{env:OPENCODE_API_KEY}"}},"openai":{"settings":{"baseURL":"%s/llm/openai/v1","apiKey":"{env:OPENAI_API_KEY}"}},"anthropic":{"settings":{"baseURL":"%s/llm/anthropic/v1","apiKey":"{env:ANTHROPIC_API_KEY}"}}}}`,
+			proxyOrigin, proxyOrigin, proxyOrigin,
+		)
+		if cfgRaw != wantExact {
+			t.Fatalf("OPENCODE_CONFIG_CONTENT =\n%s\nwant exact deterministic JSON:\n%s", cfgRaw, wantExact)
+		}
+	})
+
+	t.Run("preserves caller-supplied non-empty OPENCODE_CONFIG_CONTENT untouched", func(t *testing.T) {
+		const userOverride = `{"$schema":"https://opencode.ai/config.json","providers":{"custom":{"settings":{"baseURL":"https://custom.example/v1"}}}}`
+		var out, errOut bytes.Buffer
+		code := cli.RunWithDeps(
+			context.Background(),
+			cli.Config{ServerURL: "https://kodema.example.test"},
+			[]string{"harness", "exec", "--", os.Args[0], "-test.run=^TestHarnessExecHelperProcess$"},
+			cli.Ports{Out: &out, Err: &errOut},
+			cli.CommandDeps{
+				Environ: func() []string {
+					return []string{
+						"KODEMA_TEST_HARNESS_HELPER=1",
+						"KODEMA_TEST_HARNESS_MODE=print-env",
+						"OPENCODE_CONFIG_CONTENT=" + userOverride,
+					}
+				},
+			},
+		)
+		if code != 0 {
+			t.Fatalf("exit code = %d; stderr=%q", code, errOut.String())
+		}
+		env := parseEnvOutput(t, out.String())
+		if got := env["OPENCODE_CONFIG_CONTENT"]; got != userOverride {
+			t.Fatalf("OPENCODE_CONFIG_CONTENT = %q; want caller override %q", got, userOverride)
+		}
+	})
+
+	t.Run("deps.Env returning empty string drops inherited OPENCODE_CONFIG_CONTENT and generates default", func(t *testing.T) {
+		t.Setenv("KODEMA_TEST_HARNESS_HELPER", "1")
+		t.Setenv("KODEMA_TEST_HARNESS_MODE", "print-env")
+		t.Setenv("OPENCODE_CONFIG_CONTENT", `{"providers":{"inherited":{}}}`)
+
+		var out, errOut bytes.Buffer
+		code := cli.RunWithDeps(
+			context.Background(),
+			cli.Config{ServerURL: "https://kodema.example.test"},
+			[]string{"harness", "exec", "--", os.Args[0], "-test.run=^TestHarnessExecHelperProcess$"},
+			cli.Ports{Out: &out, Err: &errOut},
+			cli.CommandDeps{
+				Env: func(key string) string {
+					if key == "OPENCODE_CONFIG_CONTENT" {
+						return ""
+					}
+					return os.Getenv(key)
+				},
+			},
+		)
+		if code != 0 {
+			t.Fatalf("exit code = %d; stderr=%q", code, errOut.String())
+		}
+		env := parseEnvOutput(t, out.String())
+		cfgRaw := env["OPENCODE_CONFIG_CONTENT"]
+		if strings.Contains(cfgRaw, "inherited") {
+			t.Fatalf("OPENCODE_CONFIG_CONTENT leaked inherited env despite empty deps.Env override: %s", cfgRaw)
+		}
+		if !strings.Contains(cfgRaw, `"$schema":"https://opencode.ai/config.json"`) || !strings.Contains(cfgRaw, "/llm/opencode/v1") {
+			t.Fatalf("OPENCODE_CONFIG_CONTENT = %q; want generated default loopback config", cfgRaw)
 		}
 	})
 }

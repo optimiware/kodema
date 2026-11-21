@@ -261,11 +261,33 @@ func TestValidateRefusesReservedEnvironmentNames(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsLowercaseAndMixedCaseEnvironmentNames(t *testing.T) {
+	names := []string{
+		"npm_config_cache",
+		"http_proxy",
+		"log_level",
+		"MixedCase_1",
+	}
+	for _, name := range names {
+		t.Run("env name "+name, func(t *testing.T) {
+			pipeline := Pipeline{
+				Env:     []EnvVar{{Name: id.EnvName(name), Value: "/kodema/cache/npm"}},
+				Actions: []Action{k01ContainerAction("build")},
+			}
+			assertValidateOK(t, pipeline, "pipeline env "+name)
+
+			action := k01ContainerAction("build")
+			action.Container.Env = []EnvVar{{Name: id.EnvName(name), Value: "/kodema/cache/npm"}}
+			assertValidateOK(t, Pipeline{Actions: []Action{action}}, "action env "+name)
+		})
+	}
+}
+
 func TestValidateRefusesInvalidEnvironmentNames(t *testing.T) {
 	names := []string{
 		"",
-		"log_level",
 		"_LOG",
+		"0LOG",
 		"LOG-LEVEL",
 		"LOG/LEVEL",
 		"LOG.LEVEL",

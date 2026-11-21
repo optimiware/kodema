@@ -574,6 +574,196 @@ func TestCrossExecutionApprovalDecisionIDsEndToEnd(t *testing.T) {
 	}
 }
 
+// TestCrossExecutionApprovalDecisionIDsZeroRoleServiceAccount proves that a
+// zero-role (roles: []) merge-coordinator service account holding an active
+// assigned merge request passes /api/v1/verify (actor.verify) with decision_id,
+// while being refused before the merge request is assigned.
+func TestCrossExecutionApprovalDecisionIDsZeroRoleServiceAccount(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	scope := tenancy.Scope{TenantID: testTenant, ProjectID: testProject}
+	setUpVerifyBinding(t, h)
+
+	if _, err := h.invokeKey(t, testToken, "service.create",
+		jsonBody(t, map[string]any{"service_id": "merge-coordinator", "roles": []string{}}),
+		"create-zero-role-merge-coordinator",
+		map[string]string{"project": testProject}); err != nil {
+		t.Fatalf("service.create(merge-coordinator): %v", err)
+	}
+
+	applyPipeline := func(name, yamlBody string) string {
+		t.Helper()
+		res, err := h.invokeKey(t, testToken, "pipeline.apply", jsonBody(t, map[string]any{
+			"name": name,
+			"yaml": []byte(yamlBody),
+		}), "apply-zero-role-"+name, map[string]string{"project": testProject, "pipeline": name})
+		if err != nil {
+			t.Fatalf("pipeline.apply(%s): %v", name, err)
+		}
+		var out api.PipelineApplyResult
+		if err := json.Unmarshal(res.Body, &out); err != nil {
+			t.Fatalf("decode pipeline.apply: %v", err)
+		}
+		return out.PipelineID
+	}
+	reviewPipe := applyPipeline("review-stage", reviewStageYAML)
+	mergePipe := applyPipeline("merge-stage", mergeServiceStageYAML)
+
+	createTask, err := h.invokeKey(t, testToken, "task.create_and_start", jsonBody(t, map[string]any{
+		"title":       "Task Zero Role Merge",
+		"pipeline_id": reviewPipe,
+		"inputs": map[string]string{
+			"repository": "resource-1",
+			"target_ref": "refs/heads/main",
+			"base":       "base-aaa",
+			"candidate":  "cand-bbb",
+		},
+	}), "create-task-zero-role", map[string]string{"project": testProject})
+	if err != nil {
+		t.Fatalf("task.create_and_start: %v", err)
+	}
+	var taskRes api.TaskCreateAndStartResult
+	if err := json.Unmarshal(createTask.Body, &taskRes); err != nil {
+		t.Fatalf("decode task.create_and_start: %v", err)
+	}
+
+	reviewExec := loadExecForDecisionTest(t, h, scope, id.ExecutionID(taskRes.ExecutionID))
+	reviewAction := reviewExec.Actions[0]
+	activateRequestForDecisionTest(t, h, scope, reviewExec.ID, reviewAction.ID)
+
+	resolveRes, err := invokeKey(t, h, testToken, "execution.request.resolve", "resolve-zero-role-review", jsonBody(t, map[string]any{
+		"execution_id":            taskRes.ExecutionID,
+		"action_id":               string(reviewAction.ID),
+		"expected_action_version": 2,
+		"decision":                "pass",
+		"outputs":                 map[string]string{"approved": "yes"},
+	}), nil, map[string]string{"execution": taskRes.ExecutionID, "action": string(reviewAction.ID)})
+	if err != nil {
+		t.Fatalf("execution.request.resolve(pass): %v", err)
+	}
+	var resolved api.ExecutionRequestResolveResult
+	if err := json.Unmarshal(resolveRes.Body, &resolved); err != nil {
+		t.Fatalf("decode resolve result: %v", err)
+	}
+	markCleanupCompleteForDecisionTest(t, h, scope, reviewExec.ID)
+
+	bindingReader, err := readers.NewBindingReader(h.store)
+	if err != nil {
+		t.Fatalf("readers.NewBindingReader: %v", err)
+	}
+	realVerifier, err := verify.New(verify.Config{
+		Principals: staticPrincipals{principals: map[string]identity.Principal{
+			"cred-merge-svc": {
+				ID:      "merge-coordinator",
+				Kind:    identity.KindService,
+				Scope:   scope,
+				Roles:   nil,
+				Enabled: true,
+				Version: 1,
+			},
+		}},
+		Bindings:  bindingReader,
+		Evidence:  mustEvidenceReader(t, h.store),
+		Decisions: mustDecisionReader(t, h.store),
+		Records:   mustRecordAdapter(t, h.store),
+		Clock:     &mutableClock{now: fixedNow},
+		NewID:     func() (verify.VerificationID, error) { return h.ids.NewVerificationID() },
+	})
+	if err != nil {
+		t.Fatalf("verify.New: %v", err)
+	}
+	h.verifier = realVerifier
+	h.actorActions = &recordingActorActions{actions: map[string]id.ActionID{}}
+	h.buildRouter(t)
+
+	verifyBody := jsonBody(t, map[string]any{
+		"actor_credential": "cred-merge-svc",
+		"resource_id":      "resource-1",
+		"operation":        "git.ref.update",
+		"approval":         "role/reviewer",
+		"decision_id":      resolved.DecisionID,
+		"subject": map[string]any{"fields": []map[string]string{
+			{"name": "operation", "kind": "string", "value": "git.ref.update"},
+			{"name": "resource", "kind": "string", "value": "resource-1"},
+			{"name": "ref", "kind": "string", "value": "refs/heads/main"},
+			{"name": "expected_base", "kind": "string", "value": "base-aaa"},
+			{"name": "candidate", "kind": "string", "value": "cand-bbb"},
+		}},
+	})
+
+	// Before the merge request is assigned, the zero-role merge-coordinator is refused.
+	if _, err := h.invoke(t, "token-service", "actor.verify", verifyBody, nil); err == nil {
+		t.Fatal("unassigned zero-role merge-coordinator unexpectedly verified")
+	} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+		t.Fatalf("unassigned zero-role merge-coordinator err = %v; want forbidden", err)
+	}
+
+	// Start merge-stage and activate the request assigned to service/merge-coordinator.
+	vTask := taskRes.LifecycleVersion
+	startMergeRes, err := invokeKey(t, h, testToken, "task.start", "start-zero-role-merge", jsonBody(t, map[string]any{
+		"task_id":     taskRes.TaskID,
+		"pipeline_id": mergePipe,
+		"inputs": map[string]string{
+			"repository":  "resource-1",
+			"target_ref":  "refs/heads/main",
+			"base":        "base-aaa",
+			"candidate":   "cand-bbb",
+			"decision_id": resolved.DecisionID,
+		},
+	}), &vTask, map[string]string{"task": taskRes.TaskID})
+	if err != nil {
+		t.Fatalf("task.start(merge): %v", err)
+	}
+	var startMerge api.TaskStartResult
+	if err := json.Unmarshal(startMergeRes.Body, &startMerge); err != nil {
+		t.Fatalf("decode task.start(merge): %v", err)
+	}
+	mergeExec := loadExecForDecisionTest(t, h, scope, id.ExecutionID(startMerge.ExecutionID))
+	activateRequestForDecisionTest(t, h, scope, mergeExec.ID, mergeExec.Actions[0].ID)
+
+	// With an active assigned merge request, the zero-role merge-coordinator passes /api/v1/verify!
+	svcVerifyRes, err := h.invoke(t, "token-service", "actor.verify", verifyBody, nil)
+	if err != nil {
+		t.Fatalf("actor.verify(assigned zero-role merge-coordinator): %v", err)
+	}
+	var svcVR api.VerifyResponse
+	if err := json.Unmarshal(svcVerifyRes.Body, &svcVR); err != nil {
+		t.Fatalf("decode VerifyResponse: %v", err)
+	}
+	if !svcVR.Approval {
+		t.Fatalf("expected approval=true for assigned zero-role merge-coordinator")
+	}
+	verReader, err := readers.NewVerificationReader(h.store)
+	if err != nil {
+		t.Fatalf("NewVerificationReader: %v", err)
+	}
+	storedRec, err := verReader.ReadVerification(ctx, scope, verify.VerificationID(svcVR.VerificationID))
+	if err != nil {
+		t.Fatalf("ReadVerification: %v", err)
+	}
+	if storedRec.DecisionID != id.DecisionID(resolved.DecisionID) {
+		t.Fatalf("stored verification decision_id = %q; want %q", storedRec.DecisionID, resolved.DecisionID)
+	}
+	if storedRec.Actor.ID != "merge-coordinator" {
+		t.Fatalf("stored verification actor id = %q; want %q", storedRec.Actor.ID, "merge-coordinator")
+	}
+	svcRow, err := h.store.Read(ctx, scope, "services", "merge-coordinator")
+	if err != nil {
+		t.Fatalf("read service row merge-coordinator: %v", err)
+	}
+	rolesJSON, ok := svcRow.Values["roles"].([]byte)
+	if !ok {
+		t.Fatalf("merge-coordinator stored roles = %#v; want JSON bytes", svcRow.Values["roles"])
+	}
+	var roles []string
+	if err := json.Unmarshal(rolesJSON, &roles); err != nil {
+		t.Fatalf("decode merge-coordinator roles: %v", err)
+	}
+	if len(roles) != 0 {
+		t.Fatalf("merge-coordinator stored roles = %v; want empty", roles)
+	}
+}
+
 func loadExecForDecisionTest(t *testing.T, h *harness, scope tenancy.Scope, execID id.ExecutionID) kernel.Execution {
 	t.Helper()
 	exec, err := h.execs.Load(context.Background(), scope, execID)

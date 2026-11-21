@@ -89,14 +89,15 @@ type llmProxyDependencies struct {
 }
 
 type resolvedProvider struct {
-	scope            tenancy.Scope
-	name             string
-	baseURL          *url.URL
-	secretName       id.SecretName
-	useXAPIKey       bool
-	anthropicVersion string
-	maxRequestBytes  int
-	timeout          time.Duration
+	scope              tenancy.Scope
+	name               string
+	baseURL            *url.URL
+	secretName         id.SecretName
+	useXAPIKey         bool
+	explicitAuthHeader bool
+	anthropicVersion   string
+	maxRequestBytes    int
+	timeout            time.Duration
 }
 
 // disabledLLMProxyHandler fails closed with 404 when no providers are enabled.
@@ -199,6 +200,7 @@ func newLLMProxyHandler(deps llmProxyDependencies) (http.Handler, func(context.C
 			return nil, nil, err
 		}
 		useXAPIKey := providerUsesXAPIKey(entry, baseURL)
+		explicitAuthHeader := strings.TrimSpace(entry.AuthHeader) != ""
 		anthropicVersion := strings.TrimSpace(entry.AnthropicVersion)
 		if anthropicVersion == "" && entry.Name == "anthropic" {
 			anthropicVersion = DefaultAnthropicVersion
@@ -208,14 +210,15 @@ func newLLMProxyHandler(deps llmProxyDependencies) (http.Handler, func(context.C
 			maxReq = DefaultLLMProxyMaxRequestBytes
 		}
 		providers[providerScopeKey{scope: entry.Scope, name: entry.Name}] = resolvedProvider{
-			scope:            entry.Scope,
-			name:             entry.Name,
-			baseURL:          baseURL,
-			secretName:       entry.SecretName,
-			useXAPIKey:       useXAPIKey,
-			anthropicVersion: anthropicVersion,
-			maxRequestBytes:  maxReq,
-			timeout:          entry.Timeout,
+			scope:              entry.Scope,
+			name:               entry.Name,
+			baseURL:            baseURL,
+			secretName:         entry.SecretName,
+			useXAPIKey:         useXAPIKey,
+			explicitAuthHeader: explicitAuthHeader,
+			anthropicVersion:   anthropicVersion,
+			maxRequestBytes:    maxReq,
+			timeout:            entry.Timeout,
 		}
 	}
 
@@ -273,6 +276,13 @@ func providerUsesXAPIKey(entry ModelProviderConfig, baseURL *url.URL) bool {
 	}
 	host := strings.ToLower(baseURL.Hostname())
 	return host == "api.anthropic.com" || strings.HasSuffix(host, ".anthropic.com")
+}
+
+func isAnthropicMessagesPath(upstreamPath string) bool {
+	return upstreamPath == "/messages" ||
+		upstreamPath == "/v1/messages" ||
+		upstreamPath == "/messages/count_tokens" ||
+		upstreamPath == "/v1/messages/count_tokens"
 }
 
 func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -430,13 +440,26 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 	}
 
 	copySafeOutboundHeaders(outbound.Header, request.Header, credential)
+	// Multi-protocol gateways such as OpenCode Zen (/zen/v1) serve Anthropic
+	// Messages (/messages) alongside OpenAI endpoints under one base URL, and
+	// require x-api-key + anthropic-version on /messages while accepting Bearer
+	// auth on /chat/completions and /responses. Unless the operator explicitly
+	// pinned AuthHeader, send both headers on Anthropic Messages paths.
+	dualAnthropicMessages := !provider.useXAPIKey && !provider.explicitAuthHeader && isAnthropicMessagesPath(upstreamPath)
 	if provider.useXAPIKey {
 		outbound.Header.Set("x-api-key", providerSecret)
 	} else {
 		outbound.Header.Set("Authorization", "Bearer "+providerSecret)
+		if dualAnthropicMessages {
+			outbound.Header.Set("x-api-key", providerSecret)
+		}
 	}
-	if outbound.Header.Get("anthropic-version") == "" && provider.anthropicVersion != "" {
-		outbound.Header.Set("anthropic-version", provider.anthropicVersion)
+	if outbound.Header.Get("anthropic-version") == "" {
+		if provider.anthropicVersion != "" {
+			outbound.Header.Set("anthropic-version", provider.anthropicVersion)
+		} else if dualAnthropicMessages {
+			outbound.Header.Set("anthropic-version", DefaultAnthropicVersion)
+		}
 	}
 
 	response, err := handler.client.Do(outbound)

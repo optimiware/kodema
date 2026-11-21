@@ -905,9 +905,10 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		TaskID:      taskID,
 	}
 	if a.executionMode == OpenCodeExecutionModeBrain {
+		// Brain mode never operates on a local filesystem directory; sandbox
+		// workspace paths exist only inside the remote sandbox container.
 		msgReq.Directory = ""
 		if hasSandbox {
-			msgReq.Directory = sandboxLease.WorkspaceDir
 			msgReq.MCPServers = mcpServers
 		}
 		msgReq.DisabledTools = append([]string(nil), a.brain.DisabledLocalTools...)

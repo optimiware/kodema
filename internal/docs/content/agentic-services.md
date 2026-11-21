@@ -28,12 +28,15 @@ kodema services --kind opencode \
   --state-dir /var/lib/kodema/opencode-shop \
   --git-url "${KODEMA_GIT_URL:-${KODEMA_URL}/git}" \
   --opencode-url http://127.0.0.1:4096 \
+  --opencode-password-file /path/to/opencode.password \
   --llm-proxy-listen 127.0.0.1:18080 \
   --per-turn-proxy-routing \
   --max-concurrency 4
 ```
 
 Key properties:
+
+- **OpenCode v2 Basic Auth:** `kodema services --kind opencode` speaks the OpenCode v2 HTTP API (`/api/info`, `/api/session`, `/api/session/{id}/prompt`, `/api/experimental/session/{id}/wait`, `/api/session/{id}/message`, `/api/session/{id}/interrupt`, and `/api/experimental/mcp/{server}`). Authenticate against `opencode serve` with `--opencode-password-file` (`KODEMA_OPENCODE_PASSWORD_FILE`, recommended) or `--opencode-password` (`KODEMA_OPENCODE_PASSWORD`, falling back to `OPENCODE_PASSWORD`), which sends HTTP Basic Auth with username `opencode`.
 
 - **Minimal service-account privileges:** Option 1 worktree mode requires **no `engineer` role** (`roles: []` suffices to read project state/KV, call the attributed LLM proxy, and resolve explicit `service/<id>` requests; grant the service ID write access to `refs/heads/work/` in `admin/conf/git.conf`).
 - **Durable task sessions:** Persists a 1:1 `task_id -> opencode_session_id` mapping and per-action idempotency checkpoints in `--state-dir` so subsequent turns (`plan` -> `implement` -> `revise`) reuse context and restarts never double-push.
@@ -73,8 +76,9 @@ kodema services --kind opencode \
   --credential-file /path/to/opencode-shop.token \
   --state-dir /var/lib/kodema/opencode-shop \
   --opencode-url http://127.0.0.1:4096 \
+  --opencode-password-file /path/to/opencode.password \
   --llm-proxy-listen 127.0.0.1:18080 \
-  --per-turn-proxy-routing \
+  --max-concurrency 1 \
   --sandbox-default-image docker.io/library/golang:1.24 \
   --sandbox-caches go-mod,go-build \
   --sandbox-port 8090 \
@@ -86,5 +90,5 @@ Important Option 2 operational details:
 
 - **Service-account role requirement:** Brain mode's service account **requires the `engineer` role** so `KodemaExecutionSandboxManager` can call `pipeline.start` (inline sandbox execution), `execution.cancel` (teardown), and `secret.write`/`secret.delete` (ephemeral `KODEMA_SBOX_TOK_*` per-sandbox Bearer token delivery, never embedded in YAML or `/kodema/script`). Option 1 worktree mode does **not** require `engineer`.
 - **Sandbox-free reasoning turns:** Non-coding turns (`plan`, `ai_review`) without `sandbox_image` run directly in the Brain pod without starting a sandbox container.
-- **Polyglot concurrency & fault containment:** With `--per-turn-proxy-routing`, concurrent tasks can attach to distinct stock toolchain sandboxes (`golang:1.24`, `node:22`, etc.) simultaneously. If a sandbox crashes or is OOM-killed mid-turn, the Brain stays healthy, fails only that turn cleanly, and cleans up the sandbox execution and ephemeral token secret; cancelling the parent execution aborts the OpenCode session and tears down the sandbox.
+- **OpenCode v2 concurrency constraint & fault containment:** OpenCode v2 runtime MCP attachment (`/api/experimental/mcp/{server}`) is location-scoped rather than session-scoped, so Brain mode against an OpenCode v2 server enforces `--max-concurrency 1` per OpenCode v2 server instance (defaulting to `1`) to prevent concurrent turns from clobbering each other's sandbox MCP registration; run separate OpenCode v2 server instances for parallel Brain-mode sandboxes. Each stage or task can still target a different stock toolchain image (`golang:1.24`, `node:22`, etc.). If a sandbox crashes or is OOM-killed mid-turn, the Brain stays healthy, fails only that turn cleanly, and cleans up the sandbox execution and ephemeral token secret; cancelling the parent execution aborts the OpenCode session and tears down the sandbox.
 - **Kubernetes NetworkPolicies (Helm):** Enable `opencodeBrain` in `deploy/charts/kodema/values.yaml` (`templates/workloads-opencode-brain.yaml`) to render paired tenant/project-scoped NetworkPolicies: the Brain pod denies all ingress and may egress only to DNS, the Kodema control plane, and matching `kodema.dev/role: sandbox` pods on `sandboxPort`, while sandbox pods accept MCP ingress only from that exact project's Brain pod and cannot reach each other or Brain session storage.

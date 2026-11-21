@@ -36,7 +36,7 @@ Supplied when configured by the installation:
 - `KODEMA_LLM_<PROVIDER>_BASE_URL` — unshadowable streaming LLM proxy endpoint for every provider enabled in the execution's scope (provider name normalized to uppercase `[A-Z0-9_]`). In `kodema up`, Kodema enables three built-in providers out of the box plus any custom `--llm-provider` entries:
   - `KODEMA_LLM_OPENAI_BASE_URL` -> `${KODEMA_URL}/llm/openai/v1` (backed by project secret `OPENAI_API_KEY`)
   - `KODEMA_LLM_ANTHROPIC_BASE_URL` -> `${KODEMA_URL}/llm/anthropic` (backed by project secret `ANTHROPIC_API_KEY`)
-  - `KODEMA_LLM_OPENCODE_BASE_URL` -> `${KODEMA_URL}/llm/opencode/v1` (OpenCode Zen, backed by project secret `OPENCODE_API_KEY`)
+  - `KODEMA_LLM_OPENCODE_BASE_URL` -> `${KODEMA_URL}/llm/opencode/v1` (OpenCode Zen at `https://opencode.ai/zen/v1`, backed by project secret `OPENCODE_API_KEY`)
   - Custom providers (e.g. `--llm-provider openrouter=https://openrouter.ai/api/v1`) -> `KODEMA_LLM_OPENROUTER_BASE_URL=${KODEMA_URL}/llm/openrouter/v1`
 
 ## Recommended: `kodema harness exec -- <cmd>` (zero boilerplate, rotation-safe)
@@ -57,6 +57,7 @@ What `kodema harness exec` handles automatically:
 - Starts an ephemeral loopback-only HTTP reverse proxy (`127.0.0.1:0`) for the lifetime of `<cmd...>` forwarding `/llm/<provider>/*` to `$KODEMA_URL/llm/<provider>/*` over HTTPS while trusting `$KODEMA_CA_FILE` (zero `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`/`CURL_CA_BUNDLE` boilerplate needed for LLM traffic).
 - Re-reads `/kodema/secrets/KODEMA_TOKEN` (override with `--token-file`) **fresh on every upstream request**, so live controller token rotations during long coding sessions never cause `401` errors.
 - Exports `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `OPENCODE_BASE_URL`, `OPENCODE_API_KEY`, `KODEMA_HARNESS_PROXY_URL`, and rewritten `KODEMA_LLM_<NAME>_BASE_URL` variables to the child process with a random per-invocation local dummy API key (verifying that key on loopback before forwarding).
+- Automatically generates `OPENCODE_CONFIG_CONTENT` routing OpenCode's `opencode` (OpenCode Zen, `https://opencode.ai/zen/v1`), `openai`, and `anthropic` providers through the loopback proxy using `{env:*_API_KEY}` references so `kodema harness exec -- opencode run ...` works zero-config (preserving any non-empty `OPENCODE_CONFIG_CONTENT` explicitly set by the caller).
 - Streams SSE responses chunk-by-chunk and attributes all token usage to the execution's `model_usage` (`kodema inspect <execution-id>`).
 
 If a tool calls `$KODEMA_URL` directly without `kodema harness exec`, trust `$KODEMA_CA_FILE` (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`) and read `/kodema/secrets/KODEMA_TOKEN` on each request. Read any other declared non-proxy secret file with `IFS= read -r ... < /kodema/secrets/<NAME>`.

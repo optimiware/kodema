@@ -126,9 +126,10 @@ func TestAuthorityMatrixIngress(t *testing.T) {
 }
 
 // recordUnitForActor rebuilds the standard actor.verify unit for one actor
-// kind: the principal-enablement read names the actor, and the execution and
-// action targets exist only for an execution actor (a human or service actor is
-// exempt from those reads).
+// kind: the principal-enablement read names the actor (and requires only
+// AnyEnabledService for a service actor, matching verify.Verifier), and the
+// execution and action targets exist only for an execution actor (a human or
+// service actor is exempt from those reads).
 func recordUnitForActor(t *testing.T, actor identity.Principal) verify.RecordUnit {
 	t.Helper()
 	unit := recordUnit(t)
@@ -142,6 +143,9 @@ func recordUnitForActor(t *testing.T, actor identity.Principal) verify.RecordUni
 		switch read.Check {
 		case authorize.CheckPrincipalEnabled:
 			read.PrincipalID = actor.ID
+			if actor.Kind == identity.KindService {
+				read.Required = authorize.Requires{AnyEnabledService: true}
+			}
 		case authorize.CheckExecutionRunning:
 			read.TargetID = string(actor.ExecutionID)
 		case authorize.CheckActionDeadline:
@@ -155,12 +159,18 @@ func recordUnitForActor(t *testing.T, actor identity.Principal) verify.RecordUni
 	return unit
 }
 
+const testZeroRoleService = id.PrincipalID("svc-merge-coordinator")
+
 func humanAuthorityActor() identity.Principal {
 	return identity.Principal{ID: testActor, Kind: identity.KindHuman, Scope: testScope(), Enabled: true, Version: 1}
 }
 
 func serviceAuthorityActor() identity.Principal {
 	return identity.Principal{ID: testService, Kind: identity.KindService, Scope: testScope(), Enabled: true, Version: 1}
+}
+
+func zeroRoleServiceAuthorityActor() identity.Principal {
+	return identity.Principal{ID: testZeroRoleService, Kind: identity.KindService, Scope: testScope(), Enabled: true, Version: 1}
 }
 
 func executionAuthorityActor() identity.Principal {
@@ -278,6 +288,27 @@ func TestAuthorityMatrixRecord(t *testing.T) {
 			seed: func(t *testing.T, s *memoryStoreAlias) {
 				seedServiceRoles(t, s, testScope(), testService, "disabled", []tenancy.Role{tenancy.RoleEngineer})
 				seedBinding(t, s, testScope(), testBinding, 7)
+			},
+		},
+		{
+			name: "service actor zero roles enabled", actor: zeroRoleServiceAuthorityActor(),
+			seed: func(t *testing.T, s *memoryStoreAlias) {
+				seedCallingService(tenancy.RoleEngineer)(t, s)
+				seedServiceRoles(t, s, testScope(), testZeroRoleService, "enabled", []tenancy.Role{})
+			},
+		},
+		{
+			name: "service actor zero roles disabled", actor: zeroRoleServiceAuthorityActor(), wantClass: fault.Forbidden,
+			seed: func(t *testing.T, s *memoryStoreAlias) {
+				seedCallingService(tenancy.RoleEngineer)(t, s)
+				seedServiceRoles(t, s, testScope(), testZeroRoleService, "disabled", []tenancy.Role{})
+			},
+		},
+		{
+			name: "service actor zero roles wrong project", actor: zeroRoleServiceAuthorityActor(), wantClass: fault.Forbidden,
+			seed: func(t *testing.T, s *memoryStoreAlias) {
+				seedCallingService(tenancy.RoleEngineer)(t, s)
+				seedServiceRoles(t, s, tenancy.Scope{TenantID: testTenant, ProjectID: otherProject}, testZeroRoleService, "enabled", []tenancy.Role{})
 			},
 		},
 		{

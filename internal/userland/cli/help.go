@@ -826,6 +826,11 @@ ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, OPENCODE_BASE_URL, OPENCODE_API_KEY,
 KODEMA_HARNESS_PROXY_URL, and rewritten KODEMA_LLM_<NAME>_BASE_URL variables to
 the child process with a random per-invocation local dummy API key.
 
+Also injects OPENCODE_CONFIG_CONTENT automatically (when unset or empty in the
+parent environment) so OpenCode routes opencode (OpenCode Zen,
+https://opencode.ai/zen/v1), openai, and anthropic through the loopback proxy
+without extra configuration. Set OPENCODE_CONFIG_CONTENT explicitly to override.
+
 Flags:
   --server, --url <url>   Kodema server base URL (default: $KODEMA_URL / $KODEMA_SERVER)
   --ca-file <path>        PEM CA certificate bundle for TLS trust (default: $KODEMA_CA_FILE)

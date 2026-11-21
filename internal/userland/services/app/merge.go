@@ -35,6 +35,9 @@ type MergeConfig struct {
 	StateDirectory string
 	GitURL         string
 	CredentialFile string
+	// CAFile optionally configures the CA bundle trusted by child Git
+	// processes talking to GitURL.
+	CAFile string
 	// WorkDirectory is the scratch-clone parent. A zero value uses
 	// <StateDirectory>/work.
 	WorkDirectory string
@@ -94,6 +97,7 @@ func RunMergeCoordinator(ctx context.Context, config MergeConfig) error {
 		StateDirectory: filepath.Join(stateDirectory, "effects"),
 		WorkDirectory:  workDirectory,
 		CredentialFile: config.CredentialFile,
+		CAFile:         config.CAFile,
 		Executor:       executor,
 	})
 	if err != nil {

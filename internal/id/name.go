@@ -32,7 +32,7 @@ const SecretTokenName = "KODEMA_TOKEN"
 // ActionName is the lowercase slug that names an action inside a pipeline.
 type ActionName string
 
-// EnvName is an uppercase literal environment variable name.
+// EnvName is a literal environment variable name.
 type EnvName string
 
 // SecretName is an uppercase declared secret name.
@@ -55,6 +55,10 @@ func isLowerAlpha(character byte) bool {
 
 func isUpperAlpha(character byte) bool {
 	return character >= 'A' && character <= 'Z'
+}
+
+func isAlpha(character byte) bool {
+	return isLowerAlpha(character) || isUpperAlpha(character)
 }
 
 func isDigit(character byte) bool {
@@ -88,8 +92,27 @@ func validActionName(value string) bool {
 	return !previousHyphen
 }
 
-// validEnvName reports whether value is a bounded uppercase environment name.
+// validEnvName reports whether value is a bounded ASCII environment variable
+// name matching ^[A-Za-z][A-Za-z0-9_]{0,63}$.
 func validEnvName(value string) bool {
+	if value == "" || len(value) > MaxKeyLength {
+		return false
+	}
+	if !isAlpha(value[0]) {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if !isAlpha(character) && !isDigit(character) && character != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// validSecretName reports whether value is a bounded uppercase secret name
+// matching ^[A-Z][A-Z0-9_]{0,63}$.
+func validSecretName(value string) bool {
 	if value == "" || len(value) > MaxKeyLength {
 		return false
 	}
@@ -156,7 +179,7 @@ func ParseEnvName(value string) (EnvName, error) {
 // ParseSecretName validates a declared secret name and rejects the reserved
 // execution-credential name.
 func ParseSecretName(value string) (SecretName, error) {
-	if !validEnvName(value) {
+	if !validSecretName(value) {
 		return "", invalidName("secret name", value)
 	}
 	if value == SecretTokenName {

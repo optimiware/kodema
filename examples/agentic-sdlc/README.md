@@ -96,6 +96,7 @@ kodema services --kind opencode \
   --state-dir /var/lib/kodema/opencode-shop \
   --git-url "${KODEMA_GIT_URL:-${KODEMA_URL}/git}" \
   --opencode-url http://127.0.0.1:4096 \
+  --opencode-password-file /var/run/kodema/opencode-server.password \
   --llm-proxy-listen 127.0.0.1:18080 \
   --per-turn-proxy-routing \
   --max-concurrency 4
@@ -136,6 +137,7 @@ kodema services --kind opencode \
   --credential-file /var/run/kodema/opencode-shop-cred \
   --state-dir /var/lib/kodema/opencode-shop \
   --opencode-url http://127.0.0.1:4096 \
+  --opencode-password-file /var/run/kodema/opencode-server.password \
   --llm-proxy-listen 127.0.0.1:18080 \
   --per-turn-proxy-routing \
   --sandbox-default-image docker.io/library/golang:1.24 \

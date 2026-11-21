@@ -55,7 +55,17 @@ func TestActionNames(t *testing.T) {
 }
 
 func TestEnvNamesRejectReservedContext(t *testing.T) {
-	valid := []string{"A", "LOG_LEVEL", "KODEMA_X", strings.Repeat("A", MaxKeyLength)}
+	valid := []string{
+		"A",
+		"a",
+		"LOG_LEVEL",
+		"KODEMA_X",
+		"npm_config_cache",
+		"http_proxy",
+		"MixedCase_1",
+		strings.Repeat("A", MaxKeyLength),
+		strings.Repeat("a", MaxKeyLength),
+	}
 	for _, input := range valid {
 		got, err := ParseEnvName(input)
 		if err != nil {
@@ -75,12 +85,16 @@ func TestEnvNamesRejectReservedContext(t *testing.T) {
 
 	invalid := []string{
 		"",
-		"a",
 		"_A",
+		"0A",
 		"A-B",
 		"A B",
 		"A/B",
+		"a=b",
+		"a\nb",
+		"café",
 		strings.Repeat("A", MaxKeyLength+1),
+		strings.Repeat("a", MaxKeyLength+1),
 	}
 	for _, input := range invalid {
 		if _, err := ParseEnvName(input); !errors.Is(err, ErrInvalidName) {
@@ -108,7 +122,10 @@ func TestSecretNamesRejectReservedToken(t *testing.T) {
 	invalid := []string{
 		"",
 		"token",
+		"npm_config_cache",
+		"Token",
 		"_TOKEN",
+		"0TOKEN",
 		"TOKEN-1",
 		"TOKEN 1",
 		"../TOKEN",

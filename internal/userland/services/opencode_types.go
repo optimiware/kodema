@@ -322,11 +322,12 @@ type OpenCodeSession struct {
 // to an OpenCode Brain session (for example an ephemeral `kodema sandbox serve`
 // container endpoint with its per-sandbox bearer token).
 type OpenCodeMCPServerConfig struct {
-	Name    string            `json:"name"`
-	Type    string            `json:"type"`
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Enabled bool              `json:"enabled"`
+	Name      string            `json:"name"`
+	Type      string            `json:"type"`
+	URL       string            `json:"url"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Enabled   bool              `json:"enabled"`
+	Directory string            `json:"directory,omitempty"`
 }
 
 // OpenCodeMessageRequest is one turn sent to an existing OpenCode session.

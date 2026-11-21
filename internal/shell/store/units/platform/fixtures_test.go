@@ -137,7 +137,7 @@ func seedServiceRoles(t *testing.T, s *memory.Store, scope tenancy.Scope, identi
 		t.Fatalf("marshal service roles: %v", err)
 	}
 	mustInsert(t, s, scope, "services", string(identity), map[string]any{
-		"name":       "git",
+		"name":       string(identity),
 		"state":      state,
 		"roles":      encoded,
 		"version":    uint64(1),
