@@ -724,6 +724,30 @@ func TestLLMProxyServiceRefusalsFailClosed(t *testing.T) {
 			query:      "?key=kodsvc.leaked",
 			wantStatus: http.StatusBadRequest,
 		},
+		{
+			name:       "percent-encoded service token prefix smuggled in query value",
+			token:      llmProxyTestServiceToken,
+			execHeader: []string{"exec-valid"},
+			actHeader:  []string{"action-valid"},
+			query:      "?key=kodsvc%2eleaked",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "percent-encoded service token prefix smuggled in query param name",
+			token:      llmProxyTestServiceToken,
+			execHeader: []string{"exec-valid"},
+			actHeader:  []string{"action-valid"},
+			query:      "?kodsvc%2etoken=1",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "percent-encoded execution token prefix smuggled in query value",
+			token:      llmProxyTestServiceToken,
+			execHeader: []string{"exec-valid"},
+			actHeader:  []string{"action-valid"},
+			query:      "?key=kodex%2Eleaked",
+			wantStatus: http.StatusBadRequest,
+		},
 	}
 
 	for _, tc := range cases {

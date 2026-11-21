@@ -2,6 +2,9 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/id"
 )
 
 // OpenCodeLLMProxyConfig configures the local loopback attribution reverse
@@ -26,6 +30,7 @@ type OpenCodeLLMProxyConfig struct {
 	ListenAddr   string
 	KodemaURL    string
 	Credentials  client.CredentialSource
+	LocalAPIKey  string
 	RoundTripper http.RoundTripper
 	Clock        Clock
 }
@@ -40,21 +45,32 @@ type proxyTurnBinding struct {
 // service credentials and execution/action attribution headers to OpenCode's
 // LLM requests.
 type OpenCodeLLMProxy struct {
-	kodemaBase *url.URL
-	creds      client.CredentialSource
-	client     *http.Client
-	clock      Clock
+	kodemaBase  *url.URL
+	creds       client.CredentialSource
+	localAPIKey string
+	client      *http.Client
+	clock       Clock
 
 	listener net.Listener
 	server   *http.Server
 
-	mu            sync.RWMutex
-	turns         map[string]*proxyTurnBinding // "exec/action" -> binding
-	defaultKey    string
-	defaultTurnID int
+	mu    sync.RWMutex
+	turns map[string]*proxyTurnBinding // "exec/action" -> binding
 }
 
 var errProxyRedirectRefused = errors.New("opencode llm proxy refuses redirects")
+
+// defaultNoProxyTransport clones http.DefaultTransport with Proxy explicitly
+// disabled so ambient HTTP_PROXY/HTTPS_PROXY environment variables are never
+// inherited by local loopback or Kodema service HTTP clients.
+func defaultNoProxyTransport() *http.Transport {
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr := base.Clone()
+		tr.Proxy = nil
+		return tr
+	}
+	return &http.Transport{Proxy: nil}
+}
 
 // NewOpenCodeLLMProxy validates configuration and creates an unbound proxy.
 // Call Start to begin listening on a loopback socket.
@@ -76,13 +92,22 @@ func NewOpenCodeLLMProxy(config OpenCodeLLMProxyConfig) (*OpenCodeLLMProxy, erro
 	if config.Credentials == nil {
 		return nil, fmt.Errorf("opencode LLM proxy requires a credential source")
 	}
+	localKey := strings.TrimSpace(config.LocalAPIKey)
+	if localKey == "" {
+		var raw [32]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return nil, fmt.Errorf("generate opencode LLM proxy local API key: %w", err)
+		}
+		localKey = "ocproxy." + hex.EncodeToString(raw[:])
+	}
 	rt := config.RoundTripper
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = defaultNoProxyTransport()
 	}
 	p := &OpenCodeLLMProxy{
-		kodemaBase: parsed,
-		creds:      config.Credentials,
+		kodemaBase:  parsed,
+		creds:       config.Credentials,
+		localAPIKey: localKey,
 		client: &http.Client{
 			Transport: rt,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -99,8 +124,18 @@ func NewOpenCodeLLMProxy(config OpenCodeLLMProxyConfig) (*OpenCodeLLMProxy, erro
 	return p, nil
 }
 
-// Start binds a loopback listener (requiring loopback host) and serves traffic
-// in the background. Call Close to stop cleanly.
+// LocalAPIKey returns the shared secret required on inbound loopback requests
+// via `Authorization: Bearer <key>` or `x-api-key: <key>`.
+func (p *OpenCodeLLMProxy) LocalAPIKey() string {
+	if p == nil {
+		return ""
+	}
+	return p.localAPIKey
+}
+
+// Start binds a loopback listener (requiring loopback host and verified
+// loopback bound IP) and serves traffic in the background. Call Close to stop
+// cleanly.
 func (p *OpenCodeLLMProxy) Start(listenAddr string) (string, error) {
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:0"
@@ -118,6 +153,11 @@ func (p *OpenCodeLLMProxy) Start(listenAddr string) (string, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return "", fmt.Errorf("listen opencode LLM proxy: %w", err)
+	}
+	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok || tcpAddr.IP == nil || !tcpAddr.IP.IsLoopback() {
+		_ = ln.Close()
+		return "", fmt.Errorf("opencode LLM proxy bound non-loopback address %q", ln.Addr().String())
 	}
 	p.mu.Lock()
 	p.listener = ln
@@ -155,31 +195,30 @@ func (p *OpenCodeLLMProxy) RegisterTurn(turnCtx context.Context, executionID, ac
 	}
 	p.mu.Lock()
 	p.turns[key] = binding
-	p.defaultKey = key
 	p.mu.Unlock()
 	return func() {
 		p.mu.Lock()
 		if p.turns[key] == binding {
 			delete(p.turns, key)
-			if p.defaultKey == key {
-				p.defaultKey = ""
-				for otherKey := range p.turns {
-					p.defaultKey = otherKey
-					break
-				}
-			}
 		}
 		p.mu.Unlock()
 	}
 }
 
-// ServeHTTP forwards either `/turn/{exec}/{action}/llm/{provider}/*` or
-// `/llm/{provider}/*` (resolved against the active turn) to Kodema's
-// `/llm/{provider}/*` endpoint with live `kodsvc.` auth and attribution headers.
+// ServeHTTP authenticates inbound loopback callers with the local shared
+// secret, validates the path strictly against traversal, resolves attribution
+// (failing closed on ambiguous multi-turn unattributed calls), and forwards to
+// Kodema's `/llm/{provider}/*` endpoint with live `kodsvc.` auth and
+// attribution headers.
 func (p *OpenCodeLLMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	binding, upstreamPath, ok := p.resolveTurnAndPath(r)
-	if !ok {
-		writeProxyJSONError(w, http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn for LLM proxy request")
+	if !p.authenticateLocalCaller(r.Header) {
+		writeProxyJSONError(w, http.StatusUnauthorized, api.CodeUnauthenticated, "missing or invalid local LLM proxy API key")
+		return
+	}
+
+	binding, upstreamPath, status, code, msg := p.resolveTurnAndPath(r)
+	if status != 0 {
+		writeProxyJSONError(w, status, code, msg)
 		return
 	}
 	if binding.ctx.Err() != nil {
@@ -214,9 +253,10 @@ func (p *OpenCodeLLMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyJSONError(w, http.StatusInternalServerError, api.CodeInternalFailure, "failed to construct upstream LLM request")
 		return
 	}
+	reqConnHeaders := parseConnectionTokens(r.Header)
 	for name, values := range r.Header {
-		switch strings.ToLower(name) {
-		case "authorization", "x-api-key", "x-kodema-execution", "x-kodema-action", "host", "connection", "keep-alive", "transfer-encoding", "upgrade":
+		lower := strings.ToLower(name)
+		if isStrippedProxyRequestHeader(lower) || reqConnHeaders[lower] {
 			continue
 		}
 		for _, v := range values {
@@ -239,9 +279,10 @@ func (p *OpenCodeLLMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	respConnHeaders := parseConnectionTokens(resp.Header)
 	for name, values := range resp.Header {
-		switch strings.ToLower(name) {
-		case "connection", "keep-alive", "transfer-encoding", "upgrade", "content-length":
+		lower := strings.ToLower(name)
+		if isStrippedProxyResponseHeader(lower) || respConnHeaders[lower] {
 			continue
 		}
 		for _, v := range values {
@@ -280,8 +321,83 @@ func (p *OpenCodeLLMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBinding, string, bool) {
+func (p *OpenCodeLLMProxy) authenticateLocalCaller(header http.Header) bool {
+	if p == nil || p.localAPIKey == "" {
+		return false
+	}
+	var bearer string
+	for _, value := range header.Values("Authorization") {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if len(trimmed) < len("Bearer ") || !strings.EqualFold(trimmed[:len("Bearer ")], "Bearer ") {
+			return false
+		}
+		tok := strings.TrimSpace(trimmed[len("Bearer "):])
+		if tok == "" {
+			return false
+		}
+		if bearer != "" && bearer != tok {
+			return false
+		}
+		bearer = tok
+	}
+
+	var apiKey string
+	for _, value := range header.Values("X-Api-Key") {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if apiKey != "" && apiKey != trimmed {
+			return false
+		}
+		apiKey = trimmed
+	}
+
+	var presented string
+	switch {
+	case bearer != "" && apiKey != "":
+		if bearer != apiKey {
+			return false
+		}
+		presented = bearer
+	case bearer != "":
+		presented = bearer
+	case apiKey != "":
+		presented = apiKey
+	default:
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(p.localAPIKey)) == 1
+}
+
+func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBinding, string, int, string, string) {
+	if r == nil || r.URL == nil {
+		return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "invalid LLM proxy request URL"
+	}
+	if r.URL.Fragment != "" {
+		return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "fragments are not permitted on LLM proxy paths"
+	}
+	if strings.ContainsAny(r.URL.RawQuery, "\r\n\x00") {
+		return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "query string contains invalid control characters"
+	}
+	for _, encoded := range []string{r.URL.EscapedPath(), r.URL.RawPath} {
+		lower := strings.ToLower(encoded)
+		if strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") || strings.Contains(lower, "%00") {
+			return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "LLM proxy path contains an encoded path separator or NUL byte"
+		}
+	}
+
 	path := r.URL.Path
+	if r.URL.RawPath != "" && hasUnsafeProxyPath(r.URL.RawPath) {
+		return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "LLM proxy raw path contains invalid characters or relative segments"
+	}
+	if hasUnsafeProxyPath(path) {
+		return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "LLM proxy path contains invalid characters or relative segments"
+	}
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -289,36 +405,180 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 	if strings.HasPrefix(path, "/turn/") {
 		rest := strings.TrimPrefix(path, "/turn/")
 		parts := strings.SplitN(rest, "/", 3)
-		if len(parts) != 3 || !strings.HasPrefix("/"+parts[2], "/llm/") {
-			return nil, "", false
+		if len(parts) != 3 {
+			return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "invalid turn-scoped LLM proxy path"
 		}
-		key := parts[0] + "/" + parts[1]
-		binding, ok := p.turns[key]
+		execID, actID, llmPath := parts[0], parts[1], "/"+parts[2]
+		if _, err := id.ParseExecutionID(execID); err != nil {
+			return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "invalid execution id in turn-scoped LLM proxy path"
+		}
+		if _, err := id.ParseActionID(actID); err != nil {
+			return nil, "", http.StatusBadRequest, api.CodeInvalidInput, "invalid action id in turn-scoped LLM proxy path"
+		}
+		if err := validateOpenCodeProxyLLMPath(llmPath); err != nil {
+			return nil, "", http.StatusBadRequest, api.CodeInvalidInput, err.Error()
+		}
+		binding, ok := p.turns[execID+"/"+actID]
 		if !ok {
-			return nil, "", false
+			return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn for LLM proxy request"
 		}
-		return binding, "/" + parts[2], true
+		return binding, llmPath, 0, "", ""
 	}
 
-	if !strings.HasPrefix(path, "/llm/") {
-		return nil, "", false
+	if err := validateOpenCodeProxyLLMPath(path); err != nil {
+		return nil, "", http.StatusBadRequest, api.CodeInvalidInput, err.Error()
 	}
 
-	// Explicit header attribution override if matching an active registered turn.
-	if execHdr := strings.TrimSpace(r.Header.Get("X-Kodema-Execution")); execHdr != "" {
-		if actHdr := strings.TrimSpace(r.Header.Get("X-Kodema-Action")); actHdr != "" {
-			if binding, ok := p.turns[execHdr+"/"+actHdr]; ok {
-				return binding, path, true
+	// Explicit header attribution override if provided (partial or conflicting
+	// attribution headers always fail closed).
+	execVals := r.Header.Values("X-Kodema-Execution")
+	actVals := r.Header.Values("X-Kodema-Action")
+	if len(execVals) > 0 || len(actVals) > 0 {
+		execHdr, okExec := singleTrimmedProxyHeader(execVals)
+		actHdr, okAct := singleTrimmedProxyHeader(actVals)
+		if !okExec || !okAct {
+			return nil, "", http.StatusForbidden, api.CodeForbidden, "explicit LLM proxy attribution requires single X-Kodema-Execution and X-Kodema-Action headers"
+		}
+		if binding, ok := p.turns[execHdr+"/"+actHdr]; ok {
+			return binding, path, 0, "", ""
+		}
+		return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn matches attribution headers"
+	}
+
+	// Implicit attribution is permitted ONLY when exactly one turn is active.
+	// With zero active turns -> 403; with >1 concurrent turns -> fail closed
+	// with 409 Conflict to eliminate cross-task misattribution & cancel bleed.
+	switch len(p.turns) {
+	case 0:
+		return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn for LLM proxy request"
+	case 1:
+		for _, binding := range p.turns {
+			return binding, path, 0, "", ""
+		}
+	default:
+		return nil, "", http.StatusConflict, api.CodeVersionConflict, "ambiguous LLM proxy request: multiple active Kodema turns require explicit turn routing or attribution headers"
+	}
+	return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn for LLM proxy request"
+}
+
+func hasUnsafeProxyPath(rawPath string) bool {
+	if rawPath == "" || rawPath[0] != '/' {
+		return true
+	}
+	for i := 0; i < len(rawPath); i++ {
+		ch := rawPath[i]
+		if ch < 0x20 || ch == 0x7f || ch == '\\' || ch == '@' {
+			return true
+		}
+	}
+	for _, seg := range strings.Split(rawPath[1:], "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// validateOpenCodeProxyLLMPath mirrors internal/shell/app.parseLLMProxyPath so
+// path traversal, empty/relative segments, control characters, backslashes, and
+// userinfo markers are refused before any upstream request is constructed.
+func validateOpenCodeProxyLLMPath(rawPath string) error {
+	if !strings.HasPrefix(rawPath, "/llm/") {
+		return fmt.Errorf("LLM proxy path must start with /llm/")
+	}
+	rest := strings.TrimPrefix(rawPath, "/llm/")
+	provider, upstreamRel, ok := strings.Cut(rest, "/")
+	if !ok || provider == "" || upstreamRel == "" {
+		return fmt.Errorf("LLM proxy path must include provider and upstream path")
+	}
+	if _, err := id.ParseActionName(provider); err != nil {
+		return fmt.Errorf("LLM proxy provider name %q is invalid", provider)
+	}
+	for i := 0; i < len(upstreamRel); i++ {
+		ch := upstreamRel[i]
+		if ch < 0x20 || ch == 0x7f || ch == '\\' || ch == '@' {
+			return fmt.Errorf("LLM proxy upstream path contains invalid characters")
+		}
+	}
+	for _, segment := range strings.Split(upstreamRel, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return fmt.Errorf("LLM proxy upstream path contains an empty or relative segment")
+		}
+	}
+	return nil
+}
+
+func singleTrimmedProxyHeader(values []string) (string, bool) {
+	var found string
+	for _, v := range values {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return "", false
+		}
+		if found != "" {
+			return "", false
+		}
+		found = trimmed
+	}
+	return found, found != ""
+}
+
+func parseConnectionTokens(header http.Header) map[string]bool {
+	var tokens map[string]bool
+	for _, value := range header.Values("Connection") {
+		for _, part := range strings.Split(value, ",") {
+			token := strings.ToLower(strings.TrimSpace(part))
+			if token == "" {
+				continue
 			}
-			return nil, "", false
+			if tokens == nil {
+				tokens = make(map[string]bool)
+			}
+			tokens[token] = true
 		}
 	}
+	return tokens
+}
 
-	if p.defaultKey == "" {
-		return nil, "", false
+func isStrippedProxyRequestHeader(lower string) bool {
+	switch lower {
+	case "authorization",
+		"x-api-key",
+		"x-kodema-execution",
+		"x-kodema-action",
+		"host",
+		"cookie",
+		"proxy-authorization",
+		"proxy-authenticate",
+		"proxy-connection",
+		"connection",
+		"keep-alive",
+		"transfer-encoding",
+		"upgrade",
+		"te",
+		"trailer":
+		return true
+	default:
+		return false
 	}
-	binding, ok := p.turns[p.defaultKey]
-	return binding, path, ok
+}
+
+func isStrippedProxyResponseHeader(lower string) bool {
+	switch lower {
+	case "connection",
+		"keep-alive",
+		"transfer-encoding",
+		"upgrade",
+		"te",
+		"trailer",
+		"proxy-connection",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"content-length":
+		return true
+	default:
+		return false
+	}
 }
 
 func writeProxyJSONError(w http.ResponseWriter, status int, code, message string) {

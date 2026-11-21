@@ -20,10 +20,16 @@ import (
 )
 
 const (
-	defaultOpenCodeMaxConcurrency = 4
-	maxOpenCodePromptBlobBytes    = 256 << 10
-	maxOpenCodeResolveNoteBytes   = 1024
+	defaultOpenCodeMaxConcurrency   = 4
+	defaultOpenCodeAbortCallTimeout = 5 * time.Second
+	maxOpenCodePromptBlobBytes      = 256 << 10
+	maxOpenCodeResolveNoteBytes     = 1024
 )
+
+type openCodeTaskLockEntry struct {
+	sem  chan struct{}
+	refs int
+}
 
 // OpenCodeAdapter is the per-project OpenCode brain service adapter.
 // It uses ONLY public Kodema APIs (task.inbox, execution.inspect, task.read,
@@ -51,9 +57,10 @@ type OpenCodeAdapter struct {
 	turnSlots chan struct{}
 
 	mu         sync.Mutex
-	active     map[string]*activeOpenCodeTurn // "execID/actionID" -> turn
-	taskLocks  map[string]chan struct{}       // taskID -> 1-buffered semaphore
+	active     map[string]*activeOpenCodeTurn    // "execID/actionID" -> turn
+	taskLocks  map[string]*openCodeTaskLockEntry // taskID -> refcounted 1-buffered semaphore
 	turnWG     sync.WaitGroup
+	abortWG    sync.WaitGroup
 	scanSignal chan struct{}
 }
 
@@ -81,8 +88,7 @@ func (t *activeOpenCodeTurn) getSessionID() string {
 	return t.sessionID
 }
 
-func (t *activeOpenCodeTurn) cancelAndAbort(opencode OpenCodeClient) {
-	t.cancel()
+func (t *activeOpenCodeTurn) abortSession(opencode OpenCodeClient) {
 	sessionID := t.getSessionID()
 	if sessionID == "" || opencode == nil {
 		return
@@ -91,8 +97,15 @@ func (t *activeOpenCodeTurn) cancelAndAbort(opencode OpenCodeClient) {
 		t.mu.Lock()
 		t.aborted = true
 		t.mu.Unlock()
-		_ = opencode.AbortSession(context.Background(), sessionID)
+		abortCtx, cancel := context.WithTimeout(context.Background(), defaultOpenCodeAbortCallTimeout)
+		defer cancel()
+		_ = opencode.AbortSession(abortCtx, sessionID)
 	})
+}
+
+func (t *activeOpenCodeTurn) cancelAndAbort(opencode OpenCodeClient) {
+	t.cancel()
+	t.abortSession(opencode)
 }
 
 var _ ServiceAdapter = (*OpenCodeAdapter)(nil)
@@ -129,7 +142,12 @@ func NewOpenCodeAdapter(config OpenCodeAdapterConfig) (*OpenCodeAdapter, error) 
 		rescan = defaultRescanInterval
 	}
 	maxConc := config.MaxConcurrentTurns
-	if maxConc <= 0 {
+	if config.Proxy != nil && !config.PerTurnProxyRouting {
+		if maxConc > 1 {
+			return nil, fmt.Errorf("opencode adapter with shared static-URL LLM proxy requires MaxConcurrentTurns <= 1 unless PerTurnProxyRouting is enabled")
+		}
+		maxConc = 1
+	} else if maxConc <= 0 {
 		maxConc = defaultOpenCodeMaxConcurrency
 	}
 	return &OpenCodeAdapter{
@@ -150,7 +168,7 @@ func NewOpenCodeAdapter(config OpenCodeAdapterConfig) (*OpenCodeAdapter, error) 
 		agent:          strings.TrimSpace(config.Agent),
 		turnSlots:      make(chan struct{}, maxConc),
 		active:         make(map[string]*activeOpenCodeTurn),
-		taskLocks:      make(map[string]chan struct{}),
+		taskLocks:      make(map[string]*openCodeTaskLockEntry),
 		scanSignal:     make(chan struct{}, 1),
 	}, nil
 }
@@ -171,6 +189,7 @@ func (a *OpenCodeAdapter) Run(ctx context.Context) error {
 		cancelRun()
 		a.abortAllActive()
 		a.turnWG.Wait()
+		a.abortWG.Wait()
 	}()
 
 	// Initial startup reconciliation so pending requests are never stranded.
@@ -422,6 +441,19 @@ func (a *OpenCodeAdapter) triggerScan() {
 	}
 }
 
+func (a *OpenCodeAdapter) cancelTurnsAsync(matched []*activeOpenCodeTurn) {
+	for _, t := range matched {
+		// Cancel turn context synchronously before spawning AbortSession so
+		// in-flight LLM proxy calls and git commands stop immediately.
+		t.cancel()
+		a.abortWG.Add(1)
+		go func(turn *activeOpenCodeTurn) {
+			defer a.abortWG.Done()
+			turn.abortSession(a.opencode)
+		}(t)
+	}
+}
+
 func (a *OpenCodeAdapter) cancelByAction(actionID string) {
 	if actionID == "" {
 		return
@@ -434,9 +466,7 @@ func (a *OpenCodeAdapter) cancelByAction(actionID string) {
 		}
 	}
 	a.mu.Unlock()
-	for _, t := range matched {
-		go t.cancelAndAbort(a.opencode)
-	}
+	a.cancelTurnsAsync(matched)
 }
 
 func (a *OpenCodeAdapter) cancelByExecution(executionID string) {
@@ -451,9 +481,7 @@ func (a *OpenCodeAdapter) cancelByExecution(executionID string) {
 		}
 	}
 	a.mu.Unlock()
-	for _, t := range matched {
-		go t.cancelAndAbort(a.opencode)
-	}
+	a.cancelTurnsAsync(matched)
 }
 
 func (a *OpenCodeAdapter) cancelByTask(taskID string) {
@@ -468,9 +496,7 @@ func (a *OpenCodeAdapter) cancelByTask(taskID string) {
 		}
 	}
 	a.mu.Unlock()
-	for _, t := range matched {
-		go t.cancelAndAbort(a.opencode)
-	}
+	a.cancelTurnsAsync(matched)
 }
 
 func (a *OpenCodeAdapter) abortAllActive() {
@@ -480,9 +506,7 @@ func (a *OpenCodeAdapter) abortAllActive() {
 		all = append(all, t)
 	}
 	a.mu.Unlock()
-	for _, t := range all {
-		t.cancelAndAbort(a.opencode)
-	}
+	a.cancelTurnsAsync(all)
 }
 
 // executeTurn executes a single turn synchronously (used by RunOnce).
@@ -558,24 +582,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 	turn.taskID = taskID
 	a.mu.Unlock()
 
-	// 2. Check durable per-action idempotency record to avoid double-pushes or
-	// re-running after a crash between push and resolve.
-	if existing, found, err := a.store.LoadAction(turnCtx, a.tenant, a.project, scanned.ExecutionID, scanned.ActionID); err == nil && found {
-		if existing.Resolved {
-			return nil
-		}
-		if existing.Pushed && len(existing.Outputs) > 0 {
-			if err := a.resolveRequest(turnCtx, scanned, current, action, DecisionPass, existing.Outputs, ""); err != nil {
-				return err
-			}
-			existing.Resolved = true
-			existing.UpdatedAt = a.clock.Now()
-			_ = a.store.SaveAction(context.WithoutCancel(turnCtx), existing)
-			return nil
-		}
-	}
-
-	// 3. Parse and validate the typed request subject.
+	// 2. Parse and validate the typed request subject before resuming or running.
 	rawSubject := scanned.Subject
 	if rawSubject == nil {
 		rawSubject = action.Subject
@@ -585,8 +592,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		return err
 	}
 
-	// 4. Derive a deadline-bounded context for this turn and register with
-	// the local attribution LLM proxy (if configured).
+	// 3. Derive a deadline-bounded context for this turn.
 	remaining := deadline.Sub(a.clock.Now())
 	if remaining <= 0 {
 		return nil
@@ -594,16 +600,57 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 	callCtx, cancelCall := context.WithTimeout(turnCtx, remaining)
 	defer cancelCall()
 
-	unregisterProxy := a.proxy.RegisterTurn(callCtx, scanned.ExecutionID, scanned.ActionID)
-	defer unregisterProxy()
+	// 4. Check durable per-action checkpoint (failing closed on unreadable or
+	// corrupt state) so restarts never double-push or re-run settled requests.
+	existing, found, err := a.store.LoadAction(callCtx, a.tenant, a.project, scanned.ExecutionID, scanned.ActionID)
+	if err != nil {
+		return fmt.Errorf("load opencode action checkpoint: %w", err)
+	}
+	if found {
+		if existing.Resolved || existing.Stage == OpenCodeActionStageResolved {
+			return nil
+		}
+		stage := existing.Stage
+		if stage == "" {
+			if existing.Pushed && len(existing.Outputs) > 0 {
+				stage = OpenCodeActionStageOutputsReady
+			} else if existing.Pushed {
+				stage = OpenCodeActionStagePushed
+			}
+		}
+		switch stage {
+		case OpenCodeActionStageOutputsReady:
+			if err := a.resolveRequest(callCtx, scanned, current, action, DecisionPass, existing.Outputs, ""); err != nil {
+				return err
+			}
+			existing.Stage = OpenCodeActionStageResolved
+			existing.Resolved = true
+			existing.UpdatedAt = a.clock.Now()
+			if err := a.store.SaveAction(context.WithoutCancel(callCtx), existing); err != nil {
+				return fmt.Errorf("persist opencode resolved checkpoint: %w", err)
+			}
+			return nil
+		case OpenCodeActionStagePushed:
+			return a.finishTurnAfterPush(
+				callCtx, scanned, current, action, subject,
+				taskID, existing.SessionID, existing.Branch, existing.Candidate,
+				existing.ResponseText, existing.Pushed,
+			)
+		}
+	}
 
 	// 5. Serialize concurrent turns for the same task so worktree & OpenCode
-	// session state are never mutated concurrently.
+	// session state are never mutated concurrently, and ONLY register the turn
+	// with the local LLM proxy AFTER acquiring the task lock (unregistering in
+	// defer before releasing the task lock).
 	releaseTask, err := a.acquireTaskLock(callCtx, taskID)
 	if err != nil {
 		return err
 	}
 	defer releaseTask()
+
+	unregisterProxy := a.proxy.RegisterTurn(callCtx, scanned.ExecutionID, scanned.ActionID)
+	defer unregisterProxy()
 
 	// 6. Fetch task spec/conversation and referenced KV blobs.
 	var taskInfo *api.TaskReadResult
@@ -679,16 +726,19 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 			a.publishProgress(context.WithoutCancel(callCtx), scanned.ExecutionID, scanned.ActionID, taskID, sessionID, string(subject.Mode), "budget_exceeded", err.Error())
 			note := truncateString("budget_exceeded: "+err.Error(), maxOpenCodeResolveNoteBytes)
 			if resolveErr := a.resolveRequest(callCtx, scanned, current, action, "fail", nil, note); resolveErr == nil {
-				_ = a.store.SaveAction(context.WithoutCancel(callCtx), OpenCodeActionRecord{
+				if saveErr := a.store.SaveAction(context.WithoutCancel(callCtx), OpenCodeActionRecord{
 					TenantID:    a.tenant,
 					ProjectID:   a.project,
 					ExecutionID: scanned.ExecutionID,
 					ActionID:    scanned.ActionID,
 					TaskID:      taskID,
 					SessionID:   sessionID,
+					Stage:       OpenCodeActionStageResolved,
 					Resolved:    true,
 					UpdatedAt:   a.clock.Now(),
-				})
+				}); saveErr != nil {
+					return fmt.Errorf("persist opencode budget-exceeded checkpoint: %w", saveErr)
+				}
 				return nil
 			}
 			return err
@@ -703,6 +753,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 
 	// 11. For coding modes, commit & push changes to refs/heads/work/<task-id>.
 	var branch, candidate string
+	var pushed bool
 	if subject.Mode.MutatesCode() && checkout.WorktreePath != "" {
 		commitMsg := fmt.Sprintf("opencode(%s): %s", subject.Mode, taskID)
 		if taskInfo != nil && strings.TrimSpace(taskInfo.Title) != "" {
@@ -718,29 +769,46 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		}
 		branch = pushRes.Branch
 		candidate = pushRes.Candidate
+		pushed = true
 
 		// Persist pushed checkpoint immediately so a crash before KV/resolve
-		// never double-pushes on retry.
-		_ = a.store.SaveAction(context.WithoutCancel(callCtx), OpenCodeActionRecord{
-			TenantID:    a.tenant,
-			ProjectID:   a.project,
-			ExecutionID: scanned.ExecutionID,
-			ActionID:    scanned.ActionID,
-			TaskID:      taskID,
-			SessionID:   sessionID,
-			Branch:      branch,
-			Candidate:   candidate,
-			Pushed:      true,
-			UpdatedAt:   a.clock.Now(),
-		})
+		// never double-pushes on retry (even when declared outputs are empty).
+		if err := a.store.SaveAction(context.WithoutCancel(callCtx), OpenCodeActionRecord{
+			TenantID:     a.tenant,
+			ProjectID:    a.project,
+			ExecutionID:  scanned.ExecutionID,
+			ActionID:     scanned.ActionID,
+			TaskID:       taskID,
+			SessionID:    sessionID,
+			Stage:        OpenCodeActionStagePushed,
+			ResponseText: resp.Text,
+			Branch:       branch,
+			Candidate:    candidate,
+			Pushed:       true,
+			UpdatedAt:    a.clock.Now(),
+		}); err != nil {
+			return fmt.Errorf("persist opencode pushed checkpoint: %w", err)
+		}
 	} else if checkout.Branch != "" {
 		branch = checkout.Branch
 	}
 
+	return a.finishTurnAfterPush(callCtx, scanned, current, action, subject, taskID, sessionID, branch, candidate, resp.Text, pushed)
+}
+
+func (a *OpenCodeAdapter) finishTurnAfterPush(
+	callCtx context.Context,
+	scanned api.InboxItem,
+	current api.ExecutionInspectResult,
+	action api.ExecutionAction,
+	subject OpenCodeSubject,
+	taskID, sessionID, branch, candidate, responseText string,
+	pushed bool,
+) error {
 	// 12. Write Markdown summary/plan/review to Kodema KV.
-	markdown := formatOpenCodeMarkdown(subject.Mode, taskID, sessionID, branch, candidate, resp.Text)
+	markdown := formatOpenCodeMarkdown(subject.Mode, taskID, sessionID, branch, candidate, responseText)
 	var kvKey string
-	if needsKVOutput(scanned.Outputs) || strings.TrimSpace(resp.Text) != "" {
+	if needsKVOutput(scanned.Outputs) || strings.TrimSpace(responseText) != "" {
 		kvRes, kvErr := a.kvPut(callCtx, []byte(markdown), "text/markdown; charset=utf-8")
 		if kvErr != nil {
 			if callCtx.Err() != nil {
@@ -755,25 +823,27 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 	outputs := buildOpenCodeOutputs(scanned.Outputs, subject, sessionID, branch, candidate, kvKey)
 
 	actionRecord := OpenCodeActionRecord{
-		TenantID:    a.tenant,
-		ProjectID:   a.project,
-		ExecutionID: scanned.ExecutionID,
-		ActionID:    scanned.ActionID,
-		TaskID:      taskID,
-		SessionID:   sessionID,
-		Branch:      branch,
-		Candidate:   candidate,
-		SummaryKey:  kvKey,
-		PlanKey:     subject.PlanKey,
-		Outputs:     outputs,
-		Pushed:      true,
-		UpdatedAt:   a.clock.Now(),
+		TenantID:     a.tenant,
+		ProjectID:    a.project,
+		ExecutionID:  scanned.ExecutionID,
+		ActionID:     scanned.ActionID,
+		TaskID:       taskID,
+		SessionID:    sessionID,
+		Stage:        OpenCodeActionStageOutputsReady,
+		ResponseText: responseText,
+		Branch:       branch,
+		Candidate:    candidate,
+		SummaryKey:   kvKey,
+		PlanKey:      subject.PlanKey,
+		Outputs:      outputs,
+		Pushed:       pushed,
+		UpdatedAt:    a.clock.Now(),
 	}
 	if subject.Mode == OpenCodeModePlan && kvKey != "" {
 		actionRecord.PlanKey = kvKey
 	}
 	if err := a.store.SaveAction(context.WithoutCancel(callCtx), actionRecord); err != nil {
-		return err
+		return fmt.Errorf("persist opencode outputs_ready checkpoint: %w", err)
 	}
 
 	// 14. Publish best-effort completion progress event.
@@ -783,9 +853,12 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 	if err := a.resolveRequest(callCtx, scanned, current, action, DecisionPass, outputs, ""); err != nil {
 		return err
 	}
+	actionRecord.Stage = OpenCodeActionStageResolved
 	actionRecord.Resolved = true
 	actionRecord.UpdatedAt = a.clock.Now()
-	_ = a.store.SaveAction(context.WithoutCancel(callCtx), actionRecord)
+	if err := a.store.SaveAction(context.WithoutCancel(callCtx), actionRecord); err != nil {
+		return fmt.Errorf("persist opencode resolved checkpoint: %w", err)
+	}
 	return nil
 }
 
@@ -839,17 +912,31 @@ func (a *OpenCodeAdapter) ensureTaskSession(
 
 func (a *OpenCodeAdapter) acquireTaskLock(ctx context.Context, taskID string) (func(), error) {
 	a.mu.Lock()
-	sem, ok := a.taskLocks[taskID]
+	entry, ok := a.taskLocks[taskID]
 	if !ok {
-		sem = make(chan struct{}, 1)
-		a.taskLocks[taskID] = sem
+		entry = &openCodeTaskLockEntry{sem: make(chan struct{}, 1)}
+		a.taskLocks[taskID] = entry
 	}
+	entry.refs++
 	a.mu.Unlock()
 
+	releaseRef := func() {
+		a.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 && a.taskLocks[taskID] == entry {
+			delete(a.taskLocks, taskID)
+		}
+		a.mu.Unlock()
+	}
+
 	select {
-	case sem <- struct{}{}:
-		return func() { <-sem }, nil
+	case entry.sem <- struct{}{}:
+		return func() {
+			<-entry.sem
+			releaseRef()
+		}, nil
 	case <-ctx.Done():
+		releaseRef()
 		return nil, ctx.Err()
 	}
 }
@@ -1019,6 +1106,42 @@ func (a *OpenCodeAdapter) publishProgress(ctx context.Context, executionID, acti
 }
 
 func (a *OpenCodeAdapter) resolveRequest(
+	ctx context.Context,
+	scanned api.InboxItem,
+	current api.ExecutionInspectResult,
+	action api.ExecutionAction,
+	decision string,
+	outputs map[string]string,
+	note string,
+) error {
+	err := a.resolveRequestAttempt(ctx, scanned, current, action, decision, outputs, note)
+	if !errors.Is(err, ErrStaleVersion) {
+		return err
+	}
+	// Retry once by re-inspecting current execution/action versions so a
+	// concurrent version increment resolves immediately instead of stalling.
+	refreshed, inspectErr := a.inspectExecution(ctx, scanned.ExecutionID)
+	if inspectErr != nil {
+		var publicErr *api.Error
+		if errors.As(inspectErr, &publicErr) && publicErr.Code == api.CodeNotFound {
+			return nil
+		}
+		return err
+	}
+	if refreshed.ExecutionID != scanned.ExecutionID || refreshed.State != "running" {
+		return nil
+	}
+	refreshedAction, ok := currentAction(refreshed, scanned.ActionID)
+	if !ok || refreshedAction.Kind != "request" || refreshedAction.State != "running" || refreshedAction.Decision != "" {
+		return nil
+	}
+	if refreshedAction.Assignment != "" && refreshedAction.Assignment != "service/"+string(a.serviceID) {
+		return nil
+	}
+	return a.resolveRequestAttempt(ctx, scanned, refreshed, refreshedAction, decision, outputs, note)
+}
+
+func (a *OpenCodeAdapter) resolveRequestAttempt(
 	ctx context.Context,
 	scanned api.InboxItem,
 	current api.ExecutionInspectResult,

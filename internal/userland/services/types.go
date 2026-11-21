@@ -125,7 +125,7 @@ func validRepository(value string) bool {
 		return false
 	}
 	for _, segment := range strings.Split(value, "/") {
-		if segment == "" {
+		if segment == "" || segment == "." || segment == ".." || strings.HasPrefix(segment, "-") {
 			return false
 		}
 		for index := 0; index < len(segment); index++ {

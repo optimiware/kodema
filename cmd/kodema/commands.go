@@ -328,9 +328,10 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	gitURL := flags.String("git-url", envOr("KODEMA_SERVICE_GIT_URL", ""), "Git base URL")
 	opencodeURL := flags.String("opencode-url", envOr("KODEMA_OPENCODE_URL", ""), "opencode serve HTTP URL")
 	llmProxyListen := flags.String("llm-proxy-listen", envOr("KODEMA_OPENCODE_LLM_PROXY_LISTEN", ""), "optional loopback listen address for the attributed LLM reverse proxy")
+	llmProxyAPIKey := flags.String("llm-proxy-api-key", envOr("KODEMA_OPENCODE_LLM_PROXY_API_KEY", ""), "optional shared secret for inbound loopback LLM proxy requests (auto-generated if empty)")
 	model := flags.String("model", envOr("KODEMA_OPENCODE_MODEL", ""), "optional default OpenCode model")
 	agent := flags.String("agent", envOr("KODEMA_OPENCODE_AGENT", ""), "optional default OpenCode agent")
-	maxConcurrency := flags.Int("max-concurrency", 4, "maximum concurrent OpenCode turns")
+	maxConcurrency := flags.Int("max-concurrency", 0, "maximum concurrent OpenCode turns (defaults to 1 with --llm-proxy-listen, 4 otherwise)")
 	message := flags.String("message", envOr("KODEMA_EMAIL_MESSAGE", ""), "one RFC822 message file, or - for stdin")
 	pipeline := flags.String("pipeline", envOr("KODEMA_EMAIL_PIPELINE", ""), "email intake pipeline identity")
 	if err := flags.Parse(args); err != nil {
@@ -384,6 +385,10 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			usage(stderr, "opencode service requires --state-dir, --git-url and --opencode-url")
 			return 2
 		}
+		if strings.TrimSpace(*llmProxyListen) != "" && *maxConcurrency > 1 {
+			usage(stderr, "opencode service with --llm-proxy-listen requires --max-concurrency <= 1")
+			return 2
+		}
 		config := servicesapp.OpenCodeConfig{
 			ServiceID:          id.PrincipalID(*service),
 			TenantID:           id.TenantID(*tenant),
@@ -395,6 +400,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			CredentialFile:     *credentialFile,
 			OpenCodeURL:        *opencodeURL,
 			ProxyListen:        *llmProxyListen,
+			ProxyAPIKey:        *llmProxyAPIKey,
 			Model:              *model,
 			Agent:              *agent,
 			RescanInterval:     *rescan,

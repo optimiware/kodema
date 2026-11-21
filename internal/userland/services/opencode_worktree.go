@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
@@ -18,15 +20,16 @@ type GitOpenCodeWorktreeConfig struct {
 	// one path segment (never embedding credentials in the URL).
 	RemoteBaseURL string
 	// StateDirectory is the service's local state directory. Mirrors live under
-	// <StateDirectory>/repos/<safe-repo-slug>.git and per-task worktrees under
-	// <StateDirectory>/worktrees/<safe-task-id>.
+	// <StateDirectory>/repos/<repo-hash>.git and per-task worktrees under
+	// <StateDirectory>/worktrees/<repo-hash>/<safe-task-id>.
 	StateDirectory string
 	// CredentialFile is the mounted kodsvc. credential file used to
 	// authenticate HTTP(S) Git operations via GIT_CONFIG_* environment headers
 	// (never written into .git/config or URLs).
 	CredentialFile string
 	// CredentialHelper optionally configures a git credential helper command
-	// (e.g. "kodema git credential") via GIT_CONFIG_* when CredentialFile is empty.
+	// (e.g. "kodema git credential") scoped to the trusted remote origin when
+	// CredentialFile is empty.
 	CredentialHelper string
 	// CAFile optionally configures http.sslCAInfo via GIT_CONFIG_* for HTTPS
 	// Git servers using a private CA bundle.
@@ -38,8 +41,8 @@ type GitOpenCodeWorktreeConfig struct {
 }
 
 // GitOpenCodeWorktreeManager implements OpenCodeWorktreeManager over a local
-// bare mirror per repository and an isolated `git worktree` per task on
-// `refs/heads/work/<task-id>`.
+// bare mirror per repository and an isolated `git worktree` per (repo, task)
+// on `refs/heads/work/<task-id>`.
 type GitOpenCodeWorktreeManager struct {
 	remoteBaseURL    string
 	reposDir         string
@@ -49,7 +52,7 @@ type GitOpenCodeWorktreeManager struct {
 	caFile           string
 	executor         GitCommandExecutor
 
-	repoMu sync.Map // repo slug -> *sync.Mutex
+	repoMu sync.Map // repo hash -> *sync.Mutex
 }
 
 var _ OpenCodeWorktreeManager = (*GitOpenCodeWorktreeManager)(nil)
@@ -57,15 +60,9 @@ var _ OpenCodeWorktreeManager = (*GitOpenCodeWorktreeManager)(nil)
 // NewGitOpenCodeWorktreeManager validates configuration and creates the local
 // mirror and worktree parent directories.
 func NewGitOpenCodeWorktreeManager(config GitOpenCodeWorktreeConfig) (*GitOpenCodeWorktreeManager, error) {
-	base := strings.TrimSpace(config.RemoteBaseURL)
-	if base == "" {
-		return nil, fmt.Errorf("opencode git remote base URL is empty")
-	}
-	if strings.ContainsAny(base, "\x00\n\r") {
-		return nil, fmt.Errorf("opencode git remote base URL contains a control character")
-	}
-	if parsed, err := url.Parse(base); err == nil && parsed.User != nil {
-		return nil, fmt.Errorf("opencode git remote base URL must not embed credentials")
+	base, err := validateOpenCodeRemoteBaseURL(config.RemoteBaseURL)
+	if err != nil {
+		return nil, err
 	}
 	if config.Executor == nil {
 		return nil, fmt.Errorf("opencode git worktree manager requires a git executor")
@@ -97,8 +94,47 @@ func NewGitOpenCodeWorktreeManager(config GitOpenCodeWorktreeConfig) (*GitOpenCo
 	}, nil
 }
 
+func validateOpenCodeRemoteBaseURL(raw string) (string, error) {
+	base := strings.TrimSpace(raw)
+	if base == "" {
+		return "", fmt.Errorf("opencode git remote base URL is empty")
+	}
+	if strings.HasPrefix(base, "-") {
+		return "", fmt.Errorf("opencode git remote base URL must not start with '-'")
+	}
+	for i := 0; i < len(base); i++ {
+		if base[i] < 0x20 || base[i] == 0x7f {
+			return "", fmt.Errorf("opencode git remote base URL contains a control character")
+		}
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("parse opencode git remote base URL: %w", err)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "ssh":
+		if parsed.Host == "" {
+			return "", fmt.Errorf("opencode git remote base URL with scheme %q requires a host", parsed.Scheme)
+		}
+	case "file":
+		if parsed.Path == "" {
+			return "", fmt.Errorf("opencode git remote base URL with scheme file requires a path")
+		}
+	default:
+		return "", fmt.Errorf("opencode git remote base URL scheme %q is unsupported (allowed: http, https, file, ssh)", parsed.Scheme)
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("opencode git remote base URL must not embed credentials")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("opencode git remote base URL must not contain a query or fragment")
+	}
+	return base, nil
+}
+
 // Prepare ensures the project-scoped bare mirror is up to date and checks out
-// (or resumes) an isolated per-task git worktree on refs/heads/work/<task-id>.
+// (or resumes) an isolated per-(repository, task) git worktree on
+// refs/heads/work/<task-id>.
 func (m *GitOpenCodeWorktreeManager) Prepare(ctx context.Context, repository, taskID, baseRef string) (WorktreeCheckout, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -118,13 +154,16 @@ func (m *GitOpenCodeWorktreeManager) Prepare(ctx context.Context, repository, ta
 
 	repoSlug := safeRepoSlug(repository)
 	mirrorPath := filepath.Join(m.reposDir, repoSlug+".git")
-	worktreePath := filepath.Join(m.worktreesDir, taskID)
-	if !isContainedPath(m.reposDir, mirrorPath) || !isContainedPath(m.worktreesDir, worktreePath) {
+	repoWorktreesDir := filepath.Join(m.worktreesDir, repoSlug)
+	worktreePath := filepath.Join(repoWorktreesDir, taskID)
+	if !isContainedPath(m.reposDir, mirrorPath) ||
+		!isContainedPath(m.worktreesDir, repoWorktreesDir) ||
+		!isContainedPath(repoWorktreesDir, worktreePath) {
 		return WorktreeCheckout{}, fmt.Errorf("derived worktree or mirror path escapes state directory")
 	}
 
 	remoteURL := m.repositoryURL(repository)
-	env, err := m.remoteEnvironment(remoteURL)
+	env, remoteArgs, err := m.remoteEnvironment(remoteURL)
 	if err != nil {
 		return WorktreeCheckout{}, err
 	}
@@ -138,7 +177,7 @@ func (m *GitOpenCodeWorktreeManager) Prepare(ctx context.Context, repository, ta
 	mu.Lock()
 	defer mu.Unlock()
 
-	if err := m.ensureMirror(ctx, mirrorPath, remoteURL, env); err != nil {
+	if err := m.ensureMirror(ctx, mirrorPath, remoteURL, env, remoteArgs); err != nil {
 		return WorktreeCheckout{}, err
 	}
 	baseCommit, err := m.resolveMirrorRef(ctx, mirrorPath, baseRef)
@@ -148,7 +187,7 @@ func (m *GitOpenCodeWorktreeManager) Prepare(ctx context.Context, repository, ta
 
 	// If worktree already exists and is healthy (for example a fix/revise turn
 	// on the same task), resume it in place without clobbering prior work.
-	if m.worktreeHealthy(ctx, worktreePath) {
+	if m.worktreeHealthy(ctx, worktreePath, mirrorPath, branchRef) {
 		return WorktreeCheckout{
 			Repository:   repository,
 			TaskID:       taskID,
@@ -158,10 +197,16 @@ func (m *GitOpenCodeWorktreeManager) Prepare(ctx context.Context, repository, ta
 		}, nil
 	}
 
-	// Prune any stale worktree metadata and clean partial directory before adding.
-	_, _ = m.command(ctx, mirrorPath, nil, "worktree", "prune")
+	// Remove any unhealthy/partial worktree directory FIRST, then prune stale
+	// worktree registrations in the mirror so `git worktree add` never collides
+	// with a previously registered entry.
+	_, _ = m.command(ctx, mirrorPath, nil, nil, "worktree", "remove", "--force", worktreePath)
 	if err := os.RemoveAll(worktreePath); err != nil {
 		return WorktreeCheckout{}, fmt.Errorf("clean stale worktree directory: %w", err)
+	}
+	_, _ = m.command(ctx, mirrorPath, nil, nil, "worktree", "prune")
+	if err := os.MkdirAll(repoWorktreesDir, 0o700); err != nil {
+		return WorktreeCheckout{}, fmt.Errorf("create repository worktrees directory: %w", err)
 	}
 
 	// If origin already has work/<task-id> (e.g. after service host rebuild),
@@ -171,7 +216,7 @@ func (m *GitOpenCodeWorktreeManager) Prepare(ctx context.Context, repository, ta
 		startCommit = existing
 	}
 
-	if _, err := m.require(ctx, mirrorPath, nil, "worktree", "add", "-B", branchShort, worktreePath, startCommit); err != nil {
+	if _, err := m.require(ctx, mirrorPath, nil, nil, "worktree", "add", "-B", branchShort, worktreePath, startCommit); err != nil {
 		return WorktreeCheckout{}, fmt.Errorf("create task worktree: %w", err)
 	}
 
@@ -185,7 +230,7 @@ func (m *GitOpenCodeWorktreeManager) Prepare(ctx context.Context, repository, ta
 }
 
 // CommitAndPush commits any uncommitted changes in the task worktree and pushes
-// HEAD to refs/heads/work/<task-id> on origin.
+// HEAD directly to the validated explicit remote URL at refs/heads/work/<task-id>.
 func (m *GitOpenCodeWorktreeManager) CommitAndPush(ctx context.Context, checkout WorktreeCheckout, commitMessage string) (WorktreePushResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -200,36 +245,47 @@ func (m *GitOpenCodeWorktreeManager) CommitAndPush(ctx context.Context, checkout
 	if checkout.Branch != expectedBranch {
 		return WorktreePushResult{}, fmt.Errorf("checkout branch %q does not match %q", checkout.Branch, expectedBranch)
 	}
-	if !isContainedPath(m.worktreesDir, checkout.WorktreePath) {
-		return WorktreePushResult{}, fmt.Errorf("checkout worktree path escapes worktrees directory")
+	repoSlug := safeRepoSlug(checkout.Repository)
+	expectedWorktree := filepath.Join(m.worktreesDir, repoSlug, checkout.TaskID)
+	if !isContainedPath(m.worktreesDir, checkout.WorktreePath) || filepath.Clean(checkout.WorktreePath) != expectedWorktree {
+		return WorktreePushResult{}, fmt.Errorf("checkout worktree path escapes expected repository task worktree")
 	}
 
-	status, err := m.require(ctx, checkout.WorktreePath, nil, "status", "--porcelain")
+	remoteURL := m.repositoryURL(checkout.Repository)
+	env, remoteArgs, err := m.remoteEnvironment(remoteURL)
+	if err != nil {
+		return WorktreePushResult{}, err
+	}
+
+	// Serialize mirror ref updates and remote push against concurrent Prepare
+	// calls on the same repository mirror.
+	mu := m.mirrorLock(repoSlug)
+	mu.Lock()
+	defer mu.Unlock()
+
+	status, err := m.require(ctx, checkout.WorktreePath, nil, nil, "status", "--porcelain")
 	if err != nil {
 		return WorktreePushResult{}, fmt.Errorf("inspect task worktree status: %w", err)
 	}
 	committed := false
 	if strings.TrimSpace(string(status.Stdout)) != "" {
-		if _, err := m.require(ctx, checkout.WorktreePath, nil, "add", "-A"); err != nil {
+		if _, err := m.require(ctx, checkout.WorktreePath, nil, nil, "add", "-A"); err != nil {
 			return WorktreePushResult{}, fmt.Errorf("stage task worktree changes: %w", err)
 		}
-		msg := strings.TrimSpace(commitMessage)
-		if msg == "" {
-			msg = "opencode: apply changes for " + checkout.TaskID
-		}
+		msg := sanitizeCommitMessage(commitMessage, "opencode: apply changes for "+checkout.TaskID)
 		commitEnv := []string{
 			"GIT_AUTHOR_NAME=Kodema OpenCode Service",
 			"GIT_AUTHOR_EMAIL=opencode@kodema.invalid",
 			"GIT_COMMITTER_NAME=Kodema OpenCode Service",
 			"GIT_COMMITTER_EMAIL=opencode@kodema.invalid",
 		}
-		if _, err := m.require(ctx, checkout.WorktreePath, commitEnv, "commit", "-m", msg); err != nil {
+		if _, err := m.require(ctx, checkout.WorktreePath, commitEnv, nil, "commit", "--no-verify", "-m", msg); err != nil {
 			return WorktreePushResult{}, fmt.Errorf("commit task worktree changes: %w", err)
 		}
 		committed = true
 	}
 
-	headResult, err := m.require(ctx, checkout.WorktreePath, nil, "rev-parse", "HEAD")
+	headResult, err := m.require(ctx, checkout.WorktreePath, nil, nil, "rev-parse", "HEAD")
 	if err != nil {
 		return WorktreePushResult{}, fmt.Errorf("resolve task HEAD commit: %w", err)
 	}
@@ -238,12 +294,7 @@ func (m *GitOpenCodeWorktreeManager) CommitAndPush(ctx context.Context, checkout
 		return WorktreePushResult{}, fmt.Errorf("task worktree HEAD resolved to empty commit")
 	}
 
-	remoteURL := m.repositoryURL(checkout.Repository)
-	env, err := m.remoteEnvironment(remoteURL)
-	if err != nil {
-		return WorktreePushResult{}, err
-	}
-	if _, err := m.require(ctx, checkout.WorktreePath, env, "push", "--porcelain", "origin", "HEAD:"+expectedBranch); err != nil {
+	if _, err := m.require(ctx, checkout.WorktreePath, env, remoteArgs, "push", "--porcelain", "--no-verify", "--", remoteURL, "HEAD:"+expectedBranch); err != nil {
 		return WorktreePushResult{}, fmt.Errorf("push task branch %s: %w", expectedBranch, err)
 	}
 
@@ -264,35 +315,38 @@ func (m *GitOpenCodeWorktreeManager) Remove(ctx context.Context, repository, tas
 	}
 	repoSlug := safeRepoSlug(repository)
 	mirrorPath := filepath.Join(m.reposDir, repoSlug+".git")
-	worktreePath := filepath.Join(m.worktreesDir, taskID)
-	if !isContainedPath(m.reposDir, mirrorPath) || !isContainedPath(m.worktreesDir, worktreePath) {
+	repoWorktreesDir := filepath.Join(m.worktreesDir, repoSlug)
+	worktreePath := filepath.Join(repoWorktreesDir, taskID)
+	if !isContainedPath(m.reposDir, mirrorPath) ||
+		!isContainedPath(m.worktreesDir, repoWorktreesDir) ||
+		!isContainedPath(repoWorktreesDir, worktreePath) {
 		return fmt.Errorf("derived path escapes state directory")
 	}
 	mu := m.mirrorLock(repoSlug)
 	mu.Lock()
 	defer mu.Unlock()
 	if _, err := os.Stat(mirrorPath); err == nil {
-		_, _ = m.command(ctx, mirrorPath, nil, "worktree", "remove", "--force", worktreePath)
-		_, _ = m.command(ctx, mirrorPath, nil, "worktree", "prune")
+		_, _ = m.command(ctx, mirrorPath, nil, nil, "worktree", "remove", "--force", worktreePath)
+		_, _ = m.command(ctx, mirrorPath, nil, nil, "worktree", "prune")
 	}
 	return os.RemoveAll(worktreePath)
 }
 
-func (m *GitOpenCodeWorktreeManager) ensureMirror(ctx context.Context, mirrorPath, remoteURL string, env []string) error {
+func (m *GitOpenCodeWorktreeManager) ensureMirror(ctx context.Context, mirrorPath, remoteURL string, env, remoteArgs []string) error {
 	if _, err := os.Stat(filepath.Join(mirrorPath, "HEAD")); os.IsNotExist(err) {
 		if err := os.MkdirAll(mirrorPath, 0o700); err != nil {
 			return fmt.Errorf("create mirror directory: %w", err)
 		}
-		if _, err := m.require(ctx, mirrorPath, nil, "init", "--bare", "--quiet"); err != nil {
+		if _, err := m.require(ctx, mirrorPath, nil, nil, "init", "--bare", "--quiet"); err != nil {
 			return fmt.Errorf("init bare mirror: %w", err)
 		}
-		if _, err := m.require(ctx, mirrorPath, nil, "remote", "add", "origin", remoteURL); err != nil {
+		if _, err := m.require(ctx, mirrorPath, nil, nil, "remote", "add", "origin", remoteURL); err != nil {
 			return fmt.Errorf("add mirror origin remote: %w", err)
 		}
 	} else {
-		_, _ = m.require(ctx, mirrorPath, nil, "remote", "set-url", "origin", remoteURL)
+		_, _ = m.require(ctx, mirrorPath, nil, nil, "remote", "set-url", "origin", remoteURL)
 	}
-	if _, err := m.require(ctx, mirrorPath, env, "fetch", "--no-tags", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"); err != nil {
+	if _, err := m.require(ctx, mirrorPath, env, remoteArgs, "fetch", "--no-tags", "--prune", "--", remoteURL, "+refs/heads/*:refs/remotes/origin/*"); err != nil {
 		return fmt.Errorf("fetch mirror origin: %w", err)
 	}
 	return nil
@@ -307,7 +361,7 @@ func (m *GitOpenCodeWorktreeManager) resolveMirrorRef(ctx context.Context, mirro
 		candidates = append([]string{"refs/remotes/origin/" + ref}, candidates...)
 	}
 	for _, candidate := range candidates {
-		res, err := m.command(ctx, mirrorPath, nil, "rev-parse", "--verify", candidate+"^{commit}")
+		res, err := m.command(ctx, mirrorPath, nil, nil, "rev-parse", "--verify", candidate+"^{commit}")
 		if err == nil && res.ExitCode == 0 {
 			sha := strings.TrimSpace(string(res.Stdout))
 			if sha != "" {
@@ -318,12 +372,44 @@ func (m *GitOpenCodeWorktreeManager) resolveMirrorRef(ctx context.Context, mirro
 	return "", fmt.Errorf("could not resolve ref %q in mirror", ref)
 }
 
-func (m *GitOpenCodeWorktreeManager) worktreeHealthy(ctx context.Context, worktreePath string) bool {
+func (m *GitOpenCodeWorktreeManager) worktreeHealthy(ctx context.Context, worktreePath, mirrorPath, expectedBranch string) bool {
 	if _, err := os.Stat(filepath.Join(worktreePath, ".git")); err != nil {
 		return false
 	}
-	res, err := m.command(ctx, worktreePath, nil, "rev-parse", "--is-inside-work-tree")
-	return err == nil && res.ExitCode == 0 && strings.TrimSpace(string(res.Stdout)) == "true"
+	res, err := m.command(ctx, worktreePath, nil, nil, "rev-parse", "--is-inside-work-tree")
+	if err != nil || res.ExitCode != 0 || strings.TrimSpace(string(res.Stdout)) != "true" {
+		return false
+	}
+	commonRes, err := m.command(ctx, worktreePath, nil, nil, "rev-parse", "--git-common-dir")
+	if err != nil || commonRes.ExitCode != 0 {
+		return false
+	}
+	commonDir := strings.TrimSpace(string(commonRes.Stdout))
+	if commonDir == "" {
+		return false
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(worktreePath, commonDir)
+	}
+	if canonicalPath(commonDir) != canonicalPath(mirrorPath) {
+		return false
+	}
+	headRes, err := m.command(ctx, worktreePath, nil, nil, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil || headRes.ExitCode != 0 {
+		return false
+	}
+	return strings.TrimSpace(string(headRes.Stdout)) == expectedBranch
+}
+
+func canonicalPath(p string) string {
+	cleaned := filepath.Clean(p)
+	if abs, err := filepath.Abs(cleaned); err == nil {
+		cleaned = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return cleaned
 }
 
 func (m *GitOpenCodeWorktreeManager) mirrorLock(slug string) *sync.Mutex {
@@ -336,18 +422,20 @@ func (m *GitOpenCodeWorktreeManager) repositoryURL(repository string) string {
 }
 
 // remoteEnvironment injects HTTP(S) credentials and optional CA bundle purely
-// via GIT_CONFIG_* environment variables, never writing secrets to .git/config
-// or command arguments.
-func (m *GitOpenCodeWorktreeManager) remoteEnvironment(remoteURL string) ([]string, error) {
+// via GIT_CONFIG_* environment variables (never writing secrets to .git/config
+// or command arguments), and optionally returns origin-scoped credential helper
+// `-c` overrides when CredentialHelper is used without CredentialFile.
+func (m *GitOpenCodeWorktreeManager) remoteEnvironment(remoteURL string) ([]string, []string, error) {
 	parsed, err := url.Parse(remoteURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse opencode git remote URL: %w", err)
+		return nil, nil, fmt.Errorf("parse opencode git remote URL: %w", err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	type cfgPair struct{ k, v string }
 	var pairs []cfgPair
+	var extraArgs []string
 	if m.caFile != "" {
 		pairs = append(pairs, cfgPair{k: "http.sslCAInfo", v: m.caFile})
 	}
@@ -355,11 +443,11 @@ func (m *GitOpenCodeWorktreeManager) remoteEnvironment(remoteURL string) ([]stri
 	case m.credentialFile != "":
 		data, err := os.ReadFile(m.credentialFile)
 		if err != nil {
-			return nil, fmt.Errorf("read opencode git credential: %w", err)
+			return nil, nil, fmt.Errorf("read opencode git credential: %w", err)
 		}
 		tok := strings.TrimSpace(string(data))
 		if tok == "" {
-			return nil, fmt.Errorf("opencode git credential file is empty")
+			return nil, nil, fmt.Errorf("opencode git credential file is empty")
 		}
 		basic := base64.StdEncoding.EncodeToString([]byte("kodema:" + tok))
 		pairs = append(pairs, cfgPair{
@@ -367,12 +455,13 @@ func (m *GitOpenCodeWorktreeManager) remoteEnvironment(remoteURL string) ([]stri
 			v: "Authorization: Basic " + basic,
 		})
 	case m.credentialHelper != "":
-		pairs = append(pairs, cfgPair{
-			k: "credential.helper",
-			v: m.credentialHelper,
-		})
+		origin := parsed.Scheme + "://" + parsed.Host
+		extraArgs = append(extraArgs, "-c", "credential."+origin+".helper="+m.credentialHelper)
 	default:
-		return nil, fmt.Errorf("an HTTP(S) git remote requires a credential file or credential helper")
+		return nil, nil, fmt.Errorf("an HTTP(S) git remote requires a credential file or credential helper")
+	}
+	if len(pairs) == 0 {
+		return nil, extraArgs, nil
 	}
 	env := make([]string, 0, 1+2*len(pairs))
 	env = append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(pairs)))
@@ -382,25 +471,44 @@ func (m *GitOpenCodeWorktreeManager) remoteEnvironment(remoteURL string) ([]stri
 			fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, pair.v),
 		)
 	}
-	return env, nil
+	return env, extraArgs, nil
 }
 
-func (m *GitOpenCodeWorktreeManager) command(ctx context.Context, dir string, env []string, args ...string) (GitCommandResult, error) {
+// gitHardeningArgs returns explicit `-c` overrides prepended to EVERY native
+// git invocation so attacker-controlled repository configs, hooks, fsmonitors,
+// ssh commands, proxies, or credential helpers can never execute or exfiltrate
+// credentials.
+func gitHardeningArgs() []string {
+	return []string{
+		"-c", "core.hooksPath=" + os.DevNull,
+		"-c", "core.fsmonitor=false",
+		"-c", "core.sshCommand=/bin/false",
+		"-c", "http.proxy=",
+		"-c", "credential.helper=",
+	}
+}
+
+func (m *GitOpenCodeWorktreeManager) command(ctx context.Context, dir string, env []string, extraConfigArgs []string, args ...string) (GitCommandResult, error) {
 	if len(args) == 0 {
 		return GitCommandResult{}, fmt.Errorf("git command has no arguments")
 	}
 	if err := ctx.Err(); err != nil {
 		return GitCommandResult{}, err
 	}
-	res, err := m.executor.Run(ctx, GitCommand{Directory: dir, Args: args, Env: env})
+	hardening := gitHardeningArgs()
+	fullArgs := make([]string, 0, len(hardening)+len(extraConfigArgs)+len(args))
+	fullArgs = append(fullArgs, hardening...)
+	fullArgs = append(fullArgs, extraConfigArgs...)
+	fullArgs = append(fullArgs, args...)
+	res, err := m.executor.Run(ctx, GitCommand{Directory: dir, Args: fullArgs, Env: env})
 	if err != nil {
 		return res, fmt.Errorf("git %s: %w", args[0], err)
 	}
 	return res, nil
 }
 
-func (m *GitOpenCodeWorktreeManager) require(ctx context.Context, dir string, env []string, args ...string) (GitCommandResult, error) {
-	res, err := m.command(ctx, dir, env, args...)
+func (m *GitOpenCodeWorktreeManager) require(ctx context.Context, dir string, env []string, extraConfigArgs []string, args ...string) (GitCommandResult, error) {
+	res, err := m.command(ctx, dir, env, extraConfigArgs, args...)
 	if err != nil {
 		return res, err
 	}
@@ -410,8 +518,41 @@ func (m *GitOpenCodeWorktreeManager) require(ctx context.Context, dir string, en
 	return res, nil
 }
 
+func sanitizeCommitMessage(raw, fallback string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	lastSpace := true
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch < 0x20 || ch == 0x7f {
+			if !lastSpace {
+				b.WriteByte(' ')
+				lastSpace = true
+			}
+			continue
+		}
+		if ch == ' ' {
+			if !lastSpace {
+				b.WriteByte(' ')
+				lastSpace = true
+			}
+			continue
+		}
+		b.WriteByte(ch)
+		lastSpace = false
+	}
+	cleaned := strings.TrimSpace(b.String())
+	if cleaned == "" {
+		return fallback
+	}
+	return cleaned
+}
+
+// safeRepoSlug computes a collision-free filesystem-safe hash for repository
+// names so repositories such as "a/b" and "a__b" never collide.
 func safeRepoSlug(repository string) string {
-	return strings.ReplaceAll(repository, "/", "__")
+	sum := sha256.Sum256([]byte(repository))
+	return hex.EncodeToString(sum[:16])
 }
 
 func isContainedPath(baseDir, candidate string) bool {

@@ -59,7 +59,7 @@ func NewHTTPOpenCodeClient(config HTTPOpenCodeClientConfig) (*HTTPOpenCodeClient
 	}
 	rt := config.RoundTripper
 	if rt == nil {
-		rt = http.DefaultTransport
+		rt = defaultNoProxyTransport()
 	}
 	abortTimeout := config.AbortTimeout
 	if abortTimeout <= 0 {
@@ -210,7 +210,7 @@ func (c *HTTPOpenCodeClient) SendMessage(ctx context.Context, sessionID string, 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return OpenCodeMessageResponse{}, classifyOpenCodeHTTPError("send message", resp.StatusCode, body)
 	}
-	return decodeOpenCodeMessageResponse(body), nil
+	return decodeOpenCodeMessageResponse(body)
 }
 
 // AbortSession invokes POST /session/{id}/abort so OpenCode immediately halts
@@ -256,7 +256,7 @@ func (c *HTTPOpenCodeClient) endpoint(path, directory string) string {
 	return target.String()
 }
 
-func decodeOpenCodeMessageResponse(body []byte) OpenCodeMessageResponse {
+func decodeOpenCodeMessageResponse(body []byte) (OpenCodeMessageResponse, error) {
 	var parsed struct {
 		Text      string `json:"text"`
 		MessageID string `json:"message_id"`
@@ -265,6 +265,10 @@ func decodeOpenCodeMessageResponse(body []byte) OpenCodeMessageResponse {
 			Error *struct {
 				Name    string `json:"name"`
 				Message string `json:"message"`
+				Data    *struct {
+					Message    string `json:"message"`
+					StatusCode int    `json:"statusCode"`
+				} `json:"data"`
 			} `json:"error"`
 		} `json:"info"`
 		Parts []struct {
@@ -273,7 +277,36 @@ func decodeOpenCodeMessageResponse(body []byte) OpenCodeMessageResponse {
 		} `json:"parts"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return OpenCodeMessageResponse{Text: strings.TrimSpace(string(body))}
+		return OpenCodeMessageResponse{Text: strings.TrimSpace(string(body))}, nil
+	}
+	if parsed.Info != nil && parsed.Info.Error != nil {
+		errObj := parsed.Info.Error
+		name := strings.TrimSpace(errObj.Name)
+		msg := strings.TrimSpace(errObj.Message)
+		var statusCode int
+		if errObj.Data != nil {
+			if msg == "" {
+				msg = strings.TrimSpace(errObj.Data.Message)
+			}
+			statusCode = errObj.Data.StatusCode
+		}
+		if name != "" || msg != "" || statusCode >= 400 {
+			detail := msg
+			if name != "" && detail != "" {
+				detail = name + ": " + detail
+			} else if name != "" {
+				detail = name
+			} else if statusCode >= 400 {
+				detail = fmt.Sprintf("status %d", statusCode)
+			}
+			lower := strings.ToLower(detail)
+			if statusCode == http.StatusTooManyRequests ||
+				strings.Contains(lower, "budget_exceeded") ||
+				strings.Contains(lower, "429") {
+				return OpenCodeMessageResponse{}, fmt.Errorf("%w: opencode message error: %s", ErrOpenCodeBudgetExceeded, detail)
+			}
+			return OpenCodeMessageResponse{}, fmt.Errorf("opencode message error: %s", detail)
+		}
 	}
 	out := OpenCodeMessageResponse{
 		Text:      strings.TrimSpace(parsed.Text),
@@ -293,7 +326,7 @@ func decodeOpenCodeMessageResponse(body []byte) OpenCodeMessageResponse {
 			out.Text = strings.Join(parts, "\n\n")
 		}
 	}
-	return out
+	return out, nil
 }
 
 func classifyOpenCodeHTTPError(op string, status int, body []byte) error {

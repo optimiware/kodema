@@ -309,9 +309,7 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 		writeHTTPError(writer, err)
 		return
 	}
-	if strings.Contains(request.URL.RawQuery, credential) ||
-		strings.Contains(request.URL.RawQuery, token.ExecutionPrefix) ||
-		strings.Contains(request.URL.RawQuery, token.ServicePrefix) {
+	if queryContainsLLMCredential(request.URL.RawQuery, credential) {
 		writeHTTPError(writer, fault.New(fault.InvalidInput, "workload credentials must not be sent in query parameters"))
 		return
 	}
@@ -1148,6 +1146,36 @@ func (handler *llmProxyHandler) resolveProviderSecret(ctx context.Context, scope
 		return "", fault.Wrap(fault.DependencyUnavailable, "the configured model provider credential is unusable", err)
 	}
 	return resolved[0].Value, nil
+}
+
+func queryContainsLLMCredential(rawQuery, credential string) bool {
+	if rawQuery == "" {
+		return false
+	}
+	containsSecret := func(s string) bool {
+		if credential != "" && strings.Contains(s, credential) {
+			return true
+		}
+		return strings.Contains(s, token.ExecutionPrefix) || strings.Contains(s, token.ServicePrefix)
+	}
+	if containsSecret(rawQuery) {
+		return true
+	}
+	if unescaped, err := url.QueryUnescape(rawQuery); err == nil && containsSecret(unescaped) {
+		return true
+	}
+	values, _ := url.ParseQuery(rawQuery)
+	for key, vals := range values {
+		if containsSecret(key) {
+			return true
+		}
+		for _, v := range vals {
+			if containsSecret(v) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseLLMProxyPath(rawPath string) (string, string, error) {

@@ -531,6 +531,7 @@ actions:
 				proxyURL+"/llm/anthropic/v1/messages",
 				strings.NewReader(`{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"implement feature"}]}`))
 			llmReq.Header.Set("Content-Type", "application/json")
+			llmReq.Header.Set("Authorization", "Bearer "+llmProxy.LocalAPIKey())
 			llmResp, err := http.DefaultClient.Do(llmReq)
 			if err != nil {
 				http.Error(w, "llm proxy error: "+err.Error(), http.StatusBadGateway)
@@ -754,7 +755,8 @@ actions:
 	}
 
 	// Wait for Execution 1 to settle as succeeded (task stays open because completes_task: false).
-	for time.Now().Before(time.Now().Add(5 * time.Second)) {
+	wait1 := time.Now().Add(5 * time.Second)
+	for time.Now().Before(wait1) {
 		exec1 = mustInvokeOp[api.ExecutionInspectRequest, api.ExecutionInspectResult](
 			t, ctx, adminTr, "execution.inspect",
 			api.ExecutionInspectRequest{ExecutionID: exec1ID}, nil, "",

@@ -295,26 +295,36 @@ func (state OpenCodeTaskState) Validate() error {
 	return nil
 }
 
+// OpenCodeActionRecord checkpoint stages persisted atomically on disk so
+// restarts resume cleanly without double-pushing or re-running the LLM.
+const (
+	OpenCodeActionStagePushed       = "pushed"
+	OpenCodeActionStageOutputsReady = "outputs_ready"
+	OpenCodeActionStageResolved     = "resolved"
+)
+
 // OpenCodeActionRecord persists per-action completion and idempotency facts so
 // restarts never double-push or re-run already-settled requests.
 type OpenCodeActionRecord struct {
-	TenantID    id.TenantID       `json:"tenant_id"`
-	ProjectID   id.ProjectID      `json:"project_id"`
-	ExecutionID string            `json:"execution_id"`
-	ActionID    string            `json:"action_id"`
-	TaskID      string            `json:"task_id,omitempty"`
-	SessionID   string            `json:"session_id,omitempty"`
-	Branch      string            `json:"branch,omitempty"`
-	Candidate   string            `json:"candidate,omitempty"`
-	SummaryKey  string            `json:"summary_key,omitempty"`
-	PlanKey     string            `json:"plan_key,omitempty"`
-	Outputs     map[string]string `json:"outputs,omitempty"`
-	Pushed      bool              `json:"pushed,omitempty"`
-	Resolved    bool              `json:"resolved,omitempty"`
-	UpdatedAt   time.Time         `json:"updated_at"`
+	TenantID     id.TenantID       `json:"tenant_id"`
+	ProjectID    id.ProjectID      `json:"project_id"`
+	ExecutionID  string            `json:"execution_id"`
+	ActionID     string            `json:"action_id"`
+	TaskID       string            `json:"task_id,omitempty"`
+	SessionID    string            `json:"session_id,omitempty"`
+	Stage        string            `json:"stage,omitempty"`
+	ResponseText string            `json:"response_text,omitempty"`
+	Branch       string            `json:"branch,omitempty"`
+	Candidate    string            `json:"candidate,omitempty"`
+	SummaryKey   string            `json:"summary_key,omitempty"`
+	PlanKey      string            `json:"plan_key,omitempty"`
+	Outputs      map[string]string `json:"outputs,omitempty"`
+	Pushed       bool              `json:"pushed,omitempty"`
+	Resolved     bool              `json:"resolved,omitempty"`
+	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
-// Validate checks scope and execution/action identities.
+// Validate checks scope, execution/action identities, and checkpoint stage.
 func (record OpenCodeActionRecord) Validate() error {
 	if _, err := id.ParseTenantID(string(record.TenantID)); err != nil {
 		return fmt.Errorf("opencode action record tenant %q is invalid: %w", record.TenantID, err)
@@ -327,6 +337,11 @@ func (record OpenCodeActionRecord) Validate() error {
 	}
 	if _, err := id.ParseActionID(record.ActionID); err != nil {
 		return fmt.Errorf("opencode action record action %q is invalid: %w", record.ActionID, err)
+	}
+	switch record.Stage {
+	case "", OpenCodeActionStagePushed, OpenCodeActionStageOutputsReady, OpenCodeActionStageResolved:
+	default:
+		return fmt.Errorf("opencode action record stage %q is unknown", record.Stage)
 	}
 	if record.UpdatedAt.IsZero() {
 		return fmt.Errorf("opencode action record updated_at is zero")
@@ -370,19 +385,20 @@ type OpenCodeWorktreeManager interface {
 // OpenCodeAdapterConfig is the complete configuration for one project-scoped
 // OpenCode service adapter.
 type OpenCodeAdapterConfig struct {
-	ServiceID          id.PrincipalID
-	TenantID           id.TenantID
-	ProjectID          id.ProjectID
-	Handler            api.Handler
-	Stream             client.EventStreamer
-	Events             EventSource
-	OpenCode           OpenCodeClient
-	Store              OpenCodeStateStore
-	Worktrees          OpenCodeWorktreeManager
-	Proxy              *OpenCodeLLMProxy
-	Clock              Clock
-	RescanInterval     time.Duration
-	MaxConcurrentTurns int
-	Model              string
-	Agent              string
+	ServiceID           id.PrincipalID
+	TenantID            id.TenantID
+	ProjectID           id.ProjectID
+	Handler             api.Handler
+	Stream              client.EventStreamer
+	Events              EventSource
+	OpenCode            OpenCodeClient
+	Store               OpenCodeStateStore
+	Worktrees           OpenCodeWorktreeManager
+	Proxy               *OpenCodeLLMProxy
+	PerTurnProxyRouting bool
+	Clock               Clock
+	RescanInterval      time.Duration
+	MaxConcurrentTurns  int
+	Model               string
+	Agent               string
 }

@@ -14,8 +14,40 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 )
 
-// openCodeStoreLocks serializes writers per file path within one process.
-var openCodeStoreLocks sync.Map
+type openCodeStoreLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// openCodeStoreLocks serializes writers per file path within one process and
+// removes entries as soon as no goroutine references them so long-running
+// services do not leak memory across tasks or actions.
+var (
+	openCodeStoreLocksMu sync.Mutex
+	openCodeStoreLocks   = make(map[string]*openCodeStoreLockEntry)
+)
+
+func acquireOpenCodeStoreLock(path string) func() {
+	openCodeStoreLocksMu.Lock()
+	entry, ok := openCodeStoreLocks[path]
+	if !ok {
+		entry = &openCodeStoreLockEntry{}
+		openCodeStoreLocks[path] = entry
+	}
+	entry.refs++
+	openCodeStoreLocksMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		openCodeStoreLocksMu.Lock()
+		entry.refs--
+		if entry.refs == 0 && openCodeStoreLocks[path] == entry {
+			delete(openCodeStoreLocks, path)
+		}
+		openCodeStoreLocksMu.Unlock()
+	}
+}
 
 // FileOpenCodeStateStore persists task_id -> opencode_session_id mappings and
 // per-action completion records atomically on disk using temp+fsync+rename+
@@ -166,10 +198,8 @@ func (store *FileOpenCodeStateStore) actionPath(tenant id.TenantID, project id.P
 }
 
 func (store *FileOpenCodeStateStore) withLock(path string, fn func() error) error {
-	value, _ := openCodeStoreLocks.LoadOrStore(path, &sync.Mutex{})
-	mutex := value.(*sync.Mutex)
-	mutex.Lock()
-	defer mutex.Unlock()
+	unlock := acquireOpenCodeStoreLock(path)
+	defer unlock()
 	release, err := acquireFileLock(path+".lock", store.syncDir)
 	if err != nil {
 		return err
