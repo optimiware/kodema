@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.7.0
+
+Added:
+
+- **Agentic SDLC foundation** (64 registered operations across 13 families):
+  - **Rotation-safe loopback LLM proxy, named caches, and active LLM budgets.**
+    `kodema harness exec -- <cmd>` runs a loopback HTTP LLM proxy inside
+    container actions that survives live `KODEMA_TOKEN` rotation without
+    custom CA boilerplate. Pipelines can declare named non-authoritative
+    `caches: [...]` mounted at `/kodema/cache/<name>` and active per-action,
+    per-execution, and per-task LLM budgets (`budget.max_tokens` /
+    `budget.max_cost_usd`, migration `0007`).
+  - **Decoupled task completion, 3-way review decisions, and task hierarchy.**
+    Pipelines can set `completes_task: false` and finish tasks explicitly via
+    `task.complete` (`kodema task complete`), review requests support 3-way
+    `pass | revise | fail` decisions with conversation feedback and
+    `role/operator` inbox exclusion, and tasks support an optional `parent_id`
+    hierarchy (migration `0008`).
+  - **Immutable cross-execution approval Decision IDs and merge coordinator.**
+    Approved requests mint immutable `dec_...` Decision IDs verifiable across
+    executions via `POST /api/v1/verify` and `kodema git serve` push option
+    `-o kodema.decision_id=...`, paired with the built-in
+    `service/merge-coordinator` adapter
+    (`kodema services --kind merge_coordinator`, migration `0009`).
+  - **Project-scoped content-addressed immutable KV store.** Added `kv.put`
+    and `kv.get` across REST, MCP (`kv_put`/`kv_get`), and CLI
+    (`kodema kv put|get`) returning `kv:sha256:...` digests (migration `0010`).
+- **Per-project OpenCode service (worktree mode) and attributed service LLM proxy:**
+  - `kodsvc.` service LLM proxy attribution via `X-Kodema-Execution` and
+    `X-Kodema-Action` headers with active budget enforcement and live
+    cancellation cutoff.
+  - Per-project OpenCode service adapter
+    (`kodema services --kind opencode --mode worktree`) with durable
+    `task_id -> opencode_session_id` mapping, hardened per-task Git worktrees,
+    content-addressed KV outputs, and SSE `AbortSession` cancellation.
+- **OpenCode Brain + ephemeral MCP tool sandboxes (`--mode brain`):**
+  - `kodema sandbox serve` (`os.Root`-jailed authenticated HTTP MCP server
+    compiled into `/kodema/bin/kodema`) providing `read_file`, `write_file`,
+    `edit_file`, `glob`, `grep`, and `bash` with constant-time Bearer auth,
+    process-group timeout teardown, and token environment stripping.
+  - OpenCode Brain mode (`kodema services --kind opencode --mode brain`) with
+    local shell/filesystem tools disabled, ephemeral per-task toolchain
+    sandboxes managed by `KodemaExecutionSandboxManager` with ephemeral Kodema
+    secret token delivery, concurrent polyglot and OOM/cancel fault
+    containment, and sandbox-free non-coding stages.
+  - Kubernetes workload pod labels (`kodema.dev/project` and
+    `kodema.dev/role: sandbox`) and opt-in Helm `opencodeBrain`
+    NetworkPolicies (`deploy/charts/kodema/templates/workloads-opencode-brain.yaml`).
+- **PM & Orchestrator onboarding, embedded service docs, and tested SDLC examples:**
+  - Updated `README.md`, `docs/runbooks/quickstart.md`,
+    `docs/runbooks/podman-quickstart.md`, `docs/runbooks/llm-proxy-harnesses.md`,
+    `KODEMA.md`, and embedded `kodema://docs/*` resources (including the new
+    `kodema://docs/agentic-services` topic).
+  - Added a tested end-to-end Agentic SDLC example suite under
+    `examples/agentic-sdlc/`.
+
+Fixed:
+
+- Stabilize `task.restart` reconcile test execution version synchronization.
+- Align PostgreSQL component golden rows, factory `AllowStale` fixtures, MCP
+  `initialize` credential-prefix scan, and Podman harness ephemeral port-bind
+  retries with v0.7.0.
+
 ## 0.6.0
 
 Added:
