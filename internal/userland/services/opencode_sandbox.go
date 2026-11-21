@@ -505,19 +505,21 @@ func (m *KodemaExecutionSandboxManager) resolveEndpoint(
 		if !ok {
 			return "", fmt.Errorf("execution.logs.read returned unexpected %T", decoded)
 		}
+		carry := ""
+		if lineCarry != nil {
+			carry = *lineCarry
+		}
 		for _, chunk := range logs.Chunks {
 			data := string(chunk.Data)
-			if lineCarry != nil && *lineCarry != "" {
-				data = *lineCarry + data
-				*lineCarry = ""
+			if carry != "" {
+				data = carry + data
+				carry = ""
 			}
 			lines := strings.Split(data, "\n")
 			completeCount := len(lines)
 			if !strings.HasSuffix(data, "\n") {
 				completeCount = len(lines) - 1
-				if lineCarry != nil {
-					*lineCarry = lines[len(lines)-1]
-				}
+				carry = lines[len(lines)-1]
 			}
 			for i := 0; i < completeCount; i++ {
 				line := strings.TrimSpace(strings.TrimSuffix(lines[i], "\r"))
@@ -535,6 +537,9 @@ func (m *KodemaExecutionSandboxManager) resolveEndpoint(
 		}
 		if cursor != nil {
 			*cursor = logs.NextCursor
+		}
+		if lineCarry != nil {
+			*lineCarry = carry
 		}
 	}
 	return "", errors.New("sandbox endpoint not announced yet")

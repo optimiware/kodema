@@ -100,17 +100,39 @@ func validKubeLabelValue(value string) bool {
 	return true
 }
 
+const sandboxTokenSecretPrefix = "KODEMA_SBOX_TOK_"
+
 // workloadRole returns the optional kodema.dev/role label value for a prepared
-// workload. Ephemeral OpenCode sandbox actions (`name: sandbox` invoking
-// `kodema sandbox serve`) carry RoleSandbox so tenant NetworkPolicies can select
-// sandbox pods strictly by tenant, project, and role.
+// workload. Ephemeral OpenCode sandbox actions (`name: sandbox` explicitly
+// invoking `/kodema/bin/kodema sandbox serve` and declaring no non-sandbox
+// secrets) carry RoleSandbox so tenant NetworkPolicies can select sandbox pods
+// strictly by tenant, project, and role without exposing privileged workloads.
 func workloadRole(request engine.PrepareRequest) string {
 	if request.ActionName != RoleSandbox {
 		return ""
 	}
+	for _, secretName := range request.Container.Secrets {
+		if !strings.HasPrefix(string(secretName), sandboxTokenSecretPrefix) {
+			return ""
+		}
+	}
+	for _, secret := range request.Secrets {
+		if !strings.HasPrefix(string(secret.Name), sandboxTokenSecretPrefix) {
+			return ""
+		}
+	}
 	for _, cmd := range request.Container.Commands {
-		if strings.Contains(cmd, "kodema sandbox serve") {
-			return RoleSandbox
+		for _, rawLine := range strings.Split(cmd, "\n") {
+			line := strings.TrimSpace(rawLine)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if line == "/kodema/bin/kodema sandbox serve" ||
+				strings.HasPrefix(line, "/kodema/bin/kodema sandbox serve ") ||
+				line == "exec /kodema/bin/kodema sandbox serve" ||
+				strings.HasPrefix(line, "exec /kodema/bin/kodema sandbox serve ") {
+				return RoleSandbox
+			}
 		}
 	}
 	return ""

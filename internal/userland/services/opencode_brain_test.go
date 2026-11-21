@@ -985,6 +985,95 @@ func (f *fakeBrainOpenCodeClient) SendMessage(ctx context.Context, sessionID str
 	return OpenCodeMessageResponse{Text: "ok", MessageID: "m-1"}, nil
 }
 
+func TestResolveEndpointSplitLineAcrossPollsWithoutCursorAdvance(t *testing.T) {
+	// Regression test: when Poll 1 reaches the end of live logs mid-line with
+	// NextCursor == "", resolveEndpoint must NOT commit lineCarry so that Poll 2
+	// re-reading Page 1 does not duplicate the prefix and corrupt or skip the
+	// KODEMA_SANDBOX_ENDPOINT= line when Page 1 later gets a NextCursor.
+	var mu sync.Mutex
+	poll := 0
+	const wantEndpoint = "http://10.42.0.15:8090"
+
+	handler := testAPIHandlerFunc(func(_ context.Context, inv api.Invocation) (api.Result, error) {
+		if inv.Operation != OperationExecutionLogsRead {
+			return api.Result{}, fmt.Errorf("unexpected op %s", inv.Operation)
+		}
+		var req api.ExecutionLogsReadRequest
+		if err := json.Unmarshal(inv.Request.Input, &req); err != nil {
+			return api.Result{}, err
+		}
+		codec := publicCodecs[inv.Operation]
+		mu.Lock()
+		poll++
+		curPoll := poll
+		mu.Unlock()
+
+		switch {
+		case curPoll == 1 && (req.Page == nil || req.Page.Cursor == ""):
+			// Poll 1: page 1 ends mid-line without newline and NextCursor == "".
+			body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
+				Chunks: []api.LogChunk{{
+					ActionID: "act-sbox-1",
+					Stream:   "stdout",
+					Data:     []byte("booting...\nKODEMA_SANDBOX_END"),
+				}},
+				NextCursor: "",
+			})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case req.Page == nil || req.Page.Cursor == "":
+			// Poll 2: page 1 now has full chunk plus NextCursor pointing to page 2
+			// where the rest of the split line resides.
+			body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
+				Chunks: []api.LogChunk{{
+					ActionID: "act-sbox-1",
+					Stream:   "stdout",
+					Data:     []byte("booting...\nKODEMA_SANDBOX_END"),
+				}},
+				NextCursor: "cursor-page-2",
+			})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case req.Page.Cursor == "cursor-page-2":
+			body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
+				Chunks: []api.LogChunk{{
+					ActionID: "act-sbox-1",
+					Stream:   "stdout",
+					Data:     []byte("POINT=" + wantEndpoint + "\n"),
+				}},
+				NextCursor: "",
+			})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		default:
+			body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		}
+	})
+
+	mgr, err := NewKodemaExecutionSandboxManager(KodemaExecutionSandboxConfig{
+		TenantID:  id.TenantID("tenant-1"),
+		ProjectID: id.ProjectID("project-1"),
+		Handler:   handler,
+	})
+	if err != nil {
+		t.Fatalf("NewKodemaExecutionSandboxManager: %v", err)
+	}
+
+	var cursor, lineCarry string
+	if _, err := mgr.resolveEndpoint(context.Background(), "exec-sbox-1", "act-sbox-1", 8090, &cursor, &lineCarry); err == nil {
+		t.Fatal("expected Poll 1 to report endpoint not announced yet")
+	}
+	if cursor != "" || lineCarry != "" {
+		t.Fatalf("after Poll 1 with empty NextCursor: cursor=%q lineCarry=%q; want both empty", cursor, lineCarry)
+	}
+
+	got, err := mgr.resolveEndpoint(context.Background(), "exec-sbox-1", "act-sbox-1", 8090, &cursor, &lineCarry)
+	if err != nil {
+		t.Fatalf("Poll 2 resolveEndpoint: %v", err)
+	}
+	if got != wantEndpoint {
+		t.Fatalf("resolved endpoint = %q; want %q", got, wantEndpoint)
+	}
+}
+
 func (f *fakeBrainOpenCodeClient) AbortSession(_ context.Context, sessionID string) error {
 	f.mu.Lock()
 	f.abortCalls = append(f.abortCalls, sessionID)

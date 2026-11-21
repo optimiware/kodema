@@ -822,6 +822,8 @@ func TestJobPodLabelsEmitProjectAndSandboxRole(t *testing.T) {
 		req := testPrepareRequest()
 		req.ActionName = "sandbox"
 		req.Container.Commands = []string{"exec /kodema/bin/kodema sandbox serve --listen 0.0.0.0:8090 --workspace /workspace --token-file /kodema/secrets/KODEMA_SBOX_TOK_1"}
+		req.Container.Secrets = []id.SecretName{"KODEMA_SBOX_TOK_1"}
+		req.Secrets = []engine.SecretValue{{Name: "KODEMA_SBOX_TOK_1", Value: "kodsbox.test"}}
 		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
 		if _, err := adapter.Prepare(ctx, req); err != nil {
 			t.Fatalf("Prepare: %v", err)
@@ -847,6 +849,57 @@ func TestJobPodLabelsEmitProjectAndSandboxRole(t *testing.T) {
 			if got := job.Spec.PodLabels[key]; got != want {
 				t.Errorf("Job.Spec.PodLabels[%s] = %q; want %q", key, got, want)
 			}
+		}
+	})
+
+	t.Run("sandbox action with non-sandbox privileged secret does not get role=sandbox", func(t *testing.T) {
+		fake, _, adapter := testSetup(t)
+		req := testPrepareRequest()
+		req.ActionName = "sandbox"
+		req.Container.Commands = []string{"exec /kodema/bin/kodema sandbox serve --listen 0.0.0.0:8090"}
+		// testPrepareRequest carries privileged secret API_KEY.
+		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
+		if _, err := adapter.Prepare(ctx, req); err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if _, err := adapter.Start(ctx, engine.StartRequest{
+			Identity:    req.Identity,
+			WorkspaceID: req.WorkspaceID,
+		}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		if got, ok := job.Spec.PodLabels[LabelRole]; ok {
+			t.Fatalf("privileged sandbox-named workload unexpectedly carried %s=%q", LabelRole, got)
+		}
+	})
+
+	t.Run("sandbox action only mentioning kodema sandbox serve in comment or echo does not get role=sandbox", func(t *testing.T) {
+		fake, _, adapter := testSetup(t)
+		req := testPrepareRequest()
+		req.ActionName = "sandbox"
+		req.Container.Commands = []string{"# /kodema/bin/kodema sandbox serve\necho 'kodema sandbox serve'"}
+		req.Container.Secrets = nil
+		req.Secrets = nil
+		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
+		if _, err := adapter.Prepare(ctx, req); err != nil {
+			t.Fatalf("Prepare: %v", err)
+		}
+		if _, err := adapter.Start(ctx, engine.StartRequest{
+			Identity:    req.Identity,
+			WorkspaceID: req.WorkspaceID,
+		}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		if got, ok := job.Spec.PodLabels[LabelRole]; ok {
+			t.Fatalf("comment/echo sandbox workload unexpectedly carried %s=%q", LabelRole, got)
 		}
 	})
 }
