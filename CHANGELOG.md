@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.8.0
+
+Changed:
+
+- **OpenCode v2 service compatibility (#86):** Migrated `HTTPOpenCodeClient`
+  and `kodema services --kind opencode` to the OpenCode v2 (`v2.3.2`)
+  authenticated HTTP API (`/api/info`, `/api/session` with `location.directory`
+  and `{"data": ...}` envelopes, `/move`, `/agent`, `/model`, `PATCH`
+  permissions, `/prompt`, `/experimental/session/{id}/wait`, paginated
+  `/message`, `/interrupt`, and `/api/experimental/mcp/{server}`), added
+  `--opencode-password-file` / `--opencode-password` HTTP Basic Auth, and
+  failed closed on concurrent Brain-mode turns sharing a location-scoped MCP
+  server.
+- **OpenCode Zen LLM proxy & `kodema harness exec` (#87):** Updated
+  `DefaultOpenCodeBaseURL` to `https://opencode.ai/zen/v1`, sent both
+  `Authorization: Bearer` and `x-api-key` (with default
+  `anthropic-version: 2023-06-01`) for canonical Anthropic Messages paths on
+  default Bearer providers in the LLM proxy, and auto-populated OpenCode v2
+  `OPENCODE_CONFIG_CONTENT` in `kodema harness exec` when unset or empty.
+
+Fixed:
+
+- **Multi-project OIDC access (#80):** Minted tenant-scoped human OIDC access
+  tokens in `kodema up` (`org_id` without a pinned `project_id`), resolved
+  effective target-project memberships across REST, MCP, SSE event streams,
+  `actor.verify`, and NATS subscriptions without widening project-scoped,
+  service, or execution credentials, allowed project-only members to list their
+  projects via `project.list`, and aligned scope containment across project
+  operations.
+- **Registry admission diagnostics (#81):** Distinguished HTTP `404`
+  (`not_found` naming image and registry host), `429` (`dependency_unavailable`
+  with sanitized `Retry-After` and credentials/mirror hint), `401`/`403`, `5xx`,
+  and DNS/TLS/connection transport failures in `registry.Resolver` with
+  structured server warning logs and preserved admission fault codes.
+- **Project conflict error messages (#82):** Separated SQLSTATE `23505` unique
+  violations from serialization conflicts in the PostgreSQL driver and surfaced
+  clear messages naming duplicate project display names or IDs in
+  `project.create` and `project.update` (retaining `version_conflict` / HTTP
+  `409`), documenting tenant-wide project display name uniqueness.
+- **Lowercase POSIX environment variable names (#83):** Accepted valid POSIX
+  lowercase and mixed-case environment variable names
+  (`^[A-Za-z][A-Za-z0-9_]{0,63}$`, such as `npm_config_cache` and `http_proxy`)
+  in `id.ParseEnvName` while keeping secret names strictly uppercase.
+- **Private CA plumbing for `merge_coordinator` (#84):** Plumbed `--ca-file` /
+  `KODEMA_CA_FILE` through `MergeConfig` into `GitMergeEffects`, normalizing
+  relative paths and emitting origin-scoped `http.<origin>.sslCAInfo` via
+  `GIT_CONFIG_*` for HTTPS remotes.
+- **Zero-role service account verification (#85):** Allowed enabled
+  project/tenant service accounts with `roles: []` to pass `/api/v1/verify` for
+  `git.read` (`R = @all`) and `git.ref.update` (including `decision_id`), while
+  preserving calling-service role requirements and disabled/cross-scope denials.
+
 ## 0.7.0
 
 Added:
