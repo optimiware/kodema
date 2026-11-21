@@ -489,8 +489,8 @@ func TestMigrationsDefaultEventPublishSequence(t *testing.T) {
 
 func TestMigration0008PreservesBaselineAndAppliesAdditiveChanges(t *testing.T) {
 	migrations := Migrations()
-	if len(migrations) != 9 {
-		t.Fatalf("Migrations() count = %d; want 9", len(migrations))
+	if len(migrations) < 8 {
+		t.Fatalf("Migrations() count = %d; want at least 8", len(migrations))
 	}
 	if migrations[7].Name != "0008_task_review_lifecycle.sql" {
 		t.Fatalf("migration 8 name = %q; want 0008_task_review_lifecycle.sql", migrations[7].Name)
@@ -520,20 +520,60 @@ func TestMigration0008PreservesBaselineAndAppliesAdditiveChanges(t *testing.T) {
 	}
 }
 
-func TestMigration0009PreservesBaselineAndCreatesKVStore(t *testing.T) {
+func TestMigration0009PreservesBaselineAndAddsApprovalDecisions(t *testing.T) {
 	migrations := Migrations()
-	if len(migrations) != 9 {
-		t.Fatalf("Migrations() count = %d; want 9", len(migrations))
+	if len(migrations) < 9 {
+		t.Fatalf("Migrations() count = %d; want at least 9", len(migrations))
 	}
-	if migrations[8].Name != "0009_kv_store.sql" {
-		t.Fatalf("migration 9 name = %q; want 0009_kv_store.sql", migrations[8].Name)
+	if migrations[8].Name != "0009_approval_decisions.sql" {
+		t.Fatalf("migration 9 name = %q; want 0009_approval_decisions.sql", migrations[8].Name)
 	}
-	for index := 0; index < 8; index++ {
-		if strings.Contains(normalizeSQL(migrations[index].SQL), "kv_objects") {
-			t.Errorf("%s must not reference kv_objects (belongs in 0009)", migrations[index].Name)
-		}
+	baselineTables := normalizeSQL(migrations[1].SQL)
+	if strings.Contains(baselineTables, "approval_decisions") || strings.Contains(baselineTables, "decision_id") {
+		t.Error("0002_tables.sql must stay frozen without approval_decisions or verifications.decision_id")
 	}
 	mig9 := normalizeSQL(migrations[8].SQL)
+	for _, want := range []string{
+		"create table approval_decisions",
+		"constraint approval_decisions_scope_id unique (tenant_id, project_id, id)",
+		"constraint approval_decisions_scope_action unique (tenant_id, project_id, execution_id, action_id)",
+		"constraint approval_decisions_tenant foreign key (tenant_id) references tenants (id)",
+		"constraint approval_decisions_project foreign key (tenant_id, project_id) references projects (tenant_id, id)",
+		"constraint approval_decisions_task foreign key (tenant_id, project_id, task_id) references tasks (tenant_id, project_id, id)",
+		"constraint approval_decisions_execution foreign key (tenant_id, project_id, execution_id) references executions (tenant_id, project_id, id)",
+		"constraint approval_decisions_action foreign key (tenant_id, project_id, action_id) references actions (tenant_id, project_id, id)",
+		"constraint approval_decisions_assignment_role check (assignment like 'role/%')",
+		"constraint approval_decisions_expiry check (expires_at > resolved_at)",
+		"constraint approval_decisions_revocation_pair check ((revoked_at is null) = (revoked_reason is null))",
+		"create index approval_decisions_scope_task on approval_decisions (tenant_id, project_id, task_id)",
+		"create index approval_decisions_scope_execution on approval_decisions (tenant_id, project_id, execution_id)",
+		"alter table approval_decisions enable row level security",
+		"alter table approval_decisions force row level security",
+		"create policy approval_decisions_scope on approval_decisions",
+		"alter table approval_decisions owner to kodema_owner",
+		"grant select, insert, update, delete on approval_decisions to kodema_runtime",
+		"alter table verifications add column decision_id text",
+	} {
+		if !strings.Contains(mig9, want) {
+			t.Errorf("0009_approval_decisions.sql missing %q:\n%s", want, migrations[8].SQL)
+		}
+	}
+}
+
+func TestMigration0010PreservesBaselineAndCreatesKVStore(t *testing.T) {
+	migrations := Migrations()
+	if len(migrations) != 10 {
+		t.Fatalf("Migrations() count = %d; want 10", len(migrations))
+	}
+	if migrations[9].Name != "0010_kv_store.sql" {
+		t.Fatalf("migration 10 name = %q; want 0010_kv_store.sql", migrations[9].Name)
+	}
+	for index := 0; index < 9; index++ {
+		if strings.Contains(normalizeSQL(migrations[index].SQL), "kv_objects") {
+			t.Errorf("%s must not reference kv_objects (belongs in 0010)", migrations[index].Name)
+		}
+	}
+	mig10 := normalizeSQL(migrations[9].SQL)
 	for _, want := range []string{
 		"create table kv_objects",
 		"constraint kv_objects_scope_key unique (tenant_id, project_id, key)",
@@ -549,12 +589,12 @@ func TestMigration0009PreservesBaselineAndCreatesKVStore(t *testing.T) {
 		"alter table kv_objects owner to kodema_owner",
 		"grant select, insert on kv_objects to kodema_runtime",
 	} {
-		if !strings.Contains(mig9, want) {
-			t.Errorf("0009_kv_store.sql missing %q:\n%s", want, migrations[8].SQL)
+		if !strings.Contains(mig10, want) {
+			t.Errorf("0010_kv_store.sql missing %q:\n%s", want, migrations[9].SQL)
 		}
 	}
-	if strings.Contains(mig9, "grant select, insert, update") || strings.Contains(mig9, "delete on kv_objects") {
-		t.Errorf("0009_kv_store.sql must grant only write-once SELECT, INSERT to kodema_runtime:\n%s", migrations[8].SQL)
+	if strings.Contains(mig10, "grant select, insert, update") || strings.Contains(mig10, "delete on kv_objects") {
+		t.Errorf("0010_kv_store.sql must grant only write-once SELECT, INSERT to kodema_runtime:\n%s", migrations[9].SQL)
 	}
 }
 

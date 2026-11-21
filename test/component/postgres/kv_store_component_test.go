@@ -35,29 +35,29 @@ import (
 //  6. Concurrent identical kv.put calls converge cleanly on PostgreSQL:
 //     0 errors, exactly 1 Existed=false, and N-1 Existed=true preserving the
 //     winner's metadata.
-func TestMigration0009KVStoreUpgradeRLSAndRoundTripOnPostgreSQL(t *testing.T) {
+func TestMigration0010KVStoreUpgradeRLSAndRoundTripOnPostgreSQL(t *testing.T) {
 	ctx := context.Background()
 	shard := pgtest.Start(t)
 	runner := pgtest.NewMigrationRunner(shard)
 
-	// 1. Apply 0001..0008 first, then upgrade incrementally to 0009_kv_store.sql.
-	pre, err := runner.Apply(ctx, 8)
+	// 1. Apply 0001..0009 first, then upgrade incrementally to 0010_kv_store.sql.
+	pre, err := runner.Apply(ctx, 9)
 	if err != nil {
-		t.Fatalf("apply 0001..0008: %v", err)
+		t.Fatalf("apply 0001..0009: %v", err)
 	}
-	if len(pre) != 8 || pre[7].Name != "0008_task_review_lifecycle.sql" {
-		t.Fatalf("pre migrations = %d ending at %q; want 8 ending at 0008_task_review_lifecycle.sql", len(pre), pre[len(pre)-1].Name)
+	if len(pre) != 9 || pre[8].Name != "0009_approval_decisions.sql" {
+		t.Fatalf("pre migrations = %d ending at %q; want 9 ending at 0009_approval_decisions.sql", len(pre), pre[len(pre)-1].Name)
 	}
 	upgraded, err := runner.Apply(ctx, 0)
 	if err != nil {
-		t.Fatalf("apply incremental 0009_kv_store.sql: %v", err)
+		t.Fatalf("apply incremental 0010_kv_store.sql: %v", err)
 	}
-	if len(upgraded) != 1 || upgraded[0].Name != "0009_kv_store.sql" {
-		t.Fatalf("upgraded = %+v; want [0009_kv_store.sql]", upgraded)
+	if len(upgraded) != 1 || upgraded[0].Name != "0010_kv_store.sql" {
+		t.Fatalf("upgraded = %+v; want [0010_kv_store.sql]", upgraded)
 	}
 	again, err := runner.Apply(ctx, 0)
 	if err != nil || len(again) != 0 {
-		t.Fatalf("re-run after 0009 = %d (err=%v); want 0", len(again), err)
+		t.Fatalf("re-run after 0010 = %d (err=%v); want 0", len(again), err)
 	}
 
 	// 2. Seed two tenants and two projects under tenant-1.

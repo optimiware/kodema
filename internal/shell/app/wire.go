@@ -117,6 +117,10 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 	if err != nil {
 		return nil, err
 	}
+	decisionReader, err := platform.NewDecisionReader(notifyingStore, environment.scanner)
+	if err != nil {
+		return nil, err
+	}
 	secretLookup, err := platform.NewSecretLookup(environment.scanner)
 	if err != nil {
 		return nil, err
@@ -479,6 +483,7 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 		Principals: principals,
 		Bindings:   bindingReader,
 		Evidence:   evidenceReader,
+		Decisions:  decisionReader,
 		Membership: identityAdapter,
 		Records:    recordAdapter,
 		Clock:      clock,
