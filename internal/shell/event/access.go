@@ -57,8 +57,12 @@ func authorizeGrant(ctx context.Context, authorizer authorize.Authorizer, actor 
 // confirmCurrentPrincipal re-reads the actor's current principal so a stale
 // snapshot can never substitute for current enablement, scope and membership.
 func confirmCurrentPrincipal(ctx context.Context, principals identity.PrincipalReader, actor identity.Principal, operation authorize.Operation, scope tenancy.Scope) (identity.Principal, error) {
+	readScope := actor.Scope
+	if !actor.Scope.ProjectScoped() && scope.ProjectScoped() && actor.Scope.TenantID == scope.TenantID {
+		readScope = scope
+	}
 	principal, err := principals.ReadPrincipal(ctx, identity.PrincipalRequest{
-		Scope:       actor.Scope,
+		Scope:       readScope,
 		PrincipalID: actor.ID,
 	})
 	if err != nil {
@@ -67,7 +71,7 @@ func confirmCurrentPrincipal(ctx context.Context, principals identity.PrincipalR
 	if principal.ID != actor.ID {
 		return identity.Principal{}, fault.New(fault.InternalFailure, "principal reader returned another principal")
 	}
-	if principal.Scope != actor.Scope {
+	if principal.Scope != readScope && principal.Scope != actor.Scope {
 		return identity.Principal{}, fault.New(fault.Forbidden, "principal is not present in the actor scope")
 	}
 	if principal.Kind != actor.Kind {

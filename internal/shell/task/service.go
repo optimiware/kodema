@@ -102,7 +102,7 @@ func (service *Service) Create(ctx context.Context, command CreateCommand) (Crea
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return CreateResult{}, err
 	}
-	if _, err := service.confirmActor(ctx, command.Actor, operation); err != nil {
+	if _, err := service.confirmActor(ctx, command.Actor, operation, command.Scope); err != nil {
 		return CreateResult{}, err
 	}
 	if command.ParentID != "" {
@@ -264,7 +264,7 @@ func (service *Service) Edit(ctx context.Context, command EditCommand) (EditResu
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return EditResult{}, err
 	}
-	actor, err := service.confirmActor(ctx, command.Actor, operation)
+	actor, err := service.confirmActor(ctx, command.Actor, operation, command.Scope)
 	if err != nil {
 		return EditResult{}, err
 	}
@@ -359,7 +359,7 @@ func (service *Service) Start(ctx context.Context, command StartCommand) (StartR
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return StartResult{}, err
 	}
-	actor, err := service.confirmActor(ctx, command.Actor, operation)
+	actor, err := service.confirmActor(ctx, command.Actor, operation, command.Scope)
 	if err != nil {
 		return StartResult{}, err
 	}
@@ -377,7 +377,7 @@ func (service *Service) Start(ctx context.Context, command StartCommand) (StartR
 		if err := service.authorize(ctx, command.Actor, selectOperation, command.Scope); err != nil {
 			return StartResult{}, err
 		}
-		if _, err := service.confirmActor(ctx, command.Actor, selectOperation); err != nil {
+		if _, err := service.confirmActor(ctx, command.Actor, selectOperation, command.Scope); err != nil {
 			return StartResult{}, err
 		}
 	}
@@ -548,13 +548,13 @@ func (service *Service) Restart(ctx context.Context, command RestartCommand) (Re
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return RestartResult{}, err
 	}
-	if _, err := service.confirmActor(ctx, command.Actor, operation); err != nil {
+	if _, err := service.confirmActor(ctx, command.Actor, operation, command.Scope); err != nil {
 		return RestartResult{}, err
 	}
 	if err := service.authorize(ctx, command.Actor, startOperation, command.Scope); err != nil {
 		return RestartResult{}, err
 	}
-	if _, err := service.confirmActor(ctx, command.Actor, startOperation); err != nil {
+	if _, err := service.confirmActor(ctx, command.Actor, startOperation, command.Scope); err != nil {
 		return RestartResult{}, err
 	}
 	current, err := service.reader.Get(ctx, command.Scope, command.TaskID)
@@ -574,7 +574,7 @@ func (service *Service) Restart(ctx context.Context, command RestartCommand) (Re
 		if err := service.authorize(ctx, command.Actor, selectOperation, command.Scope); err != nil {
 			return RestartResult{}, err
 		}
-		if _, err := service.confirmActor(ctx, command.Actor, selectOperation); err != nil {
+		if _, err := service.confirmActor(ctx, command.Actor, selectOperation, command.Scope); err != nil {
 			return RestartResult{}, err
 		}
 	}
@@ -618,7 +618,7 @@ func (service *Service) Restart(ctx context.Context, command RestartCommand) (Re
 			if err := service.authorize(ctx, command.Actor, cancelOperation, command.Scope); err != nil {
 				return RestartResult{}, err
 			}
-			if _, err := service.confirmActor(ctx, command.Actor, cancelOperation); err != nil {
+			if _, err := service.confirmActor(ctx, command.Actor, cancelOperation, command.Scope); err != nil {
 				return RestartResult{}, err
 			}
 		}
@@ -758,7 +758,7 @@ func (service *Service) Ask(ctx context.Context, command AskCommand) (AskResult,
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return AskResult{}, err
 	}
-	actor, err := service.confirmActor(ctx, command.Actor, operation)
+	actor, err := service.confirmActor(ctx, command.Actor, operation, command.Scope)
 	if err != nil {
 		return AskResult{}, err
 	}
@@ -863,7 +863,7 @@ func (service *Service) Reply(ctx context.Context, command ReplyCommand) (ReplyR
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return ReplyResult{}, err
 	}
-	actor, err := service.confirmActor(ctx, command.Actor, operation)
+	actor, err := service.confirmActor(ctx, command.Actor, operation, command.Scope)
 	if err != nil {
 		return ReplyResult{}, err
 	}
@@ -1025,7 +1025,7 @@ func (service *Service) Cancel(ctx context.Context, command CancelCommand) (Canc
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return CancelResult{}, err
 	}
-	if _, err := service.confirmActor(ctx, command.Actor, operation); err != nil {
+	if _, err := service.confirmActor(ctx, command.Actor, operation, command.Scope); err != nil {
 		return CancelResult{}, err
 	}
 	current, err := service.reader.Get(ctx, command.Scope, command.TaskID)
@@ -1113,7 +1113,7 @@ func (service *Service) Complete(ctx context.Context, command CompleteCommand) (
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return CompleteResult{}, err
 	}
-	if _, err := service.confirmActor(ctx, command.Actor, operation); err != nil {
+	if _, err := service.confirmActor(ctx, command.Actor, operation, command.Scope); err != nil {
 		return CompleteResult{}, err
 	}
 	current, err := service.reader.Get(ctx, command.Scope, command.TaskID)
@@ -1237,7 +1237,7 @@ func (service *Service) History(ctx context.Context, command HistoryCommand) (Hi
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return HistoryPage{}, err
 	}
-	actor, err := service.confirmActor(ctx, command.Actor, operation)
+	actor, err := service.confirmActor(ctx, command.Actor, operation, command.Scope)
 	if err != nil {
 		return HistoryPage{}, err
 	}
@@ -1290,7 +1290,7 @@ func (service *Service) Read(ctx context.Context, command ReadCommand) (Task, er
 	if err := service.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return Task{}, err
 	}
-	actor, err := service.confirmActor(ctx, command.Actor, operation)
+	actor, err := service.confirmActor(ctx, command.Actor, operation, command.Scope)
 	if err != nil {
 		return Task{}, err
 	}
@@ -1347,7 +1347,7 @@ func (service *Service) predecessor(ctx context.Context, scope tenancy.Scope, ex
 }
 
 func (service *Service) authorize(ctx context.Context, actor authorize.Principal, operation authorize.OperationName, scope tenancy.Scope) error {
-	if actor.Scope != scope {
+	if !scopeContains(actor.Scope, scope) {
 		return fault.New(fault.Forbidden, "actor scope does not match command scope")
 	}
 	var (
@@ -1398,18 +1398,25 @@ func executionOwnTaskOperation(operation authorize.OperationName) bool {
 	}
 }
 
+func scopeContains(owner, target tenancy.Scope) bool {
+	if owner.TenantID != target.TenantID {
+		return false
+	}
+	return owner.ProjectID == "" || owner.ProjectID == target.ProjectID
+}
+
 // confirmActor re-reads the actor's current principal so a previously
 // calculated allow never substitutes for current enablement and membership.
-func (service *Service) confirmActor(ctx context.Context, actor authorize.Principal, operation authorize.OperationName) (identity.Principal, error) {
+func (service *Service) confirmActor(ctx context.Context, actor authorize.Principal, operation authorize.OperationName, scope tenancy.Scope) (identity.Principal, error) {
 	requires, err := registryRequires(operation)
 	if err != nil {
 		return identity.Principal{}, err
 	}
-	principal, err := service.principals.ReadPrincipal(ctx, identity.PrincipalRequest{Scope: actor.Scope, PrincipalID: actor.ID})
+	principal, err := service.principals.ReadPrincipal(ctx, identity.PrincipalRequest{Scope: scope, PrincipalID: actor.ID})
 	if err != nil {
 		return identity.Principal{}, err
 	}
-	if principal.Scope != actor.Scope {
+	if principal.Scope != scope {
 		return identity.Principal{}, fault.New(fault.Forbidden, "principal is not present in the actor scope")
 	}
 	if !principal.Enabled {

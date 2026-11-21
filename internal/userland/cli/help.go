@@ -304,7 +304,7 @@ so they are not locked out of the new project. Use --copy-members-from <project>
 to copy existing human memberships from another project in the same tenant.
 
 Flags:
-  --name <name>                    Display name (defaults to <id>)
+  --name <name>                    Display name, unique within the tenant (defaults to <id>)
   --copy-members-from <project>    Copy human project memberships from an existing project
   --creator-role <role>[,<role>..] Override roles granted to the creator (repeatable)
   --tenant <id>                    Optional tenant ID (defaults to caller's tenant)

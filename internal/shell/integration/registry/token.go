@@ -3,9 +3,11 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -210,7 +212,7 @@ func absoluteRealm(value string) bool {
 // the realm's own origin, so a registry cannot redirect a credential to a host
 // the operator never configured; otherwise the request is anonymous, which is
 // what public images need. The token is returned for one request only.
-func (resolver *Resolver) fetchToken(ctx context.Context, challenge bearerChallenge) (string, error) {
+func (resolver *Resolver) fetchToken(ctx context.Context, challenge bearerChallenge, reference parsedReference) (string, error) {
 	realm, err := url.Parse(challenge.realm)
 	if err != nil || realm.Host == "" || realm.User != nil || strings.Contains(challenge.realm, "#") ||
 		(realm.Scheme != "https" && !(resolver.insecure && realm.Scheme == "http")) {
@@ -245,20 +247,36 @@ func (resolver *Resolver) fetchToken(ctx context.Context, challenge bearerChalle
 		if contextError := ctx.Err(); contextError != nil {
 			return "", deadlineFault(contextError)
 		}
-		return "", fault.Wrap(fault.DependencyUnavailable, "registry token endpoint is unavailable", err)
+		reason := describeTransportError(err)
+		msg := fmt.Sprintf("registry token endpoint %s is unreachable: %s", realm.Host, reason)
+		logRegistryFailure(reference.raw, realm.Host, 0, "", fault.DependencyUnavailable, msg)
+		return "", fault.Wrap(fault.DependencyUnavailable, msg, err)
 	}
 	if response == nil {
-		return "", fault.New(fault.DependencyUnavailable, "registry token endpoint returned no response")
+		msg := fmt.Sprintf("registry token endpoint %s returned no response", realm.Host)
+		logRegistryFailure(reference.raw, realm.Host, 0, "", fault.DependencyUnavailable, msg)
+		return "", fault.New(fault.DependencyUnavailable, msg)
 	}
 	defer func() { _ = response.Body.Close() }()
 	switch {
 	case response.StatusCode == http.StatusOK:
 	case response.StatusCode == http.StatusUnauthorized, response.StatusCode == http.StatusForbidden:
-		return "", fault.New(fault.Unauthenticated, "registry token request was rejected")
-	case response.StatusCode == http.StatusTooManyRequests, response.StatusCode >= http.StatusInternalServerError:
-		return "", fault.New(fault.DependencyUnavailable, "registry token endpoint is unavailable")
+		msg := fmt.Sprintf("registry token endpoint %s rejected authentication (HTTP %d %s)", realm.Host, response.StatusCode, http.StatusText(response.StatusCode))
+		logRegistryFailure(reference.raw, realm.Host, response.StatusCode, "", fault.Unauthenticated, msg)
+		return "", fault.New(fault.Unauthenticated, msg)
+	case response.StatusCode == http.StatusTooManyRequests:
+		retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now())
+		msg := formatRateLimitMessage("registry token endpoint", realm.Host, retryAfter)
+		logRegistryFailure(reference.raw, realm.Host, response.StatusCode, retryAfter, fault.DependencyUnavailable, msg)
+		return "", fault.New(fault.DependencyUnavailable, msg)
+	case response.StatusCode >= http.StatusInternalServerError:
+		msg := formatHTTPStatusMessage("registry token endpoint", realm.Host, response.StatusCode)
+		logRegistryFailure(reference.raw, realm.Host, response.StatusCode, "", fault.DependencyUnavailable, msg)
+		return "", fault.New(fault.DependencyUnavailable, msg)
 	default:
-		return "", fault.New(fault.InvalidInput, "registry token endpoint returned an unexpected status")
+		msg := fmt.Sprintf("registry token endpoint %s returned unexpected HTTP %d", realm.Host, response.StatusCode)
+		logRegistryFailure(reference.raw, realm.Host, response.StatusCode, "", fault.InvalidInput, msg)
+		return "", fault.New(fault.InvalidInput, msg)
 	}
 	body, err := readBounded(response.Body, maxTokenResponse)
 	if err != nil {

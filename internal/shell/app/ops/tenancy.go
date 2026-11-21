@@ -172,6 +172,27 @@ func tenancyHandlers(deps Dependencies) map[authorize.OperationName]ops.Handler 
 			if err != nil {
 				return api.Result{}, err
 			}
+			scanner, err := requireScanner(deps)
+			if err != nil {
+				return api.Result{}, err
+			}
+			page := pageOrDefault(request.Page)
+
+			// A tenant-scoped human with no tenant-wide membership row can
+			// still belong to individual projects. List only the projects
+			// where they currently hold a membership, and refuse a
+			// 0-membership OIDC user as unauthenticated.
+			if call.Principal.Kind == identity.KindHuman && !call.Principal.Scope.ProjectScoped() && len(call.Principal.Roles) == 0 {
+				projects, nextCursor, err := listMemberProjects(ctx, scanner, call.Scope, call.Principal.ID, page)
+				if err != nil {
+					return api.Result{}, err
+				}
+				return respond(call, api.ProjectListResult{
+					Projects:   projects,
+					NextCursor: nextCursor,
+				})
+			}
+
 			scanScope := call.Scope
 			if call.Principal.Scope.ProjectScoped() {
 				scanScope = call.Principal.Scope
@@ -179,11 +200,6 @@ func tenancyHandlers(deps Dependencies) map[authorize.OperationName]ops.Handler 
 			if err := confirmReadAuthority(ctx, deps, call, scanScope); err != nil {
 				return api.Result{}, err
 			}
-			scanner, err := requireScanner(deps)
-			if err != nil {
-				return api.Result{}, err
-			}
-			page := pageOrDefault(request.Page)
 			committed, err := scanner.Query(ctx, scanScope, store.ScanQuery{
 				Table:   "projects",
 				OrderBy: []store.Order{{Column: "id"}},
@@ -387,6 +403,152 @@ func projectExistsInTenant(ctx context.Context, scanner store.Scanner, tenantSco
 		return false, err
 	}
 	return len(page.Rows) > 0, nil
+}
+
+// listMemberProjects returns one paginated slice of projects in tenantScope
+// where principalID currently holds a project membership row. When principalID
+// holds no project membership anywhere in tenantScope, it refuses with
+// fault.Unauthenticated so a 0-membership OIDC user cannot enumerate projects.
+func listMemberProjects(
+	ctx context.Context,
+	scanner store.Scanner,
+	tenantScope tenancy.Scope,
+	principalID id.PrincipalID,
+	page api.Page,
+) ([]api.ProjectView, string, error) {
+	wantLimit := page.EffectiveLimit()
+	projects := make([]api.ProjectView, 0, wantLimit)
+	after := page.Cursor
+	var nextCursor string
+	batchLimit := store.MaxQueryLimit
+	foundAny := false
+
+	for {
+		committed, err := scanner.Query(ctx, tenantScope, store.ScanQuery{
+			Table:   "projects",
+			OrderBy: []store.Order{{Column: "id"}},
+			After:   after,
+			Limit:   batchLimit,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		kept := len(projects)
+		reread := false
+		foundExtra := false
+		for index, row := range committed.Rows {
+			projectID, err := scanRowString(row, "id")
+			if err != nil {
+				return nil, "", err
+			}
+			projectScope := tenancy.Scope{
+				TenantID:  tenantScope.TenantID,
+				ProjectID: id.ProjectID(projectID),
+			}
+			roles, found, err := scanPrincipalMembershipRoles(ctx, scanner, projectScope, principalID)
+			if err != nil {
+				return nil, "", err
+			}
+			if !found || len(roles) == 0 {
+				continue
+			}
+			foundAny = true
+			if len(projects) < wantLimit {
+				name, err := scanRowString(row, "name")
+				if err != nil {
+					return nil, "", err
+				}
+				version, err := scanRowUint(row, "version")
+				if err != nil {
+					return nil, "", err
+				}
+				projects = append(projects, api.ProjectView{
+					ProjectID: projectID,
+					Name:      name,
+					Version:   version,
+				})
+				if len(projects) < wantLimit {
+					continue
+				}
+				if index < len(committed.Rows)-1 {
+					projects = projects[:kept]
+					batchLimit = index + 1
+					reread = true
+					break
+				}
+				nextCursor = committed.Next
+			} else {
+				foundExtra = true
+				break
+			}
+		}
+		if foundExtra {
+			break
+		}
+		if reread {
+			continue
+		}
+		batchLimit = store.MaxQueryLimit
+		if !committed.HasMore {
+			nextCursor = ""
+			break
+		}
+		after = committed.Next
+	}
+
+	if !foundAny {
+		if page.Cursor == "" {
+			return nil, "", fault.New(fault.Unauthenticated, "presented credential is invalid")
+		}
+		hasAny, err := principalHasAnyProjectMembership(ctx, scanner, tenantScope, principalID)
+		if err != nil {
+			return nil, "", err
+		}
+		if !hasAny {
+			return nil, "", fault.New(fault.Unauthenticated, "presented credential is invalid")
+		}
+	}
+	return projects, nextCursor, nil
+}
+
+func principalHasAnyProjectMembership(
+	ctx context.Context,
+	scanner store.Scanner,
+	tenantScope tenancy.Scope,
+	principalID id.PrincipalID,
+) (bool, error) {
+	var after string
+	for {
+		committed, err := scanner.Query(ctx, tenantScope, store.ScanQuery{
+			Table:   "projects",
+			OrderBy: []store.Order{{Column: "id"}},
+			After:   after,
+			Limit:   store.MaxQueryLimit,
+		})
+		if err != nil {
+			return false, err
+		}
+		for _, row := range committed.Rows {
+			projectID, err := scanRowString(row, "id")
+			if err != nil {
+				return false, err
+			}
+			roles, found, err := scanPrincipalMembershipRoles(ctx, scanner, tenancy.Scope{
+				TenantID:  tenantScope.TenantID,
+				ProjectID: id.ProjectID(projectID),
+			}, principalID)
+			if err != nil {
+				return false, err
+			}
+			if found && len(roles) > 0 {
+				return true, nil
+			}
+		}
+		if !committed.HasMore {
+			return false, nil
+		}
+		after = committed.Next
+	}
 }
 
 func listAllProjectMemberships(

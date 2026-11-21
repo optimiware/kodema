@@ -272,9 +272,21 @@ func (resolver *Resolver) resolveBearer(ctx context.Context, presented string) (
 	if !verified.Enabled || verified.Kind != identity.KindHuman {
 		return authorize.Principal{}, resolverRefusal()
 	}
-	if authorize.AllowsUnassignedPrincipal(ctx) && resolver.principals != nil {
+	readScope := verified.Scope
+	if !verified.Scope.ProjectScoped() {
+		if targetProject, ok := authorize.TargetProject(ctx); ok {
+			candidate := tenancy.Scope{TenantID: verified.Scope.TenantID, ProjectID: targetProject}
+			if err := candidate.Validate(); err != nil {
+				return authorize.Principal{}, resolverRefusal()
+			}
+			readScope = candidate
+		}
+	}
+	allowUnassigned := authorize.AllowsUnassignedPrincipal(ctx) ||
+		(!verified.Scope.ProjectScoped() && readScope == verified.Scope && authorize.AllowsProjectScopeResolution(ctx))
+	if allowUnassigned && resolver.principals != nil {
 		current, readErr := resolver.principals.ReadPrincipal(ctx, identity.PrincipalRequest{
-			Scope:       verified.Scope,
+			Scope:       readScope,
 			PrincipalID: verified.ID,
 		})
 		if readErr != nil {
@@ -288,10 +300,12 @@ func (resolver *Resolver) resolveBearer(ctx context.Context, presented string) (
 			}
 			return authorize.Principal{}, resolverFailure(readErr)
 		}
-		if err := current.Validate(); err != nil || current.Scope != verified.Scope || current.ID != verified.ID || !current.Enabled {
+		if err := current.Validate(); err != nil || current.Scope != readScope || current.ID != verified.ID || !current.Enabled {
 			return authorize.Principal{}, resolverRefusal()
 		}
-		if err := identity.CheckCurrent(verified, current); err != nil || current.Kind != identity.KindHuman {
+		expected := verified
+		expected.Scope = readScope
+		if err := identity.CheckCurrent(expected, current); err != nil || current.Kind != identity.KindHuman {
 			return authorize.Principal{}, resolverRefusal()
 		}
 		principal := current.WithVerifiedExpiry(verified.VerifiedExpiry())
@@ -299,13 +313,15 @@ func (resolver *Resolver) resolveBearer(ctx context.Context, presented string) (
 		return principal, nil
 	}
 	current, err := identity.Current(ctx, resolver.principals, identity.PrincipalRequest{
-		Scope:       verified.Scope,
+		Scope:       readScope,
 		PrincipalID: verified.ID,
 	})
 	if err != nil {
 		return authorize.Principal{}, resolverFailure(err)
 	}
-	if err := identity.CheckCurrent(verified, current); err != nil {
+	expected := verified
+	expected.Scope = readScope
+	if err := identity.CheckCurrent(expected, current); err != nil {
 		return authorize.Principal{}, resolverRefusal()
 	}
 	if current.Kind != identity.KindHuman {
@@ -314,6 +330,43 @@ func (resolver *Resolver) resolveBearer(ctx context.Context, presented string) (
 	principal := current.WithVerifiedExpiry(verified.VerifiedExpiry())
 	principal.Roles = append([]tenancy.Role(nil), current.Roles...)
 	return principal, nil
+}
+
+// ResolveInScope narrows an already-verified tenant-scoped human principal to
+// a target project scope inside the same tenant by reading its effective
+// current membership (the union of tenant-wide and exact-project rows). A
+// project-scoped, service or execution principal is never widened. When the
+// human holds no applicable membership in scope, ResolveInScope returns
+// fault.Forbidden without revealing whether the project exists.
+func (resolver *Resolver) ResolveInScope(ctx context.Context, principal authorize.Principal, scope tenancy.Scope) (authorize.Principal, error) {
+	if err := scope.Validate(); err != nil {
+		return authorize.Principal{}, err
+	}
+	if err := principal.Validate(); err != nil {
+		return authorize.Principal{}, resolverRefusal()
+	}
+	if principal.Kind != identity.KindHuman || principal.Scope.ProjectScoped() || !scope.ProjectScoped() {
+		return principal, nil
+	}
+	if principal.Scope.TenantID != scope.TenantID {
+		return authorize.Principal{}, fault.New(fault.NotFound, "tenant is not visible")
+	}
+	current, err := resolver.principals.ReadPrincipal(ctx, identity.PrincipalRequest{
+		Scope:       scope,
+		PrincipalID: principal.ID,
+	})
+	if err != nil {
+		if class, ok := fault.ClassOf(err); ok && class == fault.NotFound {
+			return authorize.Principal{}, fault.New(fault.Forbidden, "principal has no membership in the requested project")
+		}
+		return authorize.Principal{}, resolverFailure(err)
+	}
+	if err := current.Validate(); err != nil || current.Scope != scope || current.ID != principal.ID || !current.Enabled || current.Kind != identity.KindHuman {
+		return authorize.Principal{}, resolverRefusal()
+	}
+	narrowed := current.WithVerifiedExpiry(principal.VerifiedExpiry())
+	narrowed.Roles = append([]tenancy.Role(nil), current.Roles...)
+	return narrowed, nil
 }
 
 // resolverFailure maps a dependency error to the fail-closed unavailable class

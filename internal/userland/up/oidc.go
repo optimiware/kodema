@@ -540,7 +540,10 @@ func (issuer *DevIssuer) handleToken(w http.ResponseWriter, r *http.Request) {
 
 func (issuer *DevIssuer) issueTokenResponse(w http.ResponseWriter, persona, clientID, nonce, scope string, includeRefresh bool, now time.Time) {
 	ttl := issuer.cfg.AccessTokenTTL
-	accessToken, err := issuer.MintAccessToken(persona, ttl)
+	// Human OIDC logins are tenant-scoped (carrying org_id without a
+	// project_id claim) so logged-in personas can work in any project of the
+	// tenant where they hold a membership, not only the bootstrap project.
+	accessToken, err := issuer.mintAccessToken(persona, ttl, false)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "token signing failed")
 		return

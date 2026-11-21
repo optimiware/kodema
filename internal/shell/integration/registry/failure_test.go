@@ -1,10 +1,17 @@
 package registry_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -196,4 +203,132 @@ func TestResolveChangedTagReResolves(t *testing.T) {
 	if requests := transport.captured(); len(requests) != 2 {
 		t.Fatalf("changed tag issued %d requests, want 2", len(requests))
 	}
+}
+
+// TestResolveFailureDiagnosticsAndLogging pins Issue #81: 429 rate limits (with
+// Retry-After and mirror/credential hint), 404 missing manifests, 5xx errors,
+// DNS errors, connection refused, and TLS handshake failures produce distinct,
+// actionable messages without leaking response bodies or untrusted headers, and
+// emit server-side warning logs.
+func TestResolveFailureDiagnosticsAndLogging(t *testing.T) {
+	var logBuf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+
+	t.Run("429 with Retry-After includes host status retry_after and hint", func(t *testing.T) {
+		logBuf.Reset()
+		transport := &fakeTransport{handle: func(_ int, request *http.Request) (*http.Response, error) {
+			resp := registryResponse(request, http.StatusTooManyRequests, "application/json", `{"errors":[{"code":"TOOMANYREQUESTS"}]}`, "")
+			resp.Header.Set("Retry-After", "120")
+			return resp, nil
+		}}
+		resolver := newResolver(t, registry.Config{Transport: transport})
+		_, err := resolveWith(t, resolver, "docker.io/library/alpine:3.24")
+		requireFault(t, err, fault.DependencyUnavailable)
+		msg, _ := fault.MessageOf(err)
+		for _, want := range []string{"docker.io", "429 Too Many Requests", "retry after 120s", "credentials", "mirror"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("429 message = %q; want substring %q", msg, want)
+			}
+		}
+		requireNoLeak(t, err, "TOOMANYREQUESTS")
+		logged := logBuf.String()
+		for _, want := range []string{"level=WARN", "registry=docker.io", "status=429", "retry_after=120s"} {
+			if !strings.Contains(logged, want) {
+				t.Fatalf("server log = %q; want substring %q", logged, want)
+			}
+		}
+	})
+
+	t.Run("429 discards untrusted Retry-After header", func(t *testing.T) {
+		transport := &fakeTransport{handle: func(_ int, request *http.Request) (*http.Response, error) {
+			resp := registryResponse(request, http.StatusTooManyRequests, "application/json", "", "")
+			resp.Header.Set("Retry-After", "untrusted-secret-header")
+			return resp, nil
+		}}
+		resolver := newResolver(t, registry.Config{Transport: transport})
+		_, err := resolveWith(t, resolver, "docker.io/library/alpine:3.24")
+		requireFault(t, err, fault.DependencyUnavailable)
+		requireNoLeak(t, err, "untrusted-secret-header")
+	})
+
+	t.Run("404 names image and registry without leaking body", func(t *testing.T) {
+		logBuf.Reset()
+		transport := &fakeTransport{handle: func(_ int, request *http.Request) (*http.Response, error) {
+			return registryResponse(request, http.StatusNotFound, "application/json", `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`, ""), nil
+		}}
+		resolver := newResolver(t, registry.Config{Transport: transport})
+		_, err := resolveWith(t, resolver, "mirror.gcr.io/library/alpine:kt-no-such-tag")
+		requireFault(t, err, fault.NotFound)
+		msg, _ := fault.MessageOf(err)
+		for _, want := range []string{"mirror.gcr.io/library/alpine:kt-no-such-tag", "mirror.gcr.io", "404 Not Found"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("404 message = %q; want substring %q", msg, want)
+			}
+		}
+		requireNoLeak(t, err, "MANIFEST_UNKNOWN")
+		if !strings.Contains(logBuf.String(), "status=404") {
+			t.Fatalf("server log = %q; want status=404", logBuf.String())
+		}
+	})
+
+	t.Run("transport errors distinguish DNS, connection refused, and TLS failures", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			ref     string
+			err     error
+			wantSub []string
+		}{
+			{
+				name:    "dns not found",
+				ref:     "registry.invalid/probe/alpine:3.24",
+				err:     &net.DNSError{Err: "no such host", Name: "registry.invalid", IsNotFound: true},
+				wantSub: []string{"registry.invalid", "no such host"},
+			},
+			{
+				name:    "connection refused",
+				ref:     "host.containers.internal:18953/probe/alpine:3.24",
+				err:     &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+				wantSub: []string{"host.containers.internal:18953", "connection refused"},
+			},
+			{
+				name:    "plain http tls record error",
+				ref:     "host.containers.internal:18952/probe/alpine:3.24",
+				err:     tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"},
+				wantSub: []string{"host.containers.internal:18952", "TLS handshake failed"},
+			},
+			{
+				name:    "unknown certificate authority",
+				ref:     "registry.example.com/probe/alpine:3.24",
+				err:     x509.UnknownAuthorityError{},
+				wantSub: []string{"registry.example.com", "TLS certificate"},
+			},
+		}
+		seen := make(map[string]bool)
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				logBuf.Reset()
+				transport := &fakeTransport{handle: func(_ int, _ *http.Request) (*http.Response, error) {
+					return nil, tc.err
+				}}
+				resolver := newResolver(t, registry.Config{Transport: transport})
+				_, err := resolveWith(t, resolver, tc.ref)
+				requireFault(t, err, fault.DependencyUnavailable)
+				msg, _ := fault.MessageOf(err)
+				for _, want := range tc.wantSub {
+					if !strings.Contains(msg, want) {
+						t.Fatalf("%s message = %q; want substring %q", tc.name, msg, want)
+					}
+				}
+				if seen[msg] {
+					t.Fatalf("duplicate transport message %q across distinct error kinds", msg)
+				}
+				seen[msg] = true
+				if !strings.Contains(logBuf.String(), "level=WARN") {
+					t.Fatalf("server log = %q; want WARN entry", logBuf.String())
+				}
+			})
+		}
+	})
 }

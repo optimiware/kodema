@@ -5,6 +5,7 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/id"
+	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/event"
 	shellrequest "github.com/optimiware/kodema/internal/shell/request"
 	"github.com/optimiware/kodema/internal/shell/resource"
@@ -31,11 +32,12 @@ func verifyHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			// human or service actor resolves to no action, while an execution
 			// actor with no running container action is refused here, before any
 			// verification record.
-			actionID, err := deps.ActorActions.ResolveActorAction(ctx, request.ActorCredential)
+			verifyCtx := authorize.WithTargetProject(ctx, call.Scope.ProjectID)
+			actionID, err := deps.ActorActions.ResolveActorAction(verifyCtx, request.ActorCredential)
 			if err != nil {
 				return api.Result{}, err
 			}
-			record, err := deps.Verifier.Verify(ctx, verify.Attempt{
+			record, err := deps.Verifier.Verify(verifyCtx, verify.Attempt{
 				Scope:      call.Scope,
 				Service:    call.Principal,
 				Credential: request.ActorCredential,
