@@ -35,6 +35,7 @@ type HTTPOpenCodeClient struct {
 }
 
 var _ OpenCodeClient = (*HTTPOpenCodeClient)(nil)
+var _ OpenCodeMCPClient = (*HTTPOpenCodeClient)(nil)
 
 var errOpenCodeRedirectRefused = errors.New("opencode client refuses HTTP redirects")
 
@@ -175,6 +176,41 @@ func (c *HTTPOpenCodeClient) SendMessage(ctx context.Context, sessionID string, 
 			payload["model"] = strings.TrimSpace(msg.Model)
 		}
 	}
+	if len(msg.DisabledTools) > 0 {
+		toolsMap := make(map[string]bool, len(msg.DisabledTools))
+		for _, tool := range msg.DisabledTools {
+			if t := strings.TrimSpace(tool); t != "" {
+				toolsMap[t] = false
+			}
+		}
+		if len(toolsMap) > 0 {
+			payload["tools"] = toolsMap
+		}
+	}
+	if len(msg.MCPServers) > 0 {
+		mcpMap := make(map[string]map[string]any, len(msg.MCPServers))
+		for name, cfg := range msg.MCPServers {
+			serverName := strings.TrimSpace(name)
+			if serverName == "" {
+				serverName = strings.TrimSpace(cfg.Name)
+			}
+			if serverName == "" {
+				continue
+			}
+			entry := map[string]any{
+				"type":    cfg.Type,
+				"url":     cfg.URL,
+				"enabled": cfg.Enabled,
+			}
+			if len(cfg.Headers) > 0 {
+				entry["headers"] = cfg.Headers
+			}
+			mcpMap[serverName] = entry
+		}
+		if len(mcpMap) > 0 {
+			payload["mcp"] = mcpMap
+		}
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return OpenCodeMessageResponse{}, err
@@ -192,6 +228,9 @@ func (c *HTTPOpenCodeClient) SendMessage(ctx context.Context, sessionID string, 
 	}
 	if msg.ActionID != "" {
 		req.Header.Set("X-Kodema-Action", msg.ActionID)
+	}
+	if msg.ProxyPathPrefix != "" {
+		req.Header.Set("X-Kodema-Proxy-Turn-Path", msg.ProxyPathPrefix)
 	}
 
 	resp, err := c.client.Do(req)
@@ -242,6 +281,95 @@ func (c *HTTPOpenCodeClient) AbortSession(ctx context.Context, sessionID string)
 		return nil
 	}
 	return classifyOpenCodeHTTPError("abort session", resp.StatusCode, body)
+}
+
+// AttachMCPServer attaches a remote MCP server (such as an ephemeral per-task
+// `kodema sandbox serve` instance) to an OpenCode Brain session.
+func (c *HTTPOpenCodeClient) AttachMCPServer(ctx context.Context, sessionID string, cfg OpenCodeMCPServerConfig) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || strings.ContainsAny(sessionID, "/\\ \r\n\x00") {
+		return fmt.Errorf("opencode session id %q is invalid", sessionID)
+	}
+	name := strings.TrimSpace(cfg.Name)
+	if name == "" || strings.ContainsAny(name, "/\\ \r\n\x00") {
+		return fmt.Errorf("opencode MCP server name %q is invalid", cfg.Name)
+	}
+	if strings.TrimSpace(cfg.URL) == "" {
+		return fmt.Errorf("opencode MCP server URL is required")
+	}
+	serverType := strings.TrimSpace(cfg.Type)
+	if serverType == "" {
+		serverType = "remote"
+	}
+	payload := map[string]any{
+		"name":    name,
+		"type":    serverType,
+		"url":     strings.TrimSpace(cfg.URL),
+		"enabled": cfg.Enabled,
+	}
+	if len(cfg.Headers) > 0 {
+		payload["headers"] = cfg.Headers
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	target := c.endpoint("/session/"+url.PathEscape(sessionID)+"/mcp", "")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(encoded))
+	if err != nil {
+		return fmt.Errorf("build opencode attach MCP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("opencode attach MCP server: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return nil
+	}
+	return classifyOpenCodeHTTPError("attach MCP server", resp.StatusCode, body)
+}
+
+// DetachMCPServer removes a previously attached ephemeral MCP server from an
+// OpenCode Brain session. Uses a bounded non-cancelled context so cleanup still
+// completes after turn cancellation.
+func (c *HTTPOpenCodeClient) DetachMCPServer(ctx context.Context, sessionID string, serverName string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	serverName = strings.TrimSpace(serverName)
+	if sessionID == "" || strings.ContainsAny(sessionID, "/\\ \r\n\x00") {
+		return fmt.Errorf("opencode session id %q is invalid", sessionID)
+	}
+	if serverName == "" || strings.ContainsAny(serverName, "/\\ \r\n\x00") {
+		return fmt.Errorf("opencode MCP server name %q is invalid", serverName)
+	}
+	detachCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.abortTimeout)
+	defer cancel()
+
+	target := c.endpoint("/session/"+url.PathEscape(sessionID)+"/mcp/"+url.PathEscape(serverName), "")
+	req, err := http.NewRequestWithContext(detachCtx, http.MethodDelete, target, nil)
+	if err != nil {
+		return fmt.Errorf("build opencode detach MCP request: %w", err)
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("opencode detach MCP server: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if (resp.StatusCode >= 200 && resp.StatusCode <= 299) || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return classifyOpenCodeHTTPError("detach MCP server", resp.StatusCode, body)
 }
 
 func (c *HTTPOpenCodeClient) endpoint(path, directory string) string {

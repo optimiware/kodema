@@ -327,11 +327,18 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	stateDir := flags.String("state-dir", envOr("KODEMA_SERVICE_STATE_DIR", ""), "durable local state directory")
 	gitURL := flags.String("git-url", envOr("KODEMA_SERVICE_GIT_URL", ""), "Git base URL")
 	opencodeURL := flags.String("opencode-url", envOr("KODEMA_OPENCODE_URL", ""), "opencode serve HTTP URL")
+	opencodeMode := flags.String("mode", envOr("KODEMA_OPENCODE_MODE", string(services.OpenCodeExecutionModeWorktree)), "OpenCode execution mode (worktree|brain)")
 	llmProxyListen := flags.String("llm-proxy-listen", envOr("KODEMA_OPENCODE_LLM_PROXY_LISTEN", ""), "optional loopback listen address for the attributed LLM reverse proxy")
 	llmProxyAPIKey := flags.String("llm-proxy-api-key", envOr("KODEMA_OPENCODE_LLM_PROXY_API_KEY", ""), "optional shared secret for inbound loopback LLM proxy requests (auto-generated if empty)")
+	perTurnProxyRouting := flags.Bool("per-turn-proxy-routing", envOr("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "") == "true", "route LLM proxy calls via explicit /turn/{exec}/{action}/llm/* paths for concurrent turns")
+	sandboxDefaultImage := flags.String("sandbox-default-image", envOr("KODEMA_OPENCODE_SANDBOX_DEFAULT_IMAGE", ""), "default stock toolchain image for Option 2 brain mode sandboxes")
+	sandboxCachesRaw := flags.String("sandbox-caches", envOr("KODEMA_OPENCODE_SANDBOX_CACHES", ""), "comma-separated default Kodema cache names mounted into ephemeral sandboxes")
+	sandboxPort := flags.Int("sandbox-port", services.DefaultOpenCodeSandboxPort, "container TCP port served by kodema sandbox serve in brain mode")
+	sandboxMemory := flags.String("sandbox-memory", envOr("KODEMA_OPENCODE_SANDBOX_MEMORY", ""), "optional default memory limit for ephemeral sandboxes (e.g. 2Gi)")
+	sandboxCPU := flags.String("sandbox-cpu", envOr("KODEMA_OPENCODE_SANDBOX_CPU", ""), "optional default CPU limit for ephemeral sandboxes (e.g. 2)")
 	model := flags.String("model", envOr("KODEMA_OPENCODE_MODEL", ""), "optional default OpenCode model")
 	agent := flags.String("agent", envOr("KODEMA_OPENCODE_AGENT", ""), "optional default OpenCode agent")
-	maxConcurrency := flags.Int("max-concurrency", 0, "maximum concurrent OpenCode turns (defaults to 1 with --llm-proxy-listen, 4 otherwise)")
+	maxConcurrency := flags.Int("max-concurrency", 0, "maximum concurrent OpenCode turns (defaults to 1 with static --llm-proxy-listen, 4 otherwise)")
 	message := flags.String("message", envOr("KODEMA_EMAIL_MESSAGE", ""), "one RFC822 message file, or - for stdin")
 	pipeline := flags.String("pipeline", envOr("KODEMA_EMAIL_PIPELINE", ""), "email intake pipeline identity")
 	if err := flags.Parse(args); err != nil {
@@ -381,31 +388,77 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 		return 0
 	}
 	if services.ServiceKind(*kind) == services.KindOpenCode {
-		if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*gitURL) == "" || strings.TrimSpace(*opencodeURL) == "" {
-			usage(stderr, "opencode service requires --state-dir, --git-url and --opencode-url")
+		execMode := services.OpenCodeExecutionMode(strings.TrimSpace(*opencodeMode))
+		if execMode == "" {
+			execMode = services.OpenCodeExecutionModeWorktree
+		}
+		if !execMode.Valid() {
+			usage(stderr, fmt.Sprintf("opencode service --mode %q is unsupported (want worktree or brain)", execMode))
 			return 2
 		}
-		if strings.TrimSpace(*llmProxyListen) != "" && *maxConcurrency > 1 {
-			usage(stderr, "opencode service with --llm-proxy-listen requires --max-concurrency <= 1")
-			return 2
+		if execMode == services.OpenCodeExecutionModeWorktree {
+			if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*gitURL) == "" || strings.TrimSpace(*opencodeURL) == "" {
+				usage(stderr, "opencode service requires --state-dir, --git-url and --opencode-url")
+				return 2
+			}
+		} else {
+			if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*opencodeURL) == "" {
+				usage(stderr, "opencode brain service requires --state-dir and --opencode-url")
+				return 2
+			}
+		}
+		usePerTurnRouting := *perTurnProxyRouting
+		effectiveMaxConcurrency := *maxConcurrency
+		if strings.TrimSpace(*llmProxyListen) != "" && !usePerTurnRouting {
+			if effectiveMaxConcurrency > 1 {
+				usage(stderr, "opencode service with --llm-proxy-listen requires --max-concurrency <= 1 unless --per-turn-proxy-routing is enabled")
+				return 2
+			}
+			if effectiveMaxConcurrency <= 0 {
+				effectiveMaxConcurrency = 1
+			}
+		}
+		var defaultCaches []string
+		for _, part := range strings.Split(*sandboxCachesRaw, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				defaultCaches = append(defaultCaches, trimmed)
+			}
+		}
+		brainCfg := services.OpenCodeBrainConfig{
+			DefaultSandboxImage:  strings.TrimSpace(*sandboxDefaultImage),
+			DefaultSandboxCaches: defaultCaches,
+			SandboxPort:          *sandboxPort,
+			DefaultSandboxMemory: strings.TrimSpace(*sandboxMemory),
+			DefaultSandboxCPU:    strings.TrimSpace(*sandboxCPU),
+		}
+		if execMode == services.OpenCodeExecutionModeBrain {
+			normalized, err := services.NormalizeBrainConfig(brainCfg)
+			if err != nil {
+				usage(stderr, err.Error())
+				return 2
+			}
+			brainCfg = normalized
 		}
 		config := servicesapp.OpenCodeConfig{
-			ServiceID:          id.PrincipalID(*service),
-			TenantID:           id.TenantID(*tenant),
-			ProjectID:          id.ProjectID(*project),
-			StateDirectory:     *stateDir,
-			BaseURL:            *baseURL,
-			CAFile:             *caFile,
-			GitURL:             *gitURL,
-			CredentialFile:     *credentialFile,
-			OpenCodeURL:        *opencodeURL,
-			ProxyListen:        *llmProxyListen,
-			ProxyAPIKey:        *llmProxyAPIKey,
-			Model:              *model,
-			Agent:              *agent,
-			RescanInterval:     *rescan,
-			MaxConcurrentTurns: *maxConcurrency,
-			Transport:          transport,
+			ServiceID:           id.PrincipalID(*service),
+			TenantID:            id.TenantID(*tenant),
+			ProjectID:           id.ProjectID(*project),
+			ExecutionMode:       execMode,
+			Brain:               brainCfg,
+			StateDirectory:      *stateDir,
+			BaseURL:             *baseURL,
+			CAFile:              *caFile,
+			GitURL:              *gitURL,
+			CredentialFile:      *credentialFile,
+			OpenCodeURL:         *opencodeURL,
+			ProxyListen:         *llmProxyListen,
+			ProxyAPIKey:         *llmProxyAPIKey,
+			PerTurnProxyRouting: usePerTurnRouting,
+			Model:               *model,
+			Agent:               *agent,
+			RescanInterval:      *rescan,
+			MaxConcurrentTurns:  effectiveMaxConcurrency,
+			Transport:           transport,
 		}
 		if err := servicesapp.RunOpenCode(ctx, config); err != nil {
 			fmt.Fprintf(stderr, "kodema: %v\n", err)

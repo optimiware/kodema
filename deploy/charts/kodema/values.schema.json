@@ -664,6 +664,94 @@
         }
       ]
     },
+    "opencodeBrain": {
+      "description": "Optional per-project OpenCode Brain NetworkPolicies (Option 2: Brain/Hands split). Off by default; enabling requires at least one complete project entry.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "sandboxPort": {
+          "description": "Default unprivileged TCP port served by `kodema sandbox serve` inside ephemeral sandbox pods.",
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535
+        },
+        "projects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "tenant",
+              "project"
+            ],
+            "properties": {
+              "name": {
+                "description": "NetworkPolicy name suffix; a lowercase DNS label.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 41,
+                "pattern": "^[a-z0-9]([a-z0-9-]{0,39}[a-z0-9])?$"
+              },
+              "tenant": {
+                "description": "Tenant id matching an entry in values.tenants.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 49,
+                "pattern": "^[a-z0-9]([a-z0-9-]{0,47}[a-z0-9])?$"
+              },
+              "project": {
+                "description": "Project id matched by kodema.dev/project labels on Brain and sandbox pods.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63,
+                "pattern": "^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$"
+              },
+              "namespace": {
+                "description": "Optional namespace hosting the Brain pod. Empty defaults to the Helm release namespace.",
+                "type": "string",
+                "maxLength": 63,
+                "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+              },
+              "sandboxPort": {
+                "description": "Optional per-project override for the sandbox MCP port (1024-65535).",
+                "type": "integer",
+                "minimum": 1024,
+                "maximum": 65535
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "description": "Enabling opencodeBrain without at least one complete project entry is refused before any object renders.",
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          },
+          "then": {
+            "required": [
+              "projects"
+            ],
+            "properties": {
+              "projects": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
     "global": {
       "type": "object"
     },

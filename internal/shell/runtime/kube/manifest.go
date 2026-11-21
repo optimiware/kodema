@@ -79,6 +79,65 @@ func (a *Adapter) labels(identity engine.EffectIdentity, workspaceID id.Workspac
 	}
 }
 
+// validKubeLabelValue reports whether value satisfies the Kubernetes label
+// value grammar: 1..63 chars matching ^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$.
+func validKubeLabelValue(value string) bool {
+	if len(value) == 0 || len(value) > 63 {
+		return false
+	}
+	isAlnum := func(c byte) bool {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+	}
+	if !isAlnum(value[0]) || !isAlnum(value[len(value)-1]) {
+		return false
+	}
+	for i := 1; i < len(value)-1; i++ {
+		c := value[i]
+		if !isAlnum(c) && c != '-' && c != '_' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+const sandboxTokenSecretPrefix = "KODEMA_SBOX_TOK_"
+
+// workloadRole returns the optional kodema.dev/role label value for a prepared
+// workload. Ephemeral OpenCode sandbox actions (`name: sandbox` explicitly
+// invoking `/kodema/bin/kodema sandbox serve` and declaring no non-sandbox
+// secrets) carry RoleSandbox so tenant NetworkPolicies can select sandbox pods
+// strictly by tenant, project, and role without exposing privileged workloads.
+func workloadRole(request engine.PrepareRequest) string {
+	if request.ActionName != RoleSandbox {
+		return ""
+	}
+	for _, secretName := range request.Container.Secrets {
+		if !strings.HasPrefix(string(secretName), sandboxTokenSecretPrefix) {
+			return ""
+		}
+	}
+	for _, secret := range request.Secrets {
+		if !strings.HasPrefix(string(secret.Name), sandboxTokenSecretPrefix) {
+			return ""
+		}
+	}
+	for _, cmd := range request.Container.Commands {
+		for _, rawLine := range strings.Split(cmd, "\n") {
+			line := strings.TrimSpace(rawLine)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if line == "/kodema/bin/kodema sandbox serve" ||
+				strings.HasPrefix(line, "/kodema/bin/kodema sandbox serve ") ||
+				line == "exec /kodema/bin/kodema sandbox serve" ||
+				strings.HasPrefix(line, "exec /kodema/bin/kodema sandbox serve ") {
+				return RoleSandbox
+			}
+		}
+	}
+	return ""
+}
+
 // buildMaterialization validates and builds the complete all-or-nothing
 // activation snapshot. Validation happens before any cluster call so a partial
 // or unsafe snapshot never reaches the API.
@@ -335,6 +394,12 @@ func (a *Adapter) resolveResources(requested *definition.Resources) (Resources, 
 // jobManifest builds the pinned, fail-fast, non-replaying Job manifest.
 func (a *Adapter) jobManifest(prepared preparedWorkload, identity engine.EffectIdentity) Job {
 	labels := a.labels(identity, prepared.workspace)
+	if prepared.project != "" {
+		labels[LabelProject] = string(prepared.project)
+	}
+	if prepared.role != "" {
+		labels[LabelRole] = prepared.role
+	}
 	podLabels := make(map[string]string, len(labels))
 	maps.Copy(podLabels, labels)
 

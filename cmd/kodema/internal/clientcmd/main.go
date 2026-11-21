@@ -128,6 +128,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliD
 	if flags.Arg(0) == "help" && !flagSet(flags, "ca-file") && !flagSet(flags, "config") {
 		return deps.runCLI(ctx, cli.Config{}, flags.Args(), cli.Ports{Out: stdout, Err: stderr}, cli.CommandDeps{})
 	}
+	if flags.Arg(0) == "sandbox" {
+		return deps.runCLI(ctx, cli.Config{}, flags.Args(), cli.Ports{
+			Out: stdout,
+			Err: stderr,
+		}, cli.CommandDeps{Env: deps.environment})
+	}
 	if isOfflineDocsOrContextCommand(flags.Args()) && !flagSet(flags, "ca-file") && !flagSet(flags, "config") {
 		offlineConfig := cli.Config{Output: cli.OutputFormat(*output)}
 		if offlineConfig.Output == "" && !flagSet(flags, "output") && !envSet("KODEMA_OUTPUT") {
@@ -362,7 +368,7 @@ func hoistGlobalFlags(args []string) []string {
 		return args
 	}
 	subcmd := args[subcmdIdx]
-	if subcmd == "help" || subcmd == "version" || subcmd == "harness" {
+	if subcmd == "help" || subcmd == "version" || subcmd == "harness" || subcmd == "sandbox" {
 		return args
 	}
 	isGitConfigure := subcmd == "git" && subcmdIdx+1 < len(args) && args[subcmdIdx+1] == "configure"

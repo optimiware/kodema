@@ -137,26 +137,27 @@ type activationMaterializerConfig struct {
 }
 
 // prepare resolves the declared secret values and the committed execution
-// credential into one PrepareRequest. Every refusal happens before the runtime
-// adapter is called.
-func (materializer *activationMaterializer) prepare(ctx context.Context, request kernelengine.PrepareRequest) (kernelengine.PrepareRequest, error) {
+// credential into one PrepareRequest, returning the execution's owning project
+// identity so Shell runtime adapters can label workload pods accurately. Every
+// refusal happens before the runtime adapter is called.
+func (materializer *activationMaterializer) prepare(ctx context.Context, request kernelengine.PrepareRequest) (kernelengine.PrepareRequest, id.ProjectID, error) {
 	if err := ctx.Err(); err != nil {
-		return request, err
+		return request, "", err
 	}
 	executionID := request.Identity.ExecutionID
 	if executionID == "" {
-		return request, fault.New(fault.InvalidInput, "activation requires an execution identity")
+		return request, "", fault.New(fault.InvalidInput, "activation requires an execution identity")
 	}
 	candidate, err := materializer.lookup.LookupCredential(ctx, store.CredentialExecution, string(executionID))
 	if err != nil {
-		return request, fault.Wrap(fault.DependencyUnavailable, "activation execution scope is unavailable", err)
+		return request, "", fault.Wrap(fault.DependencyUnavailable, "activation execution scope is unavailable", err)
 	}
 	if err := candidate.Validate(); err != nil {
-		return request, fault.Wrap(fault.DependencyUnavailable, "activation execution scope is invalid", err)
+		return request, "", fault.Wrap(fault.DependencyUnavailable, "activation execution scope is invalid", err)
 	}
 	scope := tenancy.Scope{TenantID: candidate.TenantID, ProjectID: candidate.ProjectID}
 	if !scope.ProjectScoped() {
-		return request, fault.New(fault.DependencyUnavailable, "activation execution is not project scoped")
+		return request, "", fault.New(fault.DependencyUnavailable, "activation execution is not project scoped")
 	}
 
 	// Resolve every declared name before any credential mutation. A denied,
@@ -168,7 +169,7 @@ func (materializer *activationMaterializer) prepare(ctx context.Context, request
 			Names: request.Container.Secrets,
 		})
 		if err != nil {
-			return request, err
+			return request, "", err
 		}
 		values := make([]kernelengine.SecretValue, len(resolved))
 		for index, value := range resolved {
@@ -179,13 +180,13 @@ func (materializer *activationMaterializer) prepare(ctx context.Context, request
 
 	credential, err := materializer.credential(ctx, scope, candidate.PrincipalID, request.Identity)
 	if err != nil {
-		return request, err
+		return request, "", err
 	}
 	request.Credential = credential
 	if len(request.Container.Caches) > 0 {
 		caches, err := workspace.BuildCacheMounts(scope, request.Container.Caches)
 		if err != nil {
-			return request, err
+			return request, "", err
 		}
 		request.Caches = caches
 	}
@@ -196,7 +197,7 @@ func (materializer *activationMaterializer) prepare(ctx context.Context, request
 			materializer.models.providersForScope(scope),
 		)
 	}
-	return request, nil
+	return request, scope.ProjectID, nil
 }
 
 func injectModelProxyEnv(existing []kerneldefinition.EnvVar, baseURL string, providers []ModelProviderConfig) []kerneldefinition.EnvVar {

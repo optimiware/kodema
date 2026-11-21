@@ -29,6 +29,13 @@ import (
 const (
 	// LabelTenant names the owning tenant.
 	LabelTenant = "kodema.dev/tenant"
+	// LabelProject names the owning project when supplied by the Shell.
+	LabelProject = "kodema.dev/project"
+	// LabelRole names the optional workload role (for example "sandbox").
+	LabelRole = "kodema.dev/role"
+	// RoleSandbox is the pinned LabelRole value for ephemeral OpenCode sandbox
+	// workloads (`kodema sandbox serve`).
+	RoleSandbox = "sandbox"
 	// LabelExecution names the execution.
 	LabelExecution = "kodema.dev/execution"
 	// LabelAction names the action.
@@ -382,6 +389,8 @@ type preparedWorkload struct {
 	identity        engine.EffectIdentity
 	digest          string
 	workspace       id.WorkspaceID
+	project         id.ProjectID
+	role            string
 	actionName      id.ActionName
 	taskID          id.TaskID
 	container       containerDeclaration

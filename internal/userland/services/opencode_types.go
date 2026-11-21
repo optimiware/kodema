@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -53,13 +54,35 @@ func (mode OpenCodeMode) MutatesCode() bool {
 	}
 }
 
+// OpenCodeExecutionMode selects whether the OpenCode service edits code in
+// local per-task Git worktrees (Option 1, default) or delegates all shell and
+// filesystem tools to ephemeral per-task toolchain sandboxes over MCP (Option 2).
+type OpenCodeExecutionMode string
+
+const (
+	// OpenCodeExecutionModeWorktree is Option 1: local per-task Git worktrees.
+	OpenCodeExecutionModeWorktree OpenCodeExecutionMode = "worktree"
+	// OpenCodeExecutionModeBrain is Option 2: lightweight Brain service with
+	// local shell/fs tools disabled and ephemeral per-task MCP sandboxes.
+	OpenCodeExecutionModeBrain OpenCodeExecutionMode = "brain"
+)
+
+// Valid reports whether mode is a declared OpenCode execution mode.
+func (mode OpenCodeExecutionMode) Valid() bool {
+	return mode == OpenCodeExecutionModeWorktree || mode == OpenCodeExecutionModeBrain
+}
+
 // OpenCode subject field names.
 const (
-	OpenCodeFieldMode        = "mode"
-	OpenCodeFieldRepository  = "repository"
-	OpenCodeFieldBaseRef     = "base_ref"
-	OpenCodeFieldPlanKey     = "plan_key"
-	OpenCodeFieldFeedbackKey = "feedback_key"
+	OpenCodeFieldMode          = "mode"
+	OpenCodeFieldRepository    = "repository"
+	OpenCodeFieldBaseRef       = "base_ref"
+	OpenCodeFieldPlanKey       = "plan_key"
+	OpenCodeFieldFeedbackKey   = "feedback_key"
+	OpenCodeFieldSandboxImage  = "sandbox_image"
+	OpenCodeFieldSandboxCaches = "sandbox_caches"
+	OpenCodeFieldSandboxMemory = "sandbox_memory"
+	OpenCodeFieldSandboxCPU    = "sandbox_cpu"
 )
 
 // OpenCode declared response output names.
@@ -78,24 +101,37 @@ const DefaultOpenCodeBaseRef = "refs/heads/main"
 // Public operation names used by the OpenCode service adapter in addition to
 // OperationInbox, OperationInspect and OperationResolve.
 const (
-	OperationTaskRead     = "task.read"
-	OperationKVGet        = "kv.get"
-	OperationKVPut        = "kv.put"
-	OperationEventPublish = "event.publish"
+	OperationTaskRead          = "task.read"
+	OperationKVGet             = "kv.get"
+	OperationKVPut             = "kv.put"
+	OperationEventPublish      = "event.publish"
+	OperationPipelineStart     = "pipeline.start"
+	OperationExecutionCancel   = "execution.cancel"
+	OperationExecutionLogsRead = "execution.logs.read"
+	OperationSecretWrite       = "secret.write"
+	OperationSecretDelete      = "secret.delete"
 )
 
 // ErrOpenCodeBudgetExceeded signals that the LLM proxy rejected a turn call
 // with HTTP 429 budget_exceeded.
 var ErrOpenCodeBudgetExceeded = errors.New("opencode turn exceeded LLM budget")
 
+// ErrOpenCodeSandboxTerminated signals that an ephemeral task sandbox crashed,
+// was killed, or OOM-terminated mid-turn while the Brain service stayed healthy.
+var ErrOpenCodeSandboxTerminated = errors.New("opencode ephemeral sandbox terminated")
+
 // OpenCodeSubject is the validated subject of an OpenCode service request.
 type OpenCodeSubject struct {
-	Mode        OpenCodeMode
-	Repository  string
-	BaseRef     string
-	PlanKey     string
-	FeedbackKey string
-	Extra       map[string]string
+	Mode          OpenCodeMode
+	Repository    string
+	BaseRef       string
+	PlanKey       string
+	FeedbackKey   string
+	SandboxImage  string
+	SandboxCaches []string
+	SandboxMemory string
+	SandboxCPU    string
+	Extra         map[string]string
 }
 
 // ParseOpenCodeSubject validates and decodes the typed request subject for an
@@ -166,6 +202,47 @@ func ParseOpenCodeSubject(subject *api.Subject) (OpenCodeSubject, error) {
 				}
 				parsed.FeedbackKey = field.Value
 			}
+		case OpenCodeFieldSandboxImage:
+			if field.Kind != "string" {
+				return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_image must be a string")
+			}
+			if field.Value != "" {
+				if !validSandboxImage(field.Value) {
+					return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_image %q is invalid", field.Value)
+				}
+				parsed.SandboxImage = field.Value
+			}
+		case OpenCodeFieldSandboxCaches:
+			if field.Kind != "string" {
+				return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_caches must be a string")
+			}
+			if field.Value != "" {
+				caches, err := parseSandboxCachesCSV(field.Value)
+				if err != nil {
+					return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_caches: %w", err)
+				}
+				parsed.SandboxCaches = caches
+			}
+		case OpenCodeFieldSandboxMemory:
+			if field.Kind != "string" {
+				return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_memory must be a string")
+			}
+			if field.Value != "" {
+				if !validSandboxResourceQty(field.Value) {
+					return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_memory %q is invalid", field.Value)
+				}
+				parsed.SandboxMemory = field.Value
+			}
+		case OpenCodeFieldSandboxCPU:
+			if field.Kind != "string" {
+				return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_cpu must be a string")
+			}
+			if field.Value != "" {
+				if !validSandboxResourceQty(field.Value) {
+					return OpenCodeSubject{}, fmt.Errorf("opencode request subject sandbox_cpu %q is invalid", field.Value)
+				}
+				parsed.SandboxCPU = field.Value
+			}
 		default:
 			if field.Kind != "null" && field.Value != "" {
 				extra[field.Name] = field.Value
@@ -197,11 +274,16 @@ func validOpenCodeRef(value string) bool {
 	if strings.HasPrefix(value, "-") || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") {
 		return false
 	}
-	if strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.ContainsAny(value, " \t\r\n\x00*?[]\\~^:") {
+	for i := 0; i < len(value); i++ {
+		if value[i] <= 0x20 || value[i] == 0x7f {
+			return false
+		}
+	}
+	if strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.ContainsAny(value, " \t\r\n\x00*?[]\\~^:=") {
 		return false
 	}
 	for _, seg := range strings.Split(value, "/") {
-		if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") || strings.HasSuffix(seg, ".lock") {
+		if seg == "" || seg == "." || seg == ".." || strings.HasPrefix(seg, ".") || strings.HasPrefix(seg, "-") || strings.HasSuffix(seg, ".lock") {
 			return false
 		}
 	}
@@ -236,16 +318,30 @@ type OpenCodeSession struct {
 	ID string `json:"id"`
 }
 
+// OpenCodeMCPServerConfig describes one remote MCP server attached dynamically
+// to an OpenCode Brain session (for example an ephemeral `kodema sandbox serve`
+// container endpoint with its per-sandbox bearer token).
+type OpenCodeMCPServerConfig struct {
+	Name    string            `json:"name"`
+	Type    string            `json:"type"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Enabled bool              `json:"enabled"`
+}
+
 // OpenCodeMessageRequest is one turn sent to an existing OpenCode session.
 type OpenCodeMessageRequest struct {
-	Directory   string
-	Prompt      string
-	Mode        OpenCodeMode
-	Model       string
-	Agent       string
-	ExecutionID string
-	ActionID    string
-	TaskID      string
+	Directory       string
+	Prompt          string
+	Mode            OpenCodeMode
+	Model           string
+	Agent           string
+	ExecutionID     string
+	ActionID        string
+	TaskID          string
+	DisabledTools   []string
+	MCPServers      map[string]OpenCodeMCPServerConfig
+	ProxyPathPrefix string
 }
 
 // OpenCodeMessageResponse is the assistant output returned by OpenCode for one turn.
@@ -260,6 +356,13 @@ type OpenCodeClient interface {
 	CreateSession(ctx context.Context, directory string, title string) (OpenCodeSession, error)
 	SendMessage(ctx context.Context, sessionID string, req OpenCodeMessageRequest) (OpenCodeMessageResponse, error)
 	AbortSession(ctx context.Context, sessionID string) error
+}
+
+// OpenCodeMCPClient is the optional Brain-mode extension of OpenCodeClient for
+// dynamically attaching and detaching remote sandbox MCP servers per session.
+type OpenCodeMCPClient interface {
+	AttachMCPServer(ctx context.Context, sessionID string, cfg OpenCodeMCPServerConfig) error
+	DetachMCPServer(ctx context.Context, sessionID string, serverName string) error
 }
 
 // OpenCodeTaskState persists the durable 1:1 mapping from a Kodema task ID to
@@ -382,20 +485,94 @@ type OpenCodeWorktreeManager interface {
 	Remove(ctx context.Context, repository, taskID string) error
 }
 
+// OpenCodeBrainConfig configures Option 2 Brain-mode tool policies and default
+// ephemeral toolchain sandbox parameters.
+type OpenCodeBrainConfig struct {
+	// DisabledLocalTools lists OpenCode built-in local tools disabled in Brain
+	// mode so the Brain pod never executes local shell commands or file edits.
+	// Defaults to DefaultBrainDisabledLocalTools.
+	DisabledLocalTools []string
+	// DefaultSandboxImage is used when a coding turn omits subject.sandbox_image.
+	DefaultSandboxImage string
+	// DefaultSandboxCaches lists optional named Kodema caches mounted into
+	// ephemeral sandboxes when a turn omits subject.sandbox_caches.
+	DefaultSandboxCaches []string
+	// SandboxPort is the container TCP port served by `kodema sandbox serve`
+	// (default 8090).
+	SandboxPort int
+	// DefaultSandboxMemory is the optional default container memory limit.
+	DefaultSandboxMemory string
+	// DefaultSandboxCPU is the optional default container CPU limit.
+	DefaultSandboxCPU string
+}
+
+// OpenCodeSandboxRequest describes one ephemeral per-task toolchain sandbox
+// requested by the OpenCode Brain service.
+type OpenCodeSandboxRequest struct {
+	TenantID      id.TenantID
+	ProjectID     id.ProjectID
+	TaskID        string
+	ExecutionID   string
+	ActionID      string
+	Image         string
+	Repository    string
+	BaseRef       string
+	WorkBranch    string // refs/heads/work/<task-id>
+	Caches        []string
+	Memory        string
+	CPU           string
+	Port          int
+	Timeout       time.Duration
+	AllowLoopback bool
+}
+
+// OpenCodeSandboxLease represents one live ephemeral sandbox attached to a turn.
+type OpenCodeSandboxLease struct {
+	SandboxID    string
+	ExecutionID  string
+	EndpointURL  string // e.g. http://10.0.0.12:8090/mcp
+	HealthURL    string // e.g. http://10.0.0.12:8090/healthz
+	BearerToken  string
+	WorkspaceDir string // e.g. /workspace
+	// Done, when non-nil, is closed if the sandbox dies unexpectedly mid-turn
+	// (e.g. OOMKilled or container crash). Err reports the failure reason.
+	Done <-chan struct{}
+	Err  func() error
+}
+
+// OpenCodeSandboxManager is the consumer-owned lifecycle seam for ephemeral
+// per-task toolchain sandboxes in Brain mode (Option 2).
+type OpenCodeSandboxManager interface {
+	Acquire(ctx context.Context, req OpenCodeSandboxRequest) (OpenCodeSandboxLease, error)
+	Release(ctx context.Context, lease OpenCodeSandboxLease) error
+}
+
+// OpenCodeSandboxCommitter is an optional extension of OpenCodeSandboxManager
+// that commits and pushes work branch changes from inside the sandbox. When a
+// manager does not implement it, the Brain adapter commits and pushes over the
+// sandbox's authenticated MCP `bash` tool.
+type OpenCodeSandboxCommitter interface {
+	CommitAndPush(ctx context.Context, lease OpenCodeSandboxLease, repository, taskID, commitMessage string) (WorktreePushResult, error)
+}
+
 // OpenCodeAdapterConfig is the complete configuration for one project-scoped
 // OpenCode service adapter.
 type OpenCodeAdapterConfig struct {
 	ServiceID           id.PrincipalID
 	TenantID            id.TenantID
 	ProjectID           id.ProjectID
+	ExecutionMode       OpenCodeExecutionMode
+	Brain               OpenCodeBrainConfig
 	Handler             api.Handler
 	Stream              client.EventStreamer
 	Events              EventSource
 	OpenCode            OpenCodeClient
 	Store               OpenCodeStateStore
 	Worktrees           OpenCodeWorktreeManager
+	Sandboxes           OpenCodeSandboxManager
 	Proxy               *OpenCodeLLMProxy
 	PerTurnProxyRouting bool
+	SandboxRoundTripper http.RoundTripper
 	Clock               Clock
 	RescanInterval      time.Duration
 	MaxConcurrentTurns  int

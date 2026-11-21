@@ -1,0 +1,145 @@
+{{- /*
+Optional per-project OpenCode Brain <-> Ephemeral Sandbox NetworkPolicies
+(Issue #64, Option 2: Brain/Hands split).
+
+Off by default: when opencodeBrain.enabled is false nothing is rendered.
+For each declared project entry, this template renders two tightly scoped
+NetworkPolicies:
+  1. Brain pod policy (in the Brain pod's namespace): denies ALL ingress (so
+     sandbox pods can never reach the Brain pod or its session storage) and
+     permits egress ONLY to cluster DNS, the Kodema control-plane API, and
+     ephemeral sandbox pods in kodema-tenant-<tenant> carrying matching
+     kodema.dev/tenant, kodema.dev/project, and kodema.dev/role: sandbox labels
+     on the configured sandbox MCP port.
+  2. Sandbox pod ingress policy (in kodema-tenant-<tenant>): layered onto the
+     tenant default-deny policy, permits ingress ONLY from that exact project's
+     Brain pod on the sandbox MCP port. Sandbox pods remain unable to reach
+     each other or any other tenant/project.
+*/ -}}
+{{- if .Values.opencodeBrain }}
+{{- if .Values.opencodeBrain.enabled }}
+{{- $brain := .Values.opencodeBrain }}
+{{- $service := .Values.service | default dict }}
+{{- $apiPort := int ($service.targetPort | default 8443) }}
+{{- $defaultSandboxPort := int ($brain.sandboxPort | default 8090) }}
+{{- if not $brain.projects }}
+{{- fail "opencodeBrain.enabled requires at least one complete projects entry" }}
+{{- end }}
+{{- $seenNames := dict }}
+{{- range $entry := $brain.projects }}
+{{- $name := toString $entry.name }}
+{{- $tenant := toString $entry.tenant }}
+{{- $project := toString $entry.project }}
+{{- $brainNS := $entry.namespace | default $.Release.Namespace }}
+{{- $sandboxPort := int ($entry.sandboxPort | default $defaultSandboxPort) }}
+{{- if hasKey $seenNames $name }}
+{{- fail (printf "opencodeBrain repeats project entry name %q" $name) }}
+{{- end }}
+{{- $_ := set $seenNames $name true }}
+{{- if not (has $tenant $.Values.tenants) }}
+{{- fail (printf "opencodeBrain entry %q names tenant %q, which is not in values.tenants" $name $tenant) }}
+{{- end }}
+{{- if or (lt $sandboxPort 1024) (gt $sandboxPort 65535) }}
+{{- fail (printf "opencodeBrain entry %q sandboxPort %d must be between 1024 and 65535" $name $sandboxPort) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kodema-opencode-brain-{{ $name }}
+  namespace: {{ $brainNS }}
+  labels:
+    app.kubernetes.io/name: kodema
+    app.kubernetes.io/component: opencode-brain
+    kodema.dev/tenant: {{ $tenant | quote }}
+    kodema.dev/project: {{ $project | quote }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kodema
+      app.kubernetes.io/component: opencode-brain
+      kodema.dev/tenant: {{ $tenant | quote }}
+      kodema.dev/project: {{ $project | quote }}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Deny all ingress to the Brain pod so sandbox pods can never reach Brain
+  # session storage or loopback proxies.
+  ingress: []
+  egress:
+    # Cluster DNS stays reachable so permitted destinations resolve.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Public Kodema control-plane API + LLM proxy.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Release.Namespace | quote }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kodema
+              app.kubernetes.io/component: control-plane
+      ports:
+        - protocol: TCP
+          port: {{ $apiPort }}
+    # Ephemeral toolchain sandboxes in the SAME tenant namespace and SAME project ONLY.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kodema-tenant-{{ $tenant }}
+          podSelector:
+            matchLabels:
+              kodema.dev/tenant: {{ $tenant | quote }}
+              kodema.dev/project: {{ $project | quote }}
+              kodema.dev/role: sandbox
+      ports:
+        - protocol: TCP
+          port: {{ $sandboxPort }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kodema-opencode-sandbox-{{ $name }}
+  namespace: kodema-tenant-{{ $tenant }}
+  labels:
+    app.kubernetes.io/name: kodema
+    app.kubernetes.io/component: opencode-sandbox
+    kodema.dev/tenant: {{ $tenant | quote }}
+    kodema.dev/project: {{ $project | quote }}
+spec:
+  podSelector:
+    matchLabels:
+      kodema.dev/tenant: {{ $tenant | quote }}
+      kodema.dev/project: {{ $project | quote }}
+      kodema.dev/role: sandbox
+  policyTypes:
+    - Ingress
+  # Permit MCP ingress ONLY from this exact tenant/project's OpenCode Brain pod.
+  # Sandbox-to-sandbox and sandbox-to-Brain traffic remain blocked by tenant default-deny.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $brainNS | quote }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kodema
+              app.kubernetes.io/component: opencode-brain
+              kodema.dev/tenant: {{ $tenant | quote }}
+              kodema.dev/project: {{ $project | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ $sandboxPort }}
+{{- end }}
+{{- end }}
+{{- end }}
