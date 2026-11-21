@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"reflect"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/identity"
+	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/internal/shell/transport/ops"
 )
@@ -64,22 +66,27 @@ func (RegistryPermissions) Permission(name authorize.OperationName) (authorize.E
 type Ownership struct {
 	executions  ExecutionFactsReader
 	permissions ExecutionPermissionSource
+	scanner     store.Scanner
 
 	mu      sync.Mutex
 	pending map[context.Context]authorize.OperationName
 }
 
 // NewOwnership builds the scope resolver and execution authority.
-func NewOwnership(executions ExecutionFactsReader, permissions ExecutionPermissionSource) (*Ownership, error) {
+func NewOwnership(executions ExecutionFactsReader, permissions ExecutionPermissionSource, scanner store.Scanner) (*Ownership, error) {
 	if executions == nil {
 		return nil, fault.New(fault.InvalidInput, "ownership requires an execution facts reader")
 	}
 	if permissions == nil {
 		return nil, fault.New(fault.InvalidInput, "ownership requires an execution permission source")
 	}
+	if scanner == nil {
+		return nil, fault.New(fault.InvalidInput, "ownership requires a scanner")
+	}
 	return &Ownership{
 		executions:  executions,
 		permissions: permissions,
+		scanner:     scanner,
 		pending:     make(map[context.Context]authorize.OperationName),
 	}, nil
 }
@@ -119,11 +126,11 @@ func (ownership *Ownership) Resolve(ctx context.Context, principal authorize.Pri
 		case project != "":
 			scope = tenancy.Scope{TenantID: principal.Scope.TenantID, ProjectID: id.ProjectID(project)}
 		default:
-			// A tenant-wide credential has no project of its own. An id-only
-			// route cannot name one, so it is refused instead of being widened
-			// to the whole tenant.
-			return ops.Resolution{}, fault.New(fault.InvalidInput,
-				"a tenant-wide principal must name the project of the operation")
+			resolved, err := ownership.resolveResourceScope(ctx, principal, call, targets)
+			if err != nil {
+				return ops.Resolution{}, err
+			}
+			scope = resolved
 		}
 	default:
 		return ops.Resolution{}, fault.New(fault.InternalFailure, "operation has an unknown scope kind")
@@ -193,6 +200,154 @@ func keyable(ctx context.Context) bool {
 		return false
 	}
 	return reflect.TypeOf(ctx).Comparable()
+}
+
+// resourceTargetSpec pairs an ID-only route parameter with the project-owned
+// table that stores that resource.
+type resourceTargetSpec struct {
+	param string
+	table string
+}
+
+// resourceTargetSpecs lists every project-owned resource family addressed by
+// resource ID without a `{project}` route parameter.
+var resourceTargetSpecs = [...]resourceTargetSpec{
+	{param: "execution", table: "executions"},
+	{param: "task", table: "tasks"},
+	{param: "service", table: "services"},
+	{param: "binding", table: "resource_bindings"},
+}
+
+// resolveResourceScope resolves the owning project of an ID-addressed project
+// operation invoked by a tenant-wide principal (for example, a human OIDC login
+// session or a tenant-admin token). Operations that name neither a project nor
+// a project-owned resource are still refused rather than widened to the tenant.
+func (ownership *Ownership) resolveResourceScope(
+	ctx context.Context,
+	principal authorize.Principal,
+	call ops.Call,
+	targets map[string]string,
+) (tenancy.Scope, error) {
+	table, paramName, resourceID, hasResourceTarget := resourceRouteTarget(call, targets)
+	if !hasResourceTarget {
+		return tenancy.Scope{}, fault.New(fault.InvalidInput,
+			"a tenant-wide principal must name the project of the operation")
+	}
+	if resourceID == "" {
+		return tenancy.Scope{}, fault.New(fault.InvalidInput,
+			fmt.Sprintf("operation requires route parameter %q", paramName))
+	}
+	return ownership.resolveResourceProject(ctx, principal, table, resourceID)
+}
+
+// resourceRouteTarget reports whether call addresses one of the ID-only
+// project-owned resource families and extracts its resource ID from the REST
+// route parameter or canonical MCP input field.
+func resourceRouteTarget(call ops.Call, targets map[string]string) (table, paramName, resourceID string, ok bool) {
+	codec, exists := codecs[call.Operation]
+	if !exists {
+		return "", "", "", false
+	}
+	for _, spec := range resourceTargetSpecs {
+		for _, param := range codec.RouteParams {
+			if param.Name != spec.param {
+				continue
+			}
+			return spec.table, spec.param, identityTarget(call, targets, spec.param), true
+		}
+	}
+	return "", "", "", false
+}
+
+// resolveResourceProject looks up the project in principal.Scope.TenantID that
+// owns (table, resourceID).
+//
+// A tenant-wide principal with tenant-wide roles (such as a tenant admin) has
+// visibility across every project in its tenant. A tenant-scoped human without
+// tenant-wide roles (such as an OIDC login session) only has visibility into
+// projects where it currently holds a project membership row. Scanning only
+// visible projects ensures a resource in another project or another tenant is
+// uniformly not_found and never reveals project or resource existence; a
+// zero-membership OIDC user is refused as unauthenticated.
+func (ownership *Ownership) resolveResourceProject(
+	ctx context.Context,
+	principal authorize.Principal,
+	table, resourceID string,
+) (tenancy.Scope, error) {
+	tenantScope := tenancy.Scope{TenantID: principal.Scope.TenantID}
+	if err := tenantScope.Validate(); err != nil {
+		return tenancy.Scope{}, err
+	}
+	tenantWideAccess := len(principal.Roles) > 0
+	hasAnyProjectMembership := false
+
+	var after string
+	for {
+		page, err := ownership.scanner.Query(ctx, tenantScope, store.ScanQuery{
+			Table:   "projects",
+			OrderBy: []store.Order{{Column: "id"}},
+			After:   after,
+			Limit:   store.MaxQueryLimit,
+		})
+		if err != nil {
+			return tenancy.Scope{}, err
+		}
+		for _, row := range page.Rows {
+			projectID, err := scanRowString(row, "id")
+			if err != nil {
+				return tenancy.Scope{}, err
+			}
+			projectScope := tenancy.Scope{
+				TenantID:  tenantScope.TenantID,
+				ProjectID: id.ProjectID(projectID),
+			}
+			if !tenantWideAccess {
+				roles, found, err := scanPrincipalMembershipRoles(ctx, ownership.scanner, projectScope, principal.ID)
+				if err != nil {
+					return tenancy.Scope{}, err
+				}
+				if !found || len(roles) == 0 {
+					continue
+				}
+				hasAnyProjectMembership = true
+			}
+			found, err := resourceExistsInProject(ctx, ownership.scanner, projectScope, table, resourceID)
+			if err != nil {
+				return tenancy.Scope{}, err
+			}
+			if found {
+				return projectScope, nil
+			}
+		}
+		if !page.HasMore {
+			break
+		}
+		after = page.Next
+	}
+	if !tenantWideAccess && !hasAnyProjectMembership {
+		return tenancy.Scope{}, fault.New(fault.Unauthenticated, "presented credential is invalid")
+	}
+	return tenancy.Scope{}, fault.New(fault.NotFound, "resource is not visible")
+}
+
+// resourceExistsInProject reports whether a row with id=resourceID exists in
+// table inside the exact project scope.
+func resourceExistsInProject(
+	ctx context.Context,
+	scanner store.Scanner,
+	scope tenancy.Scope,
+	table, resourceID string,
+) (bool, error) {
+	page, err := scanner.Query(ctx, scope, store.ScanQuery{
+		Table:   table,
+		Equals:  map[string]any{"id": resourceID},
+		OrderBy: []store.Order{{Column: "id"}},
+		Limit:   1,
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(page.Rows) > 0, nil
 }
 
 // identityTarget returns one identity-scope value the operation's route

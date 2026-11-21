@@ -77,7 +77,7 @@ func (*recordingTenancy) ListMemberships(context.Context, tenancyadmin.Membershi
 func TestHandlerCallsTheCapabilityWithTheCompleteCommand(t *testing.T) {
 	h := newHarness(t)
 	recorder := &recordingTenancy{}
-	ownership, err := opsapp.NewOwnership(h.facts, opsapp.RegistryPermissions{})
+	ownership, err := opsapp.NewOwnership(h.facts, opsapp.RegistryPermissions{}, h.store)
 	if err != nil {
 		t.Fatalf("NewOwnership: %v", err)
 	}

@@ -535,7 +535,7 @@ func TestProjectEventStream_HumanOIDCAuthExpiryAndKeepalive(t *testing.T) {
 	})
 	factsPermission, _ := bridges.NewPermissionSource(authorize.ExecOwnTaskContent, clock)
 	executionFacts, _ := platform.NewExecutionReader(mem.Controller(), factsPermission)
-	ownership, _ := opsapp.NewOwnership(executionFacts, opsapp.RegistryPermissions{})
+	ownership, _ := opsapp.NewOwnership(executionFacts, opsapp.RegistryPermissions{}, mem)
 	hub := newEventWakeupHub()
 
 	sseHandler, err := newProjectEventStreamHandler(projectEventStreamConfig{

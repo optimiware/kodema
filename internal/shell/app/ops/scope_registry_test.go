@@ -9,8 +9,10 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/id"
 	opsapp "github.com/optimiware/kodema/internal/shell/app/ops"
 	"github.com/optimiware/kodema/internal/shell/authorize"
+	"github.com/optimiware/kodema/internal/shell/identity"
 	"github.com/optimiware/kodema/internal/shell/receipt"
 	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
@@ -352,4 +354,258 @@ func TestTenantWideProjectStaysInCallerTenant(t *testing.T) {
 		"secret":  "secret-foreign",
 	})
 	requireScopeRefusal(t, "tenant-wide foreign project read", err)
+}
+
+// TestScopeIDAddressedRegistrySweep walks every ScopeProject operation whose
+// route has no `{project}` segment and proves that:
+//   - every human-callable ID-only project operation resolves its owning
+//     project for a tenant-scoped human member and a tenant-wide admin across
+//     both REST and MCP;
+//   - resources in a project where the tenant-scoped human has no membership,
+//     or in a foreign tenant, are uniformly not_found (no existence oracle);
+//   - a zero-membership human is uniformly unauthenticated;
+//   - omitting the resource ID in MCP returns invalid_input;
+//   - service-only operations without a project or resource ID still refuse a
+//     tenant-wide principal with invalid_input.
+func TestScopeIDAddressedRegistrySweep(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.invokeKey(t, "token-admin", "tenant.create",
+		`{"tenant_id":"`+testTenant+`","name":"Tenant A"}`, "id-sweep-tenant", nil); err != nil {
+		t.Fatalf("tenant.create: %v", err)
+	}
+	for _, proj := range []string{testProject, "secret-project"} {
+		if _, err := h.invokeKey(t, "token-admin", "project.create",
+			`{"project_id":"`+proj+`","name":"Project `+proj+`"}`, "id-sweep-proj-"+proj,
+			map[string]string{"tenant": testTenant}); err != nil {
+			t.Fatalf("project.create %s: %v", proj, err)
+		}
+	}
+
+	// Seed one resource of each ID-addressed family in testProject and one in
+	// secret-project (which memberHuman does NOT belong to).
+	seedIDResources := func(projectID, suffix string) map[string]string {
+		scope := tenancy.Scope{TenantID: testTenant, ProjectID: id.ProjectID(projectID)}
+		taskID := "task-sweep-" + suffix
+		execID := "execution-sweep-" + suffix
+		svcID := "service-sweep-" + suffix
+		resID := "resource-sweep-" + suffix
+		bindID := "binding-sweep-" + suffix
+		if _, err := h.store.Execute(context.Background(), scope, store.Unit{
+			Writes: []store.Write{
+				{
+					Table:  "tasks",
+					ID:     taskID,
+					Insert: true,
+					Values: map[string]any{
+						"content_version":   int64(1),
+						"lifecycle_version": int64(1),
+						"state":             "open",
+						"initiator_id":      "initiator-1",
+						"title":             "sweep task",
+						"created_at":        fixedNow,
+					},
+				},
+				{
+					Table:  "executions",
+					ID:     execID,
+					Insert: true,
+					Values: map[string]any{
+						"principal_id": "exec-principal-" + suffix,
+						"state":        "queued",
+						"version":      int64(1),
+						"yaml_sha256":  make([]byte, 32),
+						"snapshot":     []byte(`{}`),
+						"created_at":   fixedNow,
+					},
+				},
+				{
+					Table:  "services",
+					ID:     svcID,
+					Insert: true,
+					Values: map[string]any{
+						"name":       svcID,
+						"state":      "enabled",
+						"roles":      []byte(`["engineer"]`),
+						"version":    int64(1),
+						"created_at": fixedNow,
+					},
+				},
+				{
+					Table:  "resources",
+					ID:     resID,
+					Insert: true,
+					Values: map[string]any{
+						"version":    int64(1),
+						"created_at": fixedNow,
+					},
+				},
+				{
+					Table:  "resource_bindings",
+					ID:     bindID,
+					Insert: true,
+					Values: map[string]any{
+						"resource_id":       resID,
+						"service_id":        svcID,
+						"origins":           []byte(`["https://git.local"]`),
+						"operations":        []byte(`["git.ref.update"]`),
+						"reportable_events": []byte(`[]`),
+						"metadata":          []byte(`{}`),
+						"version":           int64(1),
+						"created_at":        fixedNow,
+					},
+				},
+			},
+		}); err != nil {
+			t.Fatalf("seed ID resources in %s: %v", projectID, err)
+		}
+		return map[string]string{
+			"task":      taskID,
+			"execution": execID,
+			"service":   svcID,
+			"binding":   bindID,
+		}
+	}
+
+	ownIDs := seedIDResources(testProject, "own")
+	secretIDs := seedIDResources("secret-project", "secret")
+
+	admin, err := h.principals.Resolve(context.Background(), "token-admin")
+	if err != nil {
+		t.Fatalf("resolve admin: %v", err)
+	}
+	memberHuman := authorize.Principal{
+		ID:      "oidc-sweep-member",
+		Kind:    identity.KindHuman,
+		Scope:   tenancy.Scope{TenantID: testTenant},
+		Enabled: true,
+	}
+	h.seedMembership(t, tenancy.Scope{TenantID: testTenant, ProjectID: testProject},
+		"membership-sweep-member", memberHuman.ID, 1, tenancy.RoleEngineer)
+	unassignedHuman := authorize.Principal{
+		ID:      "oidc-sweep-unassigned",
+		Kind:    identity.KindHuman,
+		Scope:   tenancy.Scope{TenantID: testTenant},
+		Enabled: true,
+	}
+
+	scopes := []tenancy.Scope{
+		{TenantID: testTenant},
+		{TenantID: testTenant, ProjectID: testProject},
+		{TenantID: testTenant, ProjectID: "secret-project"},
+	}
+	baseline := snapshotScopeEffects(h, scopes)
+
+	for _, operation := range authorize.Operations() {
+		if operation.Scope != authorize.ScopeProject {
+			continue
+		}
+		name := string(operation.Name)
+		codec, ok := codecForOperation(name)
+		if !ok {
+			t.Fatalf("%s has no public codec", name)
+		}
+		hasProject := false
+		var idParam, idField string
+		for _, param := range codec.RouteParams {
+			if param.Name == "project" {
+				hasProject = true
+				break
+			}
+			if _, isID := ownIDs[param.Name]; isID {
+				idParam = param.Name
+				idField = param.Field
+			}
+		}
+		if hasProject {
+			continue
+		}
+		if idParam == "" {
+			if len(operation.Requires.HumanRoles) > 0 {
+				t.Fatalf("human-callable ScopeProject operation %s has neither {project} nor an ID-addressed resource param", name)
+			}
+			// Service-only operations with no project/resource ID still refuse
+			// tenant-wide principals with invalid_input.
+			if _, err := h.ownership.Resolve(context.Background(), admin, ops.Call{
+				Operation: operation.Name,
+				Request:   api.Request{Input: json.RawMessage(`{}`)},
+			}); err == nil {
+				t.Fatalf("%s unexpectedly resolved for tenant-wide admin", name)
+			} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+				t.Fatalf("%s tenant-wide error = %v; want invalid_input", name, err)
+			}
+			continue
+		}
+
+		ownRESTParams := map[string]string{idParam: ownIDs[idParam]}
+		ownMCPInput, _ := json.Marshal(map[string]string{idField: ownIDs[idParam]})
+		secretRESTParams := map[string]string{idParam: secretIDs[idParam]}
+		secretMCPInput, _ := json.Marshal(map[string]string{idField: secretIDs[idParam]})
+
+		// 1. Both tenant-wide admin and tenant-scoped human member resolve the
+		// owning project for REST and MCP.
+		for label, principal := range map[string]authorize.Principal{
+			"tenant-admin": admin,
+			"oidc-member":  memberHuman,
+		} {
+			resREST, err := h.ownership.Resolve(context.Background(), principal, ops.Call{
+				Operation: operation.Name,
+				Params:    ownRESTParams,
+				Request:   api.Request{Input: json.RawMessage(`{}`)},
+			})
+			if err != nil {
+				t.Fatalf("%s %s REST Resolve: %v", name, label, err)
+			}
+			if resREST.Scope != (tenancy.Scope{TenantID: testTenant, ProjectID: testProject}) {
+				t.Fatalf("%s %s REST scope = %+v; want %s/%s", name, label, resREST.Scope, testTenant, testProject)
+			}
+			resMCP, err := h.ownership.Resolve(context.Background(), principal, ops.Call{
+				Operation: operation.Name,
+				Request:   api.Request{Input: ownMCPInput},
+			})
+			if err != nil {
+				t.Fatalf("%s %s MCP Resolve: %v", name, label, err)
+			}
+			if resMCP.Scope != (tenancy.Scope{TenantID: testTenant, ProjectID: testProject}) {
+				t.Fatalf("%s %s MCP scope = %+v; want %s/%s", name, label, resMCP.Scope, testTenant, testProject)
+			}
+		}
+
+		// 2. Resource in a non-member project is uniformly not_found for the
+		// tenant-scoped human member (both REST and MCP).
+		for _, call := range []ops.Call{
+			{Operation: operation.Name, Params: secretRESTParams, Request: api.Request{Input: json.RawMessage(`{}`)}},
+			{Operation: operation.Name, Request: api.Request{Input: secretMCPInput}},
+		} {
+			if _, err := h.ownership.Resolve(context.Background(), memberHuman, call); err == nil {
+				t.Fatalf("%s memberHuman unexpectedly resolved secret-project resource", name)
+			} else if class, ok := fault.ClassOf(err); !ok || class != fault.NotFound {
+				t.Fatalf("%s memberHuman secret-project error = %v; want not_found", name, err)
+			}
+		}
+
+		// 3. Zero-membership human is uniformly unauthenticated (never reveals existence).
+		if _, err := h.ownership.Resolve(context.Background(), unassignedHuman, ops.Call{
+			Operation: operation.Name,
+			Params:    ownRESTParams,
+			Request:   api.Request{Input: json.RawMessage(`{}`)},
+		}); err == nil {
+			t.Fatalf("%s unassignedHuman unexpectedly succeeded", name)
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
+			t.Fatalf("%s unassignedHuman error = %v; want unauthenticated", name, err)
+		}
+
+		// 4. Omitting the resource ID in MCP input returns invalid_input.
+		if _, err := h.ownership.Resolve(context.Background(), memberHuman, ops.Call{
+			Operation: operation.Name,
+			Request:   api.Request{Input: json.RawMessage(`{}`)},
+		}); err == nil {
+			t.Fatalf("%s missing MCP id unexpectedly succeeded", name)
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("%s missing MCP id error = %v; want invalid_input", name, err)
+		}
+	}
+
+	if got := snapshotScopeEffects(h, scopes); !reflect.DeepEqual(got, baseline) {
+		t.Fatalf("ID-addressed scope lookups changed committed state: %+v -> %+v", baseline, got)
+	}
 }

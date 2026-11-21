@@ -9,15 +9,28 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/shell/store"
+	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/internal/shell/transport/httpapi"
 	"github.com/optimiware/kodema/internal/shell/transport/mcp"
 )
 
 // TestScopeRules pins the ScopeResolver rule: a project-scoped
 // credential cannot see a foreign row (uniform not_found), a tenant-wide
-// credential must name the project, and a route/body disagreement refuses.
+// credential resolves ID-addressed project resources within its own tenant,
+// refuses operations without a project or resource identity, and a route/body
+// disagreement refuses.
 func TestScopeRules(t *testing.T) {
 	h := newHarness(t)
+	if _, err := h.invokeKey(t, "token-admin", "tenant.create",
+		`{"tenant_id":"`+testTenant+`","name":"Tenant A"}`, "scope-rules-tenant", nil); err != nil {
+		t.Fatalf("tenant.create: %v", err)
+	}
+	if _, err := h.invokeKey(t, "token-admin", "project.create",
+		`{"project_id":"project-b","name":"Project B"}`, "scope-rules-project-b",
+		map[string]string{"tenant": testTenant}); err != nil {
+		t.Fatalf("project.create project-b: %v", err)
+	}
 	foreignTask := createTaskInProjectB(t, h)
 
 	t.Run("foreign row is not_found", func(t *testing.T) {
@@ -27,10 +40,66 @@ func TestScopeRules(t *testing.T) {
 		}
 	})
 
-	t.Run("tenant-wide principal must name the project", func(t *testing.T) {
-		_, err := h.invoke(t, "token-admin", "task.read", `{}`, map[string]string{"task": foreignTask})
+	t.Run("tenant-wide principal resolves owning project by resource id", func(t *testing.T) {
+		read, err := h.invoke(t, "token-admin", "task.read", `{}`, map[string]string{"task": foreignTask})
+		if err != nil {
+			t.Fatalf("tenant-wide id-only read: %v", err)
+		}
+		var result api.TaskReadResult
+		decodeResult(t, read, &result)
+		if result.TaskID != foreignTask {
+			t.Fatalf("task_id = %q; want %q", result.TaskID, foreignTask)
+		}
+	})
+
+	t.Run("tenant-wide principal cannot resolve resource in another tenant", func(t *testing.T) {
+		otherTenant := tenancy.Scope{TenantID: "tenant-b"}
+		if _, err := h.store.Execute(context.Background(), otherTenant, store.Unit{
+			Writes: []store.Write{{
+				Table:  "projects",
+				ID:     "project-z",
+				Insert: true,
+				Values: map[string]any{
+					"name":       "Project Z",
+					"version":    int64(1),
+					"created_at": fixedNow,
+				},
+			}},
+		}); err != nil {
+			t.Fatalf("seed foreign tenant project: %v", err)
+		}
+		otherProject := tenancy.Scope{TenantID: "tenant-b", ProjectID: "project-z"}
+		if _, err := h.store.Execute(context.Background(), otherProject, store.Unit{
+			Writes: []store.Write{{
+				Table:  "tasks",
+				ID:     "task-other-tenant",
+				Insert: true,
+				Values: map[string]any{
+					"content_version":   int64(1),
+					"lifecycle_version": int64(1),
+					"state":             "open",
+					"initiator_id":      "someone",
+					"title":             "other tenant task",
+					"created_at":        fixedNow,
+				},
+			}},
+		}); err != nil {
+			t.Fatalf("seed foreign tenant task: %v", err)
+		}
+		_, err := h.invoke(t, "token-admin", "task.read", `{}`, map[string]string{"task": "task-other-tenant"})
+		if class, ok := fault.ClassOf(err); !ok || class != fault.NotFound {
+			t.Fatalf("foreign-tenant task read = %v; want not_found", err)
+		}
+	})
+
+	t.Run("tenant-wide principal without project or resource id is refused", func(t *testing.T) {
+		_, err := h.invoke(t, "token-admin", "actor.verify", `{}`, nil)
 		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
-			t.Fatalf("tenant-wide id-only read = %v; want invalid_input", err)
+			t.Fatalf("tenant-wide actor.verify = %v; want invalid_input", err)
+		}
+		_, err = h.invoke(t, "token-admin", "task.read", `{}`, nil)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("tenant-wide MCP task.read without task_id = %v; want invalid_input", err)
 		}
 	})
 

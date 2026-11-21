@@ -168,7 +168,7 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 	if err != nil {
 		return nil, err
 	}
-	ownership, err := opsapp.NewOwnership(executionFacts, opsapp.RegistryPermissions{})
+	ownership, err := opsapp.NewOwnership(executionFacts, opsapp.RegistryPermissions{}, environment.scanner)
 	if err != nil {
 		return nil, err
 	}
