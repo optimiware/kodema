@@ -8,9 +8,10 @@ Kodema includes a streaming, credential-injecting LLM proxy (`/llm/{provider}/*`
 2. Store provider API keys as project secrets:
 
    ```sh
-   kodema secret set OPENCODE_API_KEY
-   kodema secret set ANTHROPIC_API_KEY
-   kodema secret set OPENAI_API_KEY
+   printf '%s' "$OPENCODE_API_KEY"  | kodema secret set OPENCODE_API_KEY  --stdin
+   printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin
+   printf '%s' "$OPENAI_API_KEY"    | kodema secret set OPENAI_API_KEY    --stdin
+   # Or read from a file with: kodema secret set ANTHROPIC_API_KEY --value-file <path>
    ```
 
 3. Container workloads **never** list provider keys in `secrets: [...]`. Kodema enforces strict secret isolation: any secret owned by a configured LLM proxy provider is refused during workload secret materialization, even when local `kodema up` allows other project secrets.
@@ -35,7 +36,7 @@ kodema up \
   --llm-provider local-vllm=http://host.containers.internal:8000/v1,secret=VLLM_API_KEY
 ```
 
-Store the matching project secret (`kodema secret set OPENROUTER_API_KEY` or `kodema secret set VLLM_API_KEY`), and workloads automatically receive `KODEMA_LLM_OPENROUTER_BASE_URL` and `KODEMA_LLM_LOCAL_VLLM_BASE_URL`.
+Store the matching project secret (for example `printf '%s' "$OPENROUTER_API_KEY" | kodema secret set OPENROUTER_API_KEY --stdin`, `printf '%s' "$VLLM_API_KEY" | kodema secret set VLLM_API_KEY --stdin`, or `--value-file <path>`), and workloads automatically receive `KODEMA_LLM_OPENROUTER_BASE_URL` and `KODEMA_LLM_LOCAL_VLLM_BASE_URL`.
 
 For `kodema serve`, pass `--models-file /path/to/models.json` (or `KODEMA_MODELS_FILE`) or repeatable `--llm-provider <name>=<base_url>[,secret=<NAME>][,auth=<Authorization|x-api-key>][,tenant=<TENANT>][,project=<PROJECT>]`.
 
@@ -157,7 +158,7 @@ kodema services --kind opencode \
   --ca-file "$KODEMA_CA_FILE" \
   --credential-file /path/to/opencode-shop.token \
   --state-dir /var/lib/kodema/opencode-shop \
-  --git-url "$KODEMA_GIT_URL" \
+  --git-url "${KODEMA_GIT_URL:-${KODEMA_URL}/git}" \
   --opencode-url http://127.0.0.1:4096 \
   --llm-proxy-listen 127.0.0.1:18080 \
   --per-turn-proxy-routing \
@@ -178,8 +179,8 @@ Option 2 separates LLM reasoning and persistent sessions (**Brain**) from build/
 
 1. **`kodema sandbox serve` (Hands):** Compiled into `/kodema/bin/kodema` using pure Go standard library—zero custom agent images required. Serves Streamable HTTP MCP JSON-RPC 2.0 at `POST /mcp` (plus `GET /healthz`) jailed strictly to `/workspace` via `os.Root`:
    - 6 jailed tools: `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`.
-   - Constant-time Bearer token auth (`--token-file` + `--unlink-token-file`, `--token-env` defaulting to `KODEMA_SANDBOX_TOKEN`, or `--generate-token-file`), failing closed when no token is configured.
-   - Strips token env vars/files before launching child `bash` processes and kills entire process groups on timeout or cancellation (`--max-cmd-timeout`, `--max-output-bytes`, `--max-file-bytes`).
+   - Constant-time Bearer token auth (`--token-file`, with optional `--unlink-token-file` for writable token files outside `/workspace`, `--token-env` defaulting to `KODEMA_SANDBOX_TOKEN`, or `--generate-token-file`), failing closed when no token is configured.
+   - Strips token env vars (`KODEMA_SANDBOX_TOKEN`, `KODEMA_SANDBOX_TOKEN_FILE`, `--token-env`) before launching child `bash` processes and kills entire process groups on timeout or cancellation (`--max-cmd-timeout`, `--max-output-bytes`, `--max-file-bytes`).
 2. **OpenCode Brain (`--mode brain`):** Disables all built-in local shell/filesystem tools (`bash`, `write`, `edit`, `read`, `glob`, `grep`) in OpenCode config and attaches ephemeral per-task sandboxes created through Kodema's public API (`KodemaExecutionSandboxManager`):
 
 ```sh

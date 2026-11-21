@@ -14,7 +14,8 @@ You do not need Kubernetes or local app builds to deliver software with Kodema:
    This starts the local control plane, Git companion, and Podman container runtime with zero Kubernetes setup.
 2. **Configure LLM provider key(s) in the control plane:**
    ```sh
-   kodema secret set ANTHROPIC_API_KEY   # or OPENAI_API_KEY, OPENCODE_API_KEY
+   printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin
+   # or OPENAI_API_KEY / OPENCODE_API_KEY, or --value-file <path>
    ```
    Workload containers and agentic services call Kodema's LLM proxy (`/llm/<provider>/*`) and never hold raw provider API keys.
 3. **Connect your user harness (Claude Code, Codex, OpenCode, Cursor) via MCP + embedded docs/skill:**

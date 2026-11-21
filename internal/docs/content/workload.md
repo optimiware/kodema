@@ -41,7 +41,7 @@ Supplied when configured by the installation:
 
 ## Recommended: `kodema harness exec -- <cmd>` (zero boilerplate, rotation-safe)
 
-Store provider API keys once as project secrets (`kodema secret set OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.). **Never declare provider keys in container `secrets: [...]`**—Kodema keeps raw provider keys inside the control plane and strictly refuses to mount LLM-proxy-managed secrets into workload containers.
+Store provider API keys once as project secrets (for example `printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin` for `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `OPENCODE_API_KEY`, or `--value-file <path>`). **Never declare provider keys in container `secrets: [...]`**—Kodema keeps raw provider keys inside the control plane and strictly refuses to mount LLM-proxy-managed secrets into workload containers.
 
 Wrap any coding harness command with **`kodema harness exec -- <cmd...>`**:
 
@@ -95,7 +95,7 @@ When any active limit is reached or exceeded, the LLM proxy rejects the call wit
   ```
 - **Inspect or comment on the task:** `kodema task show "$KODEMA_TASK"`, `kodema call task.comment ...`
 - **Connect an in-container harness over MCP:** `kodema mcp stdio` bridges stdin/stdout to `$KODEMA_URL/mcp` using `/kodema/secrets/KODEMA_TOKEN`.
-- **Run an ephemeral jailed MCP tool sandbox (Option 2 Hands):** `kodema sandbox serve --listen 0.0.0.0:8090 --workspace /workspace --token-file /kodema/secrets/<NAME> --unlink-token-file` (pure Go stdlib, `os.Root`-jailed `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`).
+- **Run an ephemeral jailed MCP tool sandbox (Option 2 Hands):** `kodema sandbox serve --listen 0.0.0.0:8090 --workspace /workspace --token-file /kodema/secrets/<NAME> --token-env <NAME>` (pure Go stdlib, `os.Root`-jailed `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`; reserve `--unlink-token-file` for writable token files outside `/workspace`, never read-only `/kodema/secrets/` mounts).
 - **Submit outputs early (optional):** `kodema output push` (also run automatically after the final command).
 
 ## Execution permissions boundary

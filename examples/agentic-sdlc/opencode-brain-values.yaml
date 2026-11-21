@@ -3,6 +3,9 @@
 #
 # Apply alongside your base deployment values with:
 #   helm upgrade --install kodema deploy/charts/kodema -f values.yaml -f opencode-brain-values.yaml
+#
+# Helm `-f` replaces the `tenants` list rather than merging it, so include your
+# full tenant list here when layering this file on top of base values.
 tenants:
   - tenant-a
 

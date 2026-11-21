@@ -274,7 +274,8 @@ harness (**Claude Code**, **Codex**, **OpenCode**, or **Cursor**) to your local
    raw provider API keys:
 
    ```sh
-   kodema secret set ANTHROPIC_API_KEY   # or OPENAI_API_KEY, OPENCODE_API_KEY
+   printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin
+   # or OPENAI_API_KEY / OPENCODE_API_KEY, or --value-file <path>
    ```
 
 2. **Connect your harness via MCP and install Kodema's embedded docs skill:**

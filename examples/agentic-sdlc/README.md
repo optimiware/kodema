@@ -18,7 +18,7 @@ instance with zero Kubernetes setup and zero local app builds:
 ```sh
 kodema up
 source ~/.kodema/instances/default/env.sh
-kodema secret set ANTHROPIC_API_KEY      # or OPENAI_API_KEY, OPENCODE_API_KEY
+printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin   # or OPENAI_API_KEY / OPENCODE_API_KEY, or --value-file <path>
 kodema mcp install claude                # or codex, opencode, cursor
 kodema docs install --target agents      # or claude, opencode, all
 ```
@@ -55,9 +55,13 @@ stateless container Job with zero long-lived agent pods:
        alerts `role/operator`.
 3. **Stage 3 — Serialized merge ([`pattern-a-merge.yaml`](pattern-a-merge.yaml)):**
    - Passes `decision_id` to `service/merge-coordinator`
-     (`kodema services --kind merge_coordinator`), which pushes with
-     `-o kodema.decision_id=<id>` (composing with
-     `option approve-rebase.refs/heads/main = disjoint` in `admin/conf/git.conf`).
+     (`kodema services --kind merge_coordinator`), which serializes pushes to
+     `target_ref` and forwards `-o kodema.decision_id=<id>` (refusing with
+     base-moved if `target_ref` advanced past `base`). When a repository enables
+     `option approve-rebase.<ref> = disjoint`, `kodema git serve` also supports
+     `-o kodema.approved_base=<sha> -o kodema.approved_candidate=<sha>`
+     (optionally paired with `-o kodema.decision_id=<id>`) for pushing
+     executions or custom rebase-aware merge services.
    - Closes the task explicitly with `kodema task complete <task-id>`.
 
 ```sh
@@ -90,7 +94,7 @@ kodema services --kind opencode \
   --ca-file "$KODEMA_CA_FILE" \
   --credential-file /var/run/kodema/opencode-shop-cred \
   --state-dir /var/lib/kodema/opencode-shop \
-  --git-url "$KODEMA_GIT_URL" \
+  --git-url "${KODEMA_GIT_URL:-${KODEMA_URL}/git}" \
   --opencode-url http://127.0.0.1:4096 \
   --llm-proxy-listen 127.0.0.1:18080 \
   --per-turn-proxy-routing \

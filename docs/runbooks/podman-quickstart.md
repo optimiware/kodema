@@ -562,7 +562,8 @@ editing application code directly on your laptop:
    or a server started with `--models-file` / `--llm-provider`):
 
    ```sh
-   kodema secret set ANTHROPIC_API_KEY   # or OPENAI_API_KEY, OPENCODE_API_KEY
+   printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin
+   # or OPENAI_API_KEY / OPENCODE_API_KEY, or --value-file <path>
    ```
 
 2. **Install the Kodema MCP bridge and embedded docs skill** for your harness:

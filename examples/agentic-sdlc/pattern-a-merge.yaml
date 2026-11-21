@@ -3,10 +3,13 @@
 # Passes the immutable `decision_id` minted by Stage 2's `review` action to
 # `service/merge-coordinator` (`kodema services --kind merge_coordinator`).
 #
-# The merge coordinator serializes updates to `target_ref` and pushes with
-# `-o kodema.decision_id=<decision_id>` (and `-o kodema.approved_base` /
-# `-o kodema.approved_candidate` when the repo enables
-# `option approve-rebase.refs/heads/main = disjoint` in `admin/conf/git.conf`).
+# The built-in `merge_coordinator` serializes pushes to `target_ref` and
+# forwards `-o kodema.decision_id=<decision_id>`, refusing with base-moved if
+# `target_ref` advanced past `base`. For clean rebases onto a moved target ref,
+# `kodema git serve` supports `option approve-rebase.<ref> = disjoint` with
+# `-o kodema.approved_base=<sha> -o kodema.approved_candidate=<sha>`
+# (optionally paired with `-o kodema.decision_id=<id>`) for pushing executions
+# or custom rebase-aware merge services.
 #
 # Keeping `completes_task: false` lets a post-merge step or orchestrator call
 # `kodema task complete <task-id>` explicitly once release checks finish.

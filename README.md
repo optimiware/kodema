@@ -181,7 +181,8 @@ builds**:
    ```
 2. **Store LLM provider key(s) in the control plane:**
    ```sh
-   kodema secret set ANTHROPIC_API_KEY   # or OPENAI_API_KEY, OPENCODE_API_KEY
+   printf '%s' "$ANTHROPIC_API_KEY" | kodema secret set ANTHROPIC_API_KEY --stdin
+   # or OPENAI_API_KEY / OPENCODE_API_KEY, or --value-file <path>
    ```
    Provider keys stay inside Kodema's control plane; workload containers and
    agentic services call Kodema's LLM proxy without ever holding raw keys.

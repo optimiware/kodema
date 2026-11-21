@@ -93,7 +93,7 @@ Rules and security invariants:
 
 - `option approve-rebase.<ref> = disjoint` requires a covering `option approve.<ref> = <role>` rule in the same repository stanza; unknown modes, duplicate declarations, or dangling `approve-rebase` rules are rejected.
 - Without `option approve-rebase.<ref> = disjoint`, strict exact `(expected_base, candidate)` matching remains enforced even if push options are supplied.
-- To use disjoint rebase approval, the pushing execution or merge coordinator rebases onto the moved target ref and pushes with both Git push options (plus `-o kodema.decision_id=<id>` when using cross-execution approval):
+- Note: `kodema services --kind merge_coordinator` serializes pushes to `target_ref` and forwards `-o kodema.decision_id=<id>` (refusing with base-moved if `target_ref` advanced past `base`). To use disjoint rebase approval with `kodema git serve`, a pushing execution or custom rebase-aware merge service rebases onto the moved target ref and pushes with both Git push options (optionally paired with `-o kodema.decision_id=<id>` for cross-execution approval):
   `-o kodema.approved_base=<40-hex-sha> -o kodema.approved_candidate=<40-hex-sha>`.
 - For non-creation, non-deletion updates when push options differ from `(old_oid, new_oid)`, `kodema git serve` enforces all of the following in `pre-receive`:
   1. **Verified approval**: either the pushing execution holds a passed `request: role/<role>` or the supplied `kodema.decision_id` verifies that approval for `(operation: git.ref.update, resource, ref, expected_base: approved_base, candidate: approved_candidate)`.

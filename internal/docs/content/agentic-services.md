@@ -26,7 +26,7 @@ kodema services --kind opencode \
   --ca-file "$KODEMA_CA_FILE" \
   --credential-file /path/to/opencode-shop.token \
   --state-dir /var/lib/kodema/opencode-shop \
-  --git-url "$KODEMA_GIT_URL" \
+  --git-url "${KODEMA_GIT_URL:-${KODEMA_URL}/git}" \
   --opencode-url http://127.0.0.1:4096 \
   --llm-proxy-listen 127.0.0.1:18080 \
   --per-turn-proxy-routing \
@@ -59,7 +59,7 @@ Option 2 separates long-lived LLM reasoning (**Brain**) from untrusted build/tes
 
 1. **`kodema sandbox serve` (Hands):** Compiled directly into `/kodema/bin/kodema` using pure Go stdlib—no custom agent image required. Runs a Streamable HTTP MCP JSON-RPC 2.0 server (`POST /mcp`, `GET /healthz`) jailed strictly to `/workspace` via `os.Root`:
    - Exposes 6 tools: `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`.
-   - Enforces constant-time Bearer token auth (`--token-file` with optional `--unlink-token-file`, `--token-env` defaulting to `KODEMA_SANDBOX_TOKEN`, or `--generate-token-file`), fails closed if no token is configured, strips token env/files from child `bash` processes, and enforces process-group timeout/cancel teardown (`--max-cmd-timeout`, `--max-output-bytes`, `--max-file-bytes`).
+   - Enforces constant-time Bearer token auth (`--token-file`, with optional `--unlink-token-file` for writable token files outside `/workspace`, `--token-env` defaulting to `KODEMA_SANDBOX_TOKEN`, or `--generate-token-file`), fails closed if no token is configured, strips token env vars (`KODEMA_SANDBOX_TOKEN`, `KODEMA_SANDBOX_TOKEN_FILE`, `--token-env`) from child `bash` processes, and enforces process-group timeout/cancel teardown (`--max-cmd-timeout`, `--max-output-bytes`, `--max-file-bytes`).
 2. **OpenCode Brain (`--mode brain`):** Disables all built-in local shell and filesystem tools (`bash`, `write`, `edit`, `read`, `glob`, `grep`) in OpenCode config and dynamically spawns ephemeral per-task toolchain sandboxes via Kodema's public API (`KodemaExecutionSandboxManager`) using stock upstream images (for example `golang:1.24`, `node:22`, `python:3.12`):
 
 ```sh

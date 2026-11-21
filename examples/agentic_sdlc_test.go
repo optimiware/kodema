@@ -3,18 +3,24 @@ package examples_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.yaml.in/yaml/v3"
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
 	"github.com/optimiware/kodema/internal/kernel"
@@ -196,6 +202,12 @@ func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 				t.Fatalf("%s project entry missing name or project: %+v", agenticSDLCBrainValuesFile, entry)
 			}
 		}
+
+		validateHelmValuesOverlayAgainstSchema(
+			t,
+			raw,
+			filepath.Join("..", "deploy", "charts", "kodema", "values.schema.json"),
+		)
 	})
 }
 
@@ -923,10 +935,18 @@ func TestAgenticSDLCHermeticLifecycleEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal mismatch verify: %v", err)
 	}
-	if mismatchRaw, err := gitTr.Invoke(ctx, api.Invocation{
+	mismatchRaw, err := gitTr.Invoke(ctx, api.Invocation{
 		Operation: "actor.verify",
 		Request:   api.Request{Input: mismatchInput},
-	}); err == nil {
+	})
+	if err != nil {
+		var pubErr *api.Error
+		code, hasCode := fault.CodeOf(err)
+		isForbidden := (hasCode && code == fault.CodeForbidden) || (errors.As(err, &pubErr) && pubErr.Code == api.CodeForbidden)
+		if !isForbidden {
+			t.Fatalf("actor.verify mismatch returned unexpected error: %v (want %s)", err, api.CodeForbidden)
+		}
+	} else {
 		var mismatchResp api.VerifyResponse
 		if decErr := json.Unmarshal(mismatchRaw.Body, &mismatchResp); decErr != nil {
 			t.Fatalf("unmarshal mismatch verify: %v", decErr)
@@ -1148,4 +1168,189 @@ func TestAgenticSDLCSandboxServeAndPipelineAdmission(t *testing.T) {
 			}
 		})
 	}
+}
+
+// validateHelmValuesOverlayAgainstSchema validates every top-level key and
+// nested value in a Helm overlay values YAML snippet against the chart's
+// values.schema.json (using stdlib only).
+func validateHelmValuesOverlayAgainstSchema(t *testing.T, rawYAML []byte, schemaPath string) {
+	t.Helper()
+	schemaBytes, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("read Helm values schema %s: %v", schemaPath, err)
+	}
+	var rootSchema map[string]any
+	if err := json.Unmarshal(schemaBytes, &rootSchema); err != nil {
+		t.Fatalf("parse Helm values schema %s: %v", schemaPath, err)
+	}
+	var decodedYAML any
+	if err := yaml.Unmarshal(rawYAML, &decodedYAML); err != nil {
+		t.Fatalf("unmarshal YAML overlay: %v", err)
+	}
+	jsonBytes, err := json.Marshal(decodedYAML)
+	if err != nil {
+		t.Fatalf("normalize YAML overlay to JSON: %v", err)
+	}
+	var overlay map[string]any
+	if err := json.Unmarshal(jsonBytes, &overlay); err != nil {
+		t.Fatalf("decode normalized JSON overlay as object: %v", err)
+	}
+	if len(overlay) == 0 {
+		t.Fatal("Helm values overlay is empty")
+	}
+	rootProps, ok := rootSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s missing top-level properties object", schemaPath)
+	}
+	for key, val := range overlay {
+		propSchema, exists := rootProps[key].(map[string]any)
+		if !exists {
+			t.Fatalf("Helm values overlay key %q is not declared in %s", key, schemaPath)
+		}
+		if err := validateSchemaNode(propSchema, val, "values."+key); err != nil {
+			t.Fatalf("Helm values overlay violates %s: %v", schemaPath, err)
+		}
+	}
+}
+
+func validateSchemaNode(schema map[string]any, value any, path string) error {
+	if expectedType, ok := schema["type"].(string); ok {
+		switch expectedType {
+		case "object":
+			if _, ok := value.(map[string]any); !ok {
+				return fmt.Errorf("%s: got %T, want object", path, value)
+			}
+		case "array":
+			if _, ok := value.([]any); !ok {
+				return fmt.Errorf("%s: got %T, want array", path, value)
+			}
+		case "string":
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("%s: got %T, want string", path, value)
+			}
+		case "boolean":
+			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("%s: got %T, want boolean", path, value)
+			}
+		case "integer":
+			n, ok := value.(float64)
+			if !ok || math.Trunc(n) != n {
+				return fmt.Errorf("%s: got %v (%T), want integer", path, value, value)
+			}
+		case "number":
+			if _, ok := value.(float64); !ok {
+				return fmt.Errorf("%s: got %T, want number", path, value)
+			}
+		}
+	}
+	if c, hasConst := schema["const"]; hasConst && value != c {
+		return fmt.Errorf("%s: got %v, want const %v", path, value, c)
+	}
+	if enumVals, ok := schema["enum"].([]any); ok {
+		matched := false
+		for _, candidate := range enumVals {
+			if value == candidate {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return fmt.Errorf("%s: value %v not in enum %v", path, value, enumVals)
+		}
+	}
+
+	switch v := value.(type) {
+	case map[string]any:
+		props, _ := schema["properties"].(map[string]any)
+		if reqList, ok := schema["required"].([]any); ok {
+			for _, entry := range reqList {
+				reqKey, ok := entry.(string)
+				if !ok {
+					continue
+				}
+				if _, present := v[reqKey]; !present {
+					return fmt.Errorf("%s: missing required property %q", path, reqKey)
+				}
+			}
+		}
+		for k, child := range v {
+			if childSchema, ok := props[k].(map[string]any); ok {
+				if err := validateSchemaNode(childSchema, child, path+"."+k); err != nil {
+					return err
+				}
+				continue
+			}
+			switch add := schema["additionalProperties"].(type) {
+			case bool:
+				if !add {
+					return fmt.Errorf("%s: unexpected property %q", path, k)
+				}
+			case map[string]any:
+				if err := validateSchemaNode(add, child, path+"."+k); err != nil {
+					return err
+				}
+			}
+		}
+	case []any:
+		if minItems, ok := schema["minItems"].(float64); ok && len(v) < int(minItems) {
+			return fmt.Errorf("%s: array length %d < minItems %d", path, len(v), int(minItems))
+		}
+		if itemSchema, ok := schema["items"].(map[string]any); ok {
+			for i, elem := range v {
+				if err := validateSchemaNode(itemSchema, elem, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+					return err
+				}
+			}
+		}
+	case string:
+		runeLen := utf8.RuneCountInString(v)
+		if minLen, ok := schema["minLength"].(float64); ok && runeLen < int(minLen) {
+			return fmt.Errorf("%s: string %q length %d < minLength %d", path, v, runeLen, int(minLen))
+		}
+		if maxLen, ok := schema["maxLength"].(float64); ok && runeLen > int(maxLen) {
+			return fmt.Errorf("%s: string %q length %d > maxLength %d", path, v, runeLen, int(maxLen))
+		}
+		if pat, ok := schema["pattern"].(string); ok {
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				return fmt.Errorf("%s: invalid schema pattern %q: %w", path, pat, err)
+			}
+			if !re.MatchString(v) {
+				return fmt.Errorf("%s: string %q does not match pattern %q", path, v, pat)
+			}
+		}
+	case float64:
+		if minVal, ok := schema["minimum"].(float64); ok && v < minVal {
+			return fmt.Errorf("%s: value %v < minimum %v", path, v, minVal)
+		}
+		if maxVal, ok := schema["maximum"].(float64); ok && v > maxVal {
+			return fmt.Errorf("%s: value %v > maximum %v", path, v, maxVal)
+		}
+	}
+
+	if allOf, ok := schema["allOf"].([]any); ok {
+		for _, entry := range allOf {
+			sub, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if err := validateSchemaNode(sub, value, path); err != nil {
+				return err
+			}
+		}
+	}
+	if ifSchema, ok := schema["if"].(map[string]any); ok {
+		if validateSchemaNode(ifSchema, value, path) == nil {
+			if thenSchema, ok := schema["then"].(map[string]any); ok {
+				if err := validateSchemaNode(thenSchema, value, path); err != nil {
+					return err
+				}
+			}
+		} else if elseSchema, ok := schema["else"].(map[string]any); ok {
+			if err := validateSchemaNode(elseSchema, value, path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
