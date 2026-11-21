@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -297,6 +298,83 @@ func TestCreateProjectAndUpdateProject(t *testing.T) {
 	stale.Receipt = h.receipt(scope, "principal-admin", "project.update", "caller-stale", tenancyadmin.ProjectUpdateResult{Version: 2})
 	_, err = h.adapter.UpdateProject(context.Background(), stale)
 	requireFaultClass(t, err, fault.VersionConflict)
+}
+
+func TestCreateAndUpdateProjectDuplicateConflictMessages(t *testing.T) {
+	h := newHarness(t)
+	h.seedMembership(tenantScope("tenant-a"), "membership-admin", "principal-admin", 1, tenancy.RoleAdmin)
+	scope := tenantScope("tenant-a")
+
+	first := tenancyadmin.ProjectCreateUnit{
+		Project:   tenancy.Project{ID: "probe-a", TenantID: "tenant-a", Name: "Probe Dup Name", Version: 1},
+		At:        testNow,
+		Receipt:   h.receipt(scope, "principal-admin", "project.create", "caller-a", tenancyadmin.ProjectCreateResult{ProjectID: "probe-a", Version: 1}),
+		Audit:     []event.Audit{h.audit(scope, "principal-admin", "project.create")},
+		Events:    []event.Envelope{h.envelope(scope, "principal-admin", "probe-a", 1)},
+		Authority: []authorize.AuthorityRead{membershipRead(scope, "principal-admin")},
+	}
+	if _, err := h.adapter.CreateProject(context.Background(), first); err != nil {
+		t.Fatalf("first CreateProject: %v", err)
+	}
+
+	// Duplicate project name with a different project ID.
+	dupName := tenancyadmin.ProjectCreateUnit{
+		Project:   tenancy.Project{ID: "probe-b", TenantID: "tenant-a", Name: "Probe Dup Name", Version: 1},
+		At:        testNow,
+		Receipt:   h.receipt(scope, "principal-admin", "project.create", "caller-b", tenancyadmin.ProjectCreateResult{ProjectID: "probe-b", Version: 1}),
+		Audit:     []event.Audit{h.audit(scope, "principal-admin", "project.create")},
+		Events:    []event.Envelope{h.envelope(scope, "principal-admin", "probe-b", 1)},
+		Authority: []authorize.AuthorityRead{membershipRead(scope, "principal-admin")},
+	}
+	_, err := h.adapter.CreateProject(context.Background(), dupName)
+	requireFaultClass(t, err, fault.VersionConflict)
+	if msg, _ := fault.MessageOf(err); !strings.Contains(msg, `a project named "Probe Dup Name" already exists`) {
+		t.Fatalf("duplicate project name message = %q; want conflicting name", msg)
+	}
+
+	// Duplicate project ID with a different name.
+	dupID := tenancyadmin.ProjectCreateUnit{
+		Project:   tenancy.Project{ID: "probe-a", TenantID: "tenant-a", Name: "Other Name", Version: 1},
+		At:        testNow,
+		Receipt:   h.receipt(scope, "principal-admin", "project.create", "caller-a-dup", tenancyadmin.ProjectCreateResult{ProjectID: "probe-a", Version: 1}),
+		Audit:     []event.Audit{h.audit(scope, "principal-admin", "project.create")},
+		Events:    []event.Envelope{h.envelope(scope, "principal-admin", "probe-a", 1)},
+		Authority: []authorize.AuthorityRead{membershipRead(scope, "principal-admin")},
+	}
+	_, err = h.adapter.CreateProject(context.Background(), dupID)
+	requireFaultClass(t, err, fault.VersionConflict)
+	if msg, _ := fault.MessageOf(err); !strings.Contains(msg, `project "probe-a" already exists`) {
+		t.Fatalf("duplicate project id message = %q; want conflicting id", msg)
+	}
+
+	// UpdateProject colliding with an existing project's name.
+	second := tenancyadmin.ProjectCreateUnit{
+		Project:   tenancy.Project{ID: "probe-c", TenantID: "tenant-a", Name: "Unique Name", Version: 1},
+		At:        testNow,
+		Receipt:   h.receipt(scope, "principal-admin", "project.create", "caller-c", tenancyadmin.ProjectCreateResult{ProjectID: "probe-c", Version: 1}),
+		Audit:     []event.Audit{h.audit(scope, "principal-admin", "project.create")},
+		Events:    []event.Envelope{h.envelope(scope, "principal-admin", "probe-c", 1)},
+		Authority: []authorize.AuthorityRead{membershipRead(scope, "principal-admin")},
+	}
+	if _, err := h.adapter.CreateProject(context.Background(), second); err != nil {
+		t.Fatalf("second CreateProject: %v", err)
+	}
+	renameDup := tenancyadmin.ProjectUpdateUnit{
+		Owner:           scope,
+		ProjectID:       "probe-c",
+		ExpectedVersion: 1,
+		Project:         tenancy.Project{ID: "probe-c", TenantID: "tenant-a", Name: "Probe Dup Name", Version: 2},
+		At:              testNow,
+		Receipt:         h.receipt(scope, "principal-admin", "project.update", "caller-rename-dup", tenancyadmin.ProjectUpdateResult{Version: 2}),
+		Audit:           []event.Audit{h.audit(scope, "principal-admin", "project.update")},
+		Events:          []event.Envelope{h.envelope(scope, "principal-admin", "probe-c", 2)},
+		Authority:       []authorize.AuthorityRead{membershipRead(scope, "principal-admin")},
+	}
+	_, err = h.adapter.UpdateProject(context.Background(), renameDup)
+	requireFaultClass(t, err, fault.VersionConflict)
+	if msg, _ := fault.MessageOf(err); !strings.Contains(msg, `a project named "Probe Dup Name" already exists`) {
+		t.Fatalf("update duplicate project name message = %q; want conflicting name", msg)
+	}
 }
 
 func TestGrantMembershipInsertAndUpdate(t *testing.T) {

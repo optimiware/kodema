@@ -485,3 +485,57 @@ func AllowsUnassignedPrincipal(ctx context.Context) bool {
 	allowed, _ := ctx.Value(unassignedPrincipalContextKey{}).(bool)
 	return allowed
 }
+
+type projectScopeResolutionContextKey struct{}
+
+// WithProjectScopeResolution marks a principal-resolution context for an
+// operation whose authority will be resolved against a project scope (or
+// project-membership list) after authentication. A tenant-scoped human OIDC
+// token that verified cleanly is returned even when it holds no tenant-wide
+// membership row, so the caller can immediately narrow and re-check membership
+// in the resolved project scope. Project-scoped tokens, services and executions
+// are unaffected.
+func WithProjectScopeResolution(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, projectScopeResolutionContextKey{}, true)
+}
+
+// AllowsProjectScopeResolution reports whether ctx carries the
+// WithProjectScopeResolution marker.
+func AllowsProjectScopeResolution(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	allowed, _ := ctx.Value(projectScopeResolutionContextKey{}).(bool)
+	return allowed
+}
+
+type targetProjectContextKey struct{}
+
+// WithTargetProject carries the project ID targeted by a request so a
+// tenant-scoped human principal (an OIDC token without a project claim) can
+// resolve its effective current membership in that project. A project-scoped
+// credential always ignores this marker and can never be widened.
+func WithTargetProject(ctx context.Context, projectID id.ProjectID) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if projectID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, targetProjectContextKey{}, projectID)
+}
+
+// TargetProject returns the target project ID attached by WithTargetProject.
+func TargetProject(ctx context.Context) (id.ProjectID, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	projectID, ok := ctx.Value(targetProjectContextKey{}).(id.ProjectID)
+	if !ok || projectID == "" {
+		return "", false
+	}
+	return projectID, true
+}

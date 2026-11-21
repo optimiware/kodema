@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
@@ -159,7 +161,7 @@ func (a *Adapter) CreateProject(ctx context.Context, unit tenancyadmin.ProjectCr
 	}
 	result, err := a.executor.Execute(ctx, scope, commit)
 	if err != nil {
-		return tenancyadmin.ProjectCreateResult{}, err
+		return tenancyadmin.ProjectCreateResult{}, mapProjectConflict(err, unit.Project.ID, unit.Project.Name, true)
 	}
 	if replayed, ok, err := decodeReceiptResult[tenancyadmin.ProjectCreateResult](result); ok {
 		if err != nil {
@@ -211,7 +213,7 @@ func (a *Adapter) UpdateProject(ctx context.Context, unit tenancyadmin.ProjectUp
 	}
 	result, err := a.executor.Execute(ctx, unit.Owner, commit)
 	if err != nil {
-		return tenancyadmin.ProjectUpdateResult{}, err
+		return tenancyadmin.ProjectUpdateResult{}, mapProjectConflict(err, unit.ProjectID, unit.Project.Name, false)
 	}
 	if replayed, ok, err := decodeReceiptResult[tenancyadmin.ProjectUpdateResult](result); ok {
 		if err != nil {
@@ -221,6 +223,34 @@ func (a *Adapter) UpdateProject(ctx context.Context, unit tenancyadmin.ProjectUp
 		return replayed, nil
 	}
 	return tenancyadmin.ProjectUpdateResult{Version: unit.Project.Version}, nil
+}
+
+// mapProjectConflict turns an opaque unique-constraint violation from a
+// projects insert or update into a clear conflict naming the duplicate field
+// (project name vs. project ID). Non-unique conflicts such as optimistic
+// version mismatches pass through unchanged.
+func mapProjectConflict(err error, projectID id.ProjectID, name string, isCreate bool) error {
+	if class, ok := fault.ClassOf(err); !ok || class != fault.VersionConflict {
+		return err
+	}
+	message, _ := fault.MessageOf(err)
+	if strings.Contains(message, "projects_tenant_name") {
+		return fault.Wrap(
+			fault.VersionConflict,
+			fmt.Sprintf("a project named %q already exists in this tenant (project names must be unique within a tenant)", name),
+			err,
+		)
+	}
+	if isCreate && (strings.Contains(message, "projects_pkey") ||
+		strings.Contains(message, "projects_tenant_id") ||
+		strings.Contains(message, "an inserted row already exists")) {
+		return fault.Wrap(
+			fault.VersionConflict,
+			fmt.Sprintf("project %q already exists", projectID),
+			err,
+		)
+	}
+	return err
 }
 
 // GrantMembership inserts a first grant or replaces the roles of the existing

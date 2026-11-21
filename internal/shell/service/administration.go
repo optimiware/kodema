@@ -212,7 +212,7 @@ func (admin *Admin) authorizeCommand(
 	if !scope.ProjectScoped() {
 		return authorize.Operation{}, fault.New(fault.InvalidInput, "service administration requires a project scope")
 	}
-	if actor.Scope != scope {
+	if !scopeContains(actor.Scope, scope) {
 		return authorize.Operation{}, fault.New(fault.Forbidden, "actor scope does not match the command scope")
 	}
 	op, err := admit(actor, name)
@@ -226,19 +226,26 @@ func (admin *Admin) authorizeCommand(
 	if decision != authorize.DecisionAllow {
 		return authorize.Operation{}, fault.New(fault.Forbidden, fmt.Sprintf("principal is not authorized for %q", name))
 	}
-	if err := admin.confirmActor(ctx, actor, op); err != nil {
+	if err := admin.confirmActor(ctx, actor, op, scope); err != nil {
 		return authorize.Operation{}, err
 	}
 	return op, nil
+}
+
+func scopeContains(owner, target tenancy.Scope) bool {
+	if owner.TenantID != target.TenantID {
+		return false
+	}
+	return owner.ProjectID == "" || owner.ProjectID == target.ProjectID
 }
 
 // confirmActor re-reads the actor's current principal so a previously calculated
 // allow never substitutes for current enablement and role. Execution principals
 // are refused because every service-administration operation grants no execution
 // permission.
-func (admin *Admin) confirmActor(ctx context.Context, actor authorize.Principal, op authorize.Operation) error {
+func (admin *Admin) confirmActor(ctx context.Context, actor authorize.Principal, op authorize.Operation, scope tenancy.Scope) error {
 	principal, err := identity.Current(ctx, admin.principals, identity.PrincipalRequest{
-		Scope:       actor.Scope,
+		Scope:       scope,
 		PrincipalID: actor.ID,
 	})
 	if err != nil {

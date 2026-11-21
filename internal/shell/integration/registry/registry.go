@@ -17,10 +17,15 @@ package registry
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"mime"
 	"net"
@@ -28,6 +33,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/shell/pipeline"
@@ -244,10 +251,15 @@ func (resolver *Resolver) Resolve(ctx context.Context, request pipeline.ResolveR
 			if contextError := ctx.Err(); contextError != nil {
 				return zero, deadlineFault(contextError)
 			}
-			return zero, fault.Wrap(fault.DependencyUnavailable, "registry is unavailable", err)
+			reason := describeTransportError(err)
+			msg := fmt.Sprintf("registry %s is unreachable: %s", reference.host, reason)
+			logRegistryFailure(reference.raw, reference.host, 0, "", fault.DependencyUnavailable, msg)
+			return zero, fault.Wrap(fault.DependencyUnavailable, msg, err)
 		}
 		if response == nil {
-			return zero, fault.New(fault.DependencyUnavailable, "registry returned no response")
+			msg := fmt.Sprintf("registry %s returned no response", reference.host)
+			logRegistryFailure(reference.raw, reference.host, 0, "", fault.DependencyUnavailable, msg)
+			return zero, fault.New(fault.DependencyUnavailable, msg)
 		}
 
 		if isRedirect(response.StatusCode) {
@@ -283,7 +295,7 @@ func (resolver *Resolver) Resolve(ctx context.Context, request pipeline.ResolveR
 					return resolver.consume(ctx, response, reference)
 				}
 				_ = response.Body.Close()
-				token, err := resolver.fetchToken(ctx, challenge)
+				token, err := resolver.fetchToken(ctx, challenge, reference)
 				if err != nil {
 					return zero, err
 				}
@@ -319,15 +331,30 @@ func (resolver *Resolver) consume(ctx context.Context, response *http.Response, 
 	switch {
 	case response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices:
 	case response.StatusCode == http.StatusUnauthorized:
-		return zero, fault.New(fault.Unauthenticated, "registry authentication was rejected")
+		msg := fmt.Sprintf("registry %s rejected authentication (HTTP 401 Unauthorized)", reference.host)
+		logRegistryFailure(reference.raw, reference.host, response.StatusCode, "", fault.Unauthenticated, msg)
+		return zero, fault.New(fault.Unauthenticated, msg)
 	case response.StatusCode == http.StatusForbidden:
-		return zero, fault.New(fault.Forbidden, "registry access is forbidden")
+		msg := fmt.Sprintf("registry %s denied access (HTTP 403 Forbidden)", reference.host)
+		logRegistryFailure(reference.raw, reference.host, response.StatusCode, "", fault.Forbidden, msg)
+		return zero, fault.New(fault.Forbidden, msg)
 	case response.StatusCode == http.StatusNotFound:
-		return zero, fault.New(fault.NotFound, "registry manifest was not found")
-	case response.StatusCode == http.StatusTooManyRequests, response.StatusCode >= http.StatusInternalServerError:
-		return zero, fault.New(fault.DependencyUnavailable, "registry is unavailable")
+		msg := fmt.Sprintf("image %q was not found on registry %s (HTTP 404 Not Found)", reference.raw, reference.host)
+		logRegistryFailure(reference.raw, reference.host, response.StatusCode, "", fault.NotFound, msg)
+		return zero, fault.New(fault.NotFound, msg)
+	case response.StatusCode == http.StatusTooManyRequests:
+		retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now())
+		msg := formatRateLimitMessage("registry", reference.host, retryAfter)
+		logRegistryFailure(reference.raw, reference.host, response.StatusCode, retryAfter, fault.DependencyUnavailable, msg)
+		return zero, fault.New(fault.DependencyUnavailable, msg)
+	case response.StatusCode >= http.StatusInternalServerError:
+		msg := formatHTTPStatusMessage("registry", reference.host, response.StatusCode)
+		logRegistryFailure(reference.raw, reference.host, response.StatusCode, "", fault.DependencyUnavailable, msg)
+		return zero, fault.New(fault.DependencyUnavailable, msg)
 	default:
-		return zero, fault.New(fault.InvalidInput, "registry returned an unexpected status")
+		msg := fmt.Sprintf("registry %s returned unexpected HTTP %d", reference.host, response.StatusCode)
+		logRegistryFailure(reference.raw, reference.host, response.StatusCode, "", fault.InvalidInput, msg)
+		return zero, fault.New(fault.InvalidInput, msg)
 	}
 
 	contentType := response.Header.Get("Content-Type")
@@ -449,6 +476,7 @@ func (credential Credential) authorization() (string, bool, error) {
 }
 
 type parsedReference struct {
+	raw        string
 	repository string
 	host       string
 	path       string
@@ -521,6 +549,7 @@ func parseReference(value string) (parsedReference, error) {
 		lookup = digest
 	}
 	return parsedReference{
+		raw:        value,
 		repository: host + "/" + path,
 		host:       host,
 		path:       path,
@@ -528,6 +557,134 @@ func parseReference(value string) (parsedReference, error) {
 		digest:     digest,
 		pinned:     pinned,
 	}, nil
+}
+
+func formatHTTPStatusMessage(kind, host string, status int) string {
+	text := http.StatusText(status)
+	if text == "" {
+		return fmt.Sprintf("%s %s returned HTTP %d", kind, host, status)
+	}
+	return fmt.Sprintf("%s %s returned HTTP %d %s", kind, host, status, text)
+}
+
+func formatRateLimitMessage(kind, host, retryAfter string) string {
+	if retryAfter != "" {
+		return fmt.Sprintf("%s %s returned HTTP 429 Too Many Requests (retry after %s); configure registry credentials or use a mirror", kind, host, retryAfter)
+	}
+	return fmt.Sprintf("%s %s returned HTTP 429 Too Many Requests; configure registry credentials or use a mirror", kind, host)
+}
+
+// parseRetryAfter parses a numeric seconds or HTTP-date Retry-After header
+// into a safe canonical duration string (e.g. "120s"). Arbitrary or invalid
+// header text is discarded so untrusted server strings are never echoed.
+func parseRetryAfter(raw string, now time.Time) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if secs, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		if secs < 0 {
+			return ""
+		}
+		return strconv.FormatInt(secs, 10) + "s"
+	}
+	if target, err := http.ParseTime(trimmed); err == nil {
+		secs := int64(math.Ceil(target.Sub(now).Seconds()))
+		if secs <= 0 {
+			return ""
+		}
+		return strconv.FormatInt(secs, 10) + "s"
+	}
+	return ""
+}
+
+// describeTransportError turns a Go transport error into a safe, concise
+// public failure category without rendering raw URLs, credentials or internal
+// buffers.
+func describeTransportError(err error) string {
+	if err == nil {
+		return "connection failed"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		switch {
+		case dnsErr.IsNotFound:
+			return "no such host"
+		case dnsErr.IsTimeout:
+			return "DNS lookup timed out"
+		default:
+			return "DNS lookup failed"
+		}
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return "TLS handshake failed (server did not respond with TLS)"
+	}
+	var certVerifyErr *tls.CertificateVerificationError
+	if errors.As(err, &certVerifyErr) {
+		return "TLS certificate verification failed"
+	}
+	var unknownAuthErr x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthErr) {
+		return "TLS certificate signed by unknown authority"
+	}
+	var hostnameErr x509.HostnameError
+	if errors.As(err, &hostnameErr) {
+		return "TLS certificate does not match registry host"
+	}
+	var certInvalidErr x509.CertificateInvalidError
+	if errors.As(err, &certInvalidErr) {
+		return "TLS certificate is invalid or expired"
+	}
+	var alertErr tls.AlertError
+	if errors.As(err, &alertErr) {
+		return "TLS handshake failed (" + alertErr.Error() + ")"
+	}
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "connection refused"
+	case errors.Is(err, syscall.ENETUNREACH):
+		return "network is unreachable"
+	case errors.Is(err, syscall.EHOSTUNREACH):
+		return "no route to host"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection reset by peer"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "connection closed unexpectedly"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "connection timed out"
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "tls:") || strings.Contains(lower, "tls handshake") || strings.Contains(lower, "http response to https"):
+		return "TLS handshake failed"
+	case strings.Contains(lower, "no such host"):
+		return "no such host"
+	case strings.Contains(lower, "connection refused"):
+		return "connection refused"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
+		return "connection timed out"
+	default:
+		return "connection failed"
+	}
+}
+
+func logRegistryFailure(image, host string, status int, retryAfter string, class fault.Class, reason string) {
+	attrs := []any{
+		"image", image,
+		"registry", host,
+		"class", string(class),
+		"reason", reason,
+	}
+	if status > 0 {
+		attrs = append(attrs, "status", status)
+	}
+	if retryAfter != "" {
+		attrs = append(attrs, "retry_after", retryAfter)
+	}
+	slog.Warn("registry image resolution failed", attrs...)
 }
 
 // apiHost returns the host that serves the registry API for an image name host.

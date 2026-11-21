@@ -899,9 +899,66 @@ func TestDevIssuerPKCEAndDeviceFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var deviceTok struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(approvedTokResp.Body).Decode(&deviceTok); err != nil {
+		t.Fatal(err)
+	}
 	_ = approvedTokResp.Body.Close()
-	if approvedTokResp.StatusCode != http.StatusOK {
+	if approvedTokResp.StatusCode != http.StatusOK || deviceTok.AccessToken == "" {
 		t.Fatalf("approved device token exchange failed: %d", approvedTokResp.StatusCode)
+	}
+
+	// Issue #80: human OIDC login tokens (PKCE and device flows) must be
+	// tenant-scoped (carrying org_id without a project_id claim) so logged-in
+	// personas can operate on any project in the tenant, not only project-local.
+	decodeClaims := func(jwt string) map[string]any {
+		t.Helper()
+		parts := strings.Split(jwt, ".")
+		if len(parts) != 3 {
+			t.Fatalf("malformed JWT: %d parts", len(parts))
+		}
+		raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			t.Fatalf("decode JWT payload: %v", err)
+		}
+		var claims map[string]any
+		if err := json.Unmarshal(raw, &claims); err != nil {
+			t.Fatalf("unmarshal JWT claims: %v", err)
+		}
+		return claims
+	}
+	for name, tok := range map[string]string{
+		"pkce":   tokPayload.AccessToken,
+		"device": deviceTok.AccessToken,
+	} {
+		claims := decodeClaims(tok)
+		if claims["org_id"] != "tenant-local" {
+			t.Fatalf("%s token org_id = %v; want tenant-local", name, claims["org_id"])
+		}
+		if _, hasProject := claims["project_id"]; hasProject {
+			t.Fatalf("%s token unexpectedly carries project_id claim: %v", name, claims["project_id"])
+		}
+	}
+	if claims := decodeClaims(deviceTok.AccessToken); claims["sub"] != "engineer" {
+		t.Fatalf("device token sub = %v; want engineer", claims["sub"])
+	}
+
+	// Project-scoped MintAccessToken keeps project_id, while MintTenantAdminToken omits it.
+	projAdminJWT, err := issuer.MintAccessToken("admin", time.Hour)
+	if err != nil {
+		t.Fatalf("MintAccessToken: %v", err)
+	}
+	if claims := decodeClaims(projAdminJWT); claims["project_id"] != "project-local" {
+		t.Fatalf("MintAccessToken project_id = %v; want project-local", claims["project_id"])
+	}
+	tenantAdminJWT, err := issuer.MintTenantAdminToken(time.Hour)
+	if err != nil {
+		t.Fatalf("MintTenantAdminToken: %v", err)
+	}
+	if claims := decodeClaims(tenantAdminJWT); claims["org_id"] != "tenant-local" || claims["project_id"] != nil {
+		t.Fatalf("MintTenantAdminToken claims = %v; want org_id=tenant-local without project_id", claims)
 	}
 }
 

@@ -33,7 +33,11 @@ func (broker *Broker) Subscribe(ctx context.Context, request SubscriptionRequest
 	if err := request.Scope.Validate(); err != nil {
 		return nil, err
 	}
-	principal, err := broker.resolveCurrent(ctx, request.Credential)
+	resolveCtx := ctx
+	if request.Scope.ProjectScoped() {
+		resolveCtx = authorize.WithTargetProject(ctx, request.Scope.ProjectID)
+	}
+	principal, err := broker.resolveCurrent(resolveCtx, request.Credential)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +179,11 @@ func (subscription *subscription) idleLoop() {
 
 // revalidate re-reads the presented credential and the event.subscribe grant.
 func (subscription *subscription) revalidate(ctx context.Context) error {
-	principal, err := subscription.broker.principal.Resolve(ctx, subscription.credential)
+	resolveCtx := ctx
+	if subscription.scope.ProjectScoped() {
+		resolveCtx = authorize.WithTargetProject(ctx, subscription.scope.ProjectID)
+	}
+	principal, err := subscription.broker.principal.Resolve(resolveCtx, subscription.credential)
 	if err != nil {
 		return dependencyError("credential could not be verified", err)
 	}

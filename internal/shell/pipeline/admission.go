@@ -277,7 +277,7 @@ func (service *AdmissionService) admitActions(ctx context.Context, pipeline defi
 			image := container.Image
 			resolved, err := service.resolver.Resolve(ctx, ResolveRequest{Reference: image})
 			if err != nil {
-				return nil, nil, nil, resolverFault(action.Name, err)
+				return nil, nil, nil, resolverFault(action.Name, image, err)
 			}
 			if err := resolved.Validate(); err != nil {
 				return nil, nil, nil, fault.Wrap(fault.UnsupportedCapability, fmt.Sprintf("image %q did not resolve to an immutable digest", image), err)
@@ -332,18 +332,34 @@ func resolveActionTimeout(explicit, fallback time.Duration) (time.Duration, erro
 }
 
 // resolverFault classifies one resolver failure. A reference the resolver
-// cannot read as an image name is the caller's input and is refused for good;
-// every other failure is an unavailable registry, which a caller may retry.
-func resolverFault(action id.ActionName, err error) error {
-	if class, ok := fault.ClassOf(err); ok && class == fault.DependencyUnavailable {
-		return err
-	}
+// cannot read as an image name is invalid input, a missing manifest (404) stays
+// not_found, a deadline stays deadline_expired, and registry outages or rate
+// limits stay dependency_unavailable with their diagnostic detail preserved.
+func resolverFault(action id.ActionName, image string, err error) error {
 	if errors.Is(err, ErrImageReference) {
 		detail, ok := fault.MessageOf(err)
 		if !ok {
 			detail = ErrImageReference.Error()
 		}
 		return fault.Wrap(fault.InvalidInput, fmt.Sprintf("action %q image is not usable: %s", action, detail), err)
+	}
+	if class, ok := fault.ClassOf(err); ok {
+		detail, hasDetail := fault.MessageOf(err)
+		switch class {
+		case fault.DependencyUnavailable:
+			return err
+		case fault.NotFound:
+			if hasDetail && strings.TrimSpace(detail) != "" {
+				return fault.Wrap(fault.NotFound, fmt.Sprintf("action %q: %s", action, detail), err)
+			}
+			return fault.Wrap(fault.NotFound, fmt.Sprintf("action %q image %q was not found", action, image), err)
+		case fault.DeadlineExpired:
+			return err
+		case fault.Unauthenticated, fault.Forbidden:
+			if hasDetail && strings.TrimSpace(detail) != "" {
+				return fault.Wrap(fault.DependencyUnavailable, fmt.Sprintf("action %q: %s", action, detail), err)
+			}
+		}
 	}
 	return fault.Wrap(fault.DependencyUnavailable, "image registry is unavailable", err)
 }

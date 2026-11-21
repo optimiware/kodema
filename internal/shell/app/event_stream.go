@@ -360,7 +360,11 @@ func (handler *projectEventStreamHandler) ServeProjectStream(writer http.Respons
 	ctx := request.Context()
 	// Authenticate before resolving project scope or touching any durable row.
 	credential := strictBearerCredential(request.Header.Get("Authorization"))
-	principal, err := handler.principals.Resolve(ctx, credential)
+	authCtx := ctx
+	if parsedProject, parseErr := id.ParseProjectID(projectID); parseErr == nil {
+		authCtx = authorize.WithTargetProject(ctx, parsedProject)
+	}
+	principal, err := handler.principals.Resolve(authCtx, credential)
 	if err != nil {
 		writeHTTPError(writer, err)
 		return
@@ -476,7 +480,7 @@ func (handler *projectEventStreamHandler) streamLoop(
 		if isExpired() {
 			return false
 		}
-		refreshed, err := handler.principals.Resolve(ctx, credential)
+		refreshed, err := handler.principals.Resolve(authorize.WithTargetProject(ctx, scope.ProjectID), credential)
 		if err != nil || !refreshed.Enabled || refreshed.Validate() != nil {
 			return false
 		}

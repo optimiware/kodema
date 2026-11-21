@@ -334,6 +334,17 @@ func TestSQLStateMapping(t *testing.T) {
 			t.Fatalf("SQLSTATE %s mapped to %q; want %q", test.code, class, test.class)
 		}
 	}
+
+	// Issue #82: SQLSTATE 23505 preserves the static constraint name (schema
+	// metadata, never row data) so higher layers can identify which field
+	// conflicted.
+	dupName := mapError(&pgconn.PgError{Code: "23505", ConstraintName: "projects_tenant_name"})
+	if class, ok := fault.ClassOf(dupName); !ok || class != fault.VersionConflict {
+		t.Fatalf("23505 class = %q; want version_conflict", class)
+	}
+	if msg, _ := fault.MessageOf(dupName); !strings.Contains(msg, "projects_tenant_name") {
+		t.Fatalf("23505 message = %q; want constraint name projects_tenant_name", msg)
+	}
 }
 
 func TestSecretsNeverAppearInErrors(t *testing.T) {

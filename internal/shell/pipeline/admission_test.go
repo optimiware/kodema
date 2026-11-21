@@ -1300,3 +1300,49 @@ func TestAdmissionInvalidActionNameReportsValueAndPattern(t *testing.T) {
 		t.Fatalf("authoring invalid action name message = %q; want value %q and pattern %q", msg, "build_image", id.ActionNamePattern)
 	}
 }
+
+func TestAdmissionPreservesRegistryFailureDiagnostics(t *testing.T) {
+	scope := projectScope("tenant-a", "project-a")
+	base := pipeline.AdmitRequest{
+		Scope:          scope,
+		Definition:     pipeline.Definition{Name: "change", YAML: validPipelineYAML()},
+		Inputs:         map[id.InputKey]string{"repository": "repo-1"},
+		DefaultTimeout: 5 * time.Minute,
+	}
+
+	t.Run("404 manifest not found stays not_found", func(t *testing.T) {
+		missing := &fakeResolver{resolve: func(context.Context, pipeline.ResolveRequest) (pipeline.ResolvedImage, error) {
+			return pipeline.ResolvedImage{}, fault.New(fault.NotFound, `image "mirror.gcr.io/library/alpine:kt-no-such-tag" was not found on registry mirror.gcr.io (HTTP 404 Not Found)`)
+		}}
+		_, err := newAdmission(t, missing, nil).Admit(t.Context(), base)
+		requireFaultClass(t, err, fault.NotFound)
+		msg, _ := fault.MessageOf(err)
+		if !strings.Contains(msg, "mirror.gcr.io/library/alpine:kt-no-such-tag") || !strings.Contains(msg, "404 Not Found") {
+			t.Fatalf("404 admission message = %q; want image and 404 detail", msg)
+		}
+	})
+
+	t.Run("429 rate limit preserves dependency_unavailable and detail", func(t *testing.T) {
+		rateLimited := &fakeResolver{resolve: func(context.Context, pipeline.ResolveRequest) (pipeline.ResolvedImage, error) {
+			return pipeline.ResolvedImage{}, fault.New(fault.DependencyUnavailable, "registry docker.io returned HTTP 429 Too Many Requests (retry after 120s); configure registry credentials or use a mirror")
+		}}
+		_, err := newAdmission(t, rateLimited, nil).Admit(t.Context(), base)
+		requireFaultClass(t, err, fault.DependencyUnavailable)
+		msg, _ := fault.MessageOf(err)
+		if !strings.Contains(msg, "429 Too Many Requests") || !strings.Contains(msg, "retry after 120s") {
+			t.Fatalf("429 admission message = %q; want 429 detail", msg)
+		}
+	})
+
+	t.Run("registry auth rejection preserves detail under dependency_unavailable", func(t *testing.T) {
+		rejected := &fakeResolver{resolve: func(context.Context, pipeline.ResolveRequest) (pipeline.ResolvedImage, error) {
+			return pipeline.ResolvedImage{}, fault.New(fault.Unauthenticated, "registry ghcr.io rejected authentication (HTTP 401 Unauthorized)")
+		}}
+		_, err := newAdmission(t, rejected, nil).Admit(t.Context(), base)
+		requireFaultClass(t, err, fault.DependencyUnavailable)
+		msg, _ := fault.MessageOf(err)
+		if !strings.Contains(msg, "ghcr.io") || !strings.Contains(msg, "401 Unauthorized") {
+			t.Fatalf("registry auth rejection message = %q; want host and 401 detail", msg)
+		}
+	})
+}

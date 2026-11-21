@@ -101,6 +101,14 @@ func NewRouter(config Config) (*Router, error) {
 	return router, nil
 }
 
+// scopedPrincipalResolver is optionally implemented by a CurrentPrincipal
+// resolver (the production token.Resolver) so a verified tenant-scoped human
+// can resolve its effective current membership in a target project scope after
+// scope resolution without re-verifying the OIDC token.
+type scopedPrincipalResolver interface {
+	ResolveInScope(context.Context, authorize.Principal, tenancy.Scope) (authorize.Principal, error)
+}
+
 // Invoke routes one decoded edge call through the fixed boundary order:
 // structural operation lookup, authentication, scope/execution ports,
 // authorization, request envelope and receipt policy, path/body agreement,
@@ -112,12 +120,16 @@ func (router *Router) Invoke(ctx context.Context, invocation Invocation) (api.Re
 			fmt.Sprintf("unknown operation %q", invocation.Operation))
 	}
 
+	scopedResolver, supportsScopeNarrowing := router.principals.(scopedPrincipalResolver)
+
 	// Authentication is the first boundary: a failed authentication never
 	// reaches a scope lookup, input validation or a handler, so no resource
 	// lookup can expose scoped information.
 	authCtx := ctx
 	if entry.operation.Name == "principal.whoami" {
 		authCtx = authorize.WithUnassignedPrincipal(ctx)
+	} else if supportsScopeNarrowing && (entry.operation.Scope == authorize.ScopeProject || entry.operation.Name == "project.list") {
+		authCtx = authorize.WithProjectScopeResolution(ctx)
 	}
 	principal, err := router.principals.Resolve(authCtx, invocation.Credential)
 	if err != nil {
@@ -138,8 +150,36 @@ func (router *Router) Invoke(ctx context.Context, invocation Invocation) (api.Re
 		return api.Result{}, sanitize(err)
 	}
 
-	if err := router.authorize(ctx, principal, entry.operation.Name, resolution.Scope); err != nil {
-		return api.Result{}, err
+	if supportsScopeNarrowing &&
+		principal.Kind == identity.KindHuman &&
+		!principal.Scope.ProjectScoped() &&
+		resolution.Scope.ProjectScoped() {
+		scoped, scopeErr := scopedResolver.ResolveInScope(ctx, principal, resolution.Scope)
+		if scopeErr != nil {
+			if class, ok := fault.ClassOf(scopeErr); ok && class == fault.Forbidden {
+				return api.Result{}, fault.New(fault.Forbidden, authorize.DenialMessage(principal, entry.operation.Name, resolution.Scope))
+			}
+			return api.Result{}, sanitize(scopeErr)
+		}
+		principal = scoped
+	}
+
+	// For project.list with a tenant-scoped human who holds no tenant-wide
+	// membership row, defer the membership check to the handler so it can
+	// list the exact projects where the human holds project memberships (and
+	// still refuse a 0-membership OIDC user as unauthenticated).
+	deferProjectListAuth := supportsScopeNarrowing &&
+		entry.operation.Name == "project.list" &&
+		principal.Kind == identity.KindHuman &&
+		principal.Enabled &&
+		!principal.Scope.ProjectScoped() &&
+		len(principal.Roles) == 0 &&
+		principal.Scope.TenantID == resolution.Scope.TenantID
+
+	if !deferProjectListAuth {
+		if err := router.authorize(ctx, principal, entry.operation.Name, resolution.Scope); err != nil {
+			return api.Result{}, err
+		}
 	}
 
 	// The envelope and receipt policy are shared by both edges and are checked

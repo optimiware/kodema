@@ -15,6 +15,7 @@ package pgdriver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -493,8 +494,13 @@ func mapError(err error) error {
 	}
 	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		switch pgErr.Code {
-		case "23505", "40001", "40P01":
-			return fault.Wrap(fault.VersionConflict, "database constraint or serialization conflict", err)
+		case "23505":
+			if pgErr.ConstraintName != "" {
+				return fault.Wrap(fault.VersionConflict, fmt.Sprintf("unique constraint %q violated", pgErr.ConstraintName), err)
+			}
+			return fault.Wrap(fault.VersionConflict, "unique constraint violated", err)
+		case "40001", "40P01":
+			return fault.Wrap(fault.VersionConflict, "database serialization conflict", err)
 		case "42501":
 			return fault.Wrap(fault.Forbidden, "database permission was denied", err)
 		case "57014":

@@ -330,7 +330,11 @@ type caller struct {
 // current authority facts. A failure never discloses a configured server or
 // tool name.
 func (proxy *Proxy) authorizeCaller(ctx context.Context, credential string) (caller, error) {
-	principal, err := proxy.credentials.Resolve(ctx, credential)
+	resolveCtx := ctx
+	if proxy.scope.ProjectScoped() {
+		resolveCtx = authorize.WithTargetProject(ctx, proxy.scope.ProjectID)
+	}
+	principal, err := proxy.credentials.Resolve(resolveCtx, credential)
 	if err != nil {
 		return caller{}, unauthenticated()
 	}
