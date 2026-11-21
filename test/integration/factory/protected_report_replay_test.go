@@ -566,16 +566,17 @@ func reportReplaySecondVerification(t *testing.T, fixture *gitHarness, evidence 
 	started := fixture.startPipeline(applied.PipelineID, "start-"+reportReplaySecondPipeline)
 	t.Cleanup(func() { fixture.stopExecution(t, started.ExecutionID) })
 
-	// Resolve the exact human pass for the canonical subject. The request runs
-	// without a workload; the later hold action then runs with a fresh live
-	// credential.
+	// Resolve the exact human pass for the canonical subject. The first golden
+	// run has already advanced main to evidence.candidate, so expected_base is
+	// intentionally stale and requires AllowStale. The request runs without a
+	// workload; the later hold action then runs with a fresh live credential.
 	waitProtectedActionRunning(t, fixture, started.ExecutionID, reportReplaySecondRequest)
 	pending := inspectProtectedGoldenExecution(t, fixture, evidence.reviewerToken, started.ExecutionID)
 	review := actionByName(t, pending, reportReplaySecondRequest)
-	resolveProtectedGoldenRequest(t, fixture, protectedGoldenEvidence{
+	resolveProtectedGoldenRequestWith(t, fixture, protectedGoldenEvidence{
 		executionID:   started.ExecutionID,
 		reviewerToken: evidence.reviewerToken,
-	}, review)
+	}, review, true)
 
 	waitProtectedActionRunning(t, fixture, started.ExecutionID, reportReplaySecondAction)
 	credential := waitProtectedGoldenCredential(t, fixture, started.ExecutionID, reportReplaySecondAction)

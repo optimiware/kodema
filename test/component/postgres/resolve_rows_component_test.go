@@ -4,8 +4,10 @@ package postgrescomponent
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/request"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
@@ -20,8 +22,15 @@ func TestRequestResolveWholeRowsOnPostgreSQL(t *testing.T) {
 	seeded := readSeededTimes(t, ctx, env.shard, env.scope, executionID)
 	resolveObserver := env.shard.ObserveUnit(t, "request", "resolve")
 	resolveIDs := env.nextCommitIDs()
-	if _, err := env.request.Resolve(ctx, resolveCommand(env.actor, env.scope, executionID, actionID)); err != nil {
+	resolved, err := env.request.Resolve(ctx, resolveCommand(env.actor, env.scope, executionID, actionID))
+	if err != nil {
 		t.Fatalf("resolve: %v%s", err, pgtest.CauseText(err))
+	}
+	if !strings.HasPrefix(string(resolved.DecisionID), "dec_") {
+		t.Fatalf("resolved.DecisionID = %q; want dec_ prefix", resolved.DecisionID)
+	}
+	if _, err := id.ParseDecisionID(string(resolved.DecisionID)); err != nil {
+		t.Fatalf("resolved.DecisionID %q invalid: %v", resolved.DecisionID, err)
 	}
 	env.shard.RequireGoldenRow(t, ctx, env.runtime, env.scope, "executions", map[string]any{"id": string(executionID)}, map[string]any{
 		"id": string(executionID), "tenant_id": "tenant-1", "project_id": "project-1",
@@ -42,8 +51,16 @@ func TestRequestResolveWholeRowsOnPostgreSQL(t *testing.T) {
 		"workload_id": pgtest.NullValue, "launch_state": "not_issued", "launch_key": pgtest.NullValue,
 		"observation": pgtest.NullValue, "activated_at": pgtest.NullValue, "answer_provenance": pgtest.NullValue,
 	})
-	// derived: the unit result is {expected+1 versions, decision}; the content is
-	// the request service's {decision,response} retry identity.
+	env.shard.RequireGoldenRow(t, ctx, env.runtime, env.scope, "approval_decisions", map[string]any{"id": string(resolved.DecisionID)}, map[string]any{
+		"id": string(resolved.DecisionID), "tenant_id": "tenant-1", "project_id": "project-1",
+		"task_id": pgtest.NullValue, "execution_id": string(executionID), "action_id": string(actionID),
+		"assignment": "role/engineer", "operation": pgtest.NullValue, "resource_id": pgtest.NullValue,
+		"subject":  `{"ref":{"kind":"literal","literal":"refs/heads/main"}}`,
+		"approver": "principal-1", "resolved_at": env.now, "expires_at": env.now.Add(request.DefaultDecisionTTL),
+		"revoked_at": pgtest.NullValue, "revoked_reason": pgtest.NullValue, "version": int64(1),
+	})
+	// derived: the unit result is {expected+1 versions, decision, decision_id};
+	// the content is the request service's {decision,response} retry identity.
 	env.shard.RequireGoldenRow(t, ctx, env.runtime, env.scope, "receipts", map[string]any{
 		"operation": "execution.request.resolve", "caller_key": string(executionID) + "/" + string(actionID),
 	}, map[string]any{
@@ -52,7 +69,7 @@ func TestRequestResolveWholeRowsOnPostgreSQL(t *testing.T) {
 		"caller_key":     string(executionID) + "/" + string(actionID),
 		"content_sha256": pgtest.ContentSHA256(t, resolveReceiptContent(request.DecisionPass)),
 		"result": pgtest.GoldenJSONOf(request.ResolveResult{
-			ExecutionVersion: 2, ActionVersion: 2, Decision: request.DecisionPass,
+			ExecutionVersion: 2, ActionVersion: 2, Decision: request.DecisionPass, DecisionID: resolved.DecisionID,
 		}),
 		"completed_at": env.now, "execution_id": string(executionID),
 		"snapshot_sha256": pgtest.NullValue, "created_at": env.now,
@@ -76,7 +93,11 @@ func TestRequestResolveWholeRowsOnPostgreSQL(t *testing.T) {
 	// (event.lifecycleEventID over execution id, committed version, type and subject).
 	env.requireEvent(t, ctx, eventWant{
 		id: resolveIDs.event, typ: "request.resolved", subject: string(executionID), version: 2,
-		principal: "principal-1", data: pgtest.NullValue,
+		principal: "principal-1",
+		data: pgtest.GoldenJSONOf(map[string]any{
+			"action_id": string(actionID), "decision": "pass", "actor": "principal-1",
+			"decision_id": string(resolved.DecisionID),
+		}),
 	})
 	env.requireEvent(t, ctx, eventWant{
 		id:  "event-0a51a9a42ab489c47eddeba3e436661bef63f4ea7a19d32ba52da95ee54a2ed0",
@@ -93,5 +114,5 @@ func TestRequestResolveWholeRowsOnPostgreSQL(t *testing.T) {
 		typ: "action.transition", subject: string(actionID), version: 2, principal: lifecycleProducer,
 		data: lifecycleActionData(actionID, 0, "request", "running", "succeeded", 2),
 	})
-	resolveObserver.Finish(map[string]int{"executions": 1, "actions": 1, "cleanup": 1, "receipts": 1, "audit": 1, "events": 4})
+	resolveObserver.Finish(map[string]int{"executions": 1, "actions": 1, "approval_decisions": 1, "cleanup": 1, "receipts": 1, "audit": 1, "events": 4})
 }

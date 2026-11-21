@@ -4,6 +4,7 @@ package postgrescomponent
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -129,11 +130,27 @@ func TestRequestResolveReviseAppendsTaskMessageAndReplaysIdempotentlyOnPostgreSQ
 		t.Fatalf("first resolve = %+v; want non-replayed revise", first)
 	}
 
+	// SQL retains the raw response JSON on actions.outputs (commit.go:586-597),
+	// while env.exec.Load keeps Action.Outputs empty for non-passing decisions.
 	actionRow := scopedRow(t, ctx, env.runtime, env.scope, 3,
-		`SELECT state, request_decision, (outputs IS NULL)::text FROM actions WHERE id = $1`,
+		`SELECT state, request_decision, outputs::text FROM actions WHERE id = $1`,
 		string(active.Actions[0].ID))
-	if actionRow[0] != "failed" || actionRow[1] != "revise" || actionRow[2] != "true" {
-		t.Fatalf("action row = %v; want failed/revise/null-outputs", actionRow)
+	if actionRow[0] != "failed" || actionRow[1] != "revise" {
+		t.Fatalf("action row = %v; want failed/revise", actionRow)
+	}
+	var retainedResponse map[string]string
+	if err := json.Unmarshal([]byte(actionRow[2]), &retainedResponse); err != nil {
+		t.Fatalf("decode retained actions.outputs %q: %v", actionRow[2], err)
+	}
+	if len(retainedResponse) != 1 || retainedResponse["feedback"] != "split handler" {
+		t.Fatalf("retained actions.outputs = %v; want map[feedback:split handler]", retainedResponse)
+	}
+	loadedAfterRevise, err := env.exec.Load(ctx, env.scope, created.ExecutionID)
+	if err != nil {
+		t.Fatalf("load execution after revise: %v%s", err, pgtest.CauseText(err))
+	}
+	if len(loadedAfterRevise.Actions[0].Outputs) != 0 {
+		t.Fatalf("loaded Action.Outputs after revise = %v; want empty settled outputs", loadedAfterRevise.Actions[0].Outputs)
 	}
 	execRow := scopedRow(t, ctx, env.runtime, env.scope, 2,
 		`SELECT state, failure->>'reason' FROM executions WHERE id = $1`,

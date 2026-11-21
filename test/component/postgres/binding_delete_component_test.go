@@ -116,8 +116,13 @@ func TestDeletingAVerifiedBindingKeepsTheVerification(t *testing.T) {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	catalog := foreignKeyCatalog(ctx, t, shard)
-	if len(catalog) != 49 {
-		t.Fatalf("foreign keys = %d; want 49", len(catalog))
+	// 49 baseline FKs (0001..0006) + 9 incremental v0.7.0 FKs:
+	//   0007: model_usage_action (1)
+	//   0008: tasks_parent (1)
+	//   0009: approval_decisions_{tenant,project,task,execution,action} (5)
+	//   0010: kv_objects_{tenant,project} (2)
+	if len(catalog) != 58 {
+		t.Fatalf("foreign keys = %d; want 58", len(catalog))
 	}
 	if _, ok := catalog["verifications_binding"]; ok {
 		t.Fatal("the schema has a verifications_binding reference")

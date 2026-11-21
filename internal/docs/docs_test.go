@@ -79,6 +79,11 @@ func TestMCPInstructionsAndSkillDocument(t *testing.T) {
 	if len(instructions) > 4096 {
 		t.Fatalf("MCPInstructions() is %d bytes; keep it concise (<= 4096 bytes)", len(instructions))
 	}
+	for _, prefix := range []string{"kodsvc.", "kodex."} {
+		if strings.Contains(instructions, prefix) {
+			t.Errorf("MCPInstructions() contains issued credential prefix %q; use descriptive prose instead", prefix)
+		}
+	}
 	for _, topic := range Topics() {
 		if !strings.Contains(instructions, topic.URI) {
 			t.Errorf("MCPInstructions() does not reference topic URI %q", topic.URI)
