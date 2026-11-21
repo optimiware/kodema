@@ -1311,13 +1311,45 @@ func SchemaDesign() Schema {
 				RowLevelSecurity:      true,
 				ForceRowLevelSecurity: true,
 			},
+			{
+				Name:       KVObjectsTable,
+				PrimaryKey: primaryKey("id"),
+				Columns: []Column{
+					column("id", "text", false),
+					column("tenant_id", "text", false),
+					column("project_id", "text", false),
+					column("key", "text", false),
+					column("content_type", "text", false),
+					column("size_bytes", "bigint", false),
+					column("data", "bytea", false),
+					column("created_by", "text", false),
+					column("created_at", "timestamptz", false),
+				},
+				ForeignKeys: []ForeignKey{
+					foreignKey("kv_objects_tenant", []string{"tenant_id"}, "tenants", []string{"id"}),
+					foreignKey("kv_objects_project", []string{"tenant_id", "project_id"}, "projects", []string{"tenant_id", "id"}),
+				},
+				Unique: []UniqueConstraint{
+					unique("kv_objects_scope_key", false, "tenant_id", "project_id", "key"),
+					unique("kv_objects_scope_id", false, "tenant_id", "project_id", "id"),
+				},
+				Checks: []Check{
+					check("kv_objects_size_bounds", "size_bytes >= 0 AND size_bytes <= 16777216 AND octet_length(data) = size_bytes"),
+					check("kv_objects_key_format", "key ~ '^kv:sha256:[0-9a-f]{64}$'"),
+				},
+				Indexes: []Index{
+					index("kv_objects_scope_created", false, "", "tenant_id", "project_id", "created_at", "id"),
+				},
+				RowLevelSecurity:      true,
+				ForceRowLevelSecurity: true,
+			},
 		},
 	}
 }
 
-// Table names of the model-usage, content-record, event-consumption and
-// approval-decisions tables. They are declared here so an adapter never spells
-// one as free text.
+// Table names of the model-usage, content-record, event-consumption,
+// approval-decisions and content-addressed KV tables. They are declared here
+// so an adapter never spells one as free text.
 const (
 	// ModelUsageTable is the attributable model-usage table.
 	ModelUsageTable = "model_usage"
@@ -1328,6 +1360,8 @@ const (
 	// ApprovalDecisionsTable is the immutable persisted cross-execution approval
 	// decisions table.
 	ApprovalDecisionsTable = "approval_decisions"
+	// KVObjectsTable is the project-scoped, content-addressed immutable KV table.
+	KVObjectsTable = "kv_objects"
 )
 
 // Operation is one SQL privilege a non-owner role may hold.
@@ -1722,6 +1756,7 @@ func lockOrder() []string {
 		"actions",
 		"cleanup",
 		"verifications",
+		"kv_objects",
 		"receipts",
 		"audit",
 		"events",

@@ -522,8 +522,8 @@ func TestMigration0008PreservesBaselineAndAppliesAdditiveChanges(t *testing.T) {
 
 func TestMigration0009PreservesBaselineAndAddsApprovalDecisions(t *testing.T) {
 	migrations := Migrations()
-	if len(migrations) != 9 {
-		t.Fatalf("Migrations() count = %d; want 9", len(migrations))
+	if len(migrations) < 9 {
+		t.Fatalf("Migrations() count = %d; want at least 9", len(migrations))
 	}
 	if migrations[8].Name != "0009_approval_decisions.sql" {
 		t.Fatalf("migration 9 name = %q; want 0009_approval_decisions.sql", migrations[8].Name)
@@ -557,6 +557,44 @@ func TestMigration0009PreservesBaselineAndAddsApprovalDecisions(t *testing.T) {
 		if !strings.Contains(mig9, want) {
 			t.Errorf("0009_approval_decisions.sql missing %q:\n%s", want, migrations[8].SQL)
 		}
+	}
+}
+
+func TestMigration0010PreservesBaselineAndCreatesKVStore(t *testing.T) {
+	migrations := Migrations()
+	if len(migrations) != 10 {
+		t.Fatalf("Migrations() count = %d; want 10", len(migrations))
+	}
+	if migrations[9].Name != "0010_kv_store.sql" {
+		t.Fatalf("migration 10 name = %q; want 0010_kv_store.sql", migrations[9].Name)
+	}
+	for index := 0; index < 9; index++ {
+		if strings.Contains(normalizeSQL(migrations[index].SQL), "kv_objects") {
+			t.Errorf("%s must not reference kv_objects (belongs in 0010)", migrations[index].Name)
+		}
+	}
+	mig10 := normalizeSQL(migrations[9].SQL)
+	for _, want := range []string{
+		"create table kv_objects",
+		"constraint kv_objects_scope_key unique (tenant_id, project_id, key)",
+		"constraint kv_objects_scope_id unique (tenant_id, project_id, id)",
+		"constraint kv_objects_tenant foreign key (tenant_id) references tenants (id)",
+		"constraint kv_objects_project foreign key (tenant_id, project_id) references projects (tenant_id, id)",
+		"constraint kv_objects_size_bounds check (size_bytes >= 0 and size_bytes <= 16777216 and octet_length(data) = size_bytes)",
+		"constraint kv_objects_key_format check (key ~ '^kv:sha256:[0-9a-f]{64}$')",
+		"create index kv_objects_scope_created on kv_objects (tenant_id, project_id, created_at, id)",
+		"alter table kv_objects enable row level security",
+		"alter table kv_objects force row level security",
+		"create policy kv_objects_scope on kv_objects",
+		"alter table kv_objects owner to kodema_owner",
+		"grant select, insert on kv_objects to kodema_runtime",
+	} {
+		if !strings.Contains(mig10, want) {
+			t.Errorf("0010_kv_store.sql missing %q:\n%s", want, migrations[9].SQL)
+		}
+	}
+	if strings.Contains(mig10, "grant select, insert, update") || strings.Contains(mig10, "delete on kv_objects") {
+		t.Errorf("0010_kv_store.sql must grant only write-once SELECT, INSERT to kodema_runtime:\n%s", migrations[9].SQL)
 	}
 }
 

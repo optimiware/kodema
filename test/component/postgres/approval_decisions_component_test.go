@@ -63,16 +63,16 @@ func TestMigration0009IncrementalUpgradeAndRLSIsolationOnPostgreSQL(t *testing.T
 	}
 
 	// 2. Incrementally apply 0009_approval_decisions.sql.
-	upgraded, err := runner.Apply(ctx, 0)
+	upgraded, err := runner.Apply(ctx, 9)
 	if err != nil {
 		t.Fatalf("apply incremental 0009: %v", err)
 	}
 	if len(upgraded) != 1 || upgraded[0].Name != "0009_approval_decisions.sql" {
 		t.Fatalf("upgraded = %+v; want [0009_approval_decisions.sql]", upgraded)
 	}
-	again, err := runner.Apply(ctx, 0)
+	again, err := runner.Apply(ctx, 9)
 	if err != nil || len(again) != 0 {
-		t.Fatalf("re-run after 0009 = %d (err=%v); want 0", len(again), err)
+		t.Fatalf("re-run at 0009 = %d (err=%v); want 0", len(again), err)
 	}
 
 	// 3. Verify forced RLS is enabled on approval_decisions.

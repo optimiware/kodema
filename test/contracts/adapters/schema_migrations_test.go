@@ -63,6 +63,8 @@ var expectedForeignKeys = []string{
 	"executions_project",
 	"executions_task",
 	"executions_tenant",
+	"kv_objects_project",
+	"kv_objects_tenant",
 	"memberships_project",
 	"memberships_tenant",
 	"model_usage_action",

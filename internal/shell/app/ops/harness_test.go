@@ -18,6 +18,7 @@ import (
 	"github.com/optimiware/kodema/internal/shell/execution"
 	"github.com/optimiware/kodema/internal/shell/identity"
 	"github.com/optimiware/kodema/internal/shell/inbox"
+	"github.com/optimiware/kodema/internal/shell/kv"
 	"github.com/optimiware/kodema/internal/shell/log"
 	"github.com/optimiware/kodema/internal/shell/mcpproxy"
 	"github.com/optimiware/kodema/internal/shell/pipeline"
@@ -327,6 +328,7 @@ type harness struct {
 	admission   *pipeline.AdmissionService
 	executions  *execution.Service
 	secrets     *secret.Manager
+	kv          *kv.Service
 	services    *service.Admin
 	credentials *token.CredentialAdmin
 	taskService *task.Service
@@ -463,6 +465,15 @@ func newHarness(t *testing.T) *harness {
 	})
 	if err != nil {
 		t.Fatalf("secret.NewManager: %v", err)
+	}
+	kvService, err := kv.NewService(kv.Config{
+		Clock:    clock,
+		IDs:      ids,
+		Executor: instance,
+		Scanner:  instance,
+	})
+	if err != nil {
+		t.Fatalf("kv.NewService: %v", err)
 	}
 	serviceAdmin, err := service.NewAdmin(service.AdminConfig{
 		Authorizer:    authorize.NewMatrix(),
@@ -670,6 +681,7 @@ func newHarness(t *testing.T) *harness {
 		admission:     admission,
 		executions:    executionService,
 		secrets:       secretManager,
+		kv:            kvService,
 		services:      serviceAdmin,
 		credentials:   credentialAdmin,
 		taskService:   taskService,
@@ -757,6 +769,7 @@ func (h *harness) buildRouter(t *testing.T) {
 		Executions:     executions,
 		Receipts:       mustReceiptLookup(t, h.store),
 		Secrets:        h.secrets,
+		KV:             h.kv,
 		Authority:      h.adapter,
 		Scanner:        h.store,
 		Services:       h.services,
