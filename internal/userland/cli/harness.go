@@ -28,6 +28,7 @@ const (
 	maxHarnessTokenFileBytes       = 64 << 10
 	harnessProxyPathPrefix         = "/llm/"
 	harnessProxyEnvURL             = "KODEMA_HARNESS_PROXY_URL"
+	harnessOpenCodeConfigEnv       = "OPENCODE_CONFIG_CONTENT"
 	harnessProxyShutdownTimeout    = 5 * time.Second
 	harnessChildGracefulStopWindow = 5 * time.Second
 )
@@ -416,7 +417,7 @@ func collectHarnessParentEnv(deps CommandDeps) []string {
 		seen[key] = true
 		if val := deps.Env(key); val != "" {
 			out = append(out, key+"="+val)
-		} else if strings.HasPrefix(key, "KODEMA_LLM_") && strings.HasSuffix(key, "_BASE_URL") {
+		} else if (strings.HasPrefix(key, "KODEMA_LLM_") && strings.HasSuffix(key, "_BASE_URL")) || key == harnessOpenCodeConfigEnv {
 			continue
 		} else {
 			out = append(out, entry)
@@ -426,6 +427,7 @@ func collectHarnessParentEnv(deps CommandDeps) []string {
 		"KODEMA_LLM_OPENAI_BASE_URL",
 		"KODEMA_LLM_ANTHROPIC_BASE_URL",
 		"KODEMA_LLM_OPENCODE_BASE_URL",
+		harnessOpenCodeConfigEnv,
 	} {
 		if seen[key] {
 			continue
@@ -437,15 +439,76 @@ func collectHarnessParentEnv(deps CommandDeps) []string {
 	return out
 }
 
+type harnessOpenCodeConfig struct {
+	Schema    string                   `json:"$schema"`
+	Providers harnessOpenCodeProviders `json:"providers"`
+}
+
+type harnessOpenCodeProviders struct {
+	OpenCode  harnessOpenCodeProvider `json:"opencode"`
+	OpenAI    harnessOpenCodeProvider `json:"openai"`
+	Anthropic harnessOpenCodeProvider `json:"anthropic"`
+}
+
+type harnessOpenCodeProvider struct {
+	Settings harnessOpenCodeProviderSettings `json:"settings"`
+}
+
+type harnessOpenCodeProviderSettings struct {
+	BaseURL string `json:"baseURL"`
+	APIKey  string `json:"apiKey"`
+}
+
+// defaultHarnessOpenCodeConfig builds a deterministic OpenCode V2 JSON config
+// routing opencode, openai, and anthropic through the loopback proxy using env
+// placeholders (never embedding the raw local proxy key in the JSON).
+func defaultHarnessOpenCodeConfig(openCodeBase, openAIBase, anthropicBase string) string {
+	anthropicV1 := strings.TrimRight(anthropicBase, "/")
+	if !strings.HasSuffix(anthropicV1, "/v1") {
+		anthropicV1 += "/v1"
+	}
+	cfg := harnessOpenCodeConfig{
+		Schema: "https://opencode.ai/config.json",
+		Providers: harnessOpenCodeProviders{
+			OpenCode: harnessOpenCodeProvider{
+				Settings: harnessOpenCodeProviderSettings{
+					BaseURL: openCodeBase,
+					APIKey:  "{env:OPENCODE_API_KEY}",
+				},
+			},
+			OpenAI: harnessOpenCodeProvider{
+				Settings: harnessOpenCodeProviderSettings{
+					BaseURL: openAIBase,
+					APIKey:  "{env:OPENAI_API_KEY}",
+				},
+			},
+			Anthropic: harnessOpenCodeProvider{
+				Settings: harnessOpenCodeProviderSettings{
+					BaseURL: anthropicV1,
+					APIKey:  "{env:ANTHROPIC_API_KEY}",
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 // buildHarnessChildEnv constructs the child process environment with provider
 // base URLs and local dummy API keys pointing at the loopback proxy. Any
 // existing KODEMA_LLM_<NAME>_BASE_URL variables with /llm/ paths are rewritten
 // to point at the loopback proxy while preserving their provider path suffix.
+// When OPENCODE_CONFIG_CONTENT is not already set to a non-empty value, a
+// default OpenCode V2 provider config targeting the loopback proxy is injected.
 func buildHarnessChildEnv(parentEnv []string, proxyOrigin, localKey string) []string {
 	origin := strings.TrimRight(proxyOrigin, "/")
 	rewrittenBase := make(map[string]string)
+	hasOpenCodeConfig := false
 
-	filtered := make([]string, 0, len(parentEnv)+8)
+	filtered := make([]string, 0, len(parentEnv)+9)
 	for _, entry := range parentEnv {
 		key, val, ok := strings.Cut(entry, "=")
 		if !ok {
@@ -456,6 +519,12 @@ func buildHarnessChildEnv(parentEnv []string, proxyOrigin, localKey string) []st
 			"OPENAI_BASE_URL", "OPENAI_API_KEY",
 			"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY",
 			"OPENCODE_BASE_URL", "OPENCODE_API_KEY":
+			continue
+		case harnessOpenCodeConfigEnv:
+			if strings.TrimSpace(val) != "" {
+				hasOpenCodeConfig = true
+				filtered = append(filtered, entry)
+			}
 			continue
 		}
 		if strings.HasPrefix(key, "KODEMA_LLM_") && strings.HasSuffix(key, "_BASE_URL") {
@@ -490,6 +559,11 @@ func buildHarnessChildEnv(parentEnv []string, proxyOrigin, localKey string) []st
 		"OPENCODE_BASE_URL="+openCodeBase,
 		"OPENCODE_API_KEY="+localKey,
 	)
+	if !hasOpenCodeConfig {
+		if content := defaultHarnessOpenCodeConfig(openCodeBase, openAIBase, anthropicBase); content != "" {
+			filtered = append(filtered, harnessOpenCodeConfigEnv+"="+content)
+		}
+	}
 	return filtered
 }
 

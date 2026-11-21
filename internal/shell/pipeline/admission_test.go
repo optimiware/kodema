@@ -920,6 +920,44 @@ actions:
 		t.Fatalf("serialized env = %+v; want %+v", decoded.Env, want)
 	}
 
+	// Lowercase and mixed-case environment names such as npm_config_cache are
+	// admitted in both pipeline defaults (snapshot) and action declarations.
+	lowercaseYAML := []byte(`env:
+  http_proxy: http://proxy.internal:8080
+  npm_config_cache: /kodema/cache/npm
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [npm ci]
+    caches: [npm]
+    env:
+      npm_config_cache: /kodema/cache/npm
+      MixedCase_1: "ok"
+`)
+	lowercaseResult, err := admission.Admit(t.Context(), pipeline.AdmitRequest{
+		Scope:          scope,
+		Definition:     pipeline.Definition{Name: "change", YAML: lowercaseYAML},
+		DefaultTimeout: 5 * time.Minute,
+	})
+	requireNoError(t, err, "Admit pipeline with lowercase env names")
+	wantLowercaseSnapshotEnv := []definition.EnvVar{
+		{Name: "http_proxy", Value: "http://proxy.internal:8080"},
+		{Name: "npm_config_cache", Value: "/kodema/cache/npm"},
+	}
+	if !reflect.DeepEqual(lowercaseResult.Snapshot.Env, wantLowercaseSnapshotEnv) {
+		t.Fatalf("lowercase snapshot env = %+v; want %+v", lowercaseResult.Snapshot.Env, wantLowercaseSnapshotEnv)
+	}
+	wantLowercaseActionEnv := []definition.EnvVar{
+		{Name: "npm_config_cache", Value: "/kodema/cache/npm"},
+		{Name: "MixedCase_1", Value: "ok"},
+	}
+	if len(lowercaseResult.Actions) != 1 || lowercaseResult.Actions[0].Container == nil {
+		t.Fatalf("lowercase admitted actions = %+v; want one container action", lowercaseResult.Actions)
+	}
+	if !reflect.DeepEqual(lowercaseResult.Actions[0].Container.Env, wantLowercaseActionEnv) {
+		t.Fatalf("lowercase action env = %+v; want %+v", lowercaseResult.Actions[0].Container.Env, wantLowercaseActionEnv)
+	}
+
 	// A definition without a pipeline env mapping admits no defaults.
 	noEnv, err := admission.Admit(t.Context(), pipeline.AdmitRequest{
 		Scope:          scope,

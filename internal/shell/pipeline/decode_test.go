@@ -516,8 +516,14 @@ actions:
     image: registry.example.com/build:latest
     outputs: [../candidate]
 `,
-		"env lowercase": `env:
-  log_level: info
+		"env leading digit": `env:
+  0LOG: info
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+`,
+		"env hyphen": `env:
+  LOG-LEVEL: info
 actions:
   - name: build
     image: registry.example.com/build:latest
@@ -558,6 +564,39 @@ actions:
 			_, err := pipeline.Decode([]byte(document), pipeline.DefaultLimits)
 			requireFaultClass(t, err, fault.InvalidInput)
 		})
+	}
+}
+
+func TestDecodeAcceptsLowercaseEnvWithCaches(t *testing.T) {
+	document := []byte(`env:
+  http_proxy: http://proxy.internal:8080
+actions:
+  - name: build
+    image: registry.example.com/node:22
+    caches: [npm]
+    env:
+      npm_config_cache: /kodema/cache/npm
+      MixedCase_1: value
+    commands:
+      - npm ci
+`)
+	decoded, err := pipeline.Decode(document, pipeline.DefaultLimits)
+	requireNoError(t, err, "Decode pipeline with lowercase env and caches")
+
+	if len(decoded.Env) != 1 || decoded.Env[0].Name != "http_proxy" || decoded.Env[0].Value != "http://proxy.internal:8080" {
+		t.Fatalf("pipeline env = %+v; want http_proxy=http://proxy.internal:8080", decoded.Env)
+	}
+	if len(decoded.Actions) != 1 || decoded.Actions[0].Container == nil {
+		t.Fatalf("actions = %+v; want one container action", decoded.Actions)
+	}
+	container := decoded.Actions[0].Container
+	if len(container.Caches) != 1 || container.Caches[0] != "npm" {
+		t.Fatalf("container caches = %v; want [npm]", container.Caches)
+	}
+	if len(container.Env) != 2 ||
+		container.Env[0].Name != "npm_config_cache" || container.Env[0].Value != "/kodema/cache/npm" ||
+		container.Env[1].Name != "MixedCase_1" || container.Env[1].Value != "value" {
+		t.Fatalf("container env = %+v; want npm_config_cache and MixedCase_1", container.Env)
 	}
 }
 

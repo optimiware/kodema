@@ -65,7 +65,8 @@ func TestBrainOpenCodeConfigDisablesLocalTools(t *testing.T) {
 func TestHTTPOpenCodeClientBrainMCPAttachDetachAndSendMessage(t *testing.T) {
 	var mu sync.Mutex
 	var attachedPayload map[string]any
-	var messagePayload map[string]any
+	var patchPayload map[string]any
+	var promptPayload map[string]any
 	var proxyTurnHeader string
 	var detachedPath string
 
@@ -74,18 +75,27 @@ func TestHTTPOpenCodeClientBrainMCPAttachDetachAndSendMessage(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/session/sess-1/mcp":
+		case r.Method == http.MethodPut && r.URL.Path == "/api/experimental/mcp/sandbox":
 			_ = json.Unmarshal(body, &attachedPayload)
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"ok":true}`))
-		case r.Method == http.MethodPost && r.URL.Path == "/session/sess-1/message":
-			_ = json.Unmarshal(body, &messagePayload)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/session/sess-1":
+			_ = json.Unmarshal(body, &patchPayload)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session/sess-1/prompt":
+			_ = json.Unmarshal(body, &promptPayload)
 			proxyTurnHeader = r.Header.Get("X-Kodema-Proxy-Turn-Path")
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"info":{"id":"m-1"},"parts":[{"type":"text","text":"done"}]}`))
-		case r.Method == http.MethodDelete && r.URL.Path == "/session/sess-1/mcp/sandbox":
+			_, _ = w.Write([]byte(`{"data":{"id":"u-1"}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/experimental/session/sess-1/wait":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/session/sess-1/message":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[{"id":"i-1","type":"idle","outcome":"succeeded"},{"id":"m-1","type":"assistant","content":[{"type":"text","text":"done"}]},{"id":"u-1","type":"user"}],"cursor":{}}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/experimental/mcp/sandbox":
 			detachedPath = r.URL.Path
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -107,7 +117,6 @@ func TestHTTPOpenCodeClientBrainMCPAttachDetachAndSendMessage(t *testing.T) {
 		t.Fatalf("AttachMCPServer: %v", err)
 	}
 	resp, err := cli.SendMessage(context.Background(), "sess-1", OpenCodeMessageRequest{
-		Directory:       "/workspace",
 		Prompt:          "implement feature",
 		Mode:            OpenCodeModeImplement,
 		ExecutionID:     "exec-1",
@@ -128,20 +137,32 @@ func TestHTTPOpenCodeClientBrainMCPAttachDetachAndSendMessage(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if attachedPayload["url"] != "http://10.0.0.5:8090/mcp" {
+	attachedCfg, _ := attachedPayload["config"].(map[string]any)
+	if attachedCfg["url"] != "http://10.0.0.5:8090/mcp" || attachedCfg["disabled"] != false || attachedCfg["oauth"] != false {
 		t.Fatalf("attached MCP payload = %+v", attachedPayload)
 	}
-	toolsMap, _ := messagePayload["tools"].(map[string]any)
-	for _, tool := range DefaultBrainDisabledLocalTools {
-		if v, ok := toolsMap[tool]; !ok || v != false {
-			t.Errorf("message tools[%q] = %v (present=%v); want false", tool, v, ok)
+	rawPerms, _ := json.Marshal(patchPayload["permissions"])
+	var gotPerms []openCodePermissionRule
+	_ = json.Unmarshal(rawPerms, &gotPerms)
+	denied := make(map[string]bool, len(gotPerms))
+	for _, rule := range gotPerms {
+		if rule.Effect == "deny" && rule.Resource == "*" {
+			denied[rule.Action] = true
 		}
+	}
+	for _, wantAction := range []string{"shell", "edit", "read", "glob", "grep"} {
+		if !denied[wantAction] {
+			t.Errorf("PATCH permissions missing deny rule for %q: %+v", wantAction, gotPerms)
+		}
+	}
+	if len(promptPayload) != 1 || promptPayload["text"] != "implement feature" {
+		t.Fatalf("promptPayload = %+v; want only {text: implement feature}", promptPayload)
 	}
 	if proxyTurnHeader != "/turn/exec-1/act-1" {
 		t.Fatalf("X-Kodema-Proxy-Turn-Path = %q; want /turn/exec-1/act-1", proxyTurnHeader)
 	}
-	if detachedPath != "/session/sess-1/mcp/sandbox" {
-		t.Fatalf("detachedPath = %q; want /session/sess-1/mcp/sandbox", detachedPath)
+	if detachedPath != "/api/experimental/mcp/sandbox" {
+		t.Fatalf("detachedPath = %q; want /api/experimental/mcp/sandbox", detachedPath)
 	}
 }
 

@@ -339,7 +339,7 @@ func TestServerModelsFileAndLLMProviderFlags(t *testing.T) {
 		"--data-dir", t.TempDir(),
 		"--dev-token", "dev-token",
 		"--models-file", modelsPath,
-		"--llm-provider", "opencode=https://opencode.ai/inference/openai/v1",
+		"--llm-provider", "opencode=https://opencode.ai/zen/v1",
 		"--llm-provider", "custom=https://llm.example.test/v1,secret=CUSTOM_KEY",
 	}, &stderr)
 	if code != 0 {
@@ -396,7 +396,7 @@ func TestServerModelsFileAndLLMProviderFlags(t *testing.T) {
 		"--data-dir", t.TempDir(),
 		"--dev-token", "dev-token",
 		"--models-file", providersOnlyPath,
-		"--llm-provider", "opencode=https://opencode.ai/inference/openai/v1",
+		"--llm-provider", "opencode=https://opencode.ai/zen/v1",
 	}, &stderr)
 	if code != 0 {
 		t.Fatalf("parseServerOptions(providers-only + --llm-provider) exited %d: %s", code, stderr.String())

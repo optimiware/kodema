@@ -11,11 +11,17 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -305,4 +311,206 @@ func TestGitMergeEffectsRealStaleBaseIsNotStarted(t *testing.T) {
 	if !ok || !record.Released {
 		t.Fatalf("record = %+v; want the assignment released", record)
 	}
+}
+
+func gitPktLine(payload string) string {
+	return fmt.Sprintf("%04x%s", len(payload)+4, payload)
+}
+
+// TestGitMergeEffectsRealHTTPSPrivateCA proves OSGitExecutor fails closed
+// against a private-CA HTTPS Git server when CAFile is unset, and succeeds for
+// both ls-remote (Observe) and fetch (Execute) when CAFile is configured with
+// either an absolute or relative PEM bundle path.
+func TestGitMergeEffectsRealHTTPSPrivateCA(t *testing.T) {
+	const (
+		token     = "test-merge-token"
+		targetRef = "refs/heads/main"
+	)
+	baseCommit := strings.Repeat("a", 40)
+	candidateCommit := strings.Repeat("b", 40)
+	resultCommit := strings.Repeat("c", 40)
+
+	var authenticatedRequests atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "kodema" || pass != token {
+			w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Query().Get("service") != "git-upload-pack" {
+			http.NotFound(w, r)
+			return
+		}
+		authenticatedRequests.Add(1)
+		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+		w.Header().Set("Cache-Control", "no-cache")
+		switch r.URL.Path {
+		case "/shop/web/info/refs":
+			_, _ = w.Write([]byte(
+				gitPktLine("# service=git-upload-pack\n") +
+					"0000" +
+					gitPktLine(resultCommit+" "+targetRef+"\x00multi_ack_detailed side-band-64k\n") +
+					"0000",
+			))
+		case "/shop/empty/info/refs":
+			_, _ = w.Write([]byte(
+				gitPktLine("# service=git-upload-pack\n") +
+					"0000" +
+					"0000",
+			))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	caDir := t.TempDir()
+	caPath := filepath.Join(caDir, "ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: server.Certificate().Raw,
+	})
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatalf("WriteFile CA bundle: %v", err)
+	}
+
+	credPath := filepath.Join(t.TempDir(), "credential")
+	if err := os.WriteFile(credPath, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile credential: %v", err)
+	}
+
+	executor, err := servicesapp.NewOSGitExecutor(servicesapp.OSGitExecutorConfig{})
+	if err != nil {
+		t.Fatalf("NewOSGitExecutor: %v", err)
+	}
+
+	seedEffectRecord := func(t *testing.T, stateDir string, opID id.OperationID) {
+		t.Helper()
+		payload, err := json.Marshal(struct {
+			Base      string `json:"base"`
+			Candidate string `json:"candidate"`
+			Result    string `json:"result"`
+		}{
+			Base:      baseCommit,
+			Candidate: candidateCommit,
+			Result:    resultCommit,
+		})
+		if err != nil {
+			t.Fatalf("json.Marshal effect record: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(stateDir, string(opID)+".json"), payload, 0o600); err != nil {
+			t.Fatalf("WriteFile effect record: %v", err)
+		}
+	}
+
+	op := services.MergeOperation{
+		Key:         services.MergeKey{Repository: "shop/web", Ref: targetRef},
+		OperationID: "merge-tls-1",
+		Base:        baseCommit,
+		Candidate:   candidateCommit,
+	}
+
+	// 1. Without CAFile, real git fails closed with a TLS certificate error.
+	t.Run("without CAFile fails closed on TLS", func(t *testing.T) {
+		stateDir := t.TempDir()
+		seedEffectRecord(t, stateDir, op.OperationID)
+		effects, err := services.NewGitMergeEffects(services.GitMergeEffectsConfig{
+			RemoteBaseURL:  server.URL,
+			StateDirectory: stateDir,
+			CredentialFile: credPath,
+			Executor:       executor,
+		})
+		if err != nil {
+			t.Fatalf("NewGitMergeEffects: %v", err)
+		}
+		before := authenticatedRequests.Load()
+		observation, err := effects.Observe(context.Background(), op)
+		if err == nil {
+			t.Fatalf("Observe succeeded without CAFile: %+v", observation)
+		}
+		if observation.State != services.EffectUncertain {
+			t.Fatalf("observation state = %q; want uncertain", observation.State)
+		}
+		lower := strings.ToLower(err.Error())
+		if !strings.Contains(lower, "certificate") && !strings.Contains(lower, "ssl") && !strings.Contains(lower, "tls") {
+			t.Fatalf("Observe error = %q; want a TLS/certificate failure", err)
+		}
+		if authenticatedRequests.Load() != before {
+			t.Fatalf("server received an HTTP request despite missing CAFile trust")
+		}
+	})
+
+	// 2. With absolute CAFile, Observe completes TLS + Basic Auth and reads the ref.
+	t.Run("with absolute CAFile observes advertised ref", func(t *testing.T) {
+		stateDir := t.TempDir()
+		seedEffectRecord(t, stateDir, op.OperationID)
+		effects, err := services.NewGitMergeEffects(services.GitMergeEffectsConfig{
+			RemoteBaseURL:  server.URL,
+			StateDirectory: stateDir,
+			CredentialFile: credPath,
+			CAFile:         caPath,
+			Executor:       executor,
+		})
+		if err != nil {
+			t.Fatalf("NewGitMergeEffects: %v", err)
+		}
+		before := authenticatedRequests.Load()
+		observation, err := effects.Observe(context.Background(), op)
+		if err != nil {
+			t.Fatalf("Observe with absolute CAFile: %v", err)
+		}
+		if observation.State != services.EffectApplied || observation.Output != resultCommit {
+			t.Fatalf("observation = %+v; want applied with output %s", observation, resultCommit)
+		}
+		if authenticatedRequests.Load() <= before {
+			t.Fatalf("expected authenticated HTTPS request to reach test server")
+		}
+	})
+
+	// 3. With relative CAFile, git -C <scratchWorkDir> still resolves the CA bundle
+	// because NewGitMergeEffects normalizes CAFile to an absolute path.
+	t.Run("with relative CAFile observes advertised ref and fetches over TLS", func(t *testing.T) {
+		t.Chdir(caDir)
+		stateDir := t.TempDir()
+		seedEffectRecord(t, stateDir, op.OperationID)
+		effects, err := services.NewGitMergeEffects(services.GitMergeEffectsConfig{
+			RemoteBaseURL:  server.URL,
+			StateDirectory: stateDir,
+			CredentialFile: credPath,
+			CAFile:         "ca.pem",
+			Executor:       executor,
+		})
+		if err != nil {
+			t.Fatalf("NewGitMergeEffects: %v", err)
+		}
+		observation, err := effects.Observe(context.Background(), op)
+		if err != nil {
+			t.Fatalf("Observe with relative CAFile: %v", err)
+		}
+		if observation.State != services.EffectApplied || observation.Output != resultCommit {
+			t.Fatalf("observation = %+v; want applied with output %s", observation, resultCommit)
+		}
+
+		// Also verify `git -C <workDir> fetch` succeeds over HTTPS with
+		// http.<origin>.sslCAInfo against an empty smart-HTTP repository
+		// (Execute then fails locally at resolveCommit, proving fetch succeeded).
+		fetchOp := services.MergeOperation{
+			Key:         services.MergeKey{Repository: "shop/empty", Ref: targetRef},
+			OperationID: "merge-tls-fetch-1",
+			Base:        baseCommit,
+			Candidate:   candidateCommit,
+		}
+		before := authenticatedRequests.Load()
+		fetchObs, fetchErr := effects.Execute(context.Background(), fetchOp)
+		if fetchErr == nil {
+			t.Fatalf("Execute unexpectedly succeeded on empty repository: %+v", fetchObs)
+		}
+		if !strings.Contains(fetchErr.Error(), "resolve merge base") {
+			t.Fatalf("Execute error = %q; want git fetch to succeed over TLS and fail locally at resolve merge base", fetchErr)
+		}
+		if authenticatedRequests.Load() <= before {
+			t.Fatalf("expected authenticated HTTPS fetch request to reach test server")
+		}
+	})
 }

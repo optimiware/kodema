@@ -389,6 +389,80 @@ func TestVerifyGitReadWithEmptySubjectIsApproved(t *testing.T) {
 	}
 }
 
+// TestVerifyZeroRoleServiceActor asserts an enabled project service account
+// created without Shell RBAC roles (roles: []) verifies cleanly for both
+// git.read and git.ref.update. Its principal_enabled authority read requires
+// only AnyEnabledService, while the calling enforcing service's
+// service_enabled authority read still keeps actor.verify's calling-service
+// role requirement.
+func TestVerifyZeroRoleServiceActor(t *testing.T) {
+	roleVariants := []struct {
+		name  string
+		roles []tenancy.Role
+	}{
+		{"nil roles", nil},
+		{"empty roles", []tenancy.Role{}},
+	}
+	ops := []struct {
+		name      string
+		binding   resource.Binding
+		makeInput func() verify.Attempt
+	}{
+		{
+			name:    "git.read",
+			binding: gitReadBinding(),
+			makeInput: func() verify.Attempt {
+				return readAttempt()
+			},
+		},
+		{
+			name:    "git.ref.update",
+			binding: gitBinding(),
+			makeInput: func() verify.Attempt {
+				input := attempt()
+				input.Approval = request.Assignment{}
+				input.ActionID = ""
+				return input
+			},
+		},
+	}
+
+	for _, roleVariant := range roleVariants {
+		for _, op := range ops {
+			t.Run(op.name+"/"+roleVariant.name, func(t *testing.T) {
+				h := newHarness(t)
+				h.bindings.set(op.binding, nil)
+				actor := identity.Principal{
+					ID:      id.PrincipalID("merge-coordinator"),
+					Kind:    identity.KindService,
+					Scope:   testScope(),
+					Roles:   roleVariant.roles,
+					Enabled: true,
+					Version: 1,
+				}
+				h.principals.set(actorCredential, actor, nil)
+
+				record, err := h.verifier.Verify(context.Background(), op.makeInput())
+				if err != nil {
+					t.Fatalf("Verify(%s): %v", op.name, err)
+				}
+				if record.Result != verify.ResultApproved || record.Approved {
+					t.Errorf("record = %#v, want approved verification without approval fact", record)
+				}
+				if record.Actor.ID != actor.ID || record.Actor.Kind != identity.KindService || len(record.Actor.Roles) != 0 {
+					t.Errorf("record actor = %#v, want zero-role service %q", record.Actor, actor.ID)
+				}
+				if h.records.count() != 1 {
+					t.Fatalf("record port calls = %d, want 1", h.records.count())
+				}
+				unit := h.records.unitAt(0)
+				assertAuthorityReads(t, unit, op.binding, actor)
+				assertNoCredential(t, unit, record)
+			})
+		}
+	}
+}
+
 // scopedMembershipRow is one observed membership row for the human actor.
 func scopedMembershipRow(scope tenancy.Scope, rowID string, version uint64, roles ...tenancy.Role) authorize.MembershipRow {
 	return authorize.MembershipRow{
@@ -1151,8 +1225,12 @@ func assertAuthorityReads(t *testing.T, unit verify.RecordUnit, binding resource
 		if read.Operation != operation.Name {
 			t.Errorf("authority read %q carries operation %q; want %q", read.Check, read.Operation, operation.Name)
 		}
-		if !reflect.DeepEqual(read.Required, operation.Requires) {
-			t.Errorf("authority read %q carries grant context %#v; want %#v", read.Check, read.Required, operation.Requires)
+		wantRequired := operation.Requires
+		if read.Check == authorize.CheckPrincipalEnabled && actor.Kind == identity.KindService {
+			wantRequired = authorize.Requires{AnyEnabledService: true}
+		}
+		if !reflect.DeepEqual(read.Required, wantRequired) {
+			t.Errorf("authority read %q carries grant context %#v; want %#v", read.Check, read.Required, wantRequired)
 		}
 		if read.Scope != testScope() {
 			t.Errorf("authority read %q carries scope %#v; want %#v", read.Check, read.Scope, testScope())

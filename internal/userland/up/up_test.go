@@ -2379,7 +2379,10 @@ func TestUpLLMProxyConfiguration(t *testing.T) {
 		if p := byName["anthropic"]; p.BaseURL != DefaultAnthropicBaseURL || p.SecretName != "ANTHROPIC_API_KEY" || p.AuthHeader != "x-api-key" {
 			t.Fatalf("anthropic provider = %+v", p)
 		}
-		if p := byName["opencode"]; p.BaseURL != DefaultOpenCodeBaseURL || p.SecretName != "OPENCODE_API_KEY" {
+		if DefaultOpenCodeBaseURL != "https://opencode.ai/zen/v1" {
+			t.Fatalf("DefaultOpenCodeBaseURL = %q; want https://opencode.ai/zen/v1", DefaultOpenCodeBaseURL)
+		}
+		if p := byName["opencode"]; p.BaseURL != "https://opencode.ai/zen/v1" || p.SecretName != "OPENCODE_API_KEY" {
 			t.Fatalf("opencode provider = %+v", p)
 		}
 		if len(parsed.SecretRules) != 1 || parsed.SecretRules[0].TenantID != DefaultTenantID ||

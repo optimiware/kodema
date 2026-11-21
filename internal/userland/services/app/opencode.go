@@ -20,25 +20,27 @@ import (
 // OpenCodeConfig is the complete composition input for one per-project
 // OpenCode service adapter process (`kodema services --kind opencode`).
 type OpenCodeConfig struct {
-	ServiceID           id.PrincipalID
-	TenantID            id.TenantID
-	ProjectID           id.ProjectID
-	ExecutionMode       services.OpenCodeExecutionMode
-	Brain               services.OpenCodeBrainConfig
-	StateDirectory      string
-	BaseURL             string
-	CAFile              string
-	GitURL              string
-	CredentialFile      string
-	CredentialHelper    string
-	OpenCodeURL         string
-	ProxyListen         string
-	ProxyAPIKey         string
-	PerTurnProxyRouting bool
-	Model               string
-	Agent               string
-	RescanInterval      time.Duration
-	MaxConcurrentTurns  int
+	ServiceID            id.PrincipalID
+	TenantID             id.TenantID
+	ProjectID            id.ProjectID
+	ExecutionMode        services.OpenCodeExecutionMode
+	Brain                services.OpenCodeBrainConfig
+	StateDirectory       string
+	BaseURL              string
+	CAFile               string
+	GitURL               string
+	CredentialFile       string
+	CredentialHelper     string
+	OpenCodeURL          string
+	OpenCodePassword     string
+	OpenCodePasswordFile string
+	ProxyListen          string
+	ProxyAPIKey          string
+	PerTurnProxyRouting  bool
+	Model                string
+	Agent                string
+	RescanInterval       time.Duration
+	MaxConcurrentTurns   int
 
 	// Transport is the public client boundary (typically *client.HTTPTransport).
 	Transport client.Transport
@@ -190,10 +192,32 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 		}
 	}
 
+	effectiveMaxConc := config.MaxConcurrentTurns
+	if execMode == services.OpenCodeExecutionModeBrain && config.OpenCode == nil {
+		if effectiveMaxConc > 1 {
+			return fmt.Errorf("opencode brain mode with OpenCode v2 HTTP client requires --max-concurrency 1 because OpenCode v2 runtime MCP attachment (/api/experimental/mcp/{server}) is location-scoped (run separate OpenCode v2 server instances for parallel Brain-mode sandboxes)")
+		}
+		if effectiveMaxConc <= 0 {
+			effectiveMaxConc = 1
+		}
+	}
+
 	opencodeClient := config.OpenCode
 	if opencodeClient == nil {
+		ocRT := config.RoundTripper
+		if ocRT == nil && strings.TrimSpace(config.CAFile) != "" &&
+			strings.HasPrefix(strings.ToLower(strings.TrimSpace(config.OpenCodeURL)), "https://") {
+			var err error
+			ocRT, err = httpRoundTripperWithCA(config.CAFile)
+			if err != nil {
+				return err
+			}
+		}
 		built, err := services.NewHTTPOpenCodeClient(services.HTTPOpenCodeClientConfig{
-			BaseURL: config.OpenCodeURL,
+			BaseURL:      config.OpenCodeURL,
+			Password:     config.OpenCodePassword,
+			PasswordFile: config.OpenCodePasswordFile,
+			RoundTripper: ocRT,
 		})
 		if err != nil {
 			return err
@@ -257,7 +281,7 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 		SandboxRoundTripper: sandboxRT,
 		Clock:               clock,
 		RescanInterval:      config.RescanInterval,
-		MaxConcurrentTurns:  config.MaxConcurrentTurns,
+		MaxConcurrentTurns:  effectiveMaxConc,
 		Model:               config.Model,
 		Agent:               config.Agent,
 	})

@@ -41,6 +41,10 @@ var runGitApp = gitapp.Run
 // replace it to capture the configuration without opening a listener.
 var runAuthApp = authapp.Run
 
+// runMergeCoordinator starts the composed merge coordinator service. Tests
+// replace it to capture the production configuration without running the loop.
+var runMergeCoordinator = servicesapp.RunMergeCoordinator
+
 // newPublicTransport builds the public HTTP transport used by the Git and agent
 // processes. The mounted credential file is read on every attempt.
 func newPublicTransport(baseURL, credentialFile string) (*client.HTTPTransport, error) {
@@ -327,9 +331,11 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	stateDir := flags.String("state-dir", envOr("KODEMA_SERVICE_STATE_DIR", ""), "durable local state directory")
 	gitURL := flags.String("git-url", envOr("KODEMA_SERVICE_GIT_URL", ""), "Git base URL")
 	opencodeURL := flags.String("opencode-url", envOr("KODEMA_OPENCODE_URL", ""), "opencode serve HTTP URL")
+	opencodePassword := flags.String("opencode-password", "", "optional OpenCode server password for HTTP Basic Auth (or KODEMA_OPENCODE_PASSWORD / OPENCODE_PASSWORD; prefer --opencode-password-file)")
+	opencodePasswordFile := flags.String("opencode-password-file", envOr("KODEMA_OPENCODE_PASSWORD_FILE", ""), "file containing the OpenCode server password for HTTP Basic Auth (recommended over --opencode-password)")
 	opencodeMode := flags.String("mode", envOr("KODEMA_OPENCODE_MODE", string(services.OpenCodeExecutionModeWorktree)), "OpenCode execution mode (worktree|brain)")
 	llmProxyListen := flags.String("llm-proxy-listen", envOr("KODEMA_OPENCODE_LLM_PROXY_LISTEN", ""), "optional loopback listen address for the attributed LLM reverse proxy")
-	llmProxyAPIKey := flags.String("llm-proxy-api-key", envOr("KODEMA_OPENCODE_LLM_PROXY_API_KEY", ""), "optional shared secret for inbound loopback LLM proxy requests (auto-generated if empty)")
+	llmProxyAPIKey := flags.String("llm-proxy-api-key", "", "optional shared secret for inbound loopback LLM proxy requests (or KODEMA_OPENCODE_LLM_PROXY_API_KEY; auto-generated if empty)")
 	perTurnProxyRouting := flags.Bool("per-turn-proxy-routing", envOr("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "") == "true", "route LLM proxy calls via explicit /turn/{exec}/{action}/llm/* paths for concurrent turns")
 	sandboxDefaultImage := flags.String("sandbox-default-image", envOr("KODEMA_OPENCODE_SANDBOX_DEFAULT_IMAGE", ""), "default stock toolchain image for Option 2 brain mode sandboxes")
 	sandboxCachesRaw := flags.String("sandbox-caches", envOr("KODEMA_OPENCODE_SANDBOX_CACHES", ""), "comma-separated default Kodema cache names mounted into ephemeral sandboxes")
@@ -378,16 +384,62 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			StateDirectory: *stateDir,
 			GitURL:         *gitURL,
 			CredentialFile: *credentialFile,
+			CAFile:         strings.TrimSpace(*caFile),
 			RescanInterval: *rescan,
 			Transport:      transport,
 		}
-		if err := servicesapp.RunMergeCoordinator(ctx, config); err != nil {
+		if err := runMergeCoordinator(ctx, config); err != nil {
 			fmt.Fprintf(stderr, "kodema: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	if services.ServiceKind(*kind) == services.KindOpenCode {
+		setFlags := make(map[string]bool)
+		flags.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+		explicitPassword := setFlags["opencode-password"]
+		explicitPasswordFile := setFlags["opencode-password-file"]
+		if explicitPassword && explicitPasswordFile {
+			usage(stderr, "opencode service cannot use both --opencode-password and --opencode-password-file")
+			return 2
+		}
+		effectiveOpenCodePassword := *opencodePassword
+		effectiveOpenCodePasswordFile := strings.TrimSpace(*opencodePasswordFile)
+		if explicitPasswordFile {
+			if effectiveOpenCodePasswordFile == "" {
+				usage(stderr, "opencode service --opencode-password-file requires a non-empty path")
+				return 2
+			}
+			effectiveOpenCodePassword = ""
+		} else if explicitPassword {
+			effectiveOpenCodePasswordFile = ""
+		} else if effectiveOpenCodePasswordFile != "" {
+			if os.Getenv("KODEMA_OPENCODE_PASSWORD") != "" {
+				usage(stderr, "opencode service cannot set both KODEMA_OPENCODE_PASSWORD and KODEMA_OPENCODE_PASSWORD_FILE")
+				return 2
+			}
+			effectiveOpenCodePassword = ""
+		} else {
+			effectiveOpenCodePassword = os.Getenv("KODEMA_OPENCODE_PASSWORD")
+			if effectiveOpenCodePassword == "" {
+				effectiveOpenCodePassword = os.Getenv("OPENCODE_PASSWORD")
+			}
+		}
+		effectiveProxyAPIKey := *llmProxyAPIKey
+		if !setFlags["llm-proxy-api-key"] {
+			effectiveProxyAPIKey = os.Getenv("KODEMA_OPENCODE_LLM_PROXY_API_KEY")
+		}
+		if effectiveOpenCodePasswordFile != "" {
+			if err := services.ValidateOpenCodePasswordFile(effectiveOpenCodePasswordFile); err != nil {
+				usage(stderr, err.Error())
+				return 2
+			}
+		} else if effectiveOpenCodePassword != "" {
+			if err := services.ValidateOpenCodePassword(effectiveOpenCodePassword); err != nil {
+				usage(stderr, err.Error())
+				return 2
+			}
+		}
 		execMode := services.OpenCodeExecutionMode(strings.TrimSpace(*opencodeMode))
 		if execMode == "" {
 			execMode = services.OpenCodeExecutionModeWorktree
@@ -440,25 +492,27 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			brainCfg = normalized
 		}
 		config := servicesapp.OpenCodeConfig{
-			ServiceID:           id.PrincipalID(*service),
-			TenantID:            id.TenantID(*tenant),
-			ProjectID:           id.ProjectID(*project),
-			ExecutionMode:       execMode,
-			Brain:               brainCfg,
-			StateDirectory:      *stateDir,
-			BaseURL:             *baseURL,
-			CAFile:              *caFile,
-			GitURL:              *gitURL,
-			CredentialFile:      *credentialFile,
-			OpenCodeURL:         *opencodeURL,
-			ProxyListen:         *llmProxyListen,
-			ProxyAPIKey:         *llmProxyAPIKey,
-			PerTurnProxyRouting: usePerTurnRouting,
-			Model:               *model,
-			Agent:               *agent,
-			RescanInterval:      *rescan,
-			MaxConcurrentTurns:  effectiveMaxConcurrency,
-			Transport:           transport,
+			ServiceID:            id.PrincipalID(*service),
+			TenantID:             id.TenantID(*tenant),
+			ProjectID:            id.ProjectID(*project),
+			ExecutionMode:        execMode,
+			Brain:                brainCfg,
+			StateDirectory:       *stateDir,
+			BaseURL:              *baseURL,
+			CAFile:               strings.TrimSpace(*caFile),
+			GitURL:               *gitURL,
+			CredentialFile:       *credentialFile,
+			OpenCodeURL:          *opencodeURL,
+			OpenCodePassword:     effectiveOpenCodePassword,
+			OpenCodePasswordFile: effectiveOpenCodePasswordFile,
+			ProxyListen:          *llmProxyListen,
+			ProxyAPIKey:          effectiveProxyAPIKey,
+			PerTurnProxyRouting:  usePerTurnRouting,
+			Model:                *model,
+			Agent:                *agent,
+			RescanInterval:       *rescan,
+			MaxConcurrentTurns:   effectiveMaxConcurrency,
+			Transport:            transport,
 		}
 		if err := servicesapp.RunOpenCode(ctx, config); err != nil {
 			fmt.Fprintf(stderr, "kodema: %v\n", err)

@@ -64,6 +64,9 @@ type GitMergeEffectsConfig struct {
 	// HTTP(S) remote, sent as an Authorization header to the configured Git
 	// remote, and never placed in command arguments.
 	CredentialFile string
+	// CAFile optionally configures http.<origin>.sslCAInfo via GIT_CONFIG_*
+	// for HTTPS Git remotes using a private CA bundle.
+	CAFile string
 	// Executor is the injected native Git boundary. It is required.
 	Executor GitCommandExecutor
 }
@@ -74,6 +77,7 @@ type GitMergeEffects struct {
 	stateDir      string
 	workDir       string
 	credential    string
+	caFile        string
 	executor      GitCommandExecutor
 }
 
@@ -101,8 +105,13 @@ func NewGitMergeEffects(config GitMergeEffectsConfig) (*GitMergeEffects, error) 
 	// The mounted credential file is the only credential source. A URL that
 	// embeds userinfo would leak into diagnostics, so it is refused without
 	// ever echoing the URL.
-	if parsed, err := url.Parse(base); err == nil && parsed.User != nil {
-		return nil, fmt.Errorf("git merge effects remote base URL must not embed credentials")
+	if parsed, err := url.Parse(base); err == nil {
+		if parsed.User != nil {
+			return nil, fmt.Errorf("git merge effects remote base URL must not embed credentials")
+		}
+		if (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host == "" {
+			return nil, fmt.Errorf("git merge effects remote base URL with scheme %q requires a host", parsed.Scheme)
+		}
 	}
 	if config.Executor == nil {
 		return nil, fmt.Errorf("git merge effects executor is required")
@@ -123,11 +132,25 @@ func NewGitMergeEffects(config GitMergeEffectsConfig) (*GitMergeEffects, error) 
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create git merge effects work directory: %w", err)
 	}
+	caFile := strings.TrimSpace(config.CAFile)
+	if caFile != "" {
+		for i := 0; i < len(caFile); i++ {
+			if ch := caFile[i]; ch < 0x20 || ch == 0x7f {
+				return nil, fmt.Errorf("git merge effects CA file contains a control character")
+			}
+		}
+		absCAFile, err := filepath.Abs(filepath.Clean(caFile))
+		if err != nil {
+			return nil, fmt.Errorf("resolve git merge effects CA file: %w", err)
+		}
+		caFile = absCAFile
+	}
 	return &GitMergeEffects{
 		remoteBaseURL: strings.TrimRight(base, "/"),
 		stateDir:      stateDir,
 		workDir:       workDir,
 		credential:    strings.TrimSpace(config.CredentialFile),
+		caFile:        caFile,
 		executor:      config.Executor,
 	}, nil
 }
@@ -347,7 +370,9 @@ func (effects *GitMergeEffects) repositoryURL(repository string) string {
 
 // remoteEnvironment composes the child variables for an HTTP(S) remote. The
 // mounted credential becomes a scoped Authorization header in the environment,
-// never in argv. A file or SSH remote needs no HTTP credential.
+// never in argv, and for HTTPS remotes an optional CA bundle becomes an
+// origin-scoped http.<origin>.sslCAInfo setting. A file or SSH remote needs
+// neither.
 func (effects *GitMergeEffects) remoteEnvironment(remoteURL string) ([]string, error) {
 	parsed, err := url.Parse(remoteURL)
 	if err != nil {
@@ -368,11 +393,32 @@ func (effects *GitMergeEffects) remoteEnvironment(remoteURL string) ([]string, e
 		return nil, fmt.Errorf("merge credential file is empty")
 	}
 	basic := base64.StdEncoding.EncodeToString([]byte("kodema:" + token))
-	return []string{
-		"GIT_CONFIG_COUNT=1",
-		"GIT_CONFIG_KEY_0=http." + remoteURL + ".extraHeader",
-		"GIT_CONFIG_VALUE_0=Authorization: Basic " + basic,
-	}, nil
+
+	type cfgPair struct {
+		k, v string
+	}
+	pairs := make([]cfgPair, 0, 2)
+	if effects.caFile != "" && parsed.Scheme == "https" && parsed.Host != "" {
+		origin := parsed.Scheme + "://" + parsed.Host
+		pairs = append(pairs, cfgPair{
+			k: "http." + origin + ".sslCAInfo",
+			v: effects.caFile,
+		})
+	}
+	pairs = append(pairs, cfgPair{
+		k: "http." + remoteURL + ".extraHeader",
+		v: "Authorization: Basic " + basic,
+	})
+
+	env := make([]string, 0, 1+2*len(pairs))
+	env = append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(pairs)))
+	for i, pair := range pairs {
+		env = append(env,
+			fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, pair.k),
+			fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, pair.v),
+		)
+	}
+	return env, nil
 }
 
 // resolveCommit maps an exact revision to its commit identity.

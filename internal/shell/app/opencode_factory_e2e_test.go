@@ -517,16 +517,51 @@ actions:
 	}
 	defer func() { _ = llmProxy.Close(context.Background()) }()
 
-	// Mock `opencode serve` that calls Kodema's attributed LLM proxy via
-	// OpenCodeLLMProxy and writes feature.go into the task's isolated worktree.
-	var opencodeSawLLMResponse bool
+	// Mock OpenCode v2 `opencode serve` requiring Basic Auth (`opencode:<pw>`)
+	// that calls Kodema's attributed LLM proxy via OpenCodeLLMProxy and writes
+	// feature.go into the task's isolated worktree.
+	const opencodeServerPassword = "factory-opencode-v2-pass"
+	var (
+		opencodeMu             sync.Mutex
+		opencodeSessionDir     string
+		opencodeSawLLMResponse bool
+	)
 	opencodeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/session":
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != "opencode" || pass != opencodeServerPassword {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"id":"oc-factory-sess-1"}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/session/oc-factory-sess-1/message":
-			dir := r.URL.Query().Get("directory")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"_tag":"UnauthorizedError","message":"Authentication required"}`)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			var req struct {
+				Location *struct {
+					Directory string `json:"directory"`
+				} `json:"location"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Location != nil {
+				opencodeMu.Lock()
+				opencodeSessionDir = req.Location.Directory
+				opencodeMu.Unlock()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":{"id":"oc-factory-sess-1"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session/oc-factory-sess-1/move":
+			var req struct {
+				Directory string `json:"directory"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			opencodeMu.Lock()
+			opencodeSessionDir = req.Directory
+			opencodeMu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session/oc-factory-sess-1/prompt":
+			opencodeMu.Lock()
+			dir := opencodeSessionDir
+			opencodeMu.Unlock()
 			llmReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost,
 				proxyURL+"/llm/anthropic/v1/messages",
 				strings.NewReader(`{"model":"claude-sonnet-4","stream":true,"messages":[{"role":"user","content":"implement feature"}]}`))
@@ -543,14 +578,21 @@ actions:
 				http.Error(w, fmt.Sprintf("unexpected llm response %d: %s", llmResp.StatusCode, string(llmBody)), http.StatusBadGateway)
 				return
 			}
+			opencodeMu.Lock()
 			opencodeSawLLMResponse = true
+			opencodeMu.Unlock()
 
 			if err := os.WriteFile(filepath.Join(dir, "feature.go"), []byte("package app\n\nfunc Feature() int { return 42 }\n"), 0o644); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"info":{"id":"msg-1"},"parts":[{"type":"text","text":"Implemented Feature() returning 42 in feature.go."}]}`)
+			_, _ = io.WriteString(w, `{"data":{"id":"usr-1"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/experimental/session/oc-factory-sess-1/wait":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/session/oc-factory-sess-1/message":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":[{"id":"idle-1","type":"idle","outcome":"succeeded"},{"id":"msg-1","type":"assistant","content":[{"type":"text","text":"Implemented Feature() returning 42 in feature.go."}]},{"id":"usr-1","type":"user"}],"cursor":{}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -577,7 +619,10 @@ actions:
 	if err != nil {
 		t.Fatalf("NewGitOpenCodeWorktreeManager: %v", err)
 	}
-	ocClient, err := services.NewHTTPOpenCodeClient(services.HTTPOpenCodeClientConfig{BaseURL: opencodeServer.URL})
+	ocClient, err := services.NewHTTPOpenCodeClient(services.HTTPOpenCodeClientConfig{
+		BaseURL:  opencodeServer.URL,
+		Password: opencodeServerPassword,
+	})
 	if err != nil {
 		t.Fatalf("NewHTTPOpenCodeClient: %v", err)
 	}
@@ -673,7 +718,10 @@ actions:
 	if !strings.Contains(string(summaryObj.Data), "Implemented Feature() returning 42") {
 		t.Fatalf("KV summary content = %q; missing expected text", string(summaryObj.Data))
 	}
-	if !opencodeSawLLMResponse {
+	opencodeMu.Lock()
+	sawLLM := opencodeSawLLMResponse
+	opencodeMu.Unlock()
+	if !sawLLM {
 		t.Fatal("OpenCode server did not receive response from attributed LLM proxy")
 	}
 	upstreamMu.Lock()

@@ -883,7 +883,7 @@ func TestInjectModelProxyEnvBuiltinsCustomAndNoShadowing(t *testing.T) {
 		{Name: "anthropic", BaseURL: "https://api.anthropic.com", AuthHeader: "x-api-key"},
 		{Name: "my-claude", BaseURL: "https://claude.internal", AuthHeader: "x-api-key"},
 		{Name: "openai", BaseURL: "https://api.openai.com"},
-		{Name: "opencode", BaseURL: "https://opencode.ai/inference/openai/v1"},
+		{Name: "opencode", BaseURL: "https://opencode.ai/zen/v1"},
 		{Name: "openrouter-eu", BaseURL: "https://openrouter.ai/api/v1"},
 	}
 	existing := []kerneldefinition.EnvVar{
@@ -1028,9 +1028,13 @@ func TestLLMProxyStrictSecretIsolationAndUsageAttributionInInspect(t *testing.T)
 				flusher.Flush()
 			}
 			_, _ = io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
-		case "/inference/openai/v1/chat/completions":
+		case "/zen/v1/chat/completions":
 			if r.Header.Get("Authorization") != "Bearer "+openCodeSecretVal {
 				http.Error(w, "bad opencode key", http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("x-api-key") != "" {
+				http.Error(w, "unexpected x-api-key on chat completions", http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -1060,7 +1064,7 @@ func TestLLMProxyStrictSecretIsolationAndUsageAttributionInInspect(t *testing.T)
 			{
 				Scope:      tenantScope,
 				Name:       "opencode",
-				BaseURL:    upstream.URL + "/inference/openai/v1",
+				BaseURL:    upstream.URL + "/zen/v1",
 				SecretName: openCodeSecretName,
 			},
 		},
@@ -1236,4 +1240,325 @@ func TestLLMProxyUsageTrackerPreservesInputTokensAcrossZeroDelta(t *testing.T) {
 	if usage.PromptTokens != 120 || usage.CompletionTokens != 45 || usage.TotalTokens != 165 {
 		t.Fatalf("usage = %+v; want prompt=120 completion=45 total=165", usage)
 	}
+}
+
+func TestLLMProxyOpenCodeZenMultiProtocolHeadersRedactionAndUsage(t *testing.T) {
+	const (
+		openCodeSecretName = id.SecretName("OPENCODE_API_KEY")
+		openCodeSecretVal  = "sk-opencode-zen-secret-4242"
+	)
+
+	var (
+		mu          sync.Mutex
+		seenHeaders = map[string]http.Header{}
+	)
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seenHeaders[r.URL.Path] = r.Header.Clone()
+		mu.Unlock()
+
+		switch r.URL.Path {
+		case "/zen/v1/messages":
+			// OpenCode Zen /zen/v1/messages requires x-api-key (and accepts
+			// Authorization alongside it) plus anthropic-version.
+			if r.Header.Get("x-api-key") != openCodeSecretVal {
+				http.Error(w, `{"type":"error","error":{"type":"AuthError","message":"Missing API key."}}`, http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("Authorization") != "Bearer "+openCodeSecretVal {
+				http.Error(w, "missing bearer auth", http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("anthropic-version") != DefaultAnthropicVersion {
+				http.Error(w, "missing anthropic-version", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Debug-Echo", "leak-"+openCodeSecretVal)
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_zen_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":210,\"output_tokens\":1}}}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"echo:"+openCodeSecretVal+"\"}}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":55}}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_, _ = io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		case "/zen/v1/chat/completions":
+			if r.Header.Get("Authorization") != "Bearer "+openCodeSecretVal {
+				http.Error(w, "bad bearer auth", http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("x-api-key") != "" {
+				http.Error(w, "unexpected x-api-key on chat/completions", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"chatcmpl-zen","model":"zen-chat-1","usage":{"prompt_tokens":100,"completion_tokens":30,"total_tokens":130}}`)
+		case "/zen/v1/responses":
+			if r.Header.Get("Authorization") != "Bearer "+openCodeSecretVal {
+				http.Error(w, "bad bearer auth", http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("x-api-key") != "" {
+				http.Error(w, "unexpected x-api-key on responses", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_zen\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20,\"total_tokens\":100}}}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	tenantScope := tenancy.Scope{TenantID: "tenant-1"}
+	fixture := newActivationFixture(t, []secret.NameRule{{
+		Scope:    tenantScope,
+		AllowAll: true,
+	}})
+	fixture.environment.config.WorkloadURL = "https://host.containers.internal:18443"
+	fixture.environment.config.Models = &ModelsConfig{
+		Providers: []ModelProviderConfig{{
+			Scope:      tenantScope,
+			Name:       "opencode",
+			BaseURL:    upstream.URL + "/zen/v1",
+			SecretName: openCodeSecretName,
+		}},
+		Transport: upstream.Client().Transport,
+	}
+
+	composed := fixture.environment.startApp(t)
+	handler := composed.Handler()
+	grantProjectEngineer(t, handler, "dev-admin-token")
+	writeActivationSecret(t, handler, "dev-project-token", openCodeSecretName, openCodeSecretVal, "write-opencode-zen")
+
+	rawPipeline := "actions:\n" +
+		"  - name: code\n" +
+		"    image: registry.example.com/kodema/harness@sha256:49f756463ad9dcfb9b6ade54d7d6f15476e7214f46a65b4b0c55d46845b12f70\n" +
+		"    commands:\n" +
+		"      - echo coding\n"
+	applied := applyActivationPipeline(t, handler, "dev-project-token", []byte(rawPipeline), "opencode-zen-pipeline")
+	started := startActivationTask(t, handler, "dev-project-token", applied.PipelineID, "opencode-zen-task")
+
+	prepares := waitForActivationPrepares(t, fixture.runtime, 1)
+	prepare := prepares[0]
+
+	// 1. POST /llm/opencode/v1/messages (Anthropic Messages on OpenCode Zen)
+	deadline := time.Now().Add(3 * time.Second)
+	var msgRec *httptest.ResponseRecorder
+	for {
+		msgRec = httptest.NewRecorder()
+		msgReq := httptest.NewRequest(http.MethodPost, "/llm/opencode/v1/messages",
+			strings.NewReader(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`))
+		msgReq.Header.Set("x-api-key", prepare.Credential)
+		msgReq.Header.Set("Content-Type", "application/json")
+		handler.ServeHTTP(msgRec, msgReq)
+		if msgRec.Code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/llm/opencode/v1/messages never succeeded: status=%d body=%s", msgRec.Code, msgRec.Body.String())
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if strings.Contains(msgRec.Body.String(), openCodeSecretVal) {
+		t.Fatalf("response body leaked OPENCODE_API_KEY: %s", msgRec.Body.String())
+	}
+	if !strings.Contains(msgRec.Body.String(), "[REDACTED]") {
+		t.Fatalf("response body did not redact echoed OPENCODE_API_KEY: %s", msgRec.Body.String())
+	}
+	if got := msgRec.Header().Get("X-Debug-Echo"); strings.Contains(got, openCodeSecretVal) || got != "leak-[REDACTED]" {
+		t.Fatalf("X-Debug-Echo = %q; want leak-[REDACTED]", got)
+	}
+
+	// 2. POST /llm/opencode/v1/chat/completions (OpenAI Chat Completions)
+	chatRec := httptest.NewRecorder()
+	chatReq := httptest.NewRequest(http.MethodPost, "/llm/opencode/v1/chat/completions",
+		strings.NewReader(`{"model":"zen-chat-1","messages":[{"role":"user","content":"hi"}]}`))
+	chatReq.Header.Set("Authorization", "Bearer "+prepare.Credential)
+	chatReq.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(chatRec, chatReq)
+	if chatRec.Code != http.StatusOK {
+		t.Fatalf("/llm/opencode/v1/chat/completions status=%d body=%s", chatRec.Code, chatRec.Body.String())
+	}
+
+	// 3. POST /llm/opencode/v1/responses (OpenAI Responses)
+	respRec := httptest.NewRecorder()
+	respReq := httptest.NewRequest(http.MethodPost, "/llm/opencode/v1/responses",
+		strings.NewReader(`{"model":"gpt-5","stream":true,"input":"hi"}`))
+	respReq.Header.Set("Authorization", "Bearer "+prepare.Credential)
+	respReq.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(respRec, respReq)
+	if respRec.Code != http.StatusOK {
+		t.Fatalf("/llm/opencode/v1/responses status=%d body=%s", respRec.Code, respRec.Body.String())
+	}
+
+	// Verify outbound headers sent to each upstream endpoint.
+	mu.Lock()
+	msgHdrs := seenHeaders["/zen/v1/messages"]
+	chatHdrs := seenHeaders["/zen/v1/chat/completions"]
+	respHdrs := seenHeaders["/zen/v1/responses"]
+	mu.Unlock()
+
+	if msgHdrs.Get("x-api-key") != openCodeSecretVal ||
+		msgHdrs.Get("Authorization") != "Bearer "+openCodeSecretVal ||
+		msgHdrs.Get("anthropic-version") != DefaultAnthropicVersion {
+		t.Fatalf("/zen/v1/messages headers = %v", msgHdrs)
+	}
+	if chatHdrs.Get("Authorization") != "Bearer "+openCodeSecretVal ||
+		chatHdrs.Get("x-api-key") != "" ||
+		chatHdrs.Get("anthropic-version") != "" {
+		t.Fatalf("/zen/v1/chat/completions headers = %v", chatHdrs)
+	}
+	if respHdrs.Get("Authorization") != "Bearer "+openCodeSecretVal ||
+		respHdrs.Get("x-api-key") != "" ||
+		respHdrs.Get("anthropic-version") != "" {
+		t.Fatalf("/zen/v1/responses headers = %v", respHdrs)
+	}
+
+	// Verify attributed usage across all three OpenCode Zen protocols.
+	inspectRec, inspectRes, _ := rawExecutionInspect(t, handler, "dev-project-token", started.ExecutionID)
+	if inspectRec.Code != api.HTTPStatusSuccess {
+		t.Fatalf("inspect status=%d", inspectRec.Code)
+	}
+	inspected := decodeBody[api.ExecutionInspectResult](t, inspectRes)
+	if inspected.ModelUsage == nil {
+		t.Fatal("execution.inspect returned nil model_usage")
+	}
+	if inspected.ModelUsage.Requests != 3 ||
+		inspected.ModelUsage.InputTokens != 390 ||
+		inspected.ModelUsage.OutputTokens != 105 ||
+		inspected.ModelUsage.TotalTokens != 495 {
+		t.Fatalf("model_usage = %+v; want requests=3 input=390 output=105 total=495", inspected.ModelUsage)
+	}
+	wantModels := map[string]api.ExecutionModelUsageBreakdown{
+		"claude-sonnet-4-6": {Provider: "opencode", Model: "claude-sonnet-4-6", Requests: 1, InputTokens: 210, OutputTokens: 55, TotalTokens: 265},
+		"zen-chat-1":        {Provider: "opencode", Model: "zen-chat-1", Requests: 1, InputTokens: 100, OutputTokens: 30, TotalTokens: 130},
+		"gpt-5":             {Provider: "opencode", Model: "gpt-5", Requests: 1, InputTokens: 80, OutputTokens: 20, TotalTokens: 100},
+	}
+	if len(inspected.ModelUsage.ByModel) != len(wantModels) {
+		t.Fatalf("by_model = %+v; want 3 models", inspected.ModelUsage.ByModel)
+	}
+	for _, item := range inspected.ModelUsage.ByModel {
+		want, ok := wantModels[item.Model]
+		if !ok || item != want {
+			t.Fatalf("by_model entry = %+v; want %+v", item, want)
+		}
+	}
+
+	// 4. Explicit AuthHeader: "Authorization" must be respected even on /messages.
+	t.Run("explicit Authorization override suppresses x-api-key on /messages", func(t *testing.T) {
+		clock := newFakeClock()
+		scope := modelTestScope("project-1")
+		var gotHeaders http.Header
+		explicitUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotHeaders = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"msg_explicit","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}}`)
+		}))
+		defer explicitUpstream.Close()
+
+		cfg := &ModelsConfig{
+			Providers: []ModelProviderConfig{{
+				Scope:      scope,
+				Name:       "opencode",
+				BaseURL:    explicitUpstream.URL + "/zen/v1",
+				SecretName: llmProxyTestOpenAISecretName,
+				AuthHeader: "Authorization",
+			}},
+			SecretRules: []secret.NameRule{{
+				Scope: scope,
+				Names: []id.SecretName{llmProxyTestOpenAISecretName},
+			}},
+			Transport: explicitUpstream.Client().Transport,
+		}
+		ctrl := modelTestExecutionContext("running", "container", "running", clock.Now().Add(time.Hour))
+		h := newLLMProxyTestHandler(t, cfg, map[string]identity.Principal{
+			llmProxyTestWorkloadToken: modelTestExecutionPrincipal(),
+		}, ctrl, nil, allowAllToolAuthority{}, clock, 50*time.Millisecond)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/llm/opencode/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-6"}`))
+		req.Header.Set("x-api-key", llmProxyTestWorkloadToken)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d; body = %s", rec.Code, rec.Body.String())
+		}
+		if got := gotHeaders.Get("Authorization"); got != "Bearer "+llmProxyTestOpenAISecret {
+			t.Fatalf("Authorization = %q; want Bearer secret", got)
+		}
+		if got := gotHeaders.Get("x-api-key"); got != "" {
+			t.Fatalf("x-api-key = %q; want empty when AuthHeader=Authorization is explicitly set", got)
+		}
+		if got := gotHeaders.Get("anthropic-version"); got != "" {
+			t.Fatalf("anthropic-version = %q; want empty when AuthHeader=Authorization is explicitly set", got)
+		}
+	})
+
+	// 5. Non-Anthropic nested .../messages paths (such as OpenAI Assistants
+	//    /v1/threads/{id}/messages) must NOT receive Anthropic x-api-key or
+	//    anthropic-version headers.
+	t.Run("openai threads messages path sends only Bearer auth", func(t *testing.T) {
+		clock := newFakeClock()
+		scope := modelTestScope("project-1")
+		var gotHeaders http.Header
+		var gotPath string
+		openaiUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotHeaders = r.Header.Clone()
+			gotPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"msg_thread_1","object":"thread.message"}`)
+		}))
+		defer openaiUpstream.Close()
+
+		cfg := &ModelsConfig{
+			Providers: []ModelProviderConfig{{
+				Scope:      scope,
+				Name:       "openai",
+				BaseURL:    openaiUpstream.URL,
+				SecretName: llmProxyTestOpenAISecretName,
+			}},
+			SecretRules: []secret.NameRule{{
+				Scope: scope,
+				Names: []id.SecretName{llmProxyTestOpenAISecretName},
+			}},
+			Transport: openaiUpstream.Client().Transport,
+		}
+		ctrl := modelTestExecutionContext("running", "container", "running", clock.Now().Add(time.Hour))
+		h := newLLMProxyTestHandler(t, cfg, map[string]identity.Principal{
+			llmProxyTestWorkloadToken: modelTestExecutionPrincipal(),
+		}, ctrl, nil, allowAllToolAuthority{}, clock, 50*time.Millisecond)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/llm/openai/v1/threads/thread_123/messages", strings.NewReader(`{"role":"user","content":"hi"}`))
+		req.Header.Set("Authorization", "Bearer "+llmProxyTestWorkloadToken)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d; body = %s", rec.Code, rec.Body.String())
+		}
+		if gotPath != "/v1/threads/thread_123/messages" {
+			t.Fatalf("upstream path = %q; want /v1/threads/thread_123/messages", gotPath)
+		}
+		if got := gotHeaders.Get("Authorization"); got != "Bearer "+llmProxyTestOpenAISecret {
+			t.Fatalf("Authorization = %q; want Bearer secret", got)
+		}
+		if got := gotHeaders.Get("x-api-key"); got != "" {
+			t.Fatalf("x-api-key = %q; want empty on OpenAI threads/messages", got)
+		}
+		if got := gotHeaders.Get("anthropic-version"); got != "" {
+			t.Fatalf("anthropic-version = %q; want empty on OpenAI threads/messages", got)
+		}
+	})
 }

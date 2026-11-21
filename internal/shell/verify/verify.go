@@ -545,7 +545,11 @@ func scopeContains(owner, target tenancy.Scope) bool {
 // binding observed here is never durable permission. When a human actor's
 // scoped membership rows were observed, the principal-enablement read carries
 // their pins and the observed role set, so the adapter confirms both rows
-// inside the same commit.
+// inside the same commit. When the verified actor is a service account,
+// principal_enabled requires only that the service account is currently enabled
+// in scope (AnyEnabledService), regardless of its Shell RBAC roles; the calling
+// enforcing service's CheckServiceEnabled read still keeps actor.verify's
+// calling-service role requirement.
 func authorityReads(input Attempt, actor identity.Principal, binding resource.Binding, membershipTargets []authorize.AuthorityTarget) []authorize.AuthorityRead {
 	operation, ok := authorize.LookupOperation("actor.verify")
 	if !ok {
@@ -574,6 +578,8 @@ func authorityReads(input Attempt, actor identity.Principal, binding resource.Bi
 			if len(membershipTargets) > 0 {
 				read.Required = authorize.Requires{HumanRoles: append([]tenancy.Role(nil), actor.Roles...)}
 				read.Targets = append([]authorize.AuthorityTarget(nil), membershipTargets...)
+			} else if actor.Kind == identity.KindService {
+				read.Required = authorize.Requires{AnyEnabledService: true}
 			}
 		}
 		reads = append(reads, read)

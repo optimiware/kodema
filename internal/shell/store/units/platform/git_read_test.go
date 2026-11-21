@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/identity"
 	"github.com/optimiware/kodema/internal/shell/resource"
@@ -56,15 +57,6 @@ func (records *capturingRecords) Record(ctx context.Context, unit verify.RecordU
 // reader and record adapter for one human Git read actor.
 func readVerifier(t *testing.T, s *memoryStoreAlias) (*verify.Verifier, *capturingRecords) {
 	t.Helper()
-	records, err := platform.NewRecordAdapter(s, s)
-	if err != nil {
-		t.Fatalf("NewRecordAdapter: %v", err)
-	}
-	memberships, err := identitystore.New(identitystore.Config{Executor: s, Scanner: s, Clock: fixedClock{}})
-	if err != nil {
-		t.Fatalf("identity.New: %v", err)
-	}
-	observer := &capturingRecords{inner: records}
 	// The credential resolves at tenant scope with the tenant-wide viewer grant
 	// only; the exact-project engineer grant must come from the scoped read.
 	actor := identity.Principal{
@@ -75,6 +67,22 @@ func readVerifier(t *testing.T, s *memoryStoreAlias) (*verify.Verifier, *capturi
 		Enabled: true,
 		Version: 1,
 	}
+	return readVerifierForActor(t, s, actor)
+}
+
+// readVerifierForActor builds the real verifier with the real store-backed
+// membership reader and record adapter for one resolved actor principal.
+func readVerifierForActor(t *testing.T, s *memoryStoreAlias, actor identity.Principal) (*verify.Verifier, *capturingRecords) {
+	t.Helper()
+	records, err := platform.NewRecordAdapter(s, s)
+	if err != nil {
+		t.Fatalf("NewRecordAdapter: %v", err)
+	}
+	memberships, err := identitystore.New(identitystore.Config{Executor: s, Scanner: s, Clock: fixedClock{}})
+	if err != nil {
+		t.Fatalf("identity.New: %v", err)
+	}
+	observer := &capturingRecords{inner: records}
 	next := 0
 	verifier, err := verify.New(verify.Config{
 		Principals: fixedPrincipals{principal: actor},
@@ -189,6 +197,179 @@ func TestRealVerifierGitReadPinsBothRowsBeforeCommit(t *testing.T) {
 	if _, err := s.Read(context.Background(), testScope(), "verifications", "verification-1"); err == nil {
 		t.Error("a refused read verification persisted a row")
 	}
+}
+
+// TestRealVerifierGitReadZeroRoleServiceAccount proves an enabled project
+// service account created with zero Shell RBAC roles (roles: []) verifies
+// cleanly for git.read end to end through verify.Verifier + platform.RecordAdapter,
+// while disabled or out-of-scope zero-role service accounts are still refused
+// with fault.Forbidden and the calling enforcing service remains role-gated.
+func TestRealVerifierGitReadZeroRoleServiceAccount(t *testing.T) {
+	const mergeCoordinator = id.PrincipalID("merge-coordinator")
+
+	newServiceActor := func(scope tenancy.Scope, enabled bool) identity.Principal {
+		return identity.Principal{
+			ID:      mergeCoordinator,
+			Kind:    identity.KindService,
+			Scope:   scope,
+			Roles:   nil,
+			Enabled: enabled,
+			Version: 1,
+		}
+	}
+
+	t.Run("enabled project service with zero roles succeeds", func(t *testing.T) {
+		s := newStore()
+		seedService(t, s, testScope(), testService, "enabled")
+		seedBinding(t, s, testScope(), testBinding, 7)
+		seedServiceRoles(t, s, testScope(), mergeCoordinator, "enabled", []tenancy.Role{})
+
+		verifier, observer := readVerifierForActor(t, s, newServiceActor(testScope(), true))
+		record, err := verifier.Verify(context.Background(), gitReadAttempt())
+		if err != nil {
+			t.Fatalf("real git.read Verify for zero-role service: %v", err)
+		}
+		if record.Result != verify.ResultApproved || record.Approved {
+			t.Errorf("record = %#v, want an approved read without an approval fact", record)
+		}
+		if record.Actor.ID != mergeCoordinator || record.Actor.Kind != identity.KindService || len(record.Actor.Roles) != 0 {
+			t.Errorf("record actor = %#v, want zero-role service %q", record.Actor, mergeCoordinator)
+		}
+		if len(observer.units) != 1 {
+			t.Fatalf("record units = %d, want 1", len(observer.units))
+		}
+		principalRead := readAuthority(t, observer.units[0], authorize.CheckPrincipalEnabled)
+		if principalRead.PrincipalID != mergeCoordinator {
+			t.Errorf("principal_enabled principal = %q, want %q", principalRead.PrincipalID, mergeCoordinator)
+		}
+		if !reflect.DeepEqual(principalRead.Required, authorize.Requires{AnyEnabledService: true}) {
+			t.Errorf("principal_enabled required = %#v, want AnyEnabledService", principalRead.Required)
+		}
+		callingRead := readAuthority(t, observer.units[0], authorize.CheckServiceEnabled)
+		if callingRead.Required.AnyEnabledService || len(callingRead.Required.ServiceRoles) == 0 {
+			t.Errorf("service_enabled required = %#v, want calling-service role requirement preserved", callingRead.Required)
+		}
+		row, err := s.Read(context.Background(), testScope(), "verifications", string(record.ID))
+		if err != nil {
+			t.Fatalf("read committed verification: %v", err)
+		}
+		if row.Values["actor_id"] != string(mergeCoordinator) {
+			t.Errorf("durable actor_id = %v, want %q", row.Values["actor_id"], mergeCoordinator)
+		}
+		if row.Values["operation"] != string(resource.OperationGitRead) {
+			t.Errorf("durable read operation = %v, want git.read", row.Values["operation"])
+		}
+	})
+
+	t.Run("enabled tenant-wide service with zero roles succeeds", func(t *testing.T) {
+		s := newStore()
+		tenantScope := tenancy.Scope{TenantID: testTenant}
+		seedService(t, s, testScope(), testService, "enabled")
+		seedBinding(t, s, testScope(), testBinding, 7)
+		seedServiceRoles(t, s, tenantScope, mergeCoordinator, "enabled", []tenancy.Role{})
+
+		verifier, observer := readVerifierForActor(t, s, newServiceActor(tenantScope, true))
+		record, err := verifier.Verify(context.Background(), gitReadAttempt())
+		if err != nil {
+			t.Fatalf("real git.read Verify for tenant-wide zero-role service: %v", err)
+		}
+		if record.Result != verify.ResultApproved || record.Approved {
+			t.Errorf("record = %#v, want an approved read without an approval fact", record)
+		}
+		if record.Actor.ID != mergeCoordinator || record.Actor.Kind != identity.KindService || len(record.Actor.Roles) != 0 {
+			t.Errorf("record actor = %#v, want zero-role service %q", record.Actor, mergeCoordinator)
+		}
+		if len(observer.units) != 1 {
+			t.Fatalf("record units = %d, want 1", len(observer.units))
+		}
+		principalRead := readAuthority(t, observer.units[0], authorize.CheckPrincipalEnabled)
+		if principalRead.PrincipalID != mergeCoordinator {
+			t.Errorf("principal_enabled principal = %q, want %q", principalRead.PrincipalID, mergeCoordinator)
+		}
+		if !reflect.DeepEqual(principalRead.Required, authorize.Requires{AnyEnabledService: true}) {
+			t.Errorf("principal_enabled required = %#v, want AnyEnabledService", principalRead.Required)
+		}
+		row, err := s.Read(context.Background(), testScope(), "verifications", string(record.ID))
+		if err != nil {
+			t.Fatalf("read committed verification: %v", err)
+		}
+		if row.Values["actor_id"] != string(mergeCoordinator) {
+			t.Errorf("durable actor_id = %v, want %q", row.Values["actor_id"], mergeCoordinator)
+		}
+		if row.Values["operation"] != string(resource.OperationGitRead) {
+			t.Errorf("durable read operation = %v, want git.read", row.Values["operation"])
+		}
+	})
+
+	t.Run("disabled project service with zero roles fails forbidden", func(t *testing.T) {
+		s := newStore()
+		seedService(t, s, testScope(), testService, "enabled")
+		seedBinding(t, s, testScope(), testBinding, 7)
+		seedServiceRoles(t, s, testScope(), mergeCoordinator, "disabled", []tenancy.Role{})
+
+		verifier, _ := readVerifierForActor(t, s, newServiceActor(testScope(), false))
+		record, err := verifier.Verify(context.Background(), gitReadAttempt())
+		requireClass(t, err, fault.Forbidden)
+		if record.ID != "" {
+			t.Errorf("record id = %q, want no committed read fact", record.ID)
+		}
+		if _, err := s.Read(context.Background(), testScope(), "verifications", "verification-1"); err == nil {
+			t.Error("a disabled zero-role service persisted a verification row")
+		}
+	})
+
+	t.Run("concurrently disabled zero-role service fails forbidden at commit", func(t *testing.T) {
+		s := newStore()
+		seedService(t, s, testScope(), testService, "enabled")
+		seedBinding(t, s, testScope(), testBinding, 7)
+		seedServiceRoles(t, s, testScope(), mergeCoordinator, "disabled", []tenancy.Role{})
+
+		// Resolved snapshot still reports enabled, proving principalEnabledLock
+		// rejects a disabled zero-role service at the commit boundary.
+		verifier, _ := readVerifierForActor(t, s, newServiceActor(testScope(), true))
+		record, err := verifier.Verify(context.Background(), gitReadAttempt())
+		requireClass(t, err, fault.Forbidden)
+		if record.ID != "" {
+			t.Errorf("record id = %q, want no committed read fact", record.ID)
+		}
+		if _, err := s.Read(context.Background(), testScope(), "verifications", "verification-1"); err == nil {
+			t.Error("a concurrently disabled zero-role service persisted a verification row")
+		}
+	})
+
+	t.Run("wrong project zero-role service fails forbidden", func(t *testing.T) {
+		s := newStore()
+		seedService(t, s, testScope(), testService, "enabled")
+		seedBinding(t, s, testScope(), testBinding, 7)
+		seedServiceRoles(t, s, tenancy.Scope{TenantID: testTenant, ProjectID: otherProject}, mergeCoordinator, "enabled", []tenancy.Role{})
+
+		verifier, _ := readVerifierForActor(t, s, newServiceActor(testScope(), true))
+		record, err := verifier.Verify(context.Background(), gitReadAttempt())
+		requireClass(t, err, fault.Forbidden)
+		if record.ID != "" {
+			t.Errorf("record id = %q, want no committed read fact", record.ID)
+		}
+		if _, err := s.Read(context.Background(), testScope(), "verifications", "verification-1"); err == nil {
+			t.Error("a foreign-project zero-role service persisted a verification row")
+		}
+	})
+
+	t.Run("cross-tenant zero-role service fails forbidden", func(t *testing.T) {
+		s := newStore()
+		seedService(t, s, testScope(), testService, "enabled")
+		seedBinding(t, s, testScope(), testBinding, 7)
+		seedServiceRoles(t, s, otherScope(), mergeCoordinator, "enabled", []tenancy.Role{})
+
+		verifier, _ := readVerifierForActor(t, s, newServiceActor(otherScope(), true))
+		record, err := verifier.Verify(context.Background(), gitReadAttempt())
+		requireClass(t, err, fault.Forbidden)
+		if record.ID != "" {
+			t.Errorf("record id = %q, want no committed read fact", record.ID)
+		}
+		if _, err := s.Read(context.Background(), testScope(), "verifications", "verification-1"); err == nil {
+			t.Error("a cross-tenant zero-role service persisted a verification row")
+		}
+	})
 }
 
 func readAuthority(t *testing.T, unit verify.RecordUnit, check authorize.AuthorityCheck) authorize.AuthorityRead {
