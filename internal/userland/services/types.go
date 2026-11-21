@@ -34,6 +34,9 @@ const (
 	KindResponder ServiceKind = "responder"
 	// KindMergeCoordinator serializes merges per repository/ref.
 	KindMergeCoordinator ServiceKind = "merge_coordinator"
+	// KindOpenCode runs a per-project OpenCode brain service with persistent
+	// task sessions, isolated local Git worktrees, and attributed LLM calls.
+	KindOpenCode ServiceKind = "opencode"
 )
 
 // serviceKinds is the declaration order.
@@ -43,6 +46,7 @@ var serviceKinds = []ServiceKind{
 	KindTimer,
 	KindResponder,
 	KindMergeCoordinator,
+	KindOpenCode,
 }
 
 // Valid reports whether the kind is one of the declared kinds.
@@ -121,7 +125,7 @@ func validRepository(value string) bool {
 		return false
 	}
 	for _, segment := range strings.Split(value, "/") {
-		if segment == "" {
+		if segment == "" || segment == "." || segment == ".." || strings.HasPrefix(segment, "-") {
 			return false
 		}
 		for index := 0; index < len(segment); index++ {

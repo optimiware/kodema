@@ -35,6 +35,7 @@ import (
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/gateway"
 	"github.com/optimiware/kodema/internal/shell/identity"
+	"github.com/optimiware/kodema/internal/shell/request"
 	"github.com/optimiware/kodema/internal/shell/secret"
 	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/store/units/platform"
@@ -45,6 +46,12 @@ import (
 const (
 	// llmProxyPathPrefix is the HTTP path prefix of the streaming LLM proxy.
 	llmProxyPathPrefix = "/llm/"
+	// headerLLMProxyExecution carries the execution ID attributed to a service
+	// LLM proxy call (required for kodsvc. credentials, stripped before upstream).
+	headerLLMProxyExecution = "X-Kodema-Execution"
+	// headerLLMProxyAction carries the active request action ID attributed to a
+	// service LLM proxy call (required for kodsvc. credentials, stripped before upstream).
+	headerLLMProxyAction = "X-Kodema-Action"
 	// operationLLMProxyInvoke is the registry operation whose execution
 	// permission (ExecConfiguredModels) and live authority checks govern
 	// workload LLM proxy access.
@@ -52,7 +59,7 @@ const (
 	// maxLLMProxyResponseBytes bounds one streamed upstream response body.
 	maxLLMProxyResponseBytes int64 = 64 << 20
 	// defaultLLMProxyWatchInterval is how often an open stream re-checks that
-	// its execution and container action remain active and within deadline.
+	// its execution and container/request action remain active and within deadline.
 	defaultLLMProxyWatchInterval = 100 * time.Millisecond
 )
 
@@ -100,11 +107,13 @@ func (disabledLLMProxyHandler) ServeHTTP(writer http.ResponseWriter, _ *http.Req
 }
 
 // llmProxyHandler serves `/llm/{provider}/{upstream_path...}` for active
-// workload executions holding ExecConfiguredModels.
+// workload executions holding ExecConfiguredModels and for enabled project
+// services holding an active attributed `request: service/<id>` action.
 type llmProxyHandler struct {
 	providers     map[providerScopeKey]resolvedProvider
 	principals    authorize.CurrentPrincipal
 	authority     authorize.AuthorityReader
+	controller    store.Controller
 	executions    gateway.ExecutionReader
 	secrets       secret.Resolver
 	store         store.Executor
@@ -113,6 +122,17 @@ type llmProxyHandler struct {
 	client        *http.Client
 	clock         Clock
 	watchInterval time.Duration
+}
+
+// admittedLLMCaller carries the verified execution/action attribution and
+// deadline for one authorized LLM proxy call (either workload kodex. or
+// attributed service kodsvc.).
+type admittedLLMCaller struct {
+	Principal   identity.Principal
+	ExecutionID id.ExecutionID
+	ActionID    id.ActionID
+	Deadline    time.Time
+	ServiceMode bool
 }
 
 // newLLMProxyHandler validates and constructs the optional streaming LLM proxy.
@@ -229,6 +249,7 @@ func newLLMProxyHandler(deps llmProxyDependencies) (http.Handler, func(context.C
 		providers:     providers,
 		principals:    deps.Principals,
 		authority:     deps.Authority,
+		controller:    deps.Controller,
 		executions:    executions,
 		secrets:       secrets,
 		store:         deps.Store,
@@ -288,7 +309,7 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 		writeHTTPError(writer, err)
 		return
 	}
-	if strings.Contains(request.URL.RawQuery, credential) || strings.Contains(request.URL.RawQuery, token.ExecutionPrefix) {
+	if queryContainsLLMCredential(request.URL.RawQuery, credential) {
 		writeHTTPError(writer, fault.New(fault.InvalidInput, "workload credentials must not be sent in query parameters"))
 		return
 	}
@@ -299,7 +320,7 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 		return
 	}
 
-	admitted, scope, err := handler.authenticateAndAuthorize(ctx, credential)
+	admitted, scope, err := handler.authenticateAndAuthorize(ctx, credential, request.Header)
 	if err != nil {
 		writeHTTPError(writer, err)
 		return
@@ -378,7 +399,12 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, remaining)
-	stopWatch := handler.startExecutionWatch(callCtx, cancel, admitted.Principal.ID, admitted.ExecutionID, admitted.ActionID, admitted.Deadline, scope)
+	var stopWatch func()
+	if admitted.ServiceMode {
+		stopWatch = handler.startServiceRequestWatch(callCtx, cancel, credential, admitted.Principal.ID, admitted.ExecutionID, admitted.ActionID, admitted.Deadline, scope)
+	} else {
+		stopWatch = handler.startExecutionWatch(callCtx, cancel, admitted.Principal.ID, admitted.ExecutionID, admitted.ActionID, admitted.Deadline, scope)
+	}
 	defer stopWatch()
 	// Deferred last so it runs first: stopWatch waits for the watcher, whose
 	// in-flight reads end only when callCtx is cancelled.
@@ -557,7 +583,7 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 func (handler *llmProxyHandler) recordUsage(
 	ctx context.Context,
 	scope tenancy.Scope,
-	admitted authorize.AdmittedExecution,
+	admitted admittedLLMCaller,
 	providerName string,
 	requestedModel string,
 	responseModel string,
@@ -605,53 +631,363 @@ func (handler *llmProxyHandler) recordUsage(
 func (handler *llmProxyHandler) authenticateAndAuthorize(
 	ctx context.Context,
 	credential string,
-) (authorize.AdmittedExecution, tenancy.Scope, error) {
+	header http.Header,
+) (admittedLLMCaller, tenancy.Scope, error) {
 	principal, err := handler.principals.Resolve(ctx, credential)
 	if err != nil {
 		if ctx.Err() != nil {
-			return authorize.AdmittedExecution{}, tenancy.Scope{}, llmProxyDeadlineFault()
+			return admittedLLMCaller{}, tenancy.Scope{}, llmProxyDeadlineFault()
 		}
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.Wrap(fault.Unauthenticated, "the presented credential could not be verified", err)
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.Wrap(fault.Unauthenticated, "the presented credential could not be verified", err)
 	}
 	if err := principal.Validate(); err != nil {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.Wrap(fault.Unauthenticated, "the presented credential did not verify a usable principal", err)
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.Wrap(fault.Unauthenticated, "the presented credential did not verify a usable principal", err)
 	}
-	if principal.Kind != identity.KindExecution {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.New(fault.Forbidden, "the LLM proxy accepts only workload execution credentials")
+	switch principal.Kind {
+	case identity.KindExecution:
+		if principal.ExecutionID == "" {
+			return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Unauthenticated, "an execution credential did not verify an execution identity")
+		}
+		if !principal.Scope.ProjectScoped() {
+			return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "workload execution is not project scoped")
+		}
+
+		admitted, err := handler.executions.ReadExecution(ctx, principal.ExecutionID)
+		if err != nil {
+			return admittedLLMCaller{}, tenancy.Scope{}, classifyLLMProxyAuthError(ctx, err)
+		}
+		if admitted.ExecutionID != principal.ExecutionID ||
+			admitted.Principal.ID != principal.ID ||
+			admitted.Principal.Scope != principal.Scope {
+			return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "the admitted execution does not match the presented principal")
+		}
+
+		scope := admitted.Principal.Scope
+		decision, err := authorize.AuthorizeExecution(admitted, operationLLMProxyInvoke, scope)
+		if err != nil {
+			return admittedLLMCaller{}, tenancy.Scope{}, classifyLLMProxyAuthError(ctx, err)
+		}
+		if decision != authorize.DecisionAllow {
+			return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "the execution does not hold the configured_models grant in this project")
+		}
+		if admitted.ActionID == "" || admitted.Deadline.IsZero() {
+			return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "an execution without an active bounded container action cannot invoke a configured model")
+		}
+
+		if err := handler.refreshExecutionAuthority(ctx, admitted.Principal.ID, admitted.ExecutionID, admitted.ActionID, admitted.Deadline, scope); err != nil {
+			return admittedLLMCaller{}, tenancy.Scope{}, err
+		}
+		return admittedLLMCaller{
+			Principal:   admitted.Principal,
+			ExecutionID: admitted.ExecutionID,
+			ActionID:    admitted.ActionID,
+			Deadline:    admitted.Deadline,
+		}, scope, nil
+
+	case identity.KindService:
+		return handler.authorizeAttributedService(ctx, principal, header)
+
+	default:
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "the LLM proxy accepts only workload execution or attributed service credentials")
 	}
-	if principal.ExecutionID == "" {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.New(fault.Unauthenticated, "an execution credential did not verify an execution identity")
+}
+
+func (handler *llmProxyHandler) authorizeAttributedService(
+	ctx context.Context,
+	principal identity.Principal,
+	header http.Header,
+) (admittedLLMCaller, tenancy.Scope, error) {
+	if !principal.Enabled {
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "the service account is disabled")
 	}
 	if !principal.Scope.ProjectScoped() {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.New(fault.Forbidden, "workload execution is not project scoped")
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "service LLM proxy access requires a project-scoped service account")
 	}
-
-	admitted, err := handler.executions.ReadExecution(ctx, principal.ExecutionID)
+	rawExecution, ok := extractSingleTrimmedHeader(header, headerLLMProxyExecution)
+	if !ok {
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "service LLM proxy calls require a single X-Kodema-Execution header")
+	}
+	rawAction, ok := extractSingleTrimmedHeader(header, headerLLMProxyAction)
+	if !ok {
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "service LLM proxy calls require a single X-Kodema-Action header")
+	}
+	executionID, err := id.ParseExecutionID(rawExecution)
 	if err != nil {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, classifyLLMProxyAuthError(ctx, err)
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "X-Kodema-Execution header is malformed")
 	}
-	if admitted.ExecutionID != principal.ExecutionID ||
-		admitted.Principal.ID != principal.ID ||
-		admitted.Principal.Scope != principal.Scope {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.New(fault.Forbidden, "the admitted execution does not match the presented principal")
-	}
-
-	scope := admitted.Principal.Scope
-	decision, err := authorize.AuthorizeExecution(admitted, operationLLMProxyInvoke, scope)
+	actionID, err := id.ParseActionID(rawAction)
 	if err != nil {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, classifyLLMProxyAuthError(ctx, err)
+		return admittedLLMCaller{}, tenancy.Scope{}, fault.New(fault.Forbidden, "X-Kodema-Action header is malformed")
 	}
-	if decision != authorize.DecisionAllow {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.New(fault.Forbidden, "the execution does not hold the configured_models grant in this project")
+	deadline, err := handler.verifyServiceRequestAttribution(ctx, principal.Scope, principal.ID, executionID, actionID)
+	if err != nil {
+		return admittedLLMCaller{}, tenancy.Scope{}, err
 	}
-	if admitted.ActionID == "" || admitted.Deadline.IsZero() {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, fault.New(fault.Forbidden, "an execution without an active bounded container action cannot invoke a configured model")
+	return admittedLLMCaller{
+		Principal:   principal,
+		ExecutionID: executionID,
+		ActionID:    actionID,
+		Deadline:    deadline,
+		ServiceMode: true,
+	}, principal.Scope, nil
+}
+
+// verifyServiceRequestAttribution fails closed unless the named execution is
+// running in the exact same (tenant, project) scope, the named action belongs
+// to that execution, is an active running request action assigned to
+// service/<servicePrincipalID>, has not reached its deadline, and live service/
+// execution/action authority checks still hold.
+func (handler *llmProxyHandler) verifyServiceRequestAttribution(
+	ctx context.Context,
+	scope tenancy.Scope,
+	servicePrincipalID id.PrincipalID,
+	executionID id.ExecutionID,
+	actionID id.ActionID,
+) (time.Time, error) {
+	execRow, err := handler.readScopedRow(ctx, scope, "executions", string(executionID))
+	if err != nil {
+		return time.Time{}, err
+	}
+	execState, _ := execRow.Values["state"].(string)
+	if execState != "running" {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed execution is not running")
 	}
 
-	if err := handler.refreshExecutionAuthority(ctx, admitted.Principal.ID, admitted.ExecutionID, admitted.ActionID, admitted.Deadline, scope); err != nil {
-		return authorize.AdmittedExecution{}, tenancy.Scope{}, err
+	actionRow, err := handler.readScopedRow(ctx, scope, "actions", string(actionID))
+	if err != nil {
+		return time.Time{}, err
 	}
-	return admitted, scope, nil
+	rowExecID, _ := actionRow.Values["execution_id"].(string)
+	if rowExecID != string(executionID) {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed action does not belong to the named execution")
+	}
+	actionKind, _ := actionRow.Values["kind"].(string)
+	if actionKind != "request" {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed action is not a request action")
+	}
+	actionState, _ := actionRow.Values["state"].(string)
+	if actionState != "running" {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed request action is not running")
+	}
+	if decision, ok := actionRow.Values["request_decision"].(string); ok && decision != "" {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed request action is already resolved")
+	}
+	deadline, ok := actionRow.Values["deadline"].(time.Time)
+	if !ok || deadline.IsZero() {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed request action has no active deadline")
+	}
+	now := handler.clock.Now()
+	if now.IsZero() {
+		return time.Time{}, fault.New(fault.InternalFailure, "LLM proxy clock returned no usable time")
+	}
+	if !now.Before(deadline) {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed request action deadline has passed")
+	}
+
+	var assignment request.Assignment
+	switch rawAssignment := actionRow.Values["request_assignment"].(type) {
+	case []byte:
+		if len(rawAssignment) == 0 || json.Unmarshal(rawAssignment, &assignment) != nil {
+			return time.Time{}, fault.New(fault.Forbidden, "the attributed request action has an invalid assignment")
+		}
+	case string:
+		if rawAssignment == "" || json.Unmarshal([]byte(rawAssignment), &assignment) != nil {
+			return time.Time{}, fault.New(fault.Forbidden, "the attributed request action has an invalid assignment")
+		}
+	default:
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed request action has no assignment")
+	}
+	if !assignment.Valid() || assignment.Kind != request.AssignmentService || string(assignment.ServiceID) != string(servicePrincipalID) {
+		return time.Time{}, fault.New(fault.Forbidden, "the attributed request action is not assigned to this service")
+	}
+
+	if err := handler.refreshServiceAuthority(ctx, servicePrincipalID, executionID, actionID, deadline, scope); err != nil {
+		return time.Time{}, err
+	}
+	return deadline, nil
+}
+
+func (handler *llmProxyHandler) readScopedRow(
+	ctx context.Context,
+	scope tenancy.Scope,
+	table string,
+	rowID string,
+) (store.Row, error) {
+	if handler.store != nil {
+		row, err := handler.store.Read(ctx, scope, table, rowID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return store.Row{}, llmProxyDeadlineFault()
+			}
+			if class, ok := fault.ClassOf(err); ok && class == fault.NotFound {
+				return store.Row{}, fault.New(fault.Forbidden, "the attributed execution or action is not available in this project")
+			}
+			return store.Row{}, classifyLLMProxyAuthError(ctx, err)
+		}
+		if !rowMatchesScope(row, scope, false) {
+			return store.Row{}, fault.New(fault.Forbidden, "the attributed execution or action is outside this project")
+		}
+		return row, nil
+	}
+	if handler.controller == nil {
+		return store.Row{}, fault.New(fault.Forbidden, "attributed service execution state cannot be verified")
+	}
+	row, err := handler.controller.Read(ctx, table, rowID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return store.Row{}, llmProxyDeadlineFault()
+		}
+		if class, ok := fault.ClassOf(err); ok && class == fault.NotFound {
+			return store.Row{}, fault.New(fault.Forbidden, "the attributed execution or action is not available in this project")
+		}
+		return store.Row{}, classifyLLMProxyAuthError(ctx, err)
+	}
+	if !rowMatchesScope(row, scope, true) {
+		return store.Row{}, fault.New(fault.Forbidden, "the attributed execution or action is outside this project")
+	}
+	return row, nil
+}
+
+func rowMatchesScope(row store.Row, scope tenancy.Scope, requireExplicit bool) bool {
+	if rawTenant, present := row.Values["tenant_id"]; present && rawTenant != nil {
+		tenant, ok := rawTenant.(string)
+		if !ok || tenant != string(scope.TenantID) {
+			return false
+		}
+	} else if requireExplicit {
+		return false
+	}
+	if rawProject, present := row.Values["project_id"]; present && rawProject != nil {
+		project, ok := rawProject.(string)
+		if !ok || project != string(scope.ProjectID) {
+			return false
+		}
+	} else if requireExplicit {
+		return false
+	}
+	return true
+}
+
+func (handler *llmProxyHandler) refreshServiceAuthority(
+	ctx context.Context,
+	servicePrincipalID id.PrincipalID,
+	executionID id.ExecutionID,
+	actionID id.ActionID,
+	deadline time.Time,
+	scope tenancy.Scope,
+) error {
+	reads := []authorize.AuthorityRead{
+		{
+			Operation:   operationLLMProxyInvoke,
+			Check:       authorize.CheckServiceEnabled,
+			Scope:       scope,
+			PrincipalID: servicePrincipalID,
+			TargetID:    string(servicePrincipalID),
+		},
+		{
+			Operation:   operationLLMProxyInvoke,
+			Check:       authorize.CheckExecutionRunning,
+			Scope:       scope,
+			PrincipalID: servicePrincipalID,
+			TargetID:    string(executionID),
+		},
+		{
+			Operation:   operationLLMProxyInvoke,
+			Check:       authorize.CheckActionDeadline,
+			Scope:       scope,
+			PrincipalID: servicePrincipalID,
+			TargetID:    string(actionID),
+		},
+	}
+	facts, err := handler.authority.Read(ctx, reads)
+	if err != nil {
+		if ctx.Err() != nil {
+			return llmProxyDeadlineFault()
+		}
+		if class, ok := fault.ClassOf(err); ok && class == fault.NotFound {
+			return fault.New(fault.Forbidden, "attributed service authority is no longer active")
+		}
+		if _, ok := fault.ClassOf(err); ok {
+			return err
+		}
+		return fault.Wrap(fault.InternalFailure, "current model authority could not be read", err)
+	}
+	if ctx.Err() != nil {
+		return llmProxyDeadlineFault()
+	}
+	if err := authorize.Confirm(reads, facts); err != nil {
+		return fault.New(fault.Forbidden, "attributed service authority check failed")
+	}
+	if !deadline.IsZero() && !handler.clock.Now().Before(deadline) {
+		return fault.New(fault.Forbidden, "the attributed request action deadline has passed")
+	}
+	return nil
+}
+
+func (handler *llmProxyHandler) startServiceRequestWatch(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	credential string,
+	servicePrincipalID id.PrincipalID,
+	executionID id.ExecutionID,
+	actionID id.ActionID,
+	deadline time.Time,
+	scope tenancy.Scope,
+) func() {
+	done := make(chan struct{})
+	var once sync.Once
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(handler.watchInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !deadline.IsZero() && !handler.clock.Now().Before(deadline) {
+					cancel()
+					return
+				}
+				principal, err := handler.principals.Resolve(ctx, credential)
+				if err != nil || !principal.Enabled || principal.Kind != identity.KindService ||
+					principal.ID != servicePrincipalID || principal.Scope != scope {
+					cancel()
+					return
+				}
+				if _, err := handler.verifyServiceRequestAttribution(ctx, scope, servicePrincipalID, executionID, actionID); err != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
+}
+
+func extractSingleTrimmedHeader(header http.Header, name string) (string, bool) {
+	values := header.Values(name)
+	var found string
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return "", false
+		}
+		if found != "" {
+			return "", false
+		}
+		found = trimmed
+	}
+	return found, found != ""
 }
 
 func (handler *llmProxyHandler) refreshExecutionAuthority(
@@ -812,6 +1148,36 @@ func (handler *llmProxyHandler) resolveProviderSecret(ctx context.Context, scope
 	return resolved[0].Value, nil
 }
 
+func queryContainsLLMCredential(rawQuery, credential string) bool {
+	if rawQuery == "" {
+		return false
+	}
+	containsSecret := func(s string) bool {
+		if credential != "" && strings.Contains(s, credential) {
+			return true
+		}
+		return strings.Contains(s, token.ExecutionPrefix) || strings.Contains(s, token.ServicePrefix)
+	}
+	if containsSecret(rawQuery) {
+		return true
+	}
+	if unescaped, err := url.QueryUnescape(rawQuery); err == nil && containsSecret(unescaped) {
+		return true
+	}
+	values, _ := url.ParseQuery(rawQuery)
+	for key, vals := range values {
+		if containsSecret(key) {
+			return true
+		}
+		for _, v := range vals {
+			if containsSecret(v) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func parseLLMProxyPath(rawPath string) (string, string, error) {
 	if !strings.HasPrefix(rawPath, llmProxyPathPrefix) {
 		return "", "", fault.New(fault.NotFound, "no operation is bound to this method and path")
@@ -903,6 +1269,8 @@ var strippedOutboundHeaders = map[string]bool{
 	"Accept-Encoding":     true,
 	"Authorization":       true,
 	"X-Api-Key":           true,
+	"X-Kodema-Execution":  true,
+	"X-Kodema-Action":     true,
 	"Proxy-Authorization": true,
 	"Proxy-Authenticate":  true,
 	"Cookie":              true,
@@ -943,7 +1311,8 @@ func copySafeOutboundHeaders(dst, src http.Header, callerCredential string) {
 				continue
 			}
 			if (callerCredential != "" && strings.Contains(value, callerCredential)) ||
-				strings.Contains(value, token.ExecutionPrefix) {
+				strings.Contains(value, token.ExecutionPrefix) ||
+				strings.Contains(value, token.ServicePrefix) {
 				continue
 			}
 			dst.Add(canonical, value)
