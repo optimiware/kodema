@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/apps/services"
+	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/factory"
 )
@@ -43,8 +43,8 @@ func (clock responderClock) Now() time.Time { return clock.now }
 // an event hint.
 type emptyEventSource struct{}
 
-func (emptyEventSource) Poll(context.Context, string) (services.NotificationPage, error) {
-	return services.NotificationPage{}, nil
+func (emptyEventSource) Poll(context.Context, string) (servicekit.NotificationPage, error) {
+	return servicekit.NotificationPage{}, nil
 }
 
 // servedResponderHandler adapts one real service credential to the public
@@ -70,7 +70,7 @@ func (handler *servedResponderHandler) Invoke(ctx context.Context, invocation ap
 	if publicError.Code != "" {
 		return api.Result{}, &api.Error{Code: publicError.Code, Message: publicError.Message}
 	}
-	if invocation.Operation != services.OperationResolve {
+	if invocation.Operation != servicekit.OperationResolve {
 		return result, nil
 	}
 
@@ -112,10 +112,10 @@ func (handler *servedResponderHandler) replay() (api.Invocation, api.Result) {
 
 // newServedResponderAdapter builds the real responder adapter over one served
 // service credential.
-func newServedResponderAdapter(t *testing.T, handler api.Handler) *services.Adapter {
+func newServedResponderAdapter(t *testing.T, handler api.Handler) *servicekit.Adapter {
 	t.Helper()
-	adapter, err := services.NewAdapter(services.AdapterConfig{
-		Kind:      services.KindResponder,
+	adapter, err := servicekit.NewAdapter(servicekit.AdapterConfig{
+		Kind:      servicekit.KindResponder,
 		ServiceID: id.PrincipalID(responderServiceID),
 		TenantID:  id.TenantID(factory.TenantID),
 		ProjectID: id.ProjectID(factory.ProjectID),
@@ -124,7 +124,7 @@ func newServedResponderAdapter(t *testing.T, handler api.Handler) *services.Adap
 		Clock:     responderClock{now: time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)},
 	})
 	if err != nil {
-		t.Fatalf("services.NewAdapter: %v", err)
+		t.Fatalf("servicekit.NewAdapter: %v", err)
 	}
 	return adapter
 }

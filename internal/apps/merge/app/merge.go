@@ -1,0 +1,192 @@
+package app
+
+// The merge-coordinator composition entry.
+//
+// It builds the concrete Git merge/rebase effects over the injected native Git
+// executor, the durable file coordination store, and the coordinator that
+// serializes one merge per repository/ref. The adapter then consumes that
+// coordinator through the existing public client boundary.
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
+	"github.com/optimiware/kodema/internal/apps/merge"
+	"github.com/optimiware/kodema/internal/id"
+)
+
+// DefaultMergeLease bounds one coordinator claim when the configuration leaves
+// the lease unset.
+const DefaultMergeLease = 2 * time.Minute
+
+// MergeConfig is the complete merge-coordinator composition input.
+type MergeConfig struct {
+	ServiceID      id.PrincipalID
+	TenantID       id.TenantID
+	ProjectID      id.ProjectID
+	StateDirectory string
+	GitURL         string
+	CredentialFile string
+	// CAFile optionally configures the CA bundle trusted by child Git
+	// processes talking to GitURL.
+	CAFile string
+	// WorkDirectory is the scratch-clone parent. A zero value uses
+	// <StateDirectory>/work.
+	WorkDirectory string
+	// Owner is this process's claim identity. A zero value derives one from
+	// the host and process.
+	Owner string
+	// Lease bounds one claim. A zero value uses DefaultMergeLease.
+	Lease          time.Duration
+	RescanInterval time.Duration
+
+	Transport client.Transport
+	Handler   api.Handler
+	Events    servicekit.EventSource
+	Clock     servicekit.Clock
+	// Executor is the native Git boundary. A nil value builds the operating
+	// system executor.
+	Executor merge.GitCommandExecutor
+	// GitPath is the native git binary used by the default executor.
+	GitPath string
+	// NewOperationID generates durable operation identities. A nil value uses
+	// a random identity.
+	NewOperationID func() (id.OperationID, error)
+}
+
+// RunMergeCoordinator composes and runs the merge-coordinator adapter until ctx
+// is canceled. It refuses an incomplete configuration before starting anything.
+func RunMergeCoordinator(ctx context.Context, config MergeConfig) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(config.StateDirectory) == "" {
+		return fmt.Errorf("merge coordinator state directory is required")
+	}
+	if strings.TrimSpace(config.GitURL) == "" {
+		return fmt.Errorf("merge coordinator Git URL is required")
+	}
+	if strings.TrimSpace(string(config.ServiceID)) == "" {
+		return servicekit.ErrDisabled
+	}
+	handler := config.Handler
+	if handler == nil {
+		if config.Transport == nil {
+			return fmt.Errorf("merge coordinator requires a public transport or handler")
+		}
+		handler = config.Transport
+	}
+	events := config.Events
+	if events == nil {
+		if config.Transport == nil {
+			return fmt.Errorf("merge coordinator requires an event source or public transport")
+		}
+		built, err := servicekit.NewPublicEventSource(config.Transport, config.ProjectID)
+		if err != nil {
+			return err
+		}
+		events = built
+	}
+	clock := config.Clock
+	if clock == nil {
+		clock = servicekit.SystemClock{}
+	}
+	stateDirectory, err := filepath.Abs(filepath.Clean(config.StateDirectory))
+	if err != nil {
+		return fmt.Errorf("resolve merge coordinator state directory: %w", err)
+	}
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		return fmt.Errorf("create merge coordinator state directory: %w", err)
+	}
+	executor := config.Executor
+	if executor == nil {
+		built, err := NewOSGitExecutor(OSGitExecutorConfig{GitPath: config.GitPath})
+		if err != nil {
+			return err
+		}
+		executor = built
+	}
+	workDirectory := config.WorkDirectory
+	if strings.TrimSpace(workDirectory) == "" {
+		workDirectory = filepath.Join(stateDirectory, "work")
+	}
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:  config.GitURL,
+		StateDirectory: filepath.Join(stateDirectory, "effects"),
+		WorkDirectory:  workDirectory,
+		CredentialFile: config.CredentialFile,
+		CAFile:         config.CAFile,
+		Executor:       executor,
+	})
+	if err != nil {
+		return err
+	}
+	store, err := merge.NewFileCoordinationStore(filepath.Join(stateDirectory, "coordination"))
+	if err != nil {
+		return err
+	}
+	lease := config.Lease
+	if lease == 0 {
+		lease = DefaultMergeLease
+	}
+	if lease < 0 {
+		return fmt.Errorf("merge coordinator lease must be positive")
+	}
+	owner := strings.TrimSpace(config.Owner)
+	if owner == "" {
+		host, hostErr := os.Hostname()
+		if hostErr != nil || strings.TrimSpace(host) == "" {
+			host = "merge-coordinator"
+		}
+		owner = host + "-" + strconv.Itoa(os.Getpid())
+	}
+	newOperationID := config.NewOperationID
+	if newOperationID == nil {
+		newOperationID = randomOperationID
+	}
+	coordinator, err := merge.NewCoordinator(merge.CoordinatorConfig{
+		TenantID:       config.TenantID,
+		Owner:          owner,
+		Lease:          lease,
+		Store:          store,
+		Effects:        effects,
+		Clock:          clock,
+		NewOperationID: newOperationID,
+	})
+	if err != nil {
+		return err
+	}
+	adapter, err := merge.NewAdapter(merge.AdapterConfig{
+		ServiceID:      config.ServiceID,
+		TenantID:       config.TenantID,
+		ProjectID:      config.ProjectID,
+		Handler:        handler,
+		Events:         events,
+		Clock:          clock,
+		RescanInterval: config.RescanInterval,
+		Merges:         coordinator,
+	})
+	if err != nil {
+		return err
+	}
+	return adapter.Run(ctx)
+}
+
+// randomOperationID returns one random durable operation identity.
+func randomOperationID() (id.OperationID, error) {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", fmt.Errorf("generate merge operation identity: %w", err)
+	}
+	return id.OperationID("merge-" + hex.EncodeToString(buffer)), nil
+}

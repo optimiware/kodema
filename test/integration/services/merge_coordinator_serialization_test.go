@@ -35,8 +35,9 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	serviceadapter "github.com/optimiware/kodema/internal/apps/services"
-	servicesapp "github.com/optimiware/kodema/internal/apps/services/app"
+	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
+	mergeapp "github.com/optimiware/kodema/internal/apps/merge"
+	mergerun "github.com/optimiware/kodema/internal/apps/merge/app"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/factory"
 )
@@ -74,7 +75,7 @@ func (counts *mergeSerializationCounts) observeCount() int { return int(counts.o
 // process-death and observation faults. It never fabricates a successful
 // observation: each Execute and Observe delegates to the real Git boundary.
 type mergeSerializationEffects struct {
-	real    serviceadapter.MergeEffects
+	real    mergeapp.MergeEffects
 	counts  *mergeSerializationCounts
 	entered chan struct{}
 	release <-chan struct{}
@@ -85,10 +86,10 @@ type mergeSerializationEffects struct {
 	crashAfterExecute bool
 	// observe overrides the real observation when set. It is the explicit
 	// inconclusive-observation seam.
-	observe func(serviceadapter.MergeOperation) (serviceadapter.MergeObservation, error)
+	observe func(mergeapp.MergeOperation) (mergeapp.MergeObservation, error)
 }
 
-func (effects *mergeSerializationEffects) Execute(ctx context.Context, operation serviceadapter.MergeOperation) (serviceadapter.MergeObservation, error) {
+func (effects *mergeSerializationEffects) Execute(ctx context.Context, operation mergeapp.MergeOperation) (mergeapp.MergeObservation, error) {
 	effects.counts.executes.Add(1)
 	if effects.entered != nil {
 		effects.once.Do(func() { close(effects.entered) })
@@ -97,21 +98,21 @@ func (effects *mergeSerializationEffects) Execute(ctx context.Context, operation
 		select {
 		case <-effects.release:
 		case <-ctx.Done():
-			return serviceadapter.MergeObservation{State: serviceadapter.EffectUncertain}, ctx.Err()
+			return mergeapp.MergeObservation{State: mergeapp.EffectUncertain}, ctx.Err()
 		}
 	}
 	observation, err := effects.real.Execute(ctx, operation)
 	if err != nil {
 		return observation, err
 	}
-	if effects.crashAfterExecute && observation.State == serviceadapter.EffectApplied {
-		return serviceadapter.MergeObservation{State: serviceadapter.EffectUncertain},
+	if effects.crashAfterExecute && observation.State == mergeapp.EffectApplied {
+		return mergeapp.MergeObservation{State: mergeapp.EffectUncertain},
 			errors.New("fault injection: coordinator stopped after the push before recording its observation")
 	}
 	return observation, nil
 }
 
-func (effects *mergeSerializationEffects) Observe(ctx context.Context, operation serviceadapter.MergeOperation) (serviceadapter.MergeObservation, error) {
+func (effects *mergeSerializationEffects) Observe(ctx context.Context, operation mergeapp.MergeOperation) (mergeapp.MergeObservation, error) {
 	effects.counts.observes.Add(1)
 	if effects.observe != nil {
 		return effects.observe(operation)
@@ -121,13 +122,13 @@ func (effects *mergeSerializationEffects) Observe(ctx context.Context, operation
 
 // newMergeSerializationEffects builds one fresh concrete Git effects instance
 // over the shared durable effect directory, like a restarted process would.
-func newMergeSerializationEffects(t *testing.T, gitRoot, effectDirectory string) *serviceadapter.GitMergeEffects {
+func newMergeSerializationEffects(t *testing.T, gitRoot, effectDirectory string) *mergeapp.GitMergeEffects {
 	t.Helper()
-	executor, err := servicesapp.NewOSGitExecutor(servicesapp.OSGitExecutorConfig{})
+	executor, err := mergerun.NewOSGitExecutor(mergerun.OSGitExecutorConfig{})
 	if err != nil {
 		t.Fatalf("NewOSGitExecutor: %v", err)
 	}
-	effects, err := serviceadapter.NewGitMergeEffects(serviceadapter.GitMergeEffectsConfig{
+	effects, err := mergeapp.NewGitMergeEffects(mergeapp.GitMergeEffectsConfig{
 		RemoteBaseURL:  "file://" + gitRoot,
 		StateDirectory: effectDirectory,
 		Executor:       executor,
@@ -140,13 +141,13 @@ func newMergeSerializationEffects(t *testing.T, gitRoot, effectDirectory string)
 
 // newMergeSerializationCoordinator opens the shared durable coordination store
 // for one coordinator process identity.
-func newMergeSerializationCoordinator(t *testing.T, directory, owner string, effects serviceadapter.MergeEffects, clock serviceadapter.Clock, operationID string) *serviceadapter.Coordinator {
+func newMergeSerializationCoordinator(t *testing.T, directory, owner string, effects mergeapp.MergeEffects, clock servicekit.Clock, operationID string) *mergeapp.Coordinator {
 	t.Helper()
-	store, err := serviceadapter.NewFileCoordinationStore(directory)
+	store, err := mergeapp.NewFileCoordinationStore(directory)
 	if err != nil {
 		t.Fatalf("NewFileCoordinationStore: %v", err)
 	}
-	coordinator, err := serviceadapter.NewCoordinator(serviceadapter.CoordinatorConfig{
+	coordinator, err := mergeapp.NewCoordinator(mergeapp.CoordinatorConfig{
 		TenantID: id.TenantID(factory.TenantID),
 		Owner:    owner,
 		Lease:    time.Minute,
@@ -164,9 +165,9 @@ func newMergeSerializationCoordinator(t *testing.T, directory, owner string, eff
 }
 
 // loadMergeCoordinationRecord reads one durable record from the shared store.
-func loadMergeCoordinationRecord(t *testing.T, directory string, key serviceadapter.MergeKey) serviceadapter.CoordinationRecord {
+func loadMergeCoordinationRecord(t *testing.T, directory string, key mergeapp.MergeKey) mergeapp.CoordinationRecord {
 	t.Helper()
-	store, err := serviceadapter.NewFileCoordinationStore(directory)
+	store, err := mergeapp.NewFileCoordinationStore(directory)
 	if err != nil {
 		t.Fatalf("NewFileCoordinationStore: %v", err)
 	}
@@ -211,10 +212,10 @@ func TestMergeCoordinatorRealGitSerialization(t *testing.T) {
 	first := newMergeSerializationCoordinator(t, directory, "merge-coordinator-a", firstEffects, clock, "merge-op-serialization")
 	liveSecond := newMergeSerializationCoordinator(t, directory, "merge-coordinator-b", newMergeSerializationEffects(t, root, effectDirectory), clock, "merge-op-unused")
 
-	key := serviceadapter.MergeKey{Repository: mergeRealRepository, Ref: mergeRealRef}
-	request := serviceadapter.MergeRequest{
+	key := mergeapp.MergeKey{Repository: mergeRealRepository, Ref: mergeRealRef}
+	request := mergeapp.MergeRequest{
 		Key: key,
-		Assignment: serviceadapter.MergeAssignment{
+		Assignment: mergeapp.MergeAssignment{
 			ExecutionID: id.ExecutionID(started.ExecutionID),
 			ActionID:    id.ActionID(actionByName(t, waiting, "merge").ActionID),
 		},
@@ -240,7 +241,7 @@ func TestMergeCoordinatorRealGitSerialization(t *testing.T) {
 	waitSignal(t, entered, "the first coordinator's effect to start")
 
 	paused, err := liveSecond.Merge(t.Context(), request)
-	if !errors.Is(err, serviceadapter.ErrClaimed) {
+	if !errors.Is(err, mergeapp.ErrClaimed) {
 		t.Fatalf("live second coordinator Merge error = %v; want ErrClaimed", err)
 	}
 	if paused.State != "" {
@@ -253,7 +254,7 @@ func TestMergeCoordinatorRealGitSerialization(t *testing.T) {
 	close(release)
 	select {
 	case err := <-result:
-		if !errors.Is(err, serviceadapter.ErrUncertain) {
+		if !errors.Is(err, mergeapp.ErrUncertain) {
 			t.Fatalf("crashed first coordinator error = %v; want ErrUncertain", err)
 		}
 	case <-time.After(2 * time.Minute):
@@ -261,7 +262,7 @@ func TestMergeCoordinatorRealGitSerialization(t *testing.T) {
 	}
 
 	uncertain := loadMergeCoordinationRecord(t, directory, key)
-	if uncertain.Released || uncertain.State != serviceadapter.EffectUncertain {
+	if uncertain.Released || uncertain.State != mergeapp.EffectUncertain {
 		t.Fatalf("record after the post-push crash = %+v; want a held uncertain record", uncertain)
 	}
 	if uncertain.Claim.OperationID != firstClaim.OperationID {
@@ -316,7 +317,7 @@ func TestMergeCoordinatorRealGitSerialization(t *testing.T) {
 		t.Fatalf("remote %s after recovery = %s; want the single observed candidate %s", mergeRealRef, remote, candidate)
 	}
 	record := loadMergeCoordinationRecord(t, directory, key)
-	if !record.Released || record.State != serviceadapter.EffectApplied {
+	if !record.Released || record.State != mergeapp.EffectApplied {
 		t.Fatalf("record after the answer = %+v; want a released applied assignment", record)
 	}
 	if record.Claim.OperationID != firstClaim.OperationID {
@@ -345,7 +346,7 @@ func TestMergeUncertainReleaseNeedsObservation(t *testing.T) {
 	effectDirectory := t.TempDir()
 	counts := &mergeSerializationCounts{}
 
-	key := serviceadapter.MergeKey{Repository: mergeRealRepository, Ref: mergeRealRef}
+	key := mergeapp.MergeKey{Repository: mergeRealRepository, Ref: mergeRealRef}
 
 	// The first process performs the real push and dies before recording the
 	// observation, leaving the real remote advanced and the record uncertain.
@@ -361,7 +362,7 @@ func TestMergeUncertainReleaseNeedsObservation(t *testing.T) {
 	}
 
 	uncertain := loadMergeCoordinationRecord(t, directory, key)
-	if uncertain.Released || uncertain.State != serviceadapter.EffectUncertain {
+	if uncertain.Released || uncertain.State != mergeapp.EffectUncertain {
 		t.Fatalf("record after the lost observation = %+v; want a held uncertain record", uncertain)
 	}
 	if got := counts.executeCount(); got != 1 {
@@ -400,7 +401,7 @@ func TestMergeUncertainReleaseNeedsObservation(t *testing.T) {
 		t.Fatalf("cancelled request action = %+v; want an unanswered cancelled action", cancelledAction)
 	}
 	held := loadMergeCoordinationRecord(t, directory, key)
-	if held.Released || held.State != serviceadapter.EffectUncertain {
+	if held.Released || held.State != mergeapp.EffectUncertain {
 		t.Fatalf("record immediately after cancellation = %+v; want still held and uncertain", held)
 	}
 	firstPending, err := first.Pending(t.Context())
@@ -415,8 +416,8 @@ func TestMergeUncertainReleaseNeedsObservation(t *testing.T) {
 	inconclusive := &mergeSerializationEffects{
 		real:   newMergeSerializationEffects(t, root, effectDirectory),
 		counts: counts,
-		observe: func(serviceadapter.MergeOperation) (serviceadapter.MergeObservation, error) {
-			return serviceadapter.MergeObservation{State: serviceadapter.EffectUncertain}, nil
+		observe: func(mergeapp.MergeOperation) (mergeapp.MergeObservation, error) {
+			return mergeapp.MergeObservation{State: mergeapp.EffectUncertain}, nil
 		},
 	}
 	heldCoordinator := newMergeSerializationCoordinator(t, directory, "merge-coordinator-observation-1", inconclusive, clock, "merge-op-unused")
@@ -428,7 +429,7 @@ func TestMergeUncertainReleaseNeedsObservation(t *testing.T) {
 		t.Fatalf("observations after the inconclusive pass = %d; want the pre-dispatch observation plus one release observation", got)
 	}
 	afterInconclusive := loadMergeCoordinationRecord(t, directory, key)
-	if afterInconclusive.Released || afterInconclusive.State != serviceadapter.EffectUncertain {
+	if afterInconclusive.Released || afterInconclusive.State != mergeapp.EffectUncertain {
 		t.Fatalf("record after an inconclusive observation = %+v; want it still held", afterInconclusive)
 	}
 	stillPending, err := heldCoordinator.Pending(t.Context())
@@ -459,7 +460,7 @@ func TestMergeUncertainReleaseNeedsObservation(t *testing.T) {
 	if !released.Released {
 		t.Fatalf("record after the conclusive observation = %+v; want released", released)
 	}
-	if released.State != serviceadapter.EffectApplied || released.Result.ObservedOutput != candidate {
+	if released.State != mergeapp.EffectApplied || released.Result.ObservedOutput != candidate {
 		t.Fatalf("released record = %+v; want the observed applied candidate", released)
 	}
 	if got := counts.executeCount(); got != 1 {

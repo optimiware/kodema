@@ -18,11 +18,14 @@ import (
 	"github.com/optimiware/kodema/internal/apps/agent"
 	agentapp "github.com/optimiware/kodema/internal/apps/agent/app"
 	authapp "github.com/optimiware/kodema/internal/apps/auth"
+	emailapp "github.com/optimiware/kodema/internal/apps/email/app"
 	"github.com/optimiware/kodema/internal/apps/git"
 	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	"github.com/optimiware/kodema/internal/apps/git/app/actors"
-	"github.com/optimiware/kodema/internal/apps/services"
-	servicesapp "github.com/optimiware/kodema/internal/apps/services/app"
+	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
+	mergeapp "github.com/optimiware/kodema/internal/apps/merge/app"
+	"github.com/optimiware/kodema/internal/apps/opencode"
+	opencodeapp "github.com/optimiware/kodema/internal/apps/opencode/app"
 	"github.com/optimiware/kodema/internal/id"
 )
 
@@ -43,7 +46,7 @@ var runAuthApp = authapp.Run
 
 // runMergeCoordinator starts the composed merge coordinator service. Tests
 // replace it to capture the production configuration without running the loop.
-var runMergeCoordinator = servicesapp.RunMergeCoordinator
+var runMergeCoordinator = mergeapp.RunMergeCoordinator
 
 // newPublicTransport builds the public HTTP transport used by the Git and agent
 // processes. The mounted credential file is read on every attempt.
@@ -333,14 +336,14 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	opencodeURL := flags.String("opencode-url", envOr("KODEMA_OPENCODE_URL", ""), "opencode serve HTTP URL")
 	opencodePassword := flags.String("opencode-password", "", "optional OpenCode server password for HTTP Basic Auth (or KODEMA_OPENCODE_PASSWORD / OPENCODE_PASSWORD; prefer --opencode-password-file)")
 	opencodePasswordFile := flags.String("opencode-password-file", envOr("KODEMA_OPENCODE_PASSWORD_FILE", ""), "file containing the OpenCode server password for HTTP Basic Auth (recommended over --opencode-password)")
-	opencodeMode := flags.String("mode", envOr("KODEMA_OPENCODE_MODE", string(services.OpenCodeExecutionModeWorktree)), "OpenCode execution mode (worktree|brain)")
+	opencodeMode := flags.String("mode", envOr("KODEMA_OPENCODE_MODE", string(opencode.OpenCodeExecutionModeWorktree)), "OpenCode execution mode (worktree|brain)")
 	llmProxyListen := flags.String("llm-proxy-listen", envOr("KODEMA_OPENCODE_LLM_PROXY_LISTEN", ""), "optional loopback listen address for the attributed LLM reverse proxy")
 	llmProxyAPIKey := flags.String("llm-proxy-api-key", "", "optional shared secret for inbound loopback LLM proxy requests (or KODEMA_OPENCODE_LLM_PROXY_API_KEY; auto-generated if empty)")
 	defaultPerTurnProxyRouting, perTurnProxyEnvErr := envBoolStrict("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", false)
 	perTurnProxyRouting := flags.Bool("per-turn-proxy-routing", defaultPerTurnProxyRouting, "route LLM proxy calls via explicit /turn/{exec}/{action}/llm/* paths for concurrent turns")
 	sandboxDefaultImage := flags.String("sandbox-default-image", envOr("KODEMA_OPENCODE_SANDBOX_DEFAULT_IMAGE", ""), "default stock toolchain image for Option 2 brain mode sandboxes")
 	sandboxCachesRaw := flags.String("sandbox-caches", envOr("KODEMA_OPENCODE_SANDBOX_CACHES", ""), "comma-separated default Kodema cache names mounted into ephemeral sandboxes")
-	sandboxPort := flags.Int("sandbox-port", services.DefaultOpenCodeSandboxPort, "container TCP port served by kodema sandbox serve in brain mode")
+	sandboxPort := flags.Int("sandbox-port", opencode.DefaultOpenCodeSandboxPort, "container TCP port served by kodema sandbox serve in brain mode")
 	sandboxMemory := flags.String("sandbox-memory", envOr("KODEMA_OPENCODE_SANDBOX_MEMORY", ""), "optional default memory limit for ephemeral sandboxes (e.g. 2Gi)")
 	sandboxCPU := flags.String("sandbox-cpu", envOr("KODEMA_OPENCODE_SANDBOX_CPU", ""), "optional default CPU limit for ephemeral sandboxes (e.g. 2)")
 	model := flags.String("model", envOr("KODEMA_OPENCODE_MODEL", ""), "optional default OpenCode model")
@@ -364,7 +367,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 		usage(stderr, "services requires --kind, --service, --tenant and --project")
 		return 2
 	}
-	if !services.ServiceKind(*kind).Valid() {
+	if !servicekit.ServiceKind(*kind).Valid() {
 		usage(stderr, fmt.Sprintf("unknown service kind %q", *kind))
 		return 2
 	}
@@ -373,12 +376,12 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 		usage(stderr, err.Error())
 		return 2
 	}
-	if services.ServiceKind(*kind) == services.KindMergeCoordinator {
+	if servicekit.ServiceKind(*kind) == servicekit.KindMergeCoordinator {
 		if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*gitURL) == "" {
 			usage(stderr, "merge coordinator requires --state-dir and --git-url")
 			return 2
 		}
-		config := servicesapp.MergeConfig{
+		config := mergeapp.MergeConfig{
 			ServiceID:      id.PrincipalID(*service),
 			TenantID:       id.TenantID(*tenant),
 			ProjectID:      id.ProjectID(*project),
@@ -395,7 +398,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 		}
 		return 0
 	}
-	if services.ServiceKind(*kind) == services.KindOpenCode {
+	if servicekit.ServiceKind(*kind) == servicekit.KindOpenCode {
 		setFlags := make(map[string]bool)
 		flags.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 		if !setFlags["per-turn-proxy-routing"] && perTurnProxyEnvErr != nil {
@@ -435,25 +438,25 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			effectiveProxyAPIKey = os.Getenv("KODEMA_OPENCODE_LLM_PROXY_API_KEY")
 		}
 		if effectiveOpenCodePasswordFile != "" {
-			if err := services.ValidateOpenCodePasswordFile(effectiveOpenCodePasswordFile); err != nil {
+			if err := opencode.ValidateOpenCodePasswordFile(effectiveOpenCodePasswordFile); err != nil {
 				usage(stderr, err.Error())
 				return 2
 			}
 		} else if effectiveOpenCodePassword != "" {
-			if err := services.ValidateOpenCodePassword(effectiveOpenCodePassword); err != nil {
+			if err := opencode.ValidateOpenCodePassword(effectiveOpenCodePassword); err != nil {
 				usage(stderr, err.Error())
 				return 2
 			}
 		}
-		execMode := services.OpenCodeExecutionMode(strings.TrimSpace(*opencodeMode))
+		execMode := opencode.OpenCodeExecutionMode(strings.TrimSpace(*opencodeMode))
 		if execMode == "" {
-			execMode = services.OpenCodeExecutionModeWorktree
+			execMode = opencode.OpenCodeExecutionModeWorktree
 		}
 		if !execMode.Valid() {
 			usage(stderr, fmt.Sprintf("opencode service --mode %q is unsupported (want worktree or brain)", execMode))
 			return 2
 		}
-		if execMode == services.OpenCodeExecutionModeWorktree {
+		if execMode == opencode.OpenCodeExecutionModeWorktree {
 			if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*gitURL) == "" || strings.TrimSpace(*opencodeURL) == "" {
 				usage(stderr, "opencode service requires --state-dir, --git-url and --opencode-url")
 				return 2
@@ -476,22 +479,22 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			}
 		}
 		defaultCaches := splitComma(*sandboxCachesRaw)
-		brainCfg := services.OpenCodeBrainConfig{
+		brainCfg := opencode.OpenCodeBrainConfig{
 			DefaultSandboxImage:  strings.TrimSpace(*sandboxDefaultImage),
 			DefaultSandboxCaches: defaultCaches,
 			SandboxPort:          *sandboxPort,
 			DefaultSandboxMemory: strings.TrimSpace(*sandboxMemory),
 			DefaultSandboxCPU:    strings.TrimSpace(*sandboxCPU),
 		}
-		if execMode == services.OpenCodeExecutionModeBrain {
-			normalized, err := services.NormalizeBrainConfig(brainCfg)
+		if execMode == opencode.OpenCodeExecutionModeBrain {
+			normalized, err := opencode.NormalizeBrainConfig(brainCfg)
 			if err != nil {
 				usage(stderr, err.Error())
 				return 2
 			}
 			brainCfg = normalized
 		}
-		config := servicesapp.OpenCodeConfig{
+		config := opencodeapp.OpenCodeConfig{
 			ServiceID:            id.PrincipalID(*service),
 			TenantID:             id.TenantID(*tenant),
 			ProjectID:            id.ProjectID(*project),
@@ -514,14 +517,14 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			MaxConcurrentTurns:   effectiveMaxConcurrency,
 			Transport:            transport,
 		}
-		if err := servicesapp.RunOpenCode(ctx, config); err != nil {
+		if err := opencodeapp.RunOpenCode(ctx, config); err != nil {
 			fmt.Fprintf(stderr, "kodema: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	config := servicesapp.Config{
-		Kind:           services.ServiceKind(*kind),
+	config := servicekit.Config{
+		Kind:           servicekit.ServiceKind(*kind),
 		ServiceID:      id.PrincipalID(*service),
 		TenantID:       id.TenantID(*tenant),
 		ProjectID:      id.ProjectID(*project),
@@ -529,7 +532,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 		RescanInterval: *rescan,
 		Transport:      transport,
 	}
-	if err := servicesapp.Run(ctx, config); err != nil {
+	if err := servicekit.Run(ctx, config); err != nil {
 		fmt.Fprintf(stderr, "kodema: %v\n", err)
 		return 1
 	}
@@ -540,7 +543,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 // intake. The message source is read before the public transport is used, so an
 // unreadable source is a local refusal, never an ambiguous mutation.
 func runServicesEmailIntake(ctx context.Context, kind, tenant, project, pipeline, message, baseURL, credentialFile, caFile string, stdout, stderr io.Writer) int {
-	if kind != string(services.KindEmail) {
+	if kind != string(servicekit.KindEmail) {
 		usage(stderr, "email intake requires --kind email")
 		return 2
 	}
@@ -567,7 +570,7 @@ func runServicesEmailIntake(ctx context.Context, kind, tenant, project, pipeline
 		usage(stderr, err.Error())
 		return 2
 	}
-	result, err := servicesapp.RunEmailIntake(ctx, servicesapp.EmailIntakeConfig{
+	result, err := emailapp.RunEmailIntake(ctx, emailapp.EmailIntakeConfig{
 		TenantID:   id.TenantID(tenant),
 		ProjectID:  id.ProjectID(project),
 		PipelineID: pipeline,

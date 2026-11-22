@@ -23,7 +23,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/optimiware/kodema/api"
-	serviceadapter "github.com/optimiware/kodema/internal/apps/services"
+	serviceadapter "github.com/optimiware/kodema/internal/apps/kit/servicekit"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/factory"
 )
