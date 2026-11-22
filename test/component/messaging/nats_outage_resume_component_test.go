@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	broker "github.com/optimiware/kodema/internal/shell/integration/nats"
-	"github.com/optimiware/kodema/internal/shell/token"
+	broker "github.com/optimiware/kodema/internal/adapter/integration/nats"
+	"github.com/optimiware/kodema/internal/control/token"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
 	support "github.com/optimiware/kodema/test/support/infrastructure/messaging"
 )
 

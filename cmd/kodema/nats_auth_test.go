@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
+	shellapp "github.com/optimiware/kodema/internal/server"
 )
 
 // TestNATSAuthFromEnv pins the deployment contract for per-credential broker

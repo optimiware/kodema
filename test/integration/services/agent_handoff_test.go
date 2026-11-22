@@ -46,12 +46,12 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/agent"
+	agentapp "github.com/optimiware/kodema/internal/apps/agent/app"
+	"github.com/optimiware/kodema/internal/apps/kit/session"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/userland/agent"
-	agentapp "github.com/optimiware/kodema/internal/userland/agent/app"
-	"github.com/optimiware/kodema/internal/userland/session"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

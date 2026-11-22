@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/cli"
+	"github.com/optimiware/kodema/internal/apps/cli"
 )
 
 // TestSessionRecordShape pins the v2 session member set and JSON names. The

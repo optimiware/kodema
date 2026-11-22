@@ -10,14 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/log"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/log"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
@@ -36,15 +36,15 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 		`printf 'err-two\n' >&2`,
 		`cat /kodema/secrets/API_KEY`,
 		`cat /kodema/secrets/KODEMA_TOKEN`,
-	}, nil, []engine.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}}, "tok-abc")
+	}, nil, []reconcile.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}}, "tok-abc")
 	if _, err := fixture.adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	if _, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, fixture.adapter,
-		engine.ObserveRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
+		reconcile.ObserveRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 
 	// Read in one page so the configured values are whole in the chunk the
 	// adapter redacts; a value split across caller-chosen pages is outside the
@@ -86,11 +86,11 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 	if _, err := recovered.Prepare(ctx, pagedRequest); err != nil {
 		t.Fatalf("paged Prepare: %v", err)
 	}
-	if _, err := recovered.Start(ctx, engine.StartRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := recovered.Start(ctx, reconcile.StartRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("paged Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, recovered,
-		engine.ObserveRequest{Identity: paged, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
+		reconcile.ObserveRequest{Identity: paged, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 	pagedStdout, pagedStderr := readAllLogs(t, ctx, recovered, paged, 3)
 	if string(pagedStdout) != "one\ntwo\nthree\n" {
 		t.Fatalf("paged stdout = %q", pagedStdout)
@@ -101,10 +101,10 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 	if again, _ := readAllLogs(t, ctx, recovered, paged, 3); !bytes.Equal(again, pagedStdout) {
 		t.Fatalf("paged stdout is not stable: %q vs %q", again, pagedStdout)
 	}
-	if evidence := waitForPodmanStop(t, ctx, recovered, engine.StopRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := waitForPodmanStop(t, ctx, recovered, reconcile.StopRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
 		t.Fatalf("paged stop evidence = %+v; want confirmed", evidence)
 	}
-	if removal, err := recovered.Remove(ctx, engine.RemoveRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := recovered.Remove(ctx, reconcile.RemoveRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("paged Remove = %+v, %v; want removed", removal, err)
 	}
 
@@ -253,10 +253,10 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 		t.Fatalf("authorized read crossed an execution boundary: %+v", isolated.Chunks)
 	}
 
-	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, engine.StopRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
-	if removal, err := fixture.adapter.Remove(ctx, engine.RemoveRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("Remove = %+v, %v; want removed", removal, err)
 	}
 	if err := fixture.adapter.Release(ctx, fixture.workspaceID); err != nil {
@@ -271,13 +271,13 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 
 // readAllLogs pages the adapter's captured streams to completion.
 func readAllLogs(t *testing.T, ctx context.Context, adapter interface {
-	Logs(context.Context, engine.LogsRequest) (engine.LogBatch, error)
-}, identityValue engine.EffectIdentity, pageSize int) ([]byte, []byte) {
+	Logs(context.Context, reconcile.LogsRequest) (reconcile.LogBatch, error)
+}, identityValue reconcile.EffectIdentity, pageSize int) ([]byte, []byte) {
 	t.Helper()
 	var stdout, stderr []byte
 	var cursor int64
 	for range 10000 {
-		batch, err := adapter.Logs(ctx, engine.LogsRequest{
+		batch, err := adapter.Logs(ctx, reconcile.LogsRequest{
 			Identity: identityValue, AfterOffset: cursor, Limit: pageSize,
 		})
 		if err != nil {
@@ -285,9 +285,9 @@ func readAllLogs(t *testing.T, ctx context.Context, adapter interface {
 		}
 		for _, chunk := range batch.Chunks {
 			switch chunk.Stream {
-			case engine.LogStdout:
+			case reconcile.LogStdout:
 				stdout = append(stdout, chunk.Data...)
-			case engine.LogStderr:
+			case reconcile.LogStderr:
 				stderr = append(stderr, chunk.Data...)
 			}
 		}
@@ -302,7 +302,7 @@ func readAllLogs(t *testing.T, ctx context.Context, adapter interface {
 
 // appendCaptured appends the captured streams to one retained sink with a
 // monotonic sequence per stream.
-func appendCaptured(t *testing.T, sink *log.FileSink, scope tenancy.Scope, identityValue engine.EffectIdentity, stdout, stderr []byte) {
+func appendCaptured(t *testing.T, sink *log.FileSink, scope tenancy.Scope, identityValue reconcile.EffectIdentity, stdout, stderr []byte) {
 	t.Helper()
 	ctx := context.Background()
 	sequence := uint64(1)

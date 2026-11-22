@@ -12,11 +12,11 @@ import (
 	"testing"
 	"unicode"
 
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/resource"
-	"github.com/optimiware/kodema/internal/shell/service"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/service"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine/definition"
 )
 
 // examplesRoot is the directory this package tests. `go test ./examples/...`

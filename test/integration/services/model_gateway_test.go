@@ -18,9 +18,9 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/gateway"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/userland/agent"
+	"github.com/optimiware/kodema/internal/apps/agent"
+	"github.com/optimiware/kodema/internal/control/gateway"
+	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

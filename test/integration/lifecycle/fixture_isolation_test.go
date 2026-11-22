@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/test/support/factory"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/git"
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
+	"github.com/optimiware/kodema/internal/apps/git"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 )
 
 type capturedRequest struct {

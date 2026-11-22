@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/adapter/store/units/platform"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	"github.com/optimiware/kodema/internal/shell/store/units/platform"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

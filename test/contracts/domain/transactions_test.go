@@ -6,23 +6,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/inbox"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/control/trigger"
+	"github.com/optimiware/kodema/internal/control/verify"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	"github.com/optimiware/kodema/internal/shell/inbox"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	"github.com/optimiware/kodema/internal/shell/request"
-	"github.com/optimiware/kodema/internal/shell/resource"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
-	"github.com/optimiware/kodema/internal/shell/trigger"
-	"github.com/optimiware/kodema/internal/shell/verify"
 )
 
 func sampleScope() tenancy.Scope {
@@ -131,10 +131,10 @@ func TestCommitUnitsCarryCompletePayload(t *testing.T) {
 		Commit: flow.Commit{
 			ExecutionID:              id.ExecutionID("exec-1"),
 			ExpectedExecutionVersion: 4,
-			NextExecutionState:       kernel.ExecutionRunning,
+			NextExecutionState:       engine.ExecutionRunning,
 			ActionID:                 id.ActionID("action-1"),
 			ExpectedActionVersion:    2,
-			NextActionState:          kernel.ActionRunning,
+			NextActionState:          engine.ActionRunning,
 			At:                       now,
 			Deadline:                 now.Add(time.Hour),
 		},
@@ -159,7 +159,7 @@ func TestCommitUnitsCarryCompletePayload(t *testing.T) {
 		Subject:                  definition.Subject{},
 		Assignment:               assignment,
 		Deadline:                 now.Add(30 * time.Minute),
-		StopEvidence:             kernel.ConfirmedStop("container exited"),
+		StopEvidence:             engine.ConfirmedStop("container exited"),
 		CredentialUpdate:         &credential,
 		Receipt:                  receiptRecord,
 		Audit:                    audit,
@@ -178,7 +178,7 @@ func TestCommitUnitsCarryCompletePayload(t *testing.T) {
 		ExpectedExecutionVersion: 5,
 		ExpectedActionVersion:    3,
 		Decision:                 request.DecisionPass,
-		Response:                 kernel.Outputs{"approved": "true"},
+		Response:                 engine.Outputs{"approved": "true"},
 		Actor:                    id.PrincipalID("reviewer-1"),
 		Assignment:               assignment,
 		At:                       now,
@@ -188,9 +188,9 @@ func TestCommitUnitsCarryCompletePayload(t *testing.T) {
 			ExpectedExecutionVersion: 5,
 			ActionID:                 id.ActionID("action-1"),
 			ExpectedActionVersion:    3,
-			NextExecutionState:       kernel.ExecutionRunning,
-			NextActionState:          kernel.ActionSucceeded,
-			Answer:                   &kernel.Answer{Decision: kernel.DecisionPass, Actor: id.PrincipalID("reviewer-1"), At: now},
+			NextExecutionState:       engine.ExecutionRunning,
+			NextActionState:          engine.ActionSucceeded,
+			Answer:                   &engine.Answer{Decision: engine.DecisionPass, Actor: id.PrincipalID("reviewer-1"), At: now},
 			At:                       now,
 		},
 		Receipt:    receiptRecord,

@@ -35,7 +35,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/agent"
+	"github.com/optimiware/kodema/internal/apps/agent"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 

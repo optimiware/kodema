@@ -14,11 +14,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 
@@ -168,7 +168,7 @@ func requireDeletedPipelineAdmitsNothing(ctx context.Context, t *testing.T, env 
 	if err != nil {
 		t.Fatalf("load the admitted execution after the delete: %v%s", err, pgtest.CauseText(err))
 	}
-	if aggregate.State != kernel.ExecutionQueued || len(aggregate.Actions) != 1 {
+	if aggregate.State != engine.ExecutionQueued || len(aggregate.Actions) != 1 {
 		t.Fatalf("admitted aggregate = state %q with %d actions; want queued with its one action", aggregate.State, len(aggregate.Actions))
 	}
 	view, err := env.exec.Inspect(ctx, env.scope, history.started.ExecutionID)

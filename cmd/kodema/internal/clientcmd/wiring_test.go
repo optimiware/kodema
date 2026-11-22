@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/cli"
-	"github.com/optimiware/kodema/internal/userland/up"
+	"github.com/optimiware/kodema/internal/apps/cli"
+	"github.com/optimiware/kodema/internal/apps/up"
 )
 
 // isolateUserConfig points the default kodema config directory and HOME at

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/apps/cli"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/userland/cli"
 )
 
 func logoutDeps(fixture *loginFixture) cli.LogoutDeps {

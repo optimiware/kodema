@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/store"
 )
 
 var (

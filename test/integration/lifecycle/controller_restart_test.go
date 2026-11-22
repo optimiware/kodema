@@ -30,9 +30,9 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/id"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

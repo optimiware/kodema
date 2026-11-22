@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 )
 
 // TestWorkspacePersistsAcrossTwoJobsAndRelease proves a retained workspace
@@ -35,10 +35,10 @@ func TestWorkspacePersistsAcrossTwoJobsAndRelease(t *testing.T) {
 		writer, workspaceID, "build", "",
 		testContainer([]string{`printf 'persisted\n' > /workspace/persist.txt`}, nil), nil, "tok-k6a",
 	))
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: writer, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
-	removal, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: writer, WorkspaceID: workspaceID})
+	}, engine.ObservationExited)
+	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: writer, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Remove writer: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestWorkspacePersistsAcrossTwoJobsAndRelease(t *testing.T) {
 		t.Fatalf("second Job read %q; want the first Job's persisted bytes", content)
 	}
 	reader := testIdentity("exec-k6b", "action-k6b", "workload-k6b", "idem-k6b")
-	if _, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: reader, WorkspaceID: workspaceID}); err != nil {
+	if _, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: reader, WorkspaceID: workspaceID}); err != nil {
 		t.Fatalf("Remove reader: %v", err)
 	}
 	waitForWorkspaceUnreferenced(t, ctx, fx.Client, workspaceID)

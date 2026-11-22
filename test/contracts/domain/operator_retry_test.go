@@ -21,10 +21,10 @@ package domaincontract
 import (
 	"testing"
 
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
 )
 
 // TestTaskStartOperatorRegistryRow pins the grant set and the
@@ -84,10 +84,10 @@ func TestOperatorGetsNoPipelineSelection(t *testing.T) {
 func TestTaskStartGrantMatrix(t *testing.T) {
 	executionStates := []executionCase{
 		{name: "no execution"},
-		{name: "failed execution", state: kernel.ExecutionFailed, present: true},
-		{name: "running execution", state: kernel.ExecutionRunning, present: true},
-		{name: "succeeded execution", state: kernel.ExecutionSucceeded, present: true},
-		{name: "cancelled execution", state: kernel.ExecutionCancelled, present: true},
+		{name: "failed execution", state: engine.ExecutionFailed, present: true},
+		{name: "running execution", state: engine.ExecutionRunning, present: true},
+		{name: "succeeded execution", state: engine.ExecutionSucceeded, present: true},
+		{name: "cancelled execution", state: engine.ExecutionCancelled, present: true},
 	}
 	taskStates := []task.State{task.StateOpen, task.StateWaiting, task.StateDone, task.StateCancelled}
 	roleSets := []struct {
@@ -120,11 +120,11 @@ func TestTaskStartGrantMatrix(t *testing.T) {
 	// The exact boundary cases, stated directly so a regression cannot
 	// hide behind the table loop.
 	operator := []tenancy.Role{tenancy.RoleOperator}
-	if !startGrantAllows(operator, task.StateOpen, executionCase{state: kernel.ExecutionFailed, present: true}) {
+	if !startGrantAllows(operator, task.StateOpen, executionCase{state: engine.ExecutionFailed, present: true}) {
 		t.Error("operator was refused an open task with a failed current execution")
 	}
 	for _, execution := range []executionCase{
-		{name: "running", state: kernel.ExecutionRunning, present: true},
+		{name: "running", state: engine.ExecutionRunning, present: true},
 		{name: "none"},
 	} {
 		if startGrantAllows(operator, task.StateOpen, execution) {
@@ -132,17 +132,17 @@ func TestTaskStartGrantMatrix(t *testing.T) {
 		}
 	}
 	for _, state := range []task.State{task.StateWaiting, task.StateDone, task.StateCancelled} {
-		if startGrantAllows(operator, state, executionCase{state: kernel.ExecutionFailed, present: true}) {
+		if startGrantAllows(operator, state, executionCase{state: engine.ExecutionFailed, present: true}) {
 			t.Errorf("operator was admitted to a %q task", state)
 		}
 	}
-	if startGrantAllows([]tenancy.Role{tenancy.RoleReviewer}, task.StateOpen, executionCase{state: kernel.ExecutionFailed, present: true}) {
+	if startGrantAllows([]tenancy.Role{tenancy.RoleReviewer}, task.StateOpen, executionCase{state: engine.ExecutionFailed, present: true}) {
 		t.Error("reviewer was admitted to task.start")
 	}
-	if startGrantAllows([]tenancy.Role{tenancy.RoleViewer}, task.StateOpen, executionCase{state: kernel.ExecutionFailed, present: true}) {
+	if startGrantAllows([]tenancy.Role{tenancy.RoleViewer}, task.StateOpen, executionCase{state: engine.ExecutionFailed, present: true}) {
 		t.Error("viewer was admitted to task.start")
 	}
-	if !startGrantAllows([]tenancy.Role{tenancy.RoleEngineer}, task.StateOpen, executionCase{state: kernel.ExecutionFailed, present: true}) {
+	if !startGrantAllows([]tenancy.Role{tenancy.RoleEngineer}, task.StateOpen, executionCase{state: engine.ExecutionFailed, present: true}) {
 		t.Error("engineer lost the unchanged failed-open-task start")
 	}
 
@@ -158,7 +158,7 @@ func TestTaskStartGrantMatrix(t *testing.T) {
 
 type executionCase struct {
 	name    string
-	state   kernel.ExecutionState
+	state   engine.ExecutionState
 	present bool
 }
 
@@ -197,7 +197,7 @@ func startGrantAllows(roles []tenancy.Role, state task.State, execution executio
 		if !hasCheck(op.Authority, authorize.CheckFailedTaskOperatorStart) {
 			return false
 		}
-		return execution.present && execution.state == kernel.ExecutionFailed
+		return execution.present && execution.state == engine.ExecutionFailed
 	}
 	return false
 }
@@ -209,7 +209,7 @@ func wantStartGrant(roles []tenancy.Role, state task.State, execution executionC
 		return state == task.StateOpen
 	}
 	if hasRole(roles, tenancy.RoleOperator) {
-		return state == task.StateOpen && execution.present && execution.state == kernel.ExecutionFailed
+		return state == task.StateOpen && execution.present && execution.state == engine.ExecutionFailed
 	}
 	return false
 }

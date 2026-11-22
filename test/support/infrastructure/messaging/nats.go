@@ -16,8 +16,8 @@ import (
 	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	broker "github.com/optimiware/kodema/internal/shell/integration/nats"
+	broker "github.com/optimiware/kodema/internal/adapter/integration/nats"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 

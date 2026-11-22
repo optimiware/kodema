@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	git "github.com/optimiware/kodema/internal/userland/git"
+	git "github.com/optimiware/kodema/internal/apps/git"
 	nativefix "github.com/optimiware/kodema/test/support/boundaries/native"
 )
 

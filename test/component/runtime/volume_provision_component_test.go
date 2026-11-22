@@ -6,8 +6,8 @@ import (
 	"maps"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/runtime/podman"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 

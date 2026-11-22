@@ -19,11 +19,11 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	app "github.com/optimiware/kodema/internal/server"
 )
 
 const (

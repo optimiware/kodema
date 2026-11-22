@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	git "github.com/optimiware/kodema/internal/userland/git"
+	git "github.com/optimiware/kodema/internal/apps/git"
 )
 
 func loadGitConfig(t *testing.T) git.Config {

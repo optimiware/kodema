@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
 )
 
 // FixtureTime is the deterministic timestamp fixtures use.

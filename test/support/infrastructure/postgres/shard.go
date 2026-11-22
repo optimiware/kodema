@@ -29,7 +29,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 

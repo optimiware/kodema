@@ -7,14 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	"github.com/optimiware/kodema/internal/shell/request"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
 // The operation matrix is the S08 operation inventory. Every family the

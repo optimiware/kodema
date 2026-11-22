@@ -28,13 +28,13 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	authapp "github.com/optimiware/kodema/internal/apps/auth"
+	"github.com/optimiware/kodema/internal/apps/cli"
+	"github.com/optimiware/kodema/internal/apps/kit/principal"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	authapp "github.com/optimiware/kodema/internal/userland/app/auth"
-	"github.com/optimiware/kodema/internal/userland/cli"
-	"github.com/optimiware/kodema/internal/userland/principal"
 )
 
 type memorySessionStore struct {

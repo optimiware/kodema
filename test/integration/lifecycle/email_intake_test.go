@@ -27,8 +27,8 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/services"
-	servicesapp "github.com/optimiware/kodema/internal/userland/services/app"
+	"github.com/optimiware/kodema/internal/apps/services"
+	servicesapp "github.com/optimiware/kodema/internal/apps/services/app"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

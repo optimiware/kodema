@@ -13,8 +13,8 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	"github.com/optimiware/kodema/internal/fault"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
 )
 
 // resultTransport answers every invocation with one fixed public result

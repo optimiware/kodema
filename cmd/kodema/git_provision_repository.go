@@ -7,8 +7,8 @@ import (
 	"io"
 	"strings"
 
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	"github.com/optimiware/kodema/internal/id"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
 )
 
 // provisionRepository is the injectable repository-provisioning entrypoint.

@@ -16,15 +16,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/registry"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
-	"github.com/optimiware/kodema/internal/shell/integration/registry"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
+	shellapp "github.com/optimiware/kodema/internal/server"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
+	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
 )
 
 // testProfileLoopInterval is the durable test profile's default background

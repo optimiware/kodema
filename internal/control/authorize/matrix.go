@@ -1,0 +1,182 @@
+package authorize
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/fault"
+)
+
+// matrix is the single explicit operation/grant evaluator shared by every
+// Shell capability and public edge. It holds no per-call state: each call
+// answers only from the registry row and the principal presented by the
+// caller. It never caches a grant, so a previously calculated allow cannot
+// survive a role removal, disablement or scope change.
+type matrix struct{}
+
+// NewMatrix returns the shared explicit operation/grant authorizer. It answers
+// only the grant question for one operation in one scope; the commit boundary
+// must still read the operation's Authority facts.
+func NewMatrix() Authorizer {
+	return matrix{}
+}
+
+// Authorize answers whether a verified human or service principal currently
+// holds the grant for one operation in one scope.
+//
+// The operation must be registered, the scope must have the operation's
+// declared shape and the principal must be structurally valid. A principal
+// whose scope does not contain the target scope is denied without an error. An
+// execution principal carries its permission separately and is refused here;
+// use AuthorizeExecution for admitted execution authority.
+func (matrix) Authorize(_ context.Context, principal Principal, name OperationName, scope tenancy.Scope) (Decision, error) {
+	operation, ok := LookupOperation(name)
+	if !ok {
+		return DecisionDeny, fault.New(fault.InvalidInput, fmt.Sprintf("unknown operation %q", name))
+	}
+	if err := scope.Validate(); err != nil {
+		return DecisionDeny, err
+	}
+	if err := principal.Validate(); err != nil {
+		return DecisionDeny, err
+	}
+	if principal.Kind == identity.KindExecution {
+		return DecisionDeny, fault.New(fault.InvalidInput, "execution principal requires its admitted permission")
+	}
+	if !operationScopeContains(operation.Name, principal.Scope, scope) {
+		return DecisionDeny, nil
+	}
+	if err := operationScopeMatches(operation, scope); err != nil {
+		return DecisionDeny, err
+	}
+	if !principal.Enabled {
+		return DecisionDeny, nil
+	}
+	switch principal.Kind {
+	case identity.KindHuman, identity.KindService:
+		if operation.Name == "principal.whoami" || operation.Requires.Allows(principal) {
+			return DecisionAllow, nil
+		}
+	}
+	return DecisionDeny, nil
+}
+
+// AuthorizeExecution answers whether an admitted execution currently holds the
+// execution permission one operation declares. The admitted context is
+// validated first, so a mismatched execution identity or unknown permission is
+// an invalid input rather than a silent deny.
+//
+// The answer is a grant fact for one attempt only. The commit boundary must
+// still re-read the current execution/action state and deadline.
+func AuthorizeExecution(admitted AdmittedExecution, name OperationName, scope tenancy.Scope) (Decision, error) {
+	operation, ok := LookupOperation(name)
+	if !ok {
+		return DecisionDeny, fault.New(fault.InvalidInput, fmt.Sprintf("unknown operation %q", name))
+	}
+	if err := scope.Validate(); err != nil {
+		return DecisionDeny, err
+	}
+	if err := admitted.Validate(); err != nil {
+		return DecisionDeny, err
+	}
+	if !operationScopeContains(operation.Name, admitted.Principal.Scope, scope) {
+		return DecisionDeny, nil
+	}
+	if err := operationScopeMatches(operation, scope); err != nil {
+		return DecisionDeny, err
+	}
+	if !admitted.Principal.Enabled {
+		return DecisionDeny, nil
+	}
+	if admitted.Permission != ExecNone && operation.Requires.Execution == admitted.Permission {
+		return DecisionAllow, nil
+	}
+	return DecisionDeny, nil
+}
+
+// operationScopeContains checks scope containment for one operation. The two
+// read-only discovery operations (principal.whoami and project.list) allow a
+// project-scoped principal inside its own tenant, while every other tenant
+// operation requires a tenant-wide owner scope.
+func operationScopeContains(name OperationName, owner, target tenancy.Scope) bool {
+	if owner.TenantID == "" || target.TenantID == "" || owner.TenantID != target.TenantID {
+		return false
+	}
+	if name == "principal.whoami" || name == "project.list" {
+		return true
+	}
+	return owner.Contains(target)
+}
+
+// AdmitPrincipalKind validates actor, looks up name in the declared operation
+// registry and pins that actor's kind can satisfy the registry grant. It never
+// treats actor's role snapshot as current authority.
+func AdmitPrincipalKind(actor Principal, name OperationName) (Operation, error) {
+	if err := actor.Validate(); err != nil {
+		return Operation{}, err
+	}
+	op, ok := LookupOperation(name)
+	if !ok {
+		return Operation{}, fault.New(fault.InternalFailure, fmt.Sprintf("operation %q is not registered", name))
+	}
+	switch actor.Kind {
+	case identity.KindHuman:
+		if !op.Requires.AdmitsKind(identity.KindHuman) {
+			return Operation{}, fault.New(fault.Forbidden, "the operation grants no human role")
+		}
+	case identity.KindService:
+		if !op.Requires.AdmitsKind(identity.KindService) {
+			return Operation{}, fault.New(fault.Forbidden, "the operation grants no service role")
+		}
+	case identity.KindExecution:
+		if !op.Requires.AdmitsKind(identity.KindExecution) {
+			return Operation{}, fault.New(fault.Forbidden, "the operation grants no execution permission")
+		}
+	default:
+		return Operation{}, fault.New(fault.Forbidden, "unknown principal kind")
+	}
+	return op, nil
+}
+
+// operationScopeMatches refuses a target scope whose shape differs from the
+// operation's declared scope. A tenant operation has no project; a project
+// operation always names one.
+func operationScopeMatches(operation Operation, scope tenancy.Scope) error {
+	switch operation.Scope {
+	case ScopeTenant:
+		if scope.ProjectScoped() {
+			return fault.New(fault.InvalidInput, fmt.Sprintf("operation %q is tenant-scoped; project scope %q is not valid", operation.Name, scope.ProjectID))
+		}
+	case ScopeProject:
+		if !scope.ProjectScoped() {
+			return fault.New(fault.InvalidInput, fmt.Sprintf("operation %q is project-scoped; a project is required", operation.Name))
+		}
+	default:
+		return fault.New(fault.InternalFailure, fmt.Sprintf("operation %q has an unknown scope kind %q", operation.Name, operation.Scope))
+	}
+	return nil
+}
+
+// DenialMessage explains why a human or service principal was denied an
+// operation in scope. When an enabled project-scoped principal attempts a
+// tenant-scoped operation inside its own tenant, the message explains that a
+// tenant-scoped credential is required rather than returning a generic role
+// refusal. Cross-tenant and disabled principals still receive the generic
+// message.
+func DenialMessage(principal Principal, name OperationName, scope tenancy.Scope) string {
+	if operation, ok := LookupOperation(name); ok &&
+		principal.Enabled &&
+		operation.Scope == ScopeTenant &&
+		!scope.ProjectScoped() &&
+		principal.Scope.TenantID == scope.TenantID &&
+		principal.Scope.ProjectScoped() &&
+		!operationScopeContains(operation.Name, principal.Scope, scope) {
+		return fmt.Sprintf(
+			"operation %q requires a tenant-scoped credential (principal %q is scoped to project %q; use a tenant-scoped credential such as $KODEMA_TENANT_ADMIN_CREDENTIAL_FILE)",
+			name, principal.ID, principal.Scope.ProjectID,
+		)
+	}
+	return fmt.Sprintf("principal %q is not authorized for operation %q", principal.ID, name)
+}

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

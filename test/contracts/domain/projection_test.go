@@ -28,13 +28,13 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
 var (
@@ -57,7 +57,7 @@ func actionPreImage(
 	index int,
 	actionID id.ActionID,
 	kind definition.ActionKind,
-	state kernel.ActionState,
+	state engine.ActionState,
 	version uint64,
 ) event.ActionPreImage {
 	return event.ActionPreImage{
@@ -70,7 +70,7 @@ func actionPreImage(
 }
 
 func executionPreImage(
-	state kernel.ExecutionState,
+	state engine.ExecutionState,
 	version uint64,
 	actions ...event.ActionPreImage,
 ) event.ExecutionPreImage {
@@ -103,16 +103,16 @@ func projectionCases() []projectionCase {
 			// The one event class that marks leaving `queued` for `running`.
 			name: "queued to running emits execution.started",
 			pre: executionPreImage(
-				kernel.ExecutionQueued, 3,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionPending, 1),
+				engine.ExecutionQueued, 3,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 3,
-				NextExecutionState:       kernel.ExecutionRunning,
+				NextExecutionState:       engine.ExecutionRunning,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    1,
-				NextActionState:          kernel.ActionRunning,
+				NextActionState:          engine.ActionRunning,
 				NextCurrentAction:        intPointer(0),
 				Output:                   flow.OutputChange{Action: flow.OutputNone},
 				At:                       projectionAt,
@@ -125,20 +125,20 @@ func projectionCases() []projectionCase {
 		{
 			name: "running to succeeded emits one terminal event",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 7,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 2),
+				engine.ExecutionRunning, 7,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 2),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 7,
-				NextExecutionState:       kernel.ExecutionSucceeded,
+				NextExecutionState:       engine.ExecutionSucceeded,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    2,
-				NextActionState:          kernel.ActionSucceeded,
+				NextActionState:          engine.ActionSucceeded,
 				NextCurrentAction:        intPointer(-1),
 				Output: flow.OutputChange{
 					Action: flow.OutputPromote,
-					Values: kernel.Outputs{"result": "ok"},
+					Values: engine.Outputs{"result": "ok"},
 				},
 				At: projectionAt,
 			},
@@ -152,26 +152,26 @@ func projectionCases() []projectionCase {
 			// the projection must still publish them in action-index order.
 			name: "running to failed cancels pending successors by index",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 5,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 4),
-				actionPreImage(1, firstSuccessor, definition.ActionKindContainer, kernel.ActionPending, 1),
-				actionPreImage(2, secondSuccessor, definition.ActionKindRequest, kernel.ActionPending, 1),
+				engine.ExecutionRunning, 5,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 4),
+				actionPreImage(1, firstSuccessor, definition.ActionKindContainer, engine.ActionPending, 1),
+				actionPreImage(2, secondSuccessor, definition.ActionKindRequest, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 5,
-				NextExecutionState:       kernel.ExecutionFailed,
+				NextExecutionState:       engine.ExecutionFailed,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    4,
-				NextActionState:          kernel.ActionFailed,
+				NextActionState:          engine.ActionFailed,
 				PendingCancellations: []flow.ActionUpdate{
-					{ActionID: secondSuccessor, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
-					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: secondSuccessor, ExpectedVersion: 1, NextState: engine.ActionCancelled},
+					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				},
 				NextCurrentAction: intPointer(-1),
 				Output:            flow.OutputChange{Action: flow.OutputDiscard},
-				Failure: &kernel.Failure{
-					Kind:   kernel.FailureRuntime,
+				Failure: &engine.Failure{
+					Kind:   engine.FailureRuntime,
 					Reason: "workload_exited",
 					Detail: "workload exited with status 1",
 				},
@@ -189,25 +189,25 @@ func projectionCases() []projectionCase {
 			// action: the total order is execution level, then action index.
 			name: "action index orders a pending cancellation before the primary action",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 9,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionSucceeded, 2),
-				actionPreImage(1, firstSuccessor, definition.ActionKindContainer, kernel.ActionPending, 1),
-				actionPreImage(2, secondSuccessor, definition.ActionKindContainer, kernel.ActionRunning, 3),
+				engine.ExecutionRunning, 9,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionSucceeded, 2),
+				actionPreImage(1, firstSuccessor, definition.ActionKindContainer, engine.ActionPending, 1),
+				actionPreImage(2, secondSuccessor, definition.ActionKindContainer, engine.ActionRunning, 3),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 9,
-				NextExecutionState:       kernel.ExecutionFailed,
+				NextExecutionState:       engine.ExecutionFailed,
 				ActionID:                 secondSuccessor,
 				ExpectedActionVersion:    3,
-				NextActionState:          kernel.ActionFailed,
+				NextActionState:          engine.ActionFailed,
 				PendingCancellations: []flow.ActionUpdate{
-					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				},
 				NextCurrentAction: intPointer(-1),
 				Output:            flow.OutputChange{Action: flow.OutputDiscard},
-				Failure: &kernel.Failure{
-					Kind:   kernel.FailureRuntime,
+				Failure: &engine.Failure{
+					Kind:   engine.FailureRuntime,
 					Reason: "workload_exited",
 				},
 				At: projectionAt,
@@ -222,15 +222,15 @@ func projectionCases() []projectionCase {
 			// Cancelling before anything started emits no execution.started.
 			name: "queued cancellation emits no started event",
 			pre: executionPreImage(
-				kernel.ExecutionQueued, 2,
-				actionPreImage(0, requestAction, definition.ActionKindRequest, kernel.ActionPending, 1),
+				engine.ExecutionQueued, 2,
+				actionPreImage(0, requestAction, definition.ActionKindRequest, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 2,
-				NextExecutionState:       kernel.ExecutionCancelled,
+				NextExecutionState:       engine.ExecutionCancelled,
 				PendingCancellations: []flow.ActionUpdate{
-					{ActionID: requestAction, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: requestAction, ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				},
 				NextCurrentAction:    intPointer(-1),
 				Output:               flow.OutputChange{Action: flow.OutputDiscard},
@@ -241,7 +241,7 @@ func projectionCases() []projectionCase {
 					Reason:      "cancelled",
 				},
 				CleanupUpdate: &flow.CleanupUpdate{
-					State:       kernel.CleanupPending,
+					State:       engine.CleanupPending,
 					WorkspaceID: id.WorkspaceID("workspace-1"),
 				},
 				At: projectionAt,
@@ -258,17 +258,17 @@ func projectionCases() []projectionCase {
 			// alias and must never appear in a projected spec.
 			name: "request activation publishes action.requested",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 4,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionSucceeded, 3),
-				actionPreImage(1, requestAction, definition.ActionKindRequest, kernel.ActionPending, 1),
+				engine.ExecutionRunning, 4,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionSucceeded, 3),
+				actionPreImage(1, requestAction, definition.ActionKindRequest, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 4,
-				NextExecutionState:       kernel.ExecutionRunning,
+				NextExecutionState:       engine.ExecutionRunning,
 				ActionID:                 requestAction,
 				ExpectedActionVersion:    1,
-				NextActionState:          kernel.ActionRunning,
+				NextActionState:          engine.ActionRunning,
 				NextCurrentAction:        intPointer(1),
 				Output:                   flow.OutputChange{Action: flow.OutputNone},
 				InvalidateCredential:     true,
@@ -284,25 +284,25 @@ func projectionCases() []projectionCase {
 			// the same commit: one terminal event, never two.
 			name: "request settlement succeeds the execution once",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 8,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionSucceeded, 2),
-				actionPreImage(1, requestAction, definition.ActionKindRequest, kernel.ActionRunning, 3),
+				engine.ExecutionRunning, 8,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionSucceeded, 2),
+				actionPreImage(1, requestAction, definition.ActionKindRequest, engine.ActionRunning, 3),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 8,
-				NextExecutionState:       kernel.ExecutionSucceeded,
+				NextExecutionState:       engine.ExecutionSucceeded,
 				ActionID:                 requestAction,
 				ExpectedActionVersion:    3,
-				NextActionState:          kernel.ActionSucceeded,
+				NextActionState:          engine.ActionSucceeded,
 				NextCurrentAction:        intPointer(-1),
 				Output: flow.OutputChange{
 					Action: flow.OutputPromote,
-					Values: kernel.Outputs{"decision": "pass"},
+					Values: engine.Outputs{"decision": "pass"},
 				},
-				Answer: &kernel.Answer{
-					Decision: kernel.DecisionPass,
-					Outputs:  kernel.Outputs{"decision": "pass"},
+				Answer: &engine.Answer{
+					Decision: engine.DecisionPass,
+					Outputs:  engine.Outputs{"decision": "pass"},
 					Actor:    id.PrincipalID("principal-1"),
 					At:       projectionAt,
 				},
@@ -318,16 +318,16 @@ func projectionCases() []projectionCase {
 			// execution-level fact; the terminal event is not repeated.
 			name: "cleanup progress after a terminal outcome",
 			pre: executionPreImage(
-				kernel.ExecutionFailed, 9,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionFailed, 4),
+				engine.ExecutionFailed, 9,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionFailed, 4),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 9,
-				NextExecutionState:       kernel.ExecutionFailed,
+				NextExecutionState:       engine.ExecutionFailed,
 				Output:                   flow.OutputChange{Action: flow.OutputNone},
 				CleanupUpdate: &flow.CleanupUpdate{
-					State:       kernel.CleanupComplete,
+					State:       engine.CleanupComplete,
 					WorkloadID:  id.WorkloadID("workload-1"),
 					WorkspaceID: id.WorkspaceID("workspace-1"),
 					Attempts:    2,
@@ -343,24 +343,24 @@ func projectionCases() []projectionCase {
 			// started event and cancels every still-pending action.
 			name: "queued workspace loss fails without a started event",
 			pre: executionPreImage(
-				kernel.ExecutionQueued, 1,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionPending, 1),
+				engine.ExecutionQueued, 1,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 1,
-				NextExecutionState:       kernel.ExecutionFailed,
+				NextExecutionState:       engine.ExecutionFailed,
 				PendingCancellations: []flow.ActionUpdate{
-					{ActionID: containerAction, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: containerAction, ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				},
 				NextCurrentAction: intPointer(-1),
 				Output:            flow.OutputChange{Action: flow.OutputDiscard},
-				Failure: &kernel.Failure{
-					Kind:   kernel.FailureWorkspaceLost,
+				Failure: &engine.Failure{
+					Kind:   engine.FailureWorkspaceLost,
 					Reason: "workspace_missing",
 				},
 				CleanupUpdate: &flow.CleanupUpdate{
-					State:       kernel.CleanupPending,
+					State:       engine.CleanupPending,
 					WorkspaceID: id.WorkspaceID("workspace-1"),
 				},
 				At: projectionAt,
@@ -377,19 +377,19 @@ func projectionCases() []projectionCase {
 			// workload observations or staged values.
 			name: "output staging emits no lifecycle event",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 6,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 3),
+				engine.ExecutionRunning, 6,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 3),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 6,
-				NextExecutionState:       kernel.ExecutionRunning,
+				NextExecutionState:       engine.ExecutionRunning,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    3,
-				NextActionState:          kernel.ActionRunning,
+				NextActionState:          engine.ActionRunning,
 				Output: flow.OutputChange{
 					Action: flow.OutputStage,
-					Values: kernel.Outputs{"result": "staged"},
+					Values: engine.Outputs{"result": "staged"},
 				},
 				At: projectionAt,
 			},
@@ -399,18 +399,18 @@ func projectionCases() []projectionCase {
 			// changes no lifecycle state and publishes no event.
 			name: "unconfirmed stop evidence emits no lifecycle event",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 6,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 3),
+				engine.ExecutionRunning, 6,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 3),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 6,
-				NextExecutionState:       kernel.ExecutionRunning,
+				NextExecutionState:       engine.ExecutionRunning,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    3,
-				NextActionState:          kernel.ActionRunning,
+				NextActionState:          engine.ActionRunning,
 				Output:                   flow.OutputChange{Action: flow.OutputNone},
-				StopEvidence:             pointerTo(kernel.PendingStop("termination requested")),
+				StopEvidence:             pointerTo(engine.PendingStop("termination requested")),
 				At:                       projectionAt,
 			},
 		},
@@ -420,19 +420,19 @@ func projectionCases() []projectionCase {
 			// exists because the barrier is evidence, not a lifecycle state.
 			name: "confirmed stop settles with the terminal events",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 4,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 2),
+				engine.ExecutionRunning, 4,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 2),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 4,
-				NextExecutionState:       kernel.ExecutionSucceeded,
+				NextExecutionState:       engine.ExecutionSucceeded,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    2,
-				NextActionState:          kernel.ActionSucceeded,
+				NextActionState:          engine.ActionSucceeded,
 				NextCurrentAction:        intPointer(-1),
 				Output:                   flow.OutputChange{Action: flow.OutputPromote},
-				StopEvidence:             pointerTo(kernel.ConfirmedStop("container exited with status 0")),
+				StopEvidence:             pointerTo(engine.ConfirmedStop("container exited with status 0")),
 				At:                       projectionAt,
 			},
 			want: []wantLifecycleEvent{
@@ -444,13 +444,13 @@ func projectionCases() []projectionCase {
 			// Cleanup intent without progress is not a progress event.
 			name: "cleanup intent alone emits no lifecycle event",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 6,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 3),
+				engine.ExecutionRunning, 6,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 3),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 6,
-				NextExecutionState:       kernel.ExecutionRunning,
+				NextExecutionState:       engine.ExecutionRunning,
 				Output:                   flow.OutputChange{Action: flow.OutputNone},
 				Cleanup: &flow.CleanupIntent{
 					WorkloadID:  id.WorkloadID("workload-1"),
@@ -465,16 +465,16 @@ func projectionCases() []projectionCase {
 			// converges with no duplicate event.
 			name: "equal replay of a settled transition emits nothing",
 			pre: executionPreImage(
-				kernel.ExecutionFailed, 9,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionFailed, 4),
+				engine.ExecutionFailed, 9,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionFailed, 4),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 9,
-				NextExecutionState:       kernel.ExecutionFailed,
+				NextExecutionState:       engine.ExecutionFailed,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    4,
-				NextActionState:          kernel.ActionFailed,
+				NextActionState:          engine.ActionFailed,
 				Output:                   flow.OutputChange{Action: flow.OutputNone},
 				At:                       projectionAt,
 			},
@@ -754,36 +754,36 @@ func TestProjectLifecycleFactsAreBoundedAndSecretFree(t *testing.T) {
 		"branch": {Kind: definition.SubjectLiteral, Literal: subjectSecret},
 	})
 	pre := executionPreImage(
-		kernel.ExecutionRunning, 5,
-		actionPreImage(0, requestAction, definition.ActionKindRequest, kernel.ActionRunning, 2),
+		engine.ExecutionRunning, 5,
+		actionPreImage(0, requestAction, definition.ActionKindRequest, engine.ActionRunning, 2),
 	)
 	commit := flow.Commit{
 		ExecutionID:              projectionExecution,
 		ExpectedExecutionVersion: 5,
-		NextExecutionState:       kernel.ExecutionFailed,
+		NextExecutionState:       engine.ExecutionFailed,
 		ActionID:                 requestAction,
 		ExpectedActionVersion:    2,
-		NextActionState:          kernel.ActionFailed,
+		NextActionState:          engine.ActionFailed,
 		NextCurrentAction:        intPointer(-1),
 		Output: flow.OutputChange{
 			Action: flow.OutputDiscard,
-			Values: kernel.Outputs{"result": outputSecret},
+			Values: engine.Outputs{"result": outputSecret},
 		},
 		InvalidateCredential: true,
 		Subject:              &subject,
-		Answer: &kernel.Answer{
-			Decision: kernel.DecisionFail,
-			Outputs:  kernel.Outputs{"result": outputSecret},
+		Answer: &engine.Answer{
+			Decision: engine.DecisionFail,
+			Outputs:  engine.Outputs{"result": outputSecret},
 			Actor:    id.PrincipalID("principal-1"),
 			At:       projectionAt,
 		},
-		Failure: &kernel.Failure{
-			Kind:   kernel.FailureRuntime,
+		Failure: &engine.Failure{
+			Kind:   engine.FailureRuntime,
 			Reason: "runtime",
 			Detail: detailSecret,
 		},
 		CleanupUpdate: &flow.CleanupUpdate{
-			State:       kernel.CleanupPending,
+			State:       engine.CleanupPending,
 			WorkspaceID: id.WorkspaceID("workspace-1"),
 			Attempts:    1,
 			LastError:   detailSecret,
@@ -821,16 +821,16 @@ func TestProjectLifecycleFactsAreBoundedAndSecretFree(t *testing.T) {
 // pre-image/commit consistency refusals. A refused projection yields no event.
 func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 	basePre := executionPreImage(
-		kernel.ExecutionRunning, 7,
-		actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 2),
+		engine.ExecutionRunning, 7,
+		actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 2),
 	)
 	baseCommit := flow.Commit{
 		ExecutionID:              projectionExecution,
 		ExpectedExecutionVersion: 7,
-		NextExecutionState:       kernel.ExecutionSucceeded,
+		NextExecutionState:       engine.ExecutionSucceeded,
 		ActionID:                 containerAction,
 		ExpectedActionVersion:    2,
-		NextActionState:          kernel.ActionSucceeded,
+		NextActionState:          engine.ActionSucceeded,
 		NextCurrentAction:        intPointer(-1),
 		Output:                   flow.OutputChange{Action: flow.OutputNone},
 		At:                       projectionAt,
@@ -840,9 +840,9 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 	}
 
 	pendingPre := executionPreImage(
-		kernel.ExecutionRunning, 7,
-		actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 2),
-		actionPreImage(1, firstSuccessor, definition.ActionKindContainer, kernel.ActionPending, 1),
+		engine.ExecutionRunning, 7,
+		actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 2),
+		actionPreImage(1, firstSuccessor, definition.ActionKindContainer, engine.ActionPending, 1),
 	)
 
 	cases := []struct {
@@ -911,7 +911,7 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 			commit: func() flow.Commit {
 				commit := baseCommit
 				commit.PendingCancellations = []flow.ActionUpdate{
-					{ActionID: id.ActionID("action-missing"), ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: id.ActionID("action-missing"), ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				}
 				return commit
 			}(),
@@ -922,7 +922,7 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 			commit: func() flow.Commit {
 				commit := baseCommit
 				commit.PendingCancellations = []flow.ActionUpdate{
-					{ActionID: firstSuccessor, ExpectedVersion: 2, NextState: kernel.ActionCancelled},
+					{ActionID: firstSuccessor, ExpectedVersion: 2, NextState: engine.ActionCancelled},
 				}
 				return commit
 			}(),
@@ -933,7 +933,7 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 			commit: func() flow.Commit {
 				commit := baseCommit
 				commit.PendingCancellations = []flow.ActionUpdate{
-					{ActionID: containerAction, ExpectedVersion: 2, NextState: kernel.ActionCancelled},
+					{ActionID: containerAction, ExpectedVersion: 2, NextState: engine.ActionCancelled},
 				}
 				return commit
 			}(),
@@ -944,8 +944,8 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 			commit: func() flow.Commit {
 				commit := baseCommit
 				commit.PendingCancellations = []flow.ActionUpdate{
-					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
-					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: engine.ActionCancelled},
+					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				}
 				return commit
 			}(),
@@ -955,7 +955,7 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 			pre:  basePre,
 			commit: func() flow.Commit {
 				commit := baseCommit
-				commit.NextExecutionState = kernel.ExecutionState("paused")
+				commit.NextExecutionState = engine.ExecutionState("paused")
 				return commit
 			}(),
 		},
@@ -964,7 +964,7 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 			pre:  basePre,
 			commit: func() flow.Commit {
 				commit := baseCommit
-				commit.NextActionState = kernel.ActionState("paused")
+				commit.NextActionState = engine.ActionState("paused")
 				return commit
 			}(),
 		},
@@ -990,7 +990,7 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 			name: "unknown pre-image execution state",
 			pre: func() event.ExecutionPreImage {
 				pre := basePre
-				pre.State = kernel.ExecutionState("paused")
+				pre.State = engine.ExecutionState("paused")
 				return pre
 			}(),
 			commit: baseCommit,
@@ -1008,24 +1008,24 @@ func TestProjectLifecycleRefusesInconsistentCommits(t *testing.T) {
 		{
 			name: "terminal execution rewritten",
 			pre: executionPreImage(
-				kernel.ExecutionFailed, 7,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionFailed, 2),
+				engine.ExecutionFailed, 7,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionFailed, 2),
 			),
 			commit: func() flow.Commit {
 				commit := baseCommit
-				commit.NextExecutionState = kernel.ExecutionRunning
+				commit.NextExecutionState = engine.ExecutionRunning
 				return commit
 			}(),
 		},
 		{
 			name: "terminal action rewritten",
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 7,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionSucceeded, 2),
+				engine.ExecutionRunning, 7,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionSucceeded, 2),
 			),
 			commit: func() flow.Commit {
 				commit := baseCommit
-				commit.NextActionState = kernel.ActionRunning
+				commit.NextActionState = engine.ActionRunning
 				return commit
 			}(),
 		},

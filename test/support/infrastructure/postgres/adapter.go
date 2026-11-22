@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 )
 
 // AdapterScopedExec runs one statement inside a transaction begun by the

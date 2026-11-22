@@ -7,22 +7,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/service"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/tenancy/admin"
+	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/control/verify"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/request"
-	"github.com/optimiware/kodema/internal/shell/resource"
-	"github.com/optimiware/kodema/internal/shell/service"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/tenancy/admin"
-	"github.com/optimiware/kodema/internal/shell/token"
-	"github.com/optimiware/kodema/internal/shell/verify"
 )
 
 // TestTenancyAdminCommitUnits pins the consumer-facing tenant/project/
@@ -847,6 +847,6 @@ func pipelineIDForTest() pipeline.PipelineID {
 	return pipeline.PipelineID("pipeline-1")
 }
 
-func kernelStopEvidenceForTest() kernel.StopEvidence {
-	return kernel.ConfirmedStop("container exited")
+func kernelStopEvidenceForTest() engine.StopEvidence {
+	return engine.ConfirmedStop("container exited")
 }

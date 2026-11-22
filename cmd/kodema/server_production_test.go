@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
+	shellapp "github.com/optimiware/kodema/internal/server"
 )
 
 // productionServeFixture builds the TLS material the production server path

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/app"
+	"github.com/optimiware/kodema/internal/server"
 )
 
 // TestTransportParityAcrossOperationFamilies proves the REST and MCP edges are
@@ -227,7 +227,7 @@ func TestMCPToolsListEqualsTheRegistry(t *testing.T) {
 	harness := newHarness(t)
 	environment := harness.start(newFakeRuntime(modeComplete))
 
-	unauthReq, err := http.NewRequest(http.MethodPost, environment.baseURL+app.DefaultMCPPath,
+	unauthReq, err := http.NewRequest(http.MethodPost, environment.baseURL+server.DefaultMCPPath,
 		bytes.NewReader([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)))
 	if err != nil {
 		t.Fatalf("build unauthenticated tools/list request: %v", err)

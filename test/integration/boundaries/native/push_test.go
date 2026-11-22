@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/git"
+	"github.com/optimiware/kodema/internal/apps/git"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 	nativefix "github.com/optimiware/kodema/test/support/boundaries/native"
 )

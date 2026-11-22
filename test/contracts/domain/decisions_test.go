@@ -23,8 +23,8 @@ package domaincontract
 import (
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 )
 
 func effectiveRolesFor(t *testing.T, scope tenancy.Scope, tenantWide, projectRow *tenancy.Membership) []tenancy.Role {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/userland/up"
+	"github.com/optimiware/kodema/internal/apps/up"
 )
 
 func TestUpDownStatusCLICommands(t *testing.T) {

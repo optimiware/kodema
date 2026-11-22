@@ -24,10 +24,10 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/git"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
+	actorapp "github.com/optimiware/kodema/internal/apps/git/app/actors"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/userland/git"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
-	actorapp "github.com/optimiware/kodema/internal/userland/git/app/actors"
 	actorfix "github.com/optimiware/kodema/test/support/boundaries/actors"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 )

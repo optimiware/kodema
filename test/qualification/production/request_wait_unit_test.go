@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 )
 
 // requestWaitFakeRequest is one recorded envelope at the fake edge.

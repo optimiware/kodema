@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/engine/definition"
 )
 
 // TestHarnessPipelineDocumentBuildsExactYAML proves the builder renders the

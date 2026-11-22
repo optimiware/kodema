@@ -37,9 +37,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/apps/agent/app"
+	"github.com/optimiware/kodema/internal/apps/kit/session"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/userland/agent/app"
-	"github.com/optimiware/kodema/internal/userland/session"
 )
 
 const (

@@ -26,7 +26,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/optimiware/kodema/internal/shell/store"
+	"github.com/optimiware/kodema/internal/control/store"
 )
 
 // holdTables is the closed set of tables the race tests may hold. A hold on any

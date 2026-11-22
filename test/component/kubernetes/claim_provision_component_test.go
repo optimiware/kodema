@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"testing"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	kubesupport "github.com/optimiware/kodema/test/support/infrastructure/kubernetes"
 )
 

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
+	shellapp "github.com/optimiware/kodema/internal/server"
 )
 
 // discoveryArguments are one complete valid public discovery document as flags.

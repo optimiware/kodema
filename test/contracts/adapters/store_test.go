@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/store"
+	"github.com/optimiware/kodema/internal/control/store"
 )
 
 // TestSchemaRequiredTables pins the relational record families S04 requires.

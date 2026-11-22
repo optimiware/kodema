@@ -7,11 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 )
 
 // TestAdapterActionEndToEnd proves one complete adapter action on a real
@@ -41,12 +41,12 @@ func TestAdapterActionEndToEnd(t *testing.T) {
 	startPrepared(t, ctx, fx, prepareRequest(
 		identity, workspaceID, "build", "task-e2e",
 		testContainer(commands, []definition.EnvVar{{Name: "BUILD_MODE", Value: "release"}}),
-		[]engine.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}},
+		[]reconcile.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}},
 		"tok-e2e",
 	))
-	observation := waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 	if code, ok := observation.ExitStatus(); !ok || code != 0 {
 		t.Fatalf("action exit = %d/%v; want 0/true (%+v)", code, ok, observation)
 	}
@@ -98,7 +98,7 @@ func TestAdapterActionEndToEnd(t *testing.T) {
 		t.Fatalf("secret material reached the workspace environment:\n%s", readerOutput)
 	}
 
-	removal, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
+	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestAdapterActionEndToEnd(t *testing.T) {
 		t.Fatalf("removal = %+v; want removed with the retained claim named", removal)
 	}
 	reader := testIdentity("exec-e2e-read", "action-e2e-read", "workload-e2e-read", "idem-e2e-read")
-	if _, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: reader, WorkspaceID: workspaceID}); err != nil {
+	if _, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: reader, WorkspaceID: workspaceID}); err != nil {
 		t.Fatalf("Remove reader: %v", err)
 	}
 	waitForWorkspaceUnreferenced(t, ctx, fx.Client, workspaceID)

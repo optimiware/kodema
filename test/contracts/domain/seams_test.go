@@ -15,36 +15,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/trigger"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	"github.com/optimiware/kodema/internal/shell/request"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/trigger"
 )
 
 // sampleAnswerCommit is the Kernel reduction flow.Reduce returns for one
 // authorized request answer. The reducer output, not a Shell state machine, is
 // what the resolve unit carries.
 func sampleAnswerCommit(now time.Time) flow.Commit {
-	answer := kernel.Answer{
-		Decision: kernel.DecisionPass,
-		Outputs:  kernel.Outputs{"approved": "true"},
+	answer := engine.Answer{
+		Decision: engine.DecisionPass,
+		Outputs:  engine.Outputs{"approved": "true"},
 		Actor:    id.PrincipalID("reviewer-1"),
 		At:       now,
 	}
 	return flow.Commit{
 		ExecutionID:              id.ExecutionID("exec-1"),
 		ExpectedExecutionVersion: 5,
-		NextExecutionState:       kernel.ExecutionRunning,
+		NextExecutionState:       engine.ExecutionRunning,
 		ActionID:                 id.ActionID("action-1"),
 		ExpectedActionVersion:    3,
-		NextActionState:          kernel.ActionSucceeded,
-		Output:                   flow.OutputChange{Action: flow.OutputPromote, Values: kernel.Outputs{"approved": "true"}},
+		NextActionState:          engine.ActionSucceeded,
+		Output:                   flow.OutputChange{Action: flow.OutputPromote, Values: engine.Outputs{"approved": "true"}},
 		Answer:                   &answer,
 		At:                       now,
 	}
@@ -59,7 +59,7 @@ func sampleResolveUnit(t *testing.T, now time.Time) request.ResolveUnit {
 		ExpectedExecutionVersion: 5,
 		ExpectedActionVersion:    3,
 		Decision:                 request.DecisionPass,
-		Response:                 kernel.Outputs{"approved": "true"},
+		Response:                 engine.Outputs{"approved": "true"},
 		Actor:                    id.PrincipalID("reviewer-1"),
 		Assignment:               mustAssignment(t, "role/reviewer"),
 		At:                       now,
@@ -101,7 +101,7 @@ func TestResolveUnitCarriesKernelAnswerCommit(t *testing.T) {
 	if err := unit.Validate(); err != nil {
 		t.Fatalf("complete resolve unit was refused: %v", err)
 	}
-	if unit.Commit.Answer == nil || unit.Commit.Answer.Decision != kernel.DecisionPass {
+	if unit.Commit.Answer == nil || unit.Commit.Answer.Decision != engine.DecisionPass {
 		t.Fatalf("resolve unit lost the Kernel answer reduction: %+v", unit.Commit)
 	}
 	if unit.Decision != request.DecisionPass || unit.Response["approved"] != "true" {
@@ -129,7 +129,7 @@ func TestResolveUnitCarriesKernelAnswerCommit(t *testing.T) {
 	invalidInputClass(t, zeroTime.Validate())
 
 	unknownState := unit
-	unknownState.Commit.NextActionState = kernel.ActionState("unknown")
+	unknownState.Commit.NextActionState = engine.ActionState("unknown")
 	invalidInputClass(t, unknownState.Validate())
 }
 
@@ -141,13 +141,13 @@ func sampleFailResolveUnit(t *testing.T, now time.Time) request.ResolveUnit {
 	unit := sampleResolveUnit(t, now)
 	unit.Decision = request.DecisionFail
 	unit.Response = nil
-	unit.Commit.Answer = &kernel.Answer{
-		Decision: kernel.DecisionFail,
+	unit.Commit.Answer = &engine.Answer{
+		Decision: engine.DecisionFail,
 		Actor:    unit.Actor,
 		At:       now,
 	}
-	unit.Commit.NextActionState = kernel.ActionFailed
-	unit.Commit.NextExecutionState = kernel.ExecutionFailed
+	unit.Commit.NextActionState = engine.ActionFailed
+	unit.Commit.NextExecutionState = engine.ExecutionFailed
 	unit.Commit.Output = flow.OutputChange{Action: flow.OutputDiscard}
 	return unit
 }
@@ -176,7 +176,7 @@ func TestResolveUnitValidateBindsCommitToUnit(t *testing.T) {
 		{
 			name: "answer decision mismatch",
 			mutate: func(unit *request.ResolveUnit) {
-				unit.Commit.Answer.Decision = kernel.DecisionFail
+				unit.Commit.Answer.Decision = engine.DecisionFail
 			},
 		},
 		{
@@ -200,13 +200,13 @@ func TestResolveUnitValidateBindsCommitToUnit(t *testing.T) {
 		{
 			name: "pass commits a failed action",
 			mutate: func(unit *request.ResolveUnit) {
-				unit.Commit.NextActionState = kernel.ActionFailed
+				unit.Commit.NextActionState = engine.ActionFailed
 			},
 		},
 		{
 			name: "pass commits a failed execution",
 			mutate: func(unit *request.ResolveUnit) {
-				unit.Commit.NextExecutionState = kernel.ExecutionFailed
+				unit.Commit.NextExecutionState = engine.ExecutionFailed
 			},
 		},
 		{
@@ -230,19 +230,19 @@ func TestResolveUnitValidateBindsCommitToUnit(t *testing.T) {
 
 	t.Run("pass commits a succeeded execution", func(t *testing.T) {
 		unit := pass
-		unit.Commit.NextExecutionState = kernel.ExecutionSucceeded
+		unit.Commit.NextExecutionState = engine.ExecutionSucceeded
 		if err := unit.Validate(); err != nil {
 			t.Fatalf("passing unit with a succeeded execution was refused: %v", err)
 		}
 	})
 	t.Run("fail commits a succeeded action", func(t *testing.T) {
 		unit := fail
-		unit.Commit.NextActionState = kernel.ActionSucceeded
+		unit.Commit.NextActionState = engine.ActionSucceeded
 		invalidInputClass(t, unit.Validate())
 	})
 	t.Run("fail commits a running execution", func(t *testing.T) {
 		unit := fail
-		unit.Commit.NextExecutionState = kernel.ExecutionRunning
+		unit.Commit.NextExecutionState = engine.ExecutionRunning
 		invalidInputClass(t, unit.Validate())
 	})
 }

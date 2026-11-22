@@ -14,7 +14,7 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
-	"github.com/optimiware/kodema/internal/userland/cli"
+	"github.com/optimiware/kodema/internal/apps/cli"
 )
 
 // The reference fakes are the compile-time witnesses for the declared ports.

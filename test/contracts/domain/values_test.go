@@ -13,24 +13,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/gateway"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/log"
+	"github.com/optimiware/kodema/internal/control/mcpproxy"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/service"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/control/verify"
+	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/gateway"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/log"
-	"github.com/optimiware/kodema/internal/shell/mcpproxy"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	"github.com/optimiware/kodema/internal/shell/request"
-	"github.com/optimiware/kodema/internal/shell/resource"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/service"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
-	"github.com/optimiware/kodema/internal/shell/verify"
 )
 
 // TestAdmissionSnapshotExactBytes pins S03's snapshot rule: the hash is
@@ -149,18 +149,18 @@ func TestResponseRequiredness(t *testing.T) {
 		Keys:     []id.OutputKey{id.OutputKey("approved"), id.OutputKey("note")},
 		Required: []id.OutputKey{id.OutputKey("approved")},
 	}
-	if err := schema.Validate(kernel.Outputs{"approved": "true"}); err != nil {
+	if err := schema.Validate(engine.Outputs{"approved": "true"}); err != nil {
 		t.Fatalf("valid response refused: %v", err)
 	}
-	if err := schema.Validate(kernel.Outputs{"approved": "true", "note": "ok"}); err != nil {
+	if err := schema.Validate(engine.Outputs{"approved": "true", "note": "ok"}); err != nil {
 		t.Fatalf("valid response with optional field refused: %v", err)
 	}
-	if err := schema.Validate(kernel.Outputs{"note": "ok"}); err == nil {
+	if err := schema.Validate(engine.Outputs{"note": "ok"}); err == nil {
 		t.Fatal("response missing a required field accepted")
 	} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
 		t.Fatalf("missing response class = %v; want invalid_input", class)
 	}
-	if err := schema.Validate(kernel.Outputs{"approved": "true", "extra": "x"}); err == nil {
+	if err := schema.Validate(engine.Outputs{"approved": "true", "extra": "x"}); err == nil {
 		t.Fatal("response with an undeclared field accepted")
 	}
 
@@ -168,7 +168,7 @@ func TestResponseRequiredness(t *testing.T) {
 	if err := open.Validate(nil); err != nil {
 		t.Fatalf("empty response schema refused an empty response: %v", err)
 	}
-	if err := open.Validate(kernel.Outputs{"anything": "x"}); err == nil {
+	if err := open.Validate(engine.Outputs{"anything": "x"}); err == nil {
 		t.Fatal("empty response schema accepted an undeclared field")
 	}
 }

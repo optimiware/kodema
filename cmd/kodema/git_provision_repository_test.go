@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 )
 
 // TestGitProvisionRepositoryDispatchesIndependently pins that

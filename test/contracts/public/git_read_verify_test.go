@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/resource"
+	"github.com/optimiware/kodema/internal/control/resource"
 )
 
 // TestGitReadVerifyShape pins the repository-level `git.read` resource

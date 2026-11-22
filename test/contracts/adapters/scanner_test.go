@@ -11,10 +11,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
 // TestMaxQueryLimit pins the required positive page bound.

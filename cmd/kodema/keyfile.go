@@ -10,10 +10,10 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/secret"
 )
 
 // testKeys is the validated local key material the test-profile server and the

@@ -26,8 +26,8 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/services"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/userland/services"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

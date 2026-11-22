@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/services"
+	"github.com/optimiware/kodema/internal/apps/services"
 )
 
 // TestEffectStateAndMergeResult pins the independent-service effect vocabulary:

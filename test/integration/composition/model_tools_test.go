@@ -21,11 +21,11 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/control/gateway"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/gateway"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	app "github.com/optimiware/kodema/internal/server"
 )
 
 const modelToolArguments = `{"path":"README.md","note":"héllo ✓"}`

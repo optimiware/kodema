@@ -34,8 +34,8 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	shelloidc "github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/userland/git"
+	shelloidc "github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/apps/git"
 	identityfixture "github.com/optimiware/kodema/test/support/boundaries/identity"
 	"github.com/optimiware/kodema/test/support/factory"
 )

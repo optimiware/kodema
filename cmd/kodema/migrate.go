@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/app/migrate"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
+	"github.com/optimiware/kodema/internal/server/migrate"
 )
 
 // newMaintenanceDB opens the administrator's maintenance database pool. Tests

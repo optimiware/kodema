@@ -37,9 +37,9 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/userland/git"
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/apps/git"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 	identityfixture "github.com/optimiware/kodema/test/support/boundaries/identity"
 	"github.com/optimiware/kodema/test/support/factory"
 )

@@ -54,7 +54,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/authorize"
+	"github.com/optimiware/kodema/internal/control/authorize"
 )
 
 // enumProbe is one request field value that must be refused.

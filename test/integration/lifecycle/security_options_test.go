@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	identityfixture "github.com/optimiware/kodema/test/support/boundaries/identity"
 	"github.com/optimiware/kodema/test/support/factory"
 )

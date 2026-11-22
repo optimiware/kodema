@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 )
 
 // Load the checkout's real image into this test's disposable kind node. The
@@ -122,7 +122,7 @@ if os.fork() == 0:
 		logs, _ := fx.Cluster.Kubectl(ctx, "logs", "-n", fx.Namespace, "job/"+job.Name, "-c", "workload")
 		t.Fatalf("toolbox Job: %v\n%s\n%s", waitErr, events.Stdout, logs.Stdout)
 	}
-	observed := waitForObservation(t, ctx, adapter, engine.ObserveRequest{Identity: identity, WorkspaceID: ws}, kernel.ObservationExited)
+	observed := waitForObservation(t, ctx, adapter, reconcile.ObserveRequest{Identity: identity, WorkspaceID: ws}, engine.ObservationExited)
 	combined, _ := readAllLogs(t, ctx, adapter, identity, 1<<20)
 	if code, ok := observed.ExitStatus(); !ok || code != 0 || !strings.Contains(string(combined), "submitted outputs result") {
 		t.Fatalf("workload exit=%d/%t log=%s", code, ok, combined)

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/store"
+	"github.com/optimiware/kodema/internal/control/store"
 )
 
 // schemaVectorDocument is the executable schema conformance input. It pins the

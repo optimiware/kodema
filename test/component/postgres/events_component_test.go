@@ -6,12 +6,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	"github.com/optimiware/kodema/internal/shell/store/units/platform"
-	"github.com/optimiware/kodema/internal/shell/store/units/readers"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/adapter/store/units/platform"
+	"github.com/optimiware/kodema/internal/adapter/store/units/readers"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

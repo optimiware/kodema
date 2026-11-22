@@ -20,18 +20,18 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/kit/sandbox"
+	"github.com/optimiware/kodema/internal/apps/services"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	kernelengine "github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/userland/sandbox"
-	"github.com/optimiware/kodema/internal/userland/services"
+	shellapp "github.com/optimiware/kodema/internal/server"
 )
 
 // requiredAgenticSDLCPipelines is the exact manifest of pipeline YAMLs shipped
@@ -337,22 +337,22 @@ func (r *sdlcHermeticRuntime) Start(_ context.Context, req kernelengine.StartReq
 	return kernelengine.StartResult{Outcome: kernelengine.StartAccepted, WorkloadID: req.Identity.WorkloadID, Detail: "started"}, nil
 }
 
-func (r *sdlcHermeticRuntime) Observe(_ context.Context, req kernelengine.ObserveRequest) (kernel.Observation, error) {
+func (r *sdlcHermeticRuntime) Observe(_ context.Context, req kernelengine.ObserveRequest) (engine.Observation, error) {
 	r.mu.Lock()
 	wasStarted := r.started[req.Identity.WorkloadID]
 	r.mu.Unlock()
 	if !wasStarted {
-		return kernel.AbsentObservation(), nil
+		return engine.AbsentObservation(), nil
 	}
-	return kernel.ExitedObservation(0, kernel.ConfirmedStop("exited 0")), nil
+	return engine.ExitedObservation(0, engine.ConfirmedStop("exited 0")), nil
 }
 
 func (r *sdlcHermeticRuntime) Logs(context.Context, kernelengine.LogsRequest) (kernelengine.LogBatch, error) {
 	return kernelengine.LogBatch{}, nil
 }
 
-func (r *sdlcHermeticRuntime) Stop(context.Context, kernelengine.StopRequest) (kernel.StopEvidence, error) {
-	return kernel.ConfirmedStop("stopped"), nil
+func (r *sdlcHermeticRuntime) Stop(context.Context, kernelengine.StopRequest) (engine.StopEvidence, error) {
+	return engine.ConfirmedStop("stopped"), nil
 }
 
 func (r *sdlcHermeticRuntime) Remove(context.Context, kernelengine.RemoveRequest) (kernelengine.Removal, error) {

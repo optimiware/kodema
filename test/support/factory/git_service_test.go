@@ -14,12 +14,12 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/git"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
+	"github.com/optimiware/kodema/internal/apps/git/app/actors"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/userland/git"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
-	"github.com/optimiware/kodema/internal/userland/git/app/actors"
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
 )
 
 // GitRepositoryAdmin and GitRepositoryProject name the two repositories the

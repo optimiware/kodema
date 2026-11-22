@@ -6,13 +6,13 @@ import (
 	"testing"
 	"time"
 
+	shelloidc "github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	shelloidc "github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
 	identityfixture "github.com/optimiware/kodema/test/support/boundaries/identity"
 )
 

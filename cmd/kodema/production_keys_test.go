@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
 )
 
 const (

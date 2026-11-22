@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 	nativefix "github.com/optimiware/kodema/test/support/boundaries/native"
 )
 

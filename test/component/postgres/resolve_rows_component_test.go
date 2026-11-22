@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/request"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/request"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

@@ -17,17 +17,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/adapter/integration/registry"
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/shell/integration/registry"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
-	"github.com/optimiware/kodema/internal/shell/secret"
+	shellapp "github.com/optimiware/kodema/internal/server"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
 )
 
 // productionEnv is the environment the Helm chart renders for the server. Every

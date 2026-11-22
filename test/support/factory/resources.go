@@ -17,9 +17,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )

@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/cli"
+	"github.com/optimiware/kodema/internal/apps/cli"
 )
 
 // loginFakeRandom is a deterministic cli.Random. It records every requested

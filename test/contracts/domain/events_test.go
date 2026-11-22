@@ -28,10 +28,10 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/event"
 )
 
 // publishedEvent is the (type, subject) identity of one published event.
@@ -50,7 +50,7 @@ type projectedEvent struct {
 
 type cancelEventCase struct {
 	name          string
-	pre           kernel.Execution
+	pre           engine.Execution
 	owner         event.Envelope
 	wantProjected []projectedEvent
 	wantPublished []publishedEvent
@@ -100,7 +100,7 @@ func cancelEventCases() []cancelEventCase {
 
 // preImageOf maps the durable aggregate onto the projection pre-image. It reads
 // only the version-guarded fields the projection needs.
-func preImageOf(exec kernel.Execution) event.ExecutionPreImage {
+func preImageOf(exec engine.Execution) event.ExecutionPreImage {
 	actions := make([]event.ActionPreImage, 0, len(exec.Actions))
 	for _, action := range exec.Actions {
 		actions = append(actions, event.ActionPreImage{
@@ -137,8 +137,8 @@ func TestTaskCancellationPublishesLifecycleOnce(t *testing.T) {
 			if commit == nil {
 				t.Fatal("flow.Reduce(cancel) returned no commit")
 			}
-			if next.State != kernel.ExecutionCancelled {
-				t.Fatalf("reduced state = %q; want %q", next.State, kernel.ExecutionCancelled)
+			if next.State != engine.ExecutionCancelled {
+				t.Fatalf("reduced state = %q; want %q", next.State, engine.ExecutionCancelled)
 			}
 			if commit.ExecutionID != testCase.pre.ID {
 				t.Fatalf("commit execution id = %q; want %q", commit.ExecutionID, testCase.pre.ID)
@@ -147,8 +147,8 @@ func TestTaskCancellationPublishesLifecycleOnce(t *testing.T) {
 				t.Fatalf("commit expected version = %d; want the aggregate version %d",
 					commit.ExpectedExecutionVersion, testCase.pre.Version)
 			}
-			if commit.NextExecutionState != kernel.ExecutionCancelled {
-				t.Fatalf("commit next state = %q; want %q", commit.NextExecutionState, kernel.ExecutionCancelled)
+			if commit.NextExecutionState != engine.ExecutionCancelled {
+				t.Fatalf("commit next state = %q; want %q", commit.NextExecutionState, engine.ExecutionCancelled)
 			}
 			// Output settlement: cancellation discards staged values and
 			// invalidates the execution credential in the same commit.
@@ -162,7 +162,7 @@ func TestTaskCancellationPublishesLifecycleOnce(t *testing.T) {
 			if commit.Cleanup == nil {
 				t.Fatal("cancellation commit carries no cleanup intent")
 			}
-			if commit.CleanupUpdate == nil || commit.CleanupUpdate.State != kernel.CleanupPending {
+			if commit.CleanupUpdate == nil || commit.CleanupUpdate.State != engine.CleanupPending {
 				t.Fatalf("cleanup progress = %#v; want a pending update", commit.CleanupUpdate)
 			}
 			// The stop barrier is a request derived from a running container
@@ -190,9 +190,9 @@ func TestTaskCancellationPublishesLifecycleOnce(t *testing.T) {
 			if len(commit.PendingCancellations) != 1 {
 				t.Fatalf("commit carries %d pending cancellations; want 1", len(commit.PendingCancellations))
 			}
-			if commit.PendingCancellations[0].NextState != kernel.ActionCancelled {
+			if commit.PendingCancellations[0].NextState != engine.ActionCancelled {
 				t.Fatalf("pending cancellation next state = %q; want %q",
-					commit.PendingCancellations[0].NextState, kernel.ActionCancelled)
+					commit.PendingCancellations[0].NextState, engine.ActionCancelled)
 			}
 
 			pre := preImageOf(testCase.pre)
@@ -235,7 +235,7 @@ func TestTaskCancellationPublishesLifecycleOnce(t *testing.T) {
 				if spec.Type == event.TypeExecutionStarted {
 					t.Fatalf("cancellation published %q", event.TypeExecutionStarted)
 				}
-				if testCase.pre.State == kernel.ExecutionQueued && spec.Type == event.TypeActionRequested {
+				if testCase.pre.State == engine.ExecutionQueued && spec.Type == event.TypeActionRequested {
 					t.Fatalf("queued cancellation published %q for a request that never activated", event.TypeActionRequested)
 				}
 			}

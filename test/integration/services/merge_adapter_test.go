@@ -35,8 +35,8 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/optimiware/kodema/api"
+	serviceadapter "github.com/optimiware/kodema/internal/apps/services"
 	"github.com/optimiware/kodema/internal/id"
-	serviceadapter "github.com/optimiware/kodema/internal/userland/services"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

@@ -6,11 +6,11 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/shell/gateway"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/trigger"
+	"github.com/optimiware/kodema/internal/control/gateway"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/trigger"
+	"github.com/optimiware/kodema/internal/engine"
 )
 
 // TestSchemaPersistsKernelAndGatewayEvidence proves every exported field of the
@@ -119,14 +119,14 @@ func TestSchemaPersistsKernelAndGatewayEvidence(t *testing.T) {
 		name  string
 		value any
 	}{
-		{"kernel.Execution", kernel.Execution{}},
-		{"kernel.Action", kernel.Action{}},
-		{"kernel.ContainerAction", kernel.ContainerAction{}},
-		{"kernel.LaunchIntent", kernel.LaunchIntent{}},
-		{"kernel.Answer", kernel.Answer{}},
-		{"kernel.Failure", kernel.Failure{}},
-		{"kernel.Observation", kernel.Observation{}},
-		{"kernel.StopEvidence", kernel.StopEvidence{}},
+		{"kernel.Execution", engine.Execution{}},
+		{"kernel.Action", engine.Action{}},
+		{"kernel.ContainerAction", engine.ContainerAction{}},
+		{"kernel.LaunchIntent", engine.LaunchIntent{}},
+		{"kernel.Answer", engine.Answer{}},
+		{"kernel.Failure", engine.Failure{}},
+		{"kernel.Observation", engine.Observation{}},
+		{"kernel.StopEvidence", engine.StopEvidence{}},
 		{"gateway.UsageRecord", gateway.UsageRecord{}},
 		{"gateway.ContentRecord", gateway.ContentRecord{}},
 		{"api.ChatUsage", api.ChatUsage{}},

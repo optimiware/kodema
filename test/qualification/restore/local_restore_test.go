@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/installation"
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	recovery "github.com/optimiware/kodema/internal/shell/app/drivers/recovery"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
+	recovery "github.com/optimiware/kodema/internal/server/drivers/recovery"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	"github.com/optimiware/kodema/test/support/infrastructure/messaging"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"

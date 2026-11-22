@@ -15,10 +15,10 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

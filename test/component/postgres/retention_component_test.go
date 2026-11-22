@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/internal/installation"
-	retentiondriver "github.com/optimiware/kodema/internal/shell/app/drivers/retention"
+	retentiondriver "github.com/optimiware/kodema/internal/server/drivers/retention"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

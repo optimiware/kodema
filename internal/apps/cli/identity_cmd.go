@@ -1,0 +1,859 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"text/tabwriter"
+
+	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/kit/principal"
+)
+
+// DeriveOIDCPrincipalID derives the deterministic Kodema human principal ID
+// ("oidc-" + lowercase hex of sha256(issuer + "\x00" + subject)[:16]).
+func DeriveOIDCPrincipalID(issuer, subject string) (string, error) {
+	pid, err := principal.ForOIDC(issuer, subject)
+	if err != nil {
+		return "", err
+	}
+	return string(pid), nil
+}
+
+type whoamiView struct {
+	Server      string   `json:"server,omitempty"`
+	PrincipalID string   `json:"principal_id"`
+	Kind        string   `json:"kind,omitempty"`
+	TenantID    string   `json:"tenant_id,omitempty"`
+	ProjectID   string   `json:"project_id,omitempty"`
+	Roles       []string `json:"roles,omitempty"`
+	Issuer      string   `json:"issuer,omitempty"`
+	Subject     string   `json:"subject,omitempty"`
+	Username    string   `json:"username,omitempty"`
+	Email       string   `json:"email,omitempty"`
+	Name        string   `json:"name,omitempty"`
+}
+
+// runWhoami displays the caller's principal identity via principal.whoami, or
+// from the local session/JWT claims with --offline. A failed server call is
+// reported, never replaced by the local claims.
+func runWhoami(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
+	if hasHelpFlag(args) {
+		return runHelp(ports.Out, ports.Err, []string{"whoami"})
+	}
+	var (
+		offlineFlag bool
+		outputFlag  string
+	)
+	spec := newArgSpec()
+	spec.boolFlag(&offlineFlag, "--offline")
+	spec.stringFlag(&outputFlag, "--output")
+	positionals, _, err := spec.parse(args)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	if len(positionals) > 0 {
+		return usage(ports.Err, fmt.Sprintf("unexpected argument %q", positionals[0]))
+	}
+	format, err := resolveOutputFormat(outputFlag, config)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+
+	offlineView, hasOffline := deriveOfflineWhoami(ctx, config, ports, deps, offlineFlag)
+
+	if !offlineFlag {
+		if err := config.Validate(); err != nil {
+			return usage(ports.Err, err.Error())
+		}
+		if ports.Client == nil {
+			return failure(ports.Err, fmt.Errorf("no public client is configured"))
+		}
+		inputPayload := json.RawMessage(`{}`)
+		if operationRequiresRouteParam("principal.whoami", "project") {
+			if proj := resolveProject("", config, deps); proj != "" {
+				encoded, marshalErr := json.Marshal(map[string]string{"project_id": proj})
+				if marshalErr == nil {
+					inputPayload = encoded
+				}
+			}
+		}
+		invocation := api.Invocation{
+			Operation: "principal.whoami",
+			Request:   api.Request{Input: inputPayload},
+		}
+		if err := invocation.Validate(); err != nil {
+			return usage(ports.Err, publicMessage(err))
+		}
+		result, err := ports.Client.Invoke(ctx, invocation)
+		if err != nil {
+			return failure(ports.Err, err)
+		}
+		offlineView.Server = strings.TrimSpace(config.ServerURL)
+		if err := renderWhoamiServerResult(ports.Out, format, result, offlineView); err != nil {
+			return failure(ports.Err, err)
+		}
+		return ExitSuccess
+	}
+
+	if !hasOffline {
+		return failure(ports.Err, fmt.Errorf("cannot determine principal identity: no active OIDC session with iss/sub claims found (run 'kodema login')"))
+	}
+	if format == OutputJSON {
+		if err := json.NewEncoder(ports.Out).Encode(offlineView); err != nil {
+			return failure(ports.Err, err)
+		}
+		return ExitSuccess
+	}
+	writeWhoamiTable(ports.Out, offlineView)
+	return ExitSuccess
+}
+
+func renderWhoamiServerResult(out io.Writer, format OutputFormat, result api.Result, fallback whoamiView) error {
+	if format == OutputJSON {
+		return renderResult(out, OutputJSON, result)
+	}
+	var raw struct {
+		PrincipalID string   `json:"principal_id"`
+		ID          string   `json:"id"`
+		Kind        string   `json:"kind"`
+		TenantID    string   `json:"tenant_id"`
+		ProjectID   string   `json:"project_id"`
+		Roles       []string `json:"roles"`
+		Principal   *struct {
+			ID   string `json:"id"`
+			Kind string `json:"kind"`
+		} `json:"principal"`
+		Scope *struct {
+			TenantID  string `json:"tenant_id"`
+			ProjectID string `json:"project_id"`
+		} `json:"scope"`
+	}
+	if len(result.Body) > 0 {
+		if err := json.Unmarshal(result.Body, &raw); err != nil {
+			return renderTable(out, result)
+		}
+	}
+	view := whoamiView{
+		Server:      strings.TrimSpace(fallback.Server),
+		PrincipalID: raw.PrincipalID,
+		Kind:        raw.Kind,
+		TenantID:    raw.TenantID,
+		ProjectID:   raw.ProjectID,
+		Roles:       raw.Roles,
+	}
+	if view.PrincipalID == "" && raw.ID != "" {
+		view.PrincipalID = raw.ID
+	}
+	if raw.Principal != nil {
+		if view.PrincipalID == "" {
+			view.PrincipalID = raw.Principal.ID
+		}
+		if view.Kind == "" {
+			view.Kind = raw.Principal.Kind
+		}
+	}
+	if raw.Scope != nil {
+		if view.TenantID == "" {
+			view.TenantID = raw.Scope.TenantID
+		}
+		if view.ProjectID == "" {
+			view.ProjectID = raw.Scope.ProjectID
+		}
+	}
+	if view.PrincipalID == "" && fallback.PrincipalID != "" {
+		view.PrincipalID = fallback.PrincipalID
+	}
+	if view.PrincipalID != "" && fallback.PrincipalID == view.PrincipalID {
+		if view.Issuer == "" {
+			view.Issuer = fallback.Issuer
+		}
+		if view.Subject == "" {
+			view.Subject = fallback.Subject
+		}
+		if view.Username == "" {
+			view.Username = fallback.Username
+		}
+		if view.Email == "" {
+			view.Email = fallback.Email
+		}
+		if view.Name == "" {
+			view.Name = fallback.Name
+		}
+	}
+	if view.PrincipalID == "" {
+		return renderTable(out, result)
+	}
+	writeWhoamiTable(out, view)
+	return nil
+}
+
+func writeWhoamiTable(out io.Writer, view whoamiView) {
+	if view.Server != "" {
+		fmt.Fprintf(out, "server\t%s\n", view.Server)
+	}
+	fmt.Fprintf(out, "principal_id\t%s\n", view.PrincipalID)
+	if view.Kind != "" {
+		fmt.Fprintf(out, "kind\t%s\n", view.Kind)
+	}
+	if view.TenantID != "" {
+		if view.ProjectID != "" {
+			fmt.Fprintf(out, "scope\tproject (%s)\n", view.ProjectID)
+		} else {
+			fmt.Fprintf(out, "scope\ttenant (%s)\n", view.TenantID)
+		}
+	}
+	if view.TenantID != "" {
+		fmt.Fprintf(out, "tenant_id\t%s\n", view.TenantID)
+	}
+	if view.ProjectID != "" {
+		fmt.Fprintf(out, "project_id\t%s\n", view.ProjectID)
+	}
+	if view.Roles != nil {
+		if len(view.Roles) == 0 {
+			fmt.Fprintln(out, "roles\t-")
+		} else {
+			fmt.Fprintf(out, "roles\t%s\n", strings.Join(view.Roles, ","))
+		}
+	}
+	if view.Username != "" {
+		fmt.Fprintf(out, "username\t%s\n", view.Username)
+	}
+	if view.Email != "" {
+		fmt.Fprintf(out, "email\t%s\n", view.Email)
+	}
+	if view.Name != "" {
+		fmt.Fprintf(out, "name\t%s\n", view.Name)
+	}
+	if view.Issuer != "" {
+		fmt.Fprintf(out, "issuer\t%s\n", view.Issuer)
+	}
+	if view.Subject != "" {
+		fmt.Fprintf(out, "subject\t%s\n", view.Subject)
+	}
+}
+
+func formatWhoamiLabel(view whoamiView) string {
+	switch {
+	case view.Username != "" && view.Email != "":
+		return fmt.Sprintf("%s <%s>", view.Username, view.Email)
+	case view.Username != "":
+		return view.Username
+	case view.Email != "":
+		return view.Email
+	case view.Name != "":
+		return view.Name
+	case view.Subject != "":
+		return view.Subject
+	default:
+		return ""
+	}
+}
+
+func deriveOfflineWhoami(ctx context.Context, config Config, ports Ports, deps CommandDeps, offlineOnly bool) (whoamiView, bool) {
+	fromToken := func(token, fallbackIssuer string) (whoamiView, bool) {
+		claims, ok := parseJWTClaims(token)
+		if !ok {
+			return whoamiView{}, false
+		}
+		iss := claims.Issuer
+		if iss == "" {
+			iss = strings.TrimSpace(fallbackIssuer)
+		}
+		if iss == "" || claims.Subject == "" {
+			return whoamiView{}, false
+		}
+		id, deriveErr := DeriveOIDCPrincipalID(iss, claims.Subject)
+		if deriveErr != nil {
+			return whoamiView{}, false
+		}
+		return whoamiView{
+			PrincipalID: id,
+			Kind:        "human",
+			Issuer:      iss,
+			Subject:     claims.Subject,
+			Username:    claims.Username,
+			Email:       claims.Email,
+			Name:        claims.Name,
+		}, true
+	}
+	if deps.Login.Store != nil {
+		if record, err := deps.Login.Store.LoadRecord(ctx); err == nil {
+			if view, ok := fromToken(record.Token, record.Issuer); ok {
+				view.Server = strings.TrimSpace(config.ServerURL)
+				if view.Server == "" {
+					view.Server = strings.TrimSpace(record.APIURL)
+				}
+				return view, true
+			}
+		}
+	}
+	if ports.Session != nil {
+		if cred, err := ports.Session.Load(ctx); err == nil {
+			if view, ok := fromToken(cred.Token, ""); ok {
+				view.Server = strings.TrimSpace(config.ServerURL)
+				return view, true
+			}
+		}
+	}
+	if config.CredentialFile != "" && ports.Files != nil {
+		if data, err := ports.Files.ReadFile(config.CredentialFile); err == nil {
+			if view, ok := fromToken(strings.TrimSpace(string(data)), ""); ok {
+				view.Server = strings.TrimSpace(config.ServerURL)
+				return view, true
+			}
+		}
+	}
+	if !offlineOnly && ports.Credential != nil {
+		if cred, err := ports.Credential.Credential(ctx); err == nil {
+			if view, ok := fromToken(cred.Token, ""); ok {
+				view.Server = strings.TrimSpace(config.ServerURL)
+				return view, true
+			}
+		}
+	}
+	return whoamiView{}, false
+}
+
+type jwtDisplayClaims struct {
+	Issuer   string
+	Subject  string
+	Username string
+	Email    string
+	Name     string
+}
+
+// parseJWTClaims decodes the payload claims of a compact JWT to extract iss,
+// sub and optional human-readable display claims for local display.
+func parseJWTClaims(token string) (jwtDisplayClaims, bool) {
+	payload, ok := decodeJWTPayload(token)
+	if !ok {
+		return jwtDisplayClaims{}, false
+	}
+	var claims struct {
+		Issuer            string `json:"iss"`
+		Subject           string `json:"sub"`
+		PreferredUsername string `json:"preferred_username"`
+		Email             string `json:"email"`
+		Name              string `json:"name"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return jwtDisplayClaims{}, false
+	}
+	out := jwtDisplayClaims{
+		Issuer:   strings.TrimSpace(claims.Issuer),
+		Subject:  strings.TrimSpace(claims.Subject),
+		Username: strings.TrimSpace(claims.PreferredUsername),
+		Email:    strings.TrimSpace(claims.Email),
+		Name:     strings.TrimSpace(claims.Name),
+	}
+	if out.Issuer == "" && out.Subject == "" {
+		return jwtDisplayClaims{}, false
+	}
+	return out, true
+}
+
+func operationRequiresRouteParam(operation, paramName string) bool {
+	for _, codec := range api.OperationCodecs() {
+		if codec.Operation != operation {
+			continue
+		}
+		for _, p := range codec.RouteParams {
+			if p.Name == paramName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// runMember dispatches `kodema member <list|grant|revoke>`.
+func runMember(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
+	if len(args) == 0 {
+		return usage(ports.Err, "member requires a subcommand (list|grant|revoke)")
+	}
+	if args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+		return runHelp(ports.Out, ports.Err, append([]string{"member"}, args[1:]...))
+	}
+	switch args[0] {
+	case "list", "ls":
+		return runMemberList(ctx, config, args[1:], ports, deps)
+	case "grant":
+		return runMemberGrant(ctx, config, args[1:], ports, deps)
+	case "revoke":
+		return runMemberRevoke(ctx, config, args[1:], ports, deps)
+	default:
+		return usage(ports.Err, fmt.Sprintf("unknown member subcommand %q", args[0]))
+	}
+}
+
+func runMemberList(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
+	if hasHelpFlag(args) {
+		return runHelp(ports.Out, ports.Err, []string{"member", "list"})
+	}
+	var (
+		projectFlag string
+		outputFlag  string
+	)
+	spec := newArgSpec()
+	spec.stringFlag(&projectFlag, "--project", "-p")
+	spec.stringFlag(&outputFlag, "--output")
+	positionals, _, err := spec.parse(args)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	if len(positionals) > 0 {
+		return usage(ports.Err, fmt.Sprintf("unexpected argument %q", positionals[0]))
+	}
+	format, err := resolveOutputFormat(outputFlag, config)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	if err := config.Validate(); err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	projectID := resolveProject(projectFlag, config, deps)
+	if projectID == "" {
+		return usage(ports.Err, "member list requires --project <id> or KODEMA_PROJECT")
+	}
+	if err := (api.MembershipListRequest{ProjectID: projectID}).Validate(); err != nil {
+		return usage(ports.Err, publicMessage(err))
+	}
+	if ports.Client == nil {
+		return failure(ports.Err, fmt.Errorf("no public client is configured"))
+	}
+
+	memberships, firstBody, pages, err := fetchAllMemberships(ctx, ports, projectID)
+	if err != nil {
+		return failure(ports.Err, err)
+	}
+	if format == OutputJSON {
+		if memberships == nil {
+			memberships = []api.MembershipView{}
+		}
+		return renderPaginatedJSON(ports, "membership.list", firstBody, pages, api.MembershipListResult{Memberships: memberships})
+	}
+
+	selfView, hasSelf := deriveOfflineWhoami(ctx, config, ports, deps, false)
+	selfLabel := ""
+	if hasSelf {
+		selfLabel = formatWhoamiLabel(selfView)
+	}
+
+	tw := tabwriter.NewWriter(ports.Out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "PRINCIPAL\tLABEL\tROLES\tVERSION")
+	for _, member := range memberships {
+		label := "-"
+		if hasSelf && member.PrincipalID == selfView.PrincipalID {
+			if selfLabel != "" {
+				label = selfLabel + " (you)"
+			} else {
+				label = "(you)"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\n",
+			member.PrincipalID,
+			label,
+			strings.Join(member.Roles, ","),
+			member.Version,
+		)
+	}
+	if err := tw.Flush(); err != nil {
+		return failure(ports.Err, err)
+	}
+	return ExitSuccess
+}
+
+func runMemberGrant(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
+	if hasHelpFlag(args) {
+		return runHelp(ports.Out, ports.Err, []string{"member", "grant"})
+	}
+	var (
+		projectFlag        string
+		subjectFlag        string
+		githubFlag         string
+		issuerFlag         string
+		expectedVerRaw     string
+		outputFlag         string
+		idempotencyKeyFlag string
+		roleFlags          []string
+	)
+	spec := newArgSpec()
+	spec.stringFlag(&projectFlag, "--project", "-p")
+	spec.stringFlag(&subjectFlag, "--subject")
+	spec.stringFlag(&githubFlag, "--github")
+	spec.stringFlag(&issuerFlag, "--issuer")
+	spec.listFlag(&roleFlags, "--role", "--roles", "-r")
+	spec.stringFlag(&expectedVerRaw, "--expected-version")
+	spec.stringFlag(&outputFlag, "--output")
+	spec.stringFlag(&idempotencyKeyFlag, "--idempotency-key")
+	positionals, seen, err := spec.parse(args)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	if len(positionals) > 1 {
+		return usage(ports.Err, fmt.Sprintf("unexpected extra argument %q", positionals[1]))
+	}
+	format, err := resolveOutputFormat(outputFlag, config)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	expectedVer, err := parsePositiveVersion(expectedVerRaw, "--expected-version")
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	if err := config.Validate(); err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	projectID := resolveProject(projectFlag, config, deps)
+	if projectID == "" {
+		return usage(ports.Err, "member grant requires --project <id> or KODEMA_PROJECT")
+	}
+	roles := parseCommaSeparatedList(roleFlags)
+	if len(roles) == 0 {
+		return usage(ports.Err, "member grant requires --role <role>[,<role>...]")
+	}
+
+	positionalTarget := ""
+	if len(positionals) == 1 {
+		positionalTarget = positionals[0]
+	}
+	resolved, statusCode := resolveMemberPrincipal(ctx, config, ports, deps,
+		positionalTarget, subjectFlag, githubFlag, issuerFlag,
+		seen["--subject"], seen["--github"])
+	if statusCode != ExitSuccess {
+		return statusCode
+	}
+
+	req := api.MembershipGrantRequest{
+		ProjectID:   projectID,
+		PrincipalID: resolved.principalID,
+		Roles:       roles,
+	}
+	if err := req.Validate(); err != nil {
+		return usage(ports.Err, publicMessage(err))
+	}
+	if ports.Client == nil {
+		return failure(ports.Err, fmt.Errorf("no public client is configured"))
+	}
+
+	input, err := json.Marshal(req)
+	if err != nil {
+		return failure(ports.Err, err)
+	}
+	key, err := makeIdempotencyKey(idempotencyKeyFlag, "membership.grant", deps.Login.Random)
+	if err != nil {
+		return failure(ports.Err, err)
+	}
+	invocation := api.Invocation{
+		Operation: "membership.grant",
+		Request: api.Request{
+			Input:           input,
+			ExpectedVersion: expectedVer,
+			IdempotencyKey:  key,
+		},
+	}
+	if err := invocation.Validate(); err != nil {
+		return usage(ports.Err, publicMessage(err))
+	}
+	result, err := ports.Client.Invoke(ctx, invocation)
+	if err != nil {
+		return failure(ports.Err, err)
+	}
+	var grantRes api.MembershipGrantResult
+	_ = json.Unmarshal(result.Body, &grantRes)
+
+	if format == OutputJSON {
+		out := map[string]any{
+			"principal_id": resolved.principalID,
+			"project_id":   projectID,
+			"roles":        roles,
+			"version":      grantRes.Version,
+		}
+		if resolved.derived {
+			out["issuer"] = resolved.issuer
+			out["subject"] = resolved.subject
+		}
+		if err := json.NewEncoder(ports.Out).Encode(out); err != nil {
+			return failure(ports.Err, err)
+		}
+		return ExitSuccess
+	}
+
+	if resolved.derived {
+		fmt.Fprintf(ports.Out, "derived principal_id\t%s\nissuer\t%s\nsubject\t%s\n",
+			resolved.principalID, resolved.issuer, resolved.subject)
+	} else {
+		fmt.Fprintf(ports.Out, "principal_id\t%s\n", resolved.principalID)
+	}
+	fmt.Fprintf(ports.Out, "project_id\t%s\nroles\t%s\nversion\t%d\n",
+		projectID, strings.Join(roles, ","), grantRes.Version)
+	return ExitSuccess
+}
+
+func runMemberRevoke(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
+	if hasHelpFlag(args) {
+		return runHelp(ports.Out, ports.Err, []string{"member", "revoke"})
+	}
+	var (
+		projectFlag        string
+		subjectFlag        string
+		githubFlag         string
+		issuerFlag         string
+		expectedVerRaw     string
+		outputFlag         string
+		idempotencyKeyFlag string
+	)
+	spec := newArgSpec()
+	spec.stringFlag(&projectFlag, "--project", "-p")
+	spec.stringFlag(&subjectFlag, "--subject")
+	spec.stringFlag(&githubFlag, "--github")
+	spec.stringFlag(&issuerFlag, "--issuer")
+	spec.stringFlag(&expectedVerRaw, "--expected-version")
+	spec.stringFlag(&outputFlag, "--output")
+	spec.stringFlag(&idempotencyKeyFlag, "--idempotency-key")
+	positionals, seen, err := spec.parse(args)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	if len(positionals) > 1 {
+		return usage(ports.Err, fmt.Sprintf("unexpected extra argument %q", positionals[1]))
+	}
+	format, err := resolveOutputFormat(outputFlag, config)
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	expectedVer, err := parsePositiveVersion(expectedVerRaw, "--expected-version")
+	if err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	if err := config.Validate(); err != nil {
+		return usage(ports.Err, err.Error())
+	}
+	projectID := resolveProject(projectFlag, config, deps)
+	if projectID == "" {
+		return usage(ports.Err, "member revoke requires --project <id> or KODEMA_PROJECT")
+	}
+
+	positionalTarget := ""
+	if len(positionals) == 1 {
+		positionalTarget = positionals[0]
+	}
+	resolved, statusCode := resolveMemberPrincipal(ctx, config, ports, deps,
+		positionalTarget, subjectFlag, githubFlag, issuerFlag,
+		seen["--subject"], seen["--github"])
+	if statusCode != ExitSuccess {
+		return statusCode
+	}
+
+	req := api.MembershipRevokeRequest{
+		ProjectID:   projectID,
+		PrincipalID: resolved.principalID,
+	}
+	if err := req.Validate(); err != nil {
+		return usage(ports.Err, publicMessage(err))
+	}
+	if ports.Client == nil {
+		return failure(ports.Err, fmt.Errorf("no public client is configured"))
+	}
+
+	if expectedVer == nil {
+		memberships, _, _, listErr := fetchAllMemberships(ctx, ports, projectID)
+		if listErr != nil {
+			return failure(ports.Err, listErr)
+		}
+		var found uint64
+		for _, member := range memberships {
+			if member.PrincipalID == resolved.principalID {
+				found = member.Version
+				break
+			}
+		}
+		if found == 0 {
+			return failure(ports.Err, fmt.Errorf("principal %q is not a member of project %q", resolved.principalID, projectID))
+		}
+		expectedVer = &found
+	}
+
+	input, err := json.Marshal(req)
+	if err != nil {
+		return failure(ports.Err, err)
+	}
+	key, err := makeIdempotencyKey(idempotencyKeyFlag, "membership.revoke", deps.Login.Random)
+	if err != nil {
+		return failure(ports.Err, err)
+	}
+	invocation := api.Invocation{
+		Operation: "membership.revoke",
+		Request: api.Request{
+			Input:           input,
+			ExpectedVersion: expectedVer,
+			IdempotencyKey:  key,
+		},
+	}
+	if err := invocation.Validate(); err != nil {
+		return usage(ports.Err, publicMessage(err))
+	}
+	result, err := ports.Client.Invoke(ctx, invocation)
+	if err != nil {
+		return failure(ports.Err, err)
+	}
+	var revokeRes api.MembershipRevokeResult
+	_ = json.Unmarshal(result.Body, &revokeRes)
+
+	if format == OutputJSON {
+		out := map[string]any{
+			"principal_id": resolved.principalID,
+			"project_id":   projectID,
+			"version":      revokeRes.Version,
+		}
+		if resolved.derived {
+			out["issuer"] = resolved.issuer
+			out["subject"] = resolved.subject
+		}
+		if err := json.NewEncoder(ports.Out).Encode(out); err != nil {
+			return failure(ports.Err, err)
+		}
+		return ExitSuccess
+	}
+
+	if resolved.derived {
+		fmt.Fprintf(ports.Out, "derived principal_id\t%s\n", resolved.principalID)
+	}
+	fmt.Fprintf(ports.Out, "revoked %s from project %s (version=%d)\n",
+		resolved.principalID, projectID, revokeRes.Version)
+	return ExitSuccess
+}
+
+type resolvedPrincipal struct {
+	principalID string
+	issuer      string
+	subject     string
+	derived     bool
+}
+
+func resolveMemberPrincipal(
+	ctx context.Context,
+	config Config,
+	ports Ports,
+	deps CommandDeps,
+	positional, subjectFlag, githubFlag, issuerFlag string,
+	hasSubjectFlag, hasGithubFlag bool,
+) (resolvedPrincipal, int) {
+	sources := 0
+	if strings.TrimSpace(positional) != "" {
+		sources++
+	}
+	if hasSubjectFlag {
+		sources++
+	}
+	if hasGithubFlag {
+		sources++
+	}
+	if sources == 0 {
+		return resolvedPrincipal{}, usage(ports.Err, "specify <principal-or-subject>, --subject <sub>, or --github <login>")
+	}
+	if sources > 1 {
+		return resolvedPrincipal{}, usage(ports.Err, "specify only one of <principal-or-subject>, --subject, or --github")
+	}
+
+	var subject string
+	switch {
+	case hasGithubFlag:
+		var err error
+		subject, err = principal.SubjectForGitHub(githubFlag)
+		if err != nil {
+			return resolvedPrincipal{}, usage(ports.Err, err.Error())
+		}
+	case hasSubjectFlag:
+		subject = strings.TrimSpace(subjectFlag)
+		if subject == "" {
+			return resolvedPrincipal{}, usage(ports.Err, "--subject requires a non-empty subject")
+		}
+	default:
+		target := strings.TrimSpace(positional)
+		if strings.HasPrefix(target, "oidc-") {
+			return resolvedPrincipal{principalID: target}, ExitSuccess
+		}
+		subject = target
+	}
+
+	issuer, err := resolveOIDCIssuer(ctx, config, ports, deps, issuerFlag)
+	if err != nil {
+		return resolvedPrincipal{}, failure(ports.Err, err)
+	}
+	derivedID, err := DeriveOIDCPrincipalID(issuer, subject)
+	if err != nil {
+		return resolvedPrincipal{}, usage(ports.Err, err.Error())
+	}
+	return resolvedPrincipal{
+		principalID: derivedID,
+		issuer:      issuer,
+		subject:     subject,
+		derived:     true,
+	}, ExitSuccess
+}
+
+// resolveOIDCIssuer resolves the installation's OIDC issuer via explicit flag,
+// injected expectation, /.well-known/kodema-configuration discovery, or the
+// persisted human session / JWT.
+func resolveOIDCIssuer(ctx context.Context, config Config, ports Ports, deps CommandDeps, explicit string) (string, error) {
+	if trimmed := strings.TrimSpace(explicit); trimmed != "" {
+		return trimmed, nil
+	}
+	if trimmed := strings.TrimSpace(deps.Login.Issuer); trimmed != "" {
+		return trimmed, nil
+	}
+	var discoveryErr error
+	if apiURL, err := normalizeAPIURL(config.ServerURL); err == nil {
+		oidcClient := deps.Login.OIDC
+		if oidcClient == nil && deps.HTTP != nil {
+			oidcClient = &HTTPOIDCClient{RoundTripper: deps.HTTP}
+		}
+		if oidcClient != nil {
+			doc, discErr := oidcClient.Discover(ctx, apiURL+api.DiscoveryPath)
+			if discErr == nil && strings.TrimSpace(doc.Issuer) != "" {
+				return strings.TrimSpace(doc.Issuer), nil
+			}
+			discoveryErr = discErr
+		}
+	}
+	if deps.Login.Store != nil {
+		if record, err := deps.Login.Store.LoadRecord(ctx); err == nil {
+			if iss := strings.TrimSpace(record.Issuer); iss != "" {
+				return iss, nil
+			}
+			if claims, ok := parseJWTClaims(record.Token); ok && claims.Issuer != "" {
+				return claims.Issuer, nil
+			}
+		}
+	}
+	if ports.Credential != nil {
+		if cred, err := ports.Credential.Credential(ctx); err == nil {
+			if claims, ok := parseJWTClaims(cred.Token); ok && claims.Issuer != "" {
+				return claims.Issuer, nil
+			}
+		}
+	}
+	if discoveryErr != nil {
+		return "", fmt.Errorf("cannot resolve OIDC issuer from %s or current session: %w", api.DiscoveryPath, discoveryErr)
+	}
+	return "", fmt.Errorf("cannot resolve OIDC issuer: configure discovery (%s) or sign in with 'kodema login'", api.DiscoveryPath)
+}
+
+func fetchAllMemberships(ctx context.Context, ports Ports, projectID string) ([]api.MembershipView, json.RawMessage, int, error) {
+	return fetchAllPages(ctx, ports, "membership.list",
+		func(cursor string) any {
+			req := api.MembershipListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
+			}
+			return req
+		},
+		func(page api.MembershipListResult) ([]api.MembershipView, string) {
+			return page.Memberships, page.NextCursor
+		},
+	)
+}

@@ -8,16 +8,16 @@ import (
 	"testing"
 	"time"
 
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	executionstore "github.com/optimiware/kodema/internal/adapter/store/units/execution"
+	"github.com/optimiware/kodema/internal/adapter/store/units/readers"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/request"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	executionstore "github.com/optimiware/kodema/internal/shell/store/units/execution"
-	"github.com/optimiware/kodema/internal/shell/store/units/readers"
-	"github.com/optimiware/kodema/internal/shell/task"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 
@@ -120,7 +120,7 @@ func TestRequestResolveReviseAppendsTaskMessageAndReplaysIdempotentlyOnPostgreSQ
 		ExpectedActionVersion:    active.Actions[0].Version,
 		Decision:                 request.DecisionRevise,
 		Note:                     "Please split the handler and add nil checks",
-		Response:                 kernel.Outputs{"feedback": "split handler"},
+		Response:                 engine.Outputs{"feedback": "split handler"},
 	}
 	first, err := requestService.Resolve(ctx, resolveCmd)
 	if err != nil {
@@ -155,7 +155,7 @@ func TestRequestResolveReviseAppendsTaskMessageAndReplaysIdempotentlyOnPostgreSQ
 	execRow := scopedRow(t, ctx, env.runtime, env.scope, 2,
 		`SELECT state, failure->>'reason' FROM executions WHERE id = $1`,
 		string(created.ExecutionID))
-	if execRow[0] != "failed" || execRow[1] != kernel.FailureReasonNeedsRevision {
+	if execRow[0] != "failed" || execRow[1] != engine.FailureReasonNeedsRevision {
 		t.Fatalf("execution row = %v; want failed/needs_revision", execRow)
 	}
 	requireScopedCount(t, ctx, env.runtime, env.scope,

@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"testing"
 
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/store"
+	"github.com/optimiware/kodema/internal/control/store"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

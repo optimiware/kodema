@@ -10,9 +10,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/optimiware/kodema/internal/apps/up"
+	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/userland/up"
 )
 
 // configureDoubleDashUsage replaces Go flag.FlagSet's single-dash usage output

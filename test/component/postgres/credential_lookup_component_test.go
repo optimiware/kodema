@@ -6,9 +6,9 @@ import (
 	"context"
 	"testing"
 
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

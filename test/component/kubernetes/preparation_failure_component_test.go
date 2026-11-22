@@ -12,9 +12,9 @@ import (
 	"errors"
 	"testing"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 )
 
 // TestPreparationFailureReleasesUnconsumedClaimAndPartialResources prepares one
@@ -55,7 +55,7 @@ func TestPreparationFailureReleasesUnconsumedClaimAndPartialResources(t *testing
 	// Remove is sufficient for an affirmatively never-started identity: it
 	// deletes the partial resources without a stop request and never touches the
 	// retained claim.
-	removal, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
+	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}

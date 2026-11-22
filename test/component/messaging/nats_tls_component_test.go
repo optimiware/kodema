@@ -8,10 +8,10 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	broker "github.com/optimiware/kodema/internal/adapter/integration/nats"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	broker "github.com/optimiware/kodema/internal/shell/integration/nats"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
 	support "github.com/optimiware/kodema/test/support/infrastructure/messaging"
 )
 

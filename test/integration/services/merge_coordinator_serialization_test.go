@@ -35,9 +35,9 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	serviceadapter "github.com/optimiware/kodema/internal/apps/services"
+	servicesapp "github.com/optimiware/kodema/internal/apps/services/app"
 	"github.com/optimiware/kodema/internal/id"
-	serviceadapter "github.com/optimiware/kodema/internal/userland/services"
-	servicesapp "github.com/optimiware/kodema/internal/userland/services/app"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

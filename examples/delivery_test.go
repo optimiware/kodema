@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/pipeline"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 )
 
 // deliveryPhrases are the statements the delivery example must make: external

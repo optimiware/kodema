@@ -13,10 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/resource"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	identityunits "github.com/optimiware/kodema/internal/shell/store/units/identity"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	identityunits "github.com/optimiware/kodema/internal/adapter/store/units/identity"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

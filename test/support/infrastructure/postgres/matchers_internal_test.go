@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/shell/receipt"
+	"github.com/optimiware/kodema/internal/control/receipt"
 )
 
 func TestGoldenNullMismatchIsTyped(t *testing.T) {

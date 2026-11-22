@@ -4,9 +4,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/runtime"
+	"github.com/optimiware/kodema/internal/adapter/runtime"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 )
 
 // TestRuntimeAdapterKinds pins the three explicit runtime families.
@@ -107,14 +107,14 @@ func TestRuntimeClientShape(t *testing.T) {
 // receives the same persisted effect identity, so a crash before or after an
 // effect cannot cause the adapter to derive a different workload or replay it.
 func TestRuntimeRequestsCarryStableIdentity(t *testing.T) {
-	identityType := reflect.TypeOf(engine.EffectIdentity{})
+	identityType := reflect.TypeOf(reconcile.EffectIdentity{})
 	requests := []reflect.Type{
-		reflect.TypeOf(engine.PrepareRequest{}),
-		reflect.TypeOf(engine.StartRequest{}),
-		reflect.TypeOf(engine.ObserveRequest{}),
-		reflect.TypeOf(engine.StopRequest{}),
-		reflect.TypeOf(engine.RemoveRequest{}),
-		reflect.TypeOf(engine.CredentialRequest{}),
+		reflect.TypeOf(reconcile.PrepareRequest{}),
+		reflect.TypeOf(reconcile.StartRequest{}),
+		reflect.TypeOf(reconcile.ObserveRequest{}),
+		reflect.TypeOf(reconcile.StopRequest{}),
+		reflect.TypeOf(reconcile.RemoveRequest{}),
+		reflect.TypeOf(reconcile.CredentialRequest{}),
 	}
 	for _, request := range requests {
 		field, ok := request.FieldByName("Identity")
@@ -126,7 +126,7 @@ func TestRuntimeRequestsCarryStableIdentity(t *testing.T) {
 			t.Errorf("%s.Identity = %v; want engine.EffectIdentity", request, field.Type)
 		}
 	}
-	identity := engine.EffectIdentity{
+	identity := reconcile.EffectIdentity{
 		ExecutionID:    "exec-1",
 		ActionID:       "action-1",
 		WorkloadID:     "workload-1",
@@ -140,42 +140,42 @@ func TestRuntimeRequestsCarryStableIdentity(t *testing.T) {
 // TestKernelUncertaintyAndStopVocabulary proves the runtime seam consumes the
 // Kernel evidence vocabulary instead of collapsing uncertainty.
 func TestKernelUncertaintyAndStopVocabulary(t *testing.T) {
-	wantOutcomes := []engine.StartOutcome{
-		engine.StartAccepted,
-		engine.StartProvenNotStarted,
-		engine.StartUnknown,
+	wantOutcomes := []reconcile.StartOutcome{
+		reconcile.StartAccepted,
+		reconcile.StartProvenNotStarted,
+		reconcile.StartUnknown,
 	}
-	if got := engine.StartOutcomes(); !reflect.DeepEqual(got, wantOutcomes) {
+	if got := reconcile.StartOutcomes(); !reflect.DeepEqual(got, wantOutcomes) {
 		t.Fatalf("start outcomes = %v; want %v", got, wantOutcomes)
 	}
-	wantKinds := []kernel.ObservationKind{
-		kernel.ObservationUnknown,
-		kernel.ObservationAbsent,
-		kernel.ObservationNeverStarted,
-		kernel.ObservationRunning,
-		kernel.ObservationExited,
+	wantKinds := []engine.ObservationKind{
+		engine.ObservationUnknown,
+		engine.ObservationAbsent,
+		engine.ObservationNeverStarted,
+		engine.ObservationRunning,
+		engine.ObservationExited,
 	}
-	if got := kernel.ObservationKinds(); !reflect.DeepEqual(got, wantKinds) {
+	if got := engine.ObservationKinds(); !reflect.DeepEqual(got, wantKinds) {
 		t.Fatalf("observation kinds = %v; want %v", got, wantKinds)
 	}
-	wantStops := []kernel.StopState{kernel.StopStateConfirmed, kernel.StopStateUnconfirmed}
-	if got := kernel.StopStates(); !reflect.DeepEqual(got, wantStops) {
+	wantStops := []engine.StopState{engine.StopStateConfirmed, engine.StopStateUnconfirmed}
+	if got := engine.StopStates(); !reflect.DeepEqual(got, wantStops) {
 		t.Fatalf("stop states = %v; want %v", got, wantStops)
 	}
 
 	cases := []struct {
 		name          string
-		observation   kernel.Observation
+		observation   engine.Observation
 		wantNonexec   bool
 		wantConfirmed bool
 	}{
-		{"unknown", kernel.UnknownObservation(), false, false},
-		{"absent", kernel.AbsentObservation(), false, false},
-		{"never started without proof", kernel.NeverStarted(""), false, false},
-		{"never started with proof", kernel.NeverStarted("cgroup absent"), true, false},
-		{"running", kernel.RunningObservation(), false, false},
-		{"exited pending stop", kernel.ExitedObservation(137, kernel.PendingStop("barrier pending")), false, false},
-		{"exited confirmed stop", kernel.ExitedObservation(0, kernel.ConfirmedStop("terminated")), false, true},
+		{"unknown", engine.UnknownObservation(), false, false},
+		{"absent", engine.AbsentObservation(), false, false},
+		{"never started without proof", engine.NeverStarted(""), false, false},
+		{"never started with proof", engine.NeverStarted("cgroup absent"), true, false},
+		{"running", engine.RunningObservation(), false, false},
+		{"exited pending stop", engine.ExitedObservation(137, engine.PendingStop("barrier pending")), false, false},
+		{"exited confirmed stop", engine.ExitedObservation(0, engine.ConfirmedStop("terminated")), false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

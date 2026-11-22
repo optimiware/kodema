@@ -169,8 +169,8 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/control/authorize"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/authorize"
 )
 
 // wantRoute is the frozen public route inventory. Paths use `{name}` parameter

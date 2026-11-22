@@ -10,7 +10,7 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/shell/app"
+	"github.com/optimiware/kodema/internal/server"
 )
 
 // TestOptionalCapabilitiesFailClosed proves the disabled model gateway, tool
@@ -82,11 +82,11 @@ func TestProductionProfileRefusesDevAdapters(t *testing.T) {
 
 	t.Run("development authenticator and seed", func(t *testing.T) {
 		config := harness.config
-		config.Profile = app.ProfileProduction
+		config.Profile = server.ProfileProduction
 		config.Installation = productionInstallation
 		config.Dev = harness.config.Dev
 		config.Adapters = nil
-		_, err := app.New(context.Background(), config)
+		_, err := server.New(context.Background(), config)
 		if err == nil {
 			t.Fatal("production profile accepted the development authenticator and first-admin seed")
 		}
@@ -97,11 +97,11 @@ func TestProductionProfileRefusesDevAdapters(t *testing.T) {
 
 	t.Run("development adapter", func(t *testing.T) {
 		config := harness.config
-		config.Profile = app.ProfileProduction
+		config.Profile = server.ProfileProduction
 		config.Installation = productionInstallation
 		config.Dev = nil
-		config.Adapters = &app.Adapters{Runtime: newFakeRuntime(modeComplete)}
-		_, err := app.New(context.Background(), config)
+		config.Adapters = &server.Adapters{Runtime: newFakeRuntime(modeComplete)}
+		_, err := server.New(context.Background(), config)
 		if err == nil {
 			t.Fatal("production profile accepted a development runtime adapter")
 		}

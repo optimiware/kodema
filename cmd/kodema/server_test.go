@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
+	shellapp "github.com/optimiware/kodema/internal/server"
 )
 
 type fakeServerApp struct {

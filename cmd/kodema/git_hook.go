@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/optimiware/kodema/internal/userland/git"
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
+	"github.com/optimiware/kodema/internal/apps/git"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 )
 
 // hookClientTimeout bounds one hook-to-service callback from the hook process.

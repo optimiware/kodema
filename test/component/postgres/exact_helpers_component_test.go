@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/store/units/execution/snapshotdoc"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/store/units/execution/snapshotdoc"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

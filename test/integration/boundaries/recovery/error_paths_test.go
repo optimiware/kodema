@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/apps/git"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/userland/git"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 	recoveryfix "github.com/optimiware/kodema/test/support/boundaries/recovery"
 )

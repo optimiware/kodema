@@ -38,10 +38,10 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/cli"
+	"github.com/optimiware/kodema/internal/apps/services"
+	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/userland/cli"
-	"github.com/optimiware/kodema/internal/userland/services"
 )
 
 // requiredPipelines is the shipped pipeline example inventory.

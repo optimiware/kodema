@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/registry"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/integration/registry"
 )
 
 // writeProductionDockerConfig writes one docker config.json credential file and

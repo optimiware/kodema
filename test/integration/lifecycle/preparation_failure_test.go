@@ -16,10 +16,10 @@ import (
 	"errors"
 	"testing"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

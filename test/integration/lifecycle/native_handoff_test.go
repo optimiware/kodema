@@ -18,8 +18,8 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/agent"
-	"github.com/optimiware/kodema/internal/userland/agent/app"
+	"github.com/optimiware/kodema/internal/apps/agent"
+	"github.com/optimiware/kodema/internal/apps/agent/app"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

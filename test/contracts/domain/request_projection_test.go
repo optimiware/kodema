@@ -11,10 +11,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	"github.com/optimiware/kodema/internal/shell/inbox"
-	"github.com/optimiware/kodema/internal/shell/request"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/inbox"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/engine/definition"
 )
 
 // TestInboxItemDeclaresRequestProjection pins the exact declaration names, JSON

@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/runtime/podman"
+	"github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
@@ -36,22 +36,22 @@ func TestPodmanRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 	}
 	request := fixture.request(identity, commands,
 		[]definition.EnvVar{{Name: "BUILD_MODE", Value: "release"}},
-		[]engine.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}},
+		[]reconcile.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}},
 		"tok-abc",
 	)
 	t.Setenv("KODEMA_HOST_CANARY", "must-not-leak")
 	if _, err := fixture.adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	start, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	start, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if start.Outcome != engine.StartAccepted {
+	if start.Outcome != reconcile.StartAccepted {
 		t.Fatalf("start outcome = %q; want accepted", start.Outcome)
 	}
 	observation := waitForPodmanObservation(t, ctx, fixture.adapter,
-		engine.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
+		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 	code, ok := observation.ExitStatus()
 	if !ok || code != 0 {
 		t.Fatalf("exit status = %d/%v; want 0/true (%+v)", code, ok, observation)
@@ -93,7 +93,7 @@ func TestPodmanRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 		t.Fatalf("task snapshot = %q", got)
 	}
 
-	batch, err := fixture.adapter.Logs(ctx, engine.LogsRequest{Identity: identity, Limit: 1 << 20})
+	batch, err := fixture.adapter.Logs(ctx, reconcile.LogsRequest{Identity: identity, Limit: 1 << 20})
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
@@ -123,14 +123,14 @@ func TestPodmanRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 		t.Fatalf("container resource limits = %q; want %q (default 2 CPUs / 2 GiB)", got, wantLimits)
 	}
 
-	evidence, err := fixture.adapter.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	evidence, err := fixture.adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
 	if err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
-	removal, err := fixture.adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}

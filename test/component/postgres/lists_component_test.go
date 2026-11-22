@@ -10,17 +10,17 @@ import (
 	"testing"
 	"time"
 
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	executionstore "github.com/optimiware/kodema/internal/adapter/store/units/execution"
+	"github.com/optimiware/kodema/internal/adapter/store/units/execution/snapshotdoc"
+	"github.com/optimiware/kodema/internal/adapter/store/units/work"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/request"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	executionstore "github.com/optimiware/kodema/internal/shell/store/units/execution"
-	"github.com/optimiware/kodema/internal/shell/store/units/execution/snapshotdoc"
-	"github.com/optimiware/kodema/internal/shell/store/units/work"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 
@@ -115,7 +115,7 @@ func TestExecutionListOrderAndFiltersOnPostgreSQL(t *testing.T) {
 	if err != nil || fmt.Sprint(viewIDs(byPipeline.Items)) != "[exec-a exec-b exec-c]" {
 		t.Fatalf("pipeline filter = %v, err=%v; want exec-a,exec-b,exec-c", viewIDs(byPipeline.Items), err)
 	}
-	byState, err := store.List(ctx, scope, execution.ListFilter{State: kernel.ExecutionQueued, Limit: 10})
+	byState, err := store.List(ctx, scope, execution.ListFilter{State: engine.ExecutionQueued, Limit: 10})
 	if err != nil || fmt.Sprint(viewIDs(byState.Items)) != "[exec-a exec-b exec-c]" {
 		t.Fatalf("state filter = %v, err=%v; want exec-a,exec-b,exec-c", viewIDs(byState.Items), err)
 	}

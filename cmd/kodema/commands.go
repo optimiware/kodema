@@ -15,15 +15,15 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/agent"
+	agentapp "github.com/optimiware/kodema/internal/apps/agent/app"
+	authapp "github.com/optimiware/kodema/internal/apps/auth"
+	"github.com/optimiware/kodema/internal/apps/git"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
+	"github.com/optimiware/kodema/internal/apps/git/app/actors"
+	"github.com/optimiware/kodema/internal/apps/services"
+	servicesapp "github.com/optimiware/kodema/internal/apps/services/app"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/userland/agent"
-	agentapp "github.com/optimiware/kodema/internal/userland/agent/app"
-	authapp "github.com/optimiware/kodema/internal/userland/app/auth"
-	"github.com/optimiware/kodema/internal/userland/git"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
-	"github.com/optimiware/kodema/internal/userland/git/app/actors"
-	"github.com/optimiware/kodema/internal/userland/services"
-	servicesapp "github.com/optimiware/kodema/internal/userland/services/app"
 )
 
 // newReadVerifier constructs the smart-HTTP read actor verifier. It is a small

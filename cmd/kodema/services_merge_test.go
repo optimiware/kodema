@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	servicesapp "github.com/optimiware/kodema/internal/userland/services/app"
+	servicesapp "github.com/optimiware/kodema/internal/apps/services/app"
 )
 
 // TestServicesMergeCoordinatorRequiresStateAndGitURL pins the merge-coordinator
