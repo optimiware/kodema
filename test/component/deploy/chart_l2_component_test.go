@@ -232,19 +232,27 @@ func TestKodemaChartKMSenvFromFollowsProfile(t *testing.T) {
 		t.Errorf("production envFrom marks the KMS credentials optional: %v", entry)
 	}
 
-	rendered, err = renderChartArgs(t, helm, "kodema", chart, kodemaProductionArgs("--set", "environment=development")...)
+	// environment=test uses keyfile and renders no kmsCredentials envFrom,
+	// while setting KODEMA_RUNTIME=kubernetes and staging /etc/kodema/keyfile/kek-v1.key.
+	rendered, err = renderChartArgs(t, helm, "kodema", chart, kodemaProductionArgs(
+		"--set", "environment=test",
+		"--set", "config.keyAdapter=keyfile",
+		"--set", "config.keyReference=keyfile:kek-v1",
+	)...)
 	if err != nil {
-		t.Fatalf("helm template kodema with environment=development: %v\n%s", err, rendered)
+		t.Fatalf("helm template kodema with environment=test: %v\n%s", err, rendered)
 	}
-	development := renderedObjectOfKind(t, rendered, "Deployment")
-	devContainers := containersOf(t, development)
-	devEnvFrom, ok := devContainers[0]["envFrom"].([]any)
-	if !ok || len(devEnvFrom) != 1 {
-		t.Fatalf("development render envFrom = %v", devContainers[0]["envFrom"])
+	testDep := renderedObjectOfKind(t, rendered, "Deployment")
+	testContainers := containersOf(t, testDep)
+	if envFrom, present := testContainers[0]["envFrom"]; present && envFrom != nil {
+		t.Errorf("test profile rendered kmsCredentials envFrom: %v", envFrom)
 	}
-	devEntry := objectAtKey(t, devEnvFrom[0].(map[string]any), "secretRef")
-	if optional, ok := devEntry["optional"].(bool); !ok || !optional {
-		t.Errorf("development envFrom does not mark the KMS credentials optional: %v", devEntry)
+	assertRenderedPodSecurity(t, rendered)
+
+	// environment=development cannot boot in-cluster and must be refused.
+	rendered, err = renderChartArgs(t, helm, "kodema", chart, kodemaProductionArgs("--set", "environment=development")...)
+	if err == nil {
+		t.Fatalf("helm template accepted environment=development:\n%s", rendered)
 	}
 }
 
@@ -276,9 +284,21 @@ func TestKodemaChartRequiresProductionOIDC(t *testing.T) {
 		t.Fatalf("helm template refused a production render with OIDC variables: %v\n%s", err, rendered)
 	}
 
+	// environment=test also requires OIDC variables (cmd/kodema/test_profile.go
+	// refuses to start without them).
+	rendered, err = renderChartArgs(t, helm, "kodema", chart,
+		"--set", "environment=test",
+		"--set", "config.keyAdapter=keyfile",
+		"--set", "config.keyReference=keyfile:kek-v1",
+	)
+	if err == nil {
+		t.Fatalf("helm template accepted a test render without OIDC variables:\n%s", rendered)
+	}
+
+	// environment=development cannot boot in-cluster and is refused.
 	rendered, err = renderChartArgs(t, helm, "kodema", chart, "--set", "environment=development")
-	if err != nil {
-		t.Fatalf("helm template refused a development render without OIDC variables: %v\n%s", err, rendered)
+	if err == nil {
+		t.Fatalf("helm template accepted environment=development:\n%s", rendered)
 	}
 
 	// The template guard is a second layer: with the schema requirement removed

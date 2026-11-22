@@ -97,7 +97,9 @@ kodema:
     keyCurrentVersion: 1
     mcpPath: "/mcp"
     workspacePVC:
-      storageClass: "sbs-default"
+      # Empty uses the cluster default StorageClass (for example local-path on
+      # k3s). Cloud overlays such as deploy/scw override this explicitly.
+      storageClass: ""
       size: "10Gi"
       accessMode: "ReadWriteOnce"
     workloadCA:
@@ -107,11 +109,17 @@ kodema:
       existingSecret: kodema-database
     broker:
       existingSecret: kodema-broker
+    # Mounted read-only at /etc/kodema/keys:
+    #   - KMS adapters (scw-kms, aws-kms, gcp-kms, vault-transit): expects
+    #     /etc/kodema/keys/kek-v<version>.blob matching config.keyCurrentVersion
+    #     (for example, Secret key "kek-v1.blob").
+    #   - keyfile (environment: test only): expects the raw 32-byte KEK under
+    #     Secret key "kek-v1.key" (or "kek-v1.blob").
     keys:
       existingSecret: kodema-keys
-    # Read only by the scw-kms adapter (SCW_SECRET_KEY). With aws-kms or
-    # gcp-kms in production the subchart renders no reference to it and
-    # requires the workload-identity annotation on the ServiceAccount instead.
+    # Read by scw-kms (SCW_SECRET_KEY) and vault-transit (VAULT_ADDR,
+    # VAULT_TOKEN, optional VAULT_NAMESPACE and VAULT_CACERT). With aws-kms,
+    # gcp-kms or environment: test the subchart renders no reference to it.
     kmsCredentials:
       existingSecret: kodema-kms-credentials
     tls:
@@ -188,4 +196,24 @@ oauthsonas:
   # http:// issuer, an empty issuer, a client without a non-empty id, a client
   # with an empty or inline `secret` since oauthsonas.config renders into a
   # ConfigMap, or a mismatched host/port) and must never contain the access code.
+  #
+  # Minimal valid example (note: api_audience must be an absolute URL, each
+  # client requires id + name + public: true, and each persona requires id,
+  # subject, email, name and roles):
+  # config: |
+  #   issuer: https://oauthsonas.kodema-system.svc.cluster.local:8443
+  #   api_audience: https://kodema.kodema-system.svc.cluster.local:8443
+  #   clients:
+  #     - id: kodema-cli
+  #       name: Kodema CLI
+  #       public: true
+  #       redirect_uris:
+  #         - http://127.0.0.1/callback
+  #   personas:
+  #     - id: admin
+  #       subject: admin
+  #       email: admin@localhost.test
+  #       name: Local Administrator
+  #       organization_id: tenant-a
+  #       roles: [admin]
   config: ""

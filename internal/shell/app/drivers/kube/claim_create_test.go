@@ -394,6 +394,42 @@ func TestCreateClaimRefusesTerminatingExistingClaim(t *testing.T) {
 	}
 }
 
+// TestCreateClaimOmitsStorageClassNameWhenEmpty proves an empty StorageClass
+// omits spec.storageClassName so Kubernetes uses the cluster's default
+// StorageClass instead of requesting static provisioning.
+func TestCreateClaimOmitsStorageClassNameWhenEmpty(t *testing.T) {
+	workspaceID := id.WorkspaceID("workspace-default-sc")
+	claimName := claimNameFor(t, workspaceID)
+	wantBody := fmt.Sprintf(`{
+	  "apiVersion": "v1",
+	  "kind": "PersistentVolumeClaim",
+	  "metadata": {
+	    "name": %q,
+	    "namespace": %q,
+	    "labels": {
+	      "kodema.dev/tenant": %q,
+	      "kodema.dev/workspace": %q
+	    }
+	  },
+	  "spec": {
+	    "accessModes": ["ReadWriteOnce"],
+	    "resources": {"requests": {"storage": "64Mi"}},
+	    "volumeMode": "Filesystem"
+	  }
+	}`, claimName, testNamespace, testNamespace, string(workspaceID))
+
+	api := newAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusCreated, ownedClaimWire(claimName, workspaceID))
+	})
+	cluster := newClusterFor(t, api)
+	spec := testClaimSpec(workspaceID)
+	spec.StorageClass = ""
+	if _, err := cluster.CreateClaim(context.Background(), spec); err != nil {
+		t.Fatalf("CreateClaim with empty StorageClass: %v", err)
+	}
+	assertJSONEqual(t, api.lastCall(t).Body, wantBody)
+}
+
 // TestCreateClaimRefusesInvalidSpecBeforeSending proves every incomplete or
 // malformed specification is refused before the API server sees a request.
 func TestCreateClaimRefusesInvalidSpecBeforeSending(t *testing.T) {
@@ -407,7 +443,7 @@ func TestCreateClaimRefusesInvalidSpecBeforeSending(t *testing.T) {
 		{name: "invalid tenant", mutate: func(spec *driverkube.ClaimSpec) { spec.TenantID = "tenant/acme" }},
 		{name: "empty workspace", mutate: func(spec *driverkube.ClaimSpec) { spec.WorkspaceID = "" }},
 		{name: "invalid workspace", mutate: func(spec *driverkube.ClaimSpec) { spec.WorkspaceID = "workspace 1" }},
-		{name: "empty storage class", mutate: func(spec *driverkube.ClaimSpec) { spec.StorageClass = "" }},
+		{name: "blank storage class", mutate: func(spec *driverkube.ClaimSpec) { spec.StorageClass = "   " }},
 		{name: "empty size", mutate: func(spec *driverkube.ClaimSpec) { spec.Size = "" }},
 		{name: "empty access mode", mutate: func(spec *driverkube.ClaimSpec) { spec.AccessMode = "" }},
 		{name: "unknown access mode", mutate: func(spec *driverkube.ClaimSpec) { spec.AccessMode = "ReadWriteTwice" }},

@@ -59,6 +59,8 @@ const (
 	KeyRefGCPKMSPrefix = "gcp-kms:"
 	// KeyRefScalewayKMSPrefix is the Scaleway KMS key reference prefix.
 	KeyRefScalewayKMSPrefix = "scw-kms:"
+	// KeyRefVaultTransitPrefix is the OpenBao / HashiCorp Vault Transit key reference prefix.
+	KeyRefVaultTransitPrefix = "vault-transit:"
 )
 
 // keyRefPrefix returns the one reference prefix the key adapter serves.
@@ -74,6 +76,8 @@ func keyRefPrefix(adapter KeyAdapter) (string, bool) {
 		return KeyRefGCPKMSPrefix, true
 	case KeyScalewayKMS:
 		return KeyRefScalewayKMSPrefix, true
+	case KeyVaultTransit:
+		return KeyRefVaultTransitPrefix, true
 	default:
 		return "", false
 	}
@@ -249,6 +253,8 @@ func (config Config) validateKeyReference() error {
 		return validateAWSKeyReference(name)
 	case KeyGCPKMS:
 		return validateGCPKeyReference(name)
+	case KeyVaultTransit:
+		return validateVaultTransitKeyReference(name)
 	default:
 		return nil
 	}

@@ -34,7 +34,8 @@ type ClaimSpec struct {
 	// WorkspaceID is the stable workspace identity the claim name and workspace
 	// ownership label are derived from. Required and validated.
 	WorkspaceID id.WorkspaceID
-	// StorageClass is the requested StorageClass. Required.
+	// StorageClass is the requested StorageClass. Empty selects the cluster's
+	// default StorageClass (storageClassName is omitted from the PVC spec).
 	StorageClass string
 	// Size is the requested storage quantity, for example "64Mi". Required.
 	Size string
@@ -55,7 +56,7 @@ type claimCreateBody struct {
 type claimSpecBody struct {
 	AccessModes      []string           `json:"accessModes"`
 	Resources        claimResourcesBody `json:"resources"`
-	StorageClassName string             `json:"storageClassName"`
+	StorageClassName string             `json:"storageClassName,omitempty"`
 	VolumeMode       string             `json:"volumeMode"`
 }
 
@@ -163,9 +164,9 @@ func buildClaimManifest(spec ClaimSpec) (claimCreateBody, string, error) {
 	if err != nil {
 		return claimCreateBody{}, "", err
 	}
-	if strings.TrimSpace(spec.StorageClass) == "" {
+	if spec.StorageClass != "" && strings.TrimSpace(spec.StorageClass) == "" {
 		return claimCreateBody{}, "", fault.New(fault.InvalidInput,
-			"kubernetes workspace claim requires a storage class")
+			"kubernetes workspace claim storage class must not be blank")
 	}
 	if strings.TrimSpace(spec.Size) == "" {
 		return claimCreateBody{}, "", fault.New(fault.InvalidInput,

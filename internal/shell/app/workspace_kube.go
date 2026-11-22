@@ -51,7 +51,8 @@ type WorkspacePVC struct {
 	Namespace string
 	// TenantID is the tenant ownership label value. Required and validated.
 	TenantID id.TenantID
-	// StorageClass is the requested StorageClass. Required.
+	// StorageClass is the requested StorageClass. Empty selects the cluster's
+	// default StorageClass.
 	StorageClass string
 	// Size is the requested storage quantity, for example "64Mi". Required.
 	Size string
@@ -80,8 +81,8 @@ func validateWorkspacePVC(template WorkspacePVC) error {
 	if _, err := id.ParseTenantID(string(template.TenantID)); err != nil {
 		return fault.New(fault.InvalidInput, "workspace claim template tenant id is invalid")
 	}
-	if strings.TrimSpace(template.StorageClass) == "" {
-		return fault.New(fault.InvalidInput, "workspace claim template requires a storage class")
+	if template.StorageClass != "" && strings.TrimSpace(template.StorageClass) == "" {
+		return fault.New(fault.InvalidInput, "workspace claim template storage class must not be blank")
 	}
 	if strings.TrimSpace(template.Size) == "" {
 		return fault.New(fault.InvalidInput, "workspace claim template requires a storage size")

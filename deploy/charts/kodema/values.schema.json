@@ -17,8 +17,8 @@
   "properties": {
     "environment": {
       "type": "string",
+      "description": "In-cluster composition profile. Only profiles that boot inside Kubernetes (production and test) are accepted; development uses in-memory state, --dev-token and plain HTTP.",
       "enum": [
-        "development",
         "test",
         "production"
       ]
@@ -805,11 +805,14 @@
       }
     },
     {
-      "description": "A production installation must carry the OIDC variables cmd/kodema/production.go reads. Development and test profiles may omit them.",
+      "description": "Every in-cluster profile (production and test) must carry the OIDC variables cmd/kodema/production.go and cmd/kodema/test_profile.go refuse to start without.",
       "if": {
         "properties": {
           "environment": {
-            "const": "production"
+            "enum": [
+              "production",
+              "test"
+            ]
           }
         },
         "required": [
@@ -837,7 +840,60 @@
       }
     },
     {
-      "description": "A production installation whose key adapter has a static cloud credential must name the KMS credentials Secret: scw-kms reads SCW_SECRET_KEY from it. Only aws-kms (EKS IRSA) and gcp-kms (GKE Workload Identity) are exempt, so an unknown adapter name cannot drop the requirement; for those two the chart renders no reference to the Secret and a value left in secrets.kmsCredentials is ignored. Development and test profiles may omit the Secret.",
+      "description": "In-cluster environment: test runs --profile test with the Kubernetes runtime and local keyfile; it requires config.keyAdapter=keyfile and needs no cloud KMS credentials Secret.",
+      "if": {
+        "properties": {
+          "environment": {
+            "const": "test"
+          }
+        },
+        "required": [
+          "environment"
+        ]
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "required": [
+              "keyAdapter"
+            ],
+            "properties": {
+              "keyAdapter": {
+                "const": "keyfile"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "Production refuses config.keyAdapter=keyfile; use scw-kms, aws-kms, gcp-kms or vault-transit.",
+      "if": {
+        "properties": {
+          "environment": {
+            "const": "production"
+          }
+        },
+        "required": [
+          "environment"
+        ]
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "keyAdapter": {
+                "not": {
+                  "const": "keyfile"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "A production installation whose key adapter has a static KMS credential must name the KMS credentials Secret: scw-kms reads SCW_SECRET_KEY and vault-transit reads VAULT_ADDR/VAULT_TOKEN from it. Only aws-kms (EKS IRSA) and gcp-kms (GKE Workload Identity) are exempt, so an unknown adapter name cannot drop the requirement; for those two the chart renders no reference to the Secret and a value left in secrets.kmsCredentials is ignored. Test profile uses keyfile and may omit the Secret.",
       "if": {
         "properties": {
           "environment": {

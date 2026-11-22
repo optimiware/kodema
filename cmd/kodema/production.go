@@ -118,7 +118,7 @@ func buildProduction(options serverOptions, getenv productionEnv, kube driverkub
 		"KODEMA_KEY_REF", "KODEMA_KEY_BLOBS_DIR",
 		"KODEMA_TLS_DIR",
 		"KODEMA_OIDC_ISSUER", "KODEMA_OIDC_AUDIENCE", "KODEMA_OIDC_JWKS_URL", "KODEMA_OIDC_TENANT_CLAIM",
-		"KODEMA_WORKSPACE_PVC_STORAGE_CLASS", "KODEMA_WORKSPACE_PVC_SIZE", "KODEMA_WORKSPACE_PVC_ACCESS_MODE",
+		"KODEMA_WORKSPACE_PVC_SIZE", "KODEMA_WORKSPACE_PVC_ACCESS_MODE",
 		"KODEMA_TOOLBOX_IMAGE",
 	} {
 		value, err := need(name)
@@ -232,11 +232,12 @@ func buildProduction(options serverOptions, getenv productionEnv, kube driverkub
 		return productionBuild{}, fmt.Errorf("server certificate: %w", err)
 	}
 
+	workspaceStorageClass := strings.TrimSpace(getenv("KODEMA_WORKSPACE_PVC_STORAGE_CLASS"))
 	template := func(namespace string, tenant id.TenantID) *shellapp.WorkspacePVC {
 		return &shellapp.WorkspacePVC{
 			Namespace:    namespace,
 			TenantID:     tenant,
-			StorageClass: values["KODEMA_WORKSPACE_PVC_STORAGE_CLASS"],
+			StorageClass: workspaceStorageClass,
 			Size:         values["KODEMA_WORKSPACE_PVC_SIZE"],
 			AccessMode:   values["KODEMA_WORKSPACE_PVC_ACCESS_MODE"],
 		}
@@ -580,11 +581,11 @@ type productionKeys struct {
 func productionKeyAdapter(getenv productionEnv) (installation.KeyAdapter, error) {
 	adapter := installation.KeyAdapter(strings.TrimSpace(getenv("KODEMA_KEY_ADAPTER")))
 	switch adapter {
-	case installation.KeyScalewayKMS, installation.KeyAWSKMS, installation.KeyGCPKMS:
+	case installation.KeyScalewayKMS, installation.KeyAWSKMS, installation.KeyGCPKMS, installation.KeyVaultTransit:
 		return adapter, nil
 	default:
-		return "", fmt.Errorf("production supports KODEMA_KEY_ADAPTER=%s, %s or %s only",
-			installation.KeyScalewayKMS, installation.KeyAWSKMS, installation.KeyGCPKMS)
+		return "", fmt.Errorf("production supports KODEMA_KEY_ADAPTER=%s, %s, %s or %s only",
+			installation.KeyScalewayKMS, installation.KeyAWSKMS, installation.KeyGCPKMS, installation.KeyVaultTransit)
 	}
 }
 
@@ -699,9 +700,28 @@ func productionKMS(adapter installation.KeyAdapter, keyRef secret.KeyRef, getenv
 			return nil, nil, err
 		}
 		return kms, keys.NewGCP, nil
+	case installation.KeyVaultTransit:
+		address, err := need("VAULT_ADDR")
+		if err != nil {
+			return nil, nil, err
+		}
+		token, err := need("VAULT_TOKEN")
+		if err != nil {
+			return nil, nil, err
+		}
+		kms, err := keys.NewVaultTransitKMS(keys.VaultTransitKMSConfig{
+			Address:   address,
+			Token:     token,
+			Namespace: strings.TrimSpace(getenv("VAULT_NAMESPACE")),
+			CAFile:    strings.TrimSpace(getenv("VAULT_CACERT")),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return kms, keys.NewVaultTransit, nil
 	default:
-		return nil, nil, fmt.Errorf("production supports KODEMA_KEY_ADAPTER=%s, %s or %s only",
-			installation.KeyScalewayKMS, installation.KeyAWSKMS, installation.KeyGCPKMS)
+		return nil, nil, fmt.Errorf("production supports KODEMA_KEY_ADAPTER=%s, %s, %s or %s only",
+			installation.KeyScalewayKMS, installation.KeyAWSKMS, installation.KeyGCPKMS, installation.KeyVaultTransit)
 	}
 }
 

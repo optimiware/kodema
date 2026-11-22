@@ -17,7 +17,9 @@ import (
 
 	"github.com/optimiware/kodema/internal/installation"
 	shellapp "github.com/optimiware/kodema/internal/shell/app"
+	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
 	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
+	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
 	"github.com/optimiware/kodema/internal/shell/secret"
 )
@@ -711,4 +713,95 @@ func TestResolveTestToolboxFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildTestProfileKubernetesRuntime(t *testing.T) {
+	newKubeFixture := func(t *testing.T) (*testProfileFixture, driverkube.InClusterConfig) {
+		t.Helper()
+		fixture := newTestProfileFixture(t)
+		delete(fixture.values, "KODEMA_PODMAN_SOCKET")
+		fixture.values["KODEMA_RUNTIME"] = "kubernetes"
+		fixture.values["KODEMA_TENANT"] = "tenant-a"
+		fixture.values["KODEMA_WORKSPACE_PVC_STORAGE_CLASS"] = ""
+		fixture.values["KODEMA_WORKSPACE_PVC_SIZE"] = "10Gi"
+		fixture.values["KODEMA_WORKSPACE_PVC_ACCESS_MODE"] = "ReadWriteOnce"
+		fixture.options.WorkloadURL = ""
+		fixture.options.PublicURL = "https://kodema.kodema-system.svc.cluster.local:8443"
+
+		saDir := t.TempDir()
+		selfSigned(t, saDir)
+		tokenPath := filepath.Join(saDir, "token")
+		if err := os.WriteFile(tokenPath, []byte("sa-token"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		kube := driverkube.InClusterConfig{
+			Server:    "https://kubernetes.default.svc:443",
+			CAFile:    filepath.Join(saDir, "tls.crt"),
+			TokenFile: tokenPath,
+		}
+		return fixture, kube
+	}
+
+	t.Run("single-tenant kubernetes with keyfile and cluster default storage class", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err != nil {
+			t.Fatalf("buildTestProfileWithKube: %v", err)
+		}
+		if build.Config.Installation.Runtime != installation.RuntimeKubernetes {
+			t.Fatalf("runtime = %q; want kubernetes", build.Config.Installation.Runtime)
+		}
+		if build.Config.Installation.Keys != installation.KeyKeyfile {
+			t.Fatalf("keys = %q; want keyfile", build.Config.Installation.Keys)
+		}
+		if _, ok := build.Config.Test.Runtime.(*runtimekube.Adapter); !ok {
+			t.Fatalf("Test.Runtime = %T; want *runtimekube.Adapter", build.Config.Test.Runtime)
+		}
+		if build.Config.Test.VolumeProvisioner != nil {
+			t.Fatal("Test.VolumeProvisioner must be nil for kubernetes runtime")
+		}
+		if build.Config.Test.ClaimProvisioner == nil {
+			t.Fatal("Test.ClaimProvisioner is nil")
+		}
+		if build.Config.WorkspacePVC == nil || build.Config.WorkspacePVC.StorageClass != "" || build.Config.WorkspacePVC.Size != "10Gi" {
+			t.Fatalf("WorkspacePVC = %+v; want empty StorageClass and 10Gi Size", build.Config.WorkspacePVC)
+		}
+		if build.Config.WorkloadURL != fixture.options.PublicURL {
+			t.Fatalf("WorkloadURL = %q; want %q", build.Config.WorkloadURL, fixture.options.PublicURL)
+		}
+	})
+
+	t.Run("multi-tenant kubernetes with keyfile", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		delete(fixture.values, "KODEMA_TENANT")
+		fixture.values["KODEMA_TENANTS"] = `["tenant-a","tenant-b"]`
+		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err != nil {
+			t.Fatalf("buildTestProfileWithKube multi-tenant: %v", err)
+		}
+		if len(build.Config.Test.Tenants) != 2 {
+			t.Fatalf("len(Test.Tenants) = %d; want 2", len(build.Config.Test.Tenants))
+		}
+		if build.Config.WorkspacePVC != nil {
+			t.Fatal("single-tenant WorkspacePVC must be nil when KODEMA_TENANTS is used")
+		}
+	})
+
+	t.Run("refuses KODEMA_PODMAN_SOCKET with kubernetes runtime", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		fixture.values["KODEMA_PODMAN_SOCKET"] = "/run/podman.sock"
+		_, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err == nil || !strings.Contains(err.Error(), "KODEMA_PODMAN_SOCKET") {
+			t.Fatalf("err = %v; want refusal naming KODEMA_PODMAN_SOCKET", err)
+		}
+	})
+
+	t.Run("refuses unknown KODEMA_RUNTIME", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		fixture.values["KODEMA_RUNTIME"] = "docker"
+		_, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err == nil || !strings.Contains(err.Error(), "KODEMA_RUNTIME") {
+			t.Fatalf("err = %v; want refusal naming KODEMA_RUNTIME", err)
+		}
+	})
 }

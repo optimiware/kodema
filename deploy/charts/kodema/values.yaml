@@ -40,8 +40,9 @@ config:
   # Server environment, name to literal string. This is a narrow allowlist,
   # repeated in values.schema.json and templates/_extraenv.tpl:
   #
-  # REQUIRED for environment: production (the render fails without them or with
-  # an empty value; cmd/kodema/production.go refuses to start):
+  # REQUIRED for environment: production and environment: test (the render
+  # fails without them or with an empty value; cmd/kodema/production.go and
+  # cmd/kodema/test_profile.go refuse to start):
   #   KODEMA_OIDC_ISSUER, KODEMA_OIDC_AUDIENCE, KODEMA_OIDC_JWKS_URL,
   #   KODEMA_OIDC_TENANT_CLAIM
   #
@@ -50,7 +51,7 @@ config:
   #
   # Optional:
   #   KODEMA_OIDC_{SUBJECT_CLAIM,PROJECT_CLAIM,CA_FILE}
-  #                                            (cmd/kodema/production.go)
+  #                                            (cmd/kodema/production.go, test_profile.go)
   #   KODEMA_DISCOVERY_{ISSUER,CLIENT_ID,AUDIENCE,AUTHORIZATION_ENDPOINT,
   #                     TOKEN_ENDPOINT,DEVICE_AUTHORIZATION_ENDPOINT,
   #                     REVOCATION_ENDPOINT,SCOPES,API_URL}
@@ -69,7 +70,9 @@ config:
   # Never put a secret here; credentials come from Secrets.
   extraEnv: {}
   workspacePVC:
-    storageClass: "sbs-default"
+    # Empty selects the cluster's default StorageClass (e.g. local-path on k3s).
+    # Cloud overlays (such as deploy/scw with sbs-default) override this explicitly.
+    storageClass: ""
     size: "10Gi"
     accessMode: "ReadWriteOnce"
   workloadCA:
@@ -80,19 +83,29 @@ secrets:
     existingSecret: kodema-database
   broker:
     existingSecret: kodema-broker
+  # Key material Secret mounted read-only at /etc/kodema/keys:
+  #   - KMS adapters (scw-kms, aws-kms, gcp-kms, vault-transit): must contain
+  #     the KMS-wrapped KEK blob at /etc/kodema/keys/kek-v<version>.blob
+  #     matching config.keyCurrentVersion (for example, key "kek-v1.blob").
+  #   - keyfile (environment: test only): must contain the raw 32-byte KEK
+  #     under key "kek-v1.key" (or "kek-v1.blob"), which the prepare-keyfile
+  #     initContainer stages into a mode-0400 in-memory file at
+  #     /etc/kodema/keyfile/kek-v1.key.
   keys:
     existingSecret: kodema-keys
-  # The static cloud KMS credential, by config.keyAdapter:
-  #   scw-kms  REQUIRED for environment: production. The production composition
-  #            reads SCW_SECRET_KEY from this Secret.
-  #   aws-kms  not used. The pod authenticates with EKS IRSA: set
-  #            serviceAccount.annotations."eks.amazonaws.com/role-arn".
-  #   gcp-kms  not used. The pod authenticates with GKE Workload Identity: set
-  #            serviceAccount.annotations."iam.gke.io/gcp-service-account".
-  # For aws-kms and gcp-kms in production the chart renders no reference to
-  # this Secret, so the value below is ignored and the Secret need not exist;
-  # the render fails instead when the ServiceAccount the chart creates lacks
-  # the annotation. A development or test profile may omit the Secret.
+  # The static KMS credential Secret, by config.keyAdapter:
+  #   scw-kms        REQUIRED for environment: production. Reads SCW_SECRET_KEY
+  #                  from this Secret.
+  #   vault-transit  REQUIRED for environment: production. Reads VAULT_ADDR and
+  #                  VAULT_TOKEN (plus optional VAULT_NAMESPACE, VAULT_CACERT)
+  #                  from this Secret.
+  #   aws-kms        not used. The pod authenticates with EKS IRSA: set
+  #                  serviceAccount.annotations."eks.amazonaws.com/role-arn".
+  #   gcp-kms        not used. The pod authenticates with GKE Workload Identity:
+  #                  set serviceAccount.annotations."iam.gke.io/gcp-service-account".
+  #   keyfile        not used (environment: test only; refused in production).
+  # For aws-kms, gcp-kms and environment: test the chart renders no reference
+  # to this Secret, so the value below is ignored and the Secret need not exist.
   kmsCredentials:
     existingSecret: kodema-kms-credentials
   tls:
@@ -126,10 +139,18 @@ networkPolicy:
   permitGit: true
   # Hosts tenant workloads may reach on 443 (Cilium FQDN policy), for example
   # ["registry.npmjs.org"]. Empty keeps workloads on cluster-internal traffic.
-  # The policy needs the cilium.io/v2 CiliumNetworkPolicy CRD: on a cluster
-  # without Cilium FQDN support this renders no policy at all, it never
-  # approximates the allowlist with CIDR or entity rules. Cilium's DNS proxy
-  # must also be enabled (enable-l7-proxy) for the DNS rule to work.
+  # The policy needs the cilium.io/v2 CiliumNetworkPolicy CRD: setting a
+  # non-empty egressFQDNs list on a cluster without Cilium fails render time
+  # rather than silently leaving workloads blocked behind default-deny.
+  # Cilium's DNS proxy must also be enabled (enable-l7-proxy) for the DNS rule
+  # to work.
+  #
+  # k3s networking prerequisites:
+  #   - Default k3s (flannel + kube-router NetworkPolicy): ensure the host has
+  #     br_netfilter loaded and net.bridge.bridge-nf-call-iptables=1.
+  #   - When FQDN egress allowlists are needed on k3s: start k3s with
+  #     --flannel-backend=none --disable-network-policy and install Cilium with
+  #     enable-l7-proxy enabled.
   egressFQDNs: []
 
 securityContext:
@@ -248,7 +269,7 @@ gitService:
   #     tls:
   #       existingSecret: kodema-tls
   #     storage:
-  #       storageClass: sbs-default
+  #       storageClass: ""
   #       size: 10Gi
   #       accessMode: ReadWriteOnce
   #     # The only pod sources permitted to reach the Git service. Each entry

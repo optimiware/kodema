@@ -63,7 +63,7 @@ func loadKMSReferences(t *testing.T) kmsReferenceCorpus {
 	t.Helper()
 	var corpus kmsReferenceCorpus
 	readTestJSON(t, "kms_references.json", &corpus)
-	for _, name := range []string{"aws", "gcp", "scaleway"} {
+	for _, name := range []string{"aws", "gcp", "scaleway", "vault_transit"} {
 		provider, ok := corpus.Providers[name]
 		if !ok {
 			t.Fatalf("kms reference corpus has no %s provider section", name)
@@ -149,6 +149,8 @@ func buildKMSProvider(t *testing.T, provider, reference string, client keys.KMSC
 		return keys.NewGCP(client, config, nil)
 	case "scaleway":
 		return keys.NewScaleway(client, config, nil)
+	case "vault_transit":
+		return keys.NewVaultTransit(client, config, nil)
 	default:
 		t.Fatalf("kms reference vector names unknown cloud provider %q", provider)
 		return nil, nil
@@ -251,6 +253,12 @@ func TestAWSKeyReferenceGrammar(t *testing.T) {
 // both real seams.
 func TestGCPKeyReferenceGrammar(t *testing.T) {
 	runKMSGrammar(t, "gcp")
+}
+
+// TestVaultTransitKeyReferenceGrammar pins the accepted and refused Vault
+// Transit forms through both real seams.
+func TestVaultTransitKeyReferenceGrammar(t *testing.T) {
+	runKMSGrammar(t, "vault_transit")
 }
 
 // TestKMSReferencePreflightProviderParity proves the two independent parsers

@@ -3,9 +3,13 @@ Opt-in egress to named internet hosts for tenant workloads (for example a
 package registry). The Kubernetes default-deny policy stays in force and this
 only adds allowed destinations, so a build can reach exactly the hosts listed in
 networkPolicy.egressFQDNs on 443 and nothing else. It needs Cilium's FQDN
-support and is skipped, never approximated, on a cluster without the CRD.
+support and fails rendering, never approximating or silently dropping the
+allowlist, on a cluster without the cilium.io/v2/CiliumNetworkPolicy CRD.
 */ -}}
-{{- if and .Values.networkPolicy.egressFQDNs (.Capabilities.APIVersions.Has "cilium.io/v2/CiliumNetworkPolicy") }}
+{{- if .Values.networkPolicy.egressFQDNs }}
+{{- if not (.Capabilities.APIVersions.Has "cilium.io/v2/CiliumNetworkPolicy") }}
+{{- fail "networkPolicy.egressFQDNs requires the cilium.io/v2/CiliumNetworkPolicy CRD, which this cluster does not advertise (for offline helm template pass --api-versions cilium.io/v2/CiliumNetworkPolicy; on k3s run with --flannel-backend=none --disable-network-policy and install Cilium with enable-l7-proxy)" }}
+{{- end }}
 {{- range $tenant := .Values.tenants }}
 ---
 apiVersion: cilium.io/v2

@@ -137,6 +137,28 @@
         {"name": "space after prefix", "reference": "scw-kms: fr-par/kid"},
         {"name": "uppercase scheme prefix", "reference": "SCW-KMS:fr-par/kid"}
       ]
+    },
+    "vault_transit": {
+      "adapter": "vault-transit",
+      "environment": "production",
+      "accepted": [
+        {"name": "standard mount and key", "reference": "vault-transit:transit/kodema-kek"},
+        {"name": "nested mount and dotted key", "reference": "vault-transit:platform/transit/kodema.kek_1"}
+      ],
+      "refused": [
+        {"name": "empty reference", "reference": "vault-transit:"},
+        {"name": "missing mount", "reference": "vault-transit:kodema-kek"},
+        {"name": "empty key", "reference": "vault-transit:transit/"},
+        {"name": "leading slash", "reference": "vault-transit:/transit/kodema-kek"},
+        {"name": "double slash", "reference": "vault-transit:transit//kodema-kek"},
+        {"name": "traversal mount", "reference": "vault-transit:../kodema-kek"},
+        {"name": "traversal key", "reference": "vault-transit:transit/a..b"},
+        {"name": "query string", "reference": "vault-transit:transit/kodema-kek?x=1"},
+        {"name": "fragment", "reference": "vault-transit:transit/kodema-kek#frag"},
+        {"name": "percent escape", "reference": "vault-transit:transit/%2e%2e"},
+        {"name": "space after prefix", "reference": "vault-transit: transit/kodema-kek"},
+        {"name": "uppercase scheme prefix", "reference": "VAULT-TRANSIT:transit/kodema-kek"}
+      ]
     }
   },
   "preserved": [

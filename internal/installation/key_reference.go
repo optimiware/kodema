@@ -299,3 +299,68 @@ func validateGCPKeyReference(body string) error {
 	}
 	return nil
 }
+
+// validVaultTransitMountSegment accepts one Vault/OpenBao mount path segment:
+// 1 to 63 ASCII letters, digits, hyphens or underscores starting with an
+// alphanumeric character.
+func validVaultTransitMountSegment(segment string) bool {
+	if len(segment) == 0 || len(segment) > 63 {
+		return false
+	}
+	for index, character := range segment {
+		switch {
+		case character >= 'A' && character <= 'Z':
+		case character >= 'a' && character <= 'z':
+		case character >= '0' && character <= '9':
+		case character == '-' || character == '_':
+			if index == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validVaultTransitKeyName accepts a Vault/OpenBao Transit key name: 1 to 128
+// ASCII letters, digits, dots, hyphens or underscores starting with an
+// alphanumeric character and without ".." traversal sequences.
+func validVaultTransitKeyName(name string) bool {
+	if len(name) == 0 || len(name) > 128 || strings.Contains(name, "..") {
+		return false
+	}
+	for index, character := range name {
+		switch {
+		case character >= 'A' && character <= 'Z':
+		case character >= 'a' && character <= 'z':
+		case character >= '0' && character <= '9':
+		case character == '-' || character == '_' || character == '.':
+			if index == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateVaultTransitKeyReference validates the reference body after the
+// "vault-transit:" family prefix: <mount>/<key-name> (with optional nested
+// mount segments such as "platform/transit/kodema-kek").
+func validateVaultTransitKeyReference(body string) error {
+	parts := strings.Split(body, "/")
+	if len(parts) < 2 || len(parts) > 8 {
+		return fault.New(fault.InvalidInput, "vault transit key reference must be vault-transit:<mount>/<key-name>")
+	}
+	for _, segment := range parts[:len(parts)-1] {
+		if !validVaultTransitMountSegment(segment) {
+			return fault.New(fault.InvalidInput, "vault transit key reference has an invalid mount path")
+		}
+	}
+	if !validVaultTransitKeyName(parts[len(parts)-1]) {
+		return fault.New(fault.InvalidInput, "vault transit key reference has an invalid key name")
+	}
+	return nil
+}

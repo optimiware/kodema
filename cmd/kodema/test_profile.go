@@ -16,9 +16,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
 	"github.com/optimiware/kodema/internal/kernel/definition"
 	shellapp "github.com/optimiware/kodema/internal/shell/app"
+	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
 	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
 	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
 	"github.com/optimiware/kodema/internal/shell/identity"
@@ -38,13 +40,33 @@ const testProfileLoopInterval = time.Second
 // container network forwards to, never on loopback alone.
 var hostAliases = map[string]bool{"host.containers.internal": true, "host.docker.internal": true}
 
-// buildTestProfile assembles KODEMA.md's single-host `test` environment from
-// the parsed options and the process environment: PostgreSQL and NATS, the
-// Podman runtime over an explicit API socket, an existing local keyfile, OIDC
-// humans and HTTPS. Every setting is explicit; nothing is auto-detected, no
-// key is created and no dependency is dialed here, so a wrong installation is
-// an exit-2 refusal whose text names settings, never their values.
+// testProfileRuntime reads the explicitly selected workload runtime for the
+// durable test profile. Empty defaults to podman for single-host compatibility;
+// kubernetes selects the in-cluster Job runtime with the local keyfile.
+func testProfileRuntime(getenv productionEnv) (installation.RuntimeAdapter, error) {
+	switch strings.TrimSpace(getenv("KODEMA_RUNTIME")) {
+	case "", string(installation.RuntimePodman):
+		return installation.RuntimePodman, nil
+	case string(installation.RuntimeKubernetes):
+		return installation.RuntimeKubernetes, nil
+	default:
+		return "", fmt.Errorf("test profile supports KODEMA_RUNTIME=%s or %s only",
+			installation.RuntimePodman, installation.RuntimeKubernetes)
+	}
+}
+
+// buildTestProfile assembles KODEMA.md's durable `test` environment from the
+// parsed options and the process environment: PostgreSQL and NATS, either the
+// single-host Podman runtime or the in-cluster Kubernetes Job runtime
+// (KODEMA_RUNTIME=kubernetes), an existing local keyfile, OIDC humans and
+// HTTPS. Every setting is explicit; nothing is auto-detected, no key is
+// created and no dependency is dialed here, so a wrong installation is an
+// exit-2 refusal whose text names settings, never their values.
 func buildTestProfile(options serverOptions, getenv productionEnv) (productionBuild, error) {
+	return buildTestProfileWithKube(options, getenv, driverkube.InClusterConfig{})
+}
+
+func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube driverkube.InClusterConfig) (productionBuild, error) {
 	if len(options.DevTokens) > 0 {
 		return productionBuild{}, fmt.Errorf("test profile refuses development tokens; humans sign in through OIDC")
 	}
@@ -54,6 +76,10 @@ func buildTestProfile(options serverOptions, getenv productionEnv) (productionBu
 	if strings.TrimSpace(options.DataDir) == "" || !filepath.IsAbs(options.DataDir) {
 		return productionBuild{}, fmt.Errorf("test profile requires an absolute persistent data directory (--data-dir or KODEMA_DATA_DIR)")
 	}
+	runtimeKind, err := testProfileRuntime(getenv)
+	if err != nil {
+		return productionBuild{}, err
+	}
 	loopInterval, err := resolvedLoopInterval(options.LoopInterval, testProfileLoopInterval)
 	if err != nil {
 		return productionBuild{}, err
@@ -62,20 +88,47 @@ func buildTestProfile(options serverOptions, getenv productionEnv) (productionBu
 	if err != nil {
 		return productionBuild{}, err
 	}
-	workloadURL, workloadHost, err := validateWorkloadURL(options.WorkloadURL)
+	registryCredentials, err := productionRegistryCredentials(getenv)
 	if err != nil {
 		return productionBuild{}, err
 	}
-	if hostAliases[strings.ToLower(workloadHost)] && loopbackListener(options.Address) {
-		return productionBuild{}, fmt.Errorf("the workload URL names the container host alias but --address listens on loopback only; workloads cannot reach it")
+
+	var workloadURL string
+	if runtimeKind == installation.RuntimePodman {
+		var workloadHost string
+		workloadURL, workloadHost, err = validateWorkloadURL(options.WorkloadURL)
+		if err != nil {
+			return productionBuild{}, err
+		}
+		if hostAliases[strings.ToLower(workloadHost)] && loopbackListener(options.Address) {
+			return productionBuild{}, fmt.Errorf("the workload URL names the container host alias but --address listens on loopback only; workloads cannot reach it")
+		}
+	} else {
+		if strings.TrimSpace(getenv("KODEMA_PODMAN_SOCKET")) != "" {
+			return productionBuild{}, fmt.Errorf("test profile with KODEMA_RUNTIME=kubernetes refuses KODEMA_PODMAN_SOCKET")
+		}
+		if strings.TrimSpace(options.WorkloadURL) != "" {
+			workloadURL, _, err = validateWorkloadURL(options.WorkloadURL)
+			if err != nil {
+				return productionBuild{}, err
+			}
+		} else {
+			workloadURL = strings.TrimSuffix(strings.TrimSpace(options.PublicURL), "/")
+		}
 	}
 
-	values := map[string]string{}
-	for _, name := range []string{
+	requiredEnv := []string{
 		"KODEMA_DATABASE_URL", "KODEMA_CONTROLLER_DATABASE_URL", "KODEMA_PUBLISHER_DATABASE_URL", "KODEMA_AUTH_DATABASE_URL",
-		"KODEMA_NATS_URL", "KODEMA_PODMAN_SOCKET", "KODEMA_TLS_DIR",
+		"KODEMA_NATS_URL", "KODEMA_TLS_DIR",
 		"KODEMA_OIDC_ISSUER", "KODEMA_OIDC_AUDIENCE", "KODEMA_OIDC_JWKS_URL", "KODEMA_OIDC_TENANT_CLAIM",
-	} {
+	}
+	if runtimeKind == installation.RuntimePodman {
+		requiredEnv = append(requiredEnv, "KODEMA_PODMAN_SOCKET")
+	} else {
+		requiredEnv = append(requiredEnv, "KODEMA_WORKSPACE_PVC_SIZE", "KODEMA_WORKSPACE_PVC_ACCESS_MODE")
+	}
+	values := map[string]string{}
+	for _, name := range requiredEnv {
 		value := strings.TrimSpace(getenv(name))
 		if value == "" {
 			return productionBuild{}, fmt.Errorf("test profile requires %s", name)
@@ -91,7 +144,7 @@ func buildTestProfile(options serverOptions, getenv productionEnv) (productionBu
 		Environment: installation.EnvironmentTest,
 		State:       installation.StatePostgres,
 		Messaging:   installation.MessagingNATS,
-		Runtime:     installation.RuntimePodman,
+		Runtime:     runtimeKind,
 		Keys:        installation.KeyKeyfile,
 		DatabaseURL: values["KODEMA_DATABASE_URL"],
 		NATSURL:     values["KODEMA_NATS_URL"],
@@ -114,13 +167,6 @@ func buildTestProfile(options serverOptions, getenv productionEnv) (productionBu
 	natsTLS, err := testBrokerTLS(getenv)
 	if err != nil {
 		return productionBuild{}, err
-	}
-	socket := values["KODEMA_PODMAN_SOCKET"]
-	if !filepath.IsAbs(socket) {
-		return productionBuild{}, fmt.Errorf("KODEMA_PODMAN_SOCKET must be an absolute path")
-	}
-	if info, err := os.Stat(socket); err != nil || info.Mode()&os.ModeSocket == 0 {
-		return productionBuild{}, fmt.Errorf("KODEMA_PODMAN_SOCKET does not name an existing Unix socket")
 	}
 	// The server reads an existing key only; `bootstrap-admin --profile test
 	// --init-keyfile` is the one explicit way to create it.
@@ -159,47 +205,30 @@ func buildTestProfile(options serverOptions, getenv productionEnv) (productionBu
 			return productionBuild{}, fmt.Errorf("discovery audience differs from KODEMA_OIDC_AUDIENCE")
 		}
 	}
-
-	workloadCAFile, err := resolveTestWorkloadCAFile(options, values["KODEMA_TLS_DIR"], getenv)
-	if err != nil {
-		return productionBuild{}, err
-	}
-
-	libpod, err := podmandriver.NewLibpod(podmandriver.LibpodConfig{SocketPath: socket})
-	if err != nil {
-		return productionBuild{}, fmt.Errorf("podman client: %w", err)
-	}
-	runtimeRoot := filepath.Join(options.DataDir, "runtime")
-	files, err := podmandriver.NewFiles(runtimeRoot)
-	if err != nil {
-		return productionBuild{}, fmt.Errorf("podman runtime root under the data directory: %w", err)
-	}
-	toolboxFile, err := resolveTestToolboxFile(options.ToolboxFile, runtime.GOOS, os.Executable)
-	if err != nil {
-		return productionBuild{}, err
-	}
-	workloadResources, err := resolveTestWorkloadResources(options, getenv)
-	if err != nil {
-		return productionBuild{}, err
-	}
-	adapter, err := runtimepodman.New(runtimepodman.Config{
-		Libpod:         libpod,
-		Files:          files,
-		Root:           runtimeRoot,
-		KodemaURL:      workloadURL,
-		WorkloadCAFile: workloadCAFile,
-		ToolboxFile:    toolboxFile,
-		GitURL:         options.WorkloadGitURL,
-		Resources:      workloadResources,
-		Cleanup:        runtimepodman.CleanupPolicy{Attempts: 3, Backoff: time.Second},
-	})
-	if err != nil {
-		return productionBuild{}, fmt.Errorf("podman runtime: %w", err)
-	}
-
 	gitCompanion, err := resolveGitCompanionConfig(getenv)
 	if err != nil {
 		return productionBuild{}, err
+	}
+
+	testConfig := &shellapp.TestConfig{
+		KeyfilePath: keyfilePath,
+		OIDC: oidc.Config{
+			OIDCConfig:    identity.OIDCConfig{Issuer: values["KODEMA_OIDC_ISSUER"], Audience: values["KODEMA_OIDC_AUDIENCE"], ClockSkew: time.Minute},
+			JWKSURL:       values["KODEMA_OIDC_JWKS_URL"],
+			Algorithms:    []string{oidc.AlgorithmRS256, oidc.AlgorithmES256},
+			HTTPClient:    oidcClient,
+			MaxJWKSBytes:  1 << 20,
+			MaxTokenBytes: 1 << 20,
+			CacheTTL:      10 * time.Minute,
+			SubjectClaim:  strings.TrimSpace(getenv("KODEMA_OIDC_SUBJECT_CLAIM")),
+			TenantClaim:   values["KODEMA_OIDC_TENANT_CLAIM"],
+			ProjectClaim:  strings.TrimSpace(getenv("KODEMA_OIDC_PROJECT_CLAIM")),
+		},
+		Registry:      registry.Config{Transport: http.DefaultTransport, Credentials: registryCredentials},
+		NATSTLS:       natsTLS,
+		ControllerURL: values["KODEMA_CONTROLLER_DATABASE_URL"],
+		PublisherURL:  values["KODEMA_PUBLISHER_DATABASE_URL"],
+		AuthURL:       values["KODEMA_AUTH_DATABASE_URL"],
 	}
 
 	config := shellapp.Config{
@@ -219,32 +248,125 @@ func buildTestProfile(options serverOptions, getenv productionEnv) (productionBu
 		Models:               models,
 		WorkloadURL:          workloadURL,
 		ToolProxy:            toolProxy,
-		Test: &shellapp.TestConfig{
-			Runtime:           adapter,
-			Workspace:         adapter,
-			VolumeProvisioner: libpod,
-			RuntimeReady:      libpod.Ping,
-			RuntimeCloser:     libpod.Close,
-			KeyfilePath:       keyfilePath,
-			OIDC: oidc.Config{
-				OIDCConfig:    identity.OIDCConfig{Issuer: values["KODEMA_OIDC_ISSUER"], Audience: values["KODEMA_OIDC_AUDIENCE"], ClockSkew: time.Minute},
-				JWKSURL:       values["KODEMA_OIDC_JWKS_URL"],
-				Algorithms:    []string{oidc.AlgorithmRS256, oidc.AlgorithmES256},
-				HTTPClient:    oidcClient,
-				MaxJWKSBytes:  1 << 20,
-				MaxTokenBytes: 1 << 20,
-				CacheTTL:      10 * time.Minute,
-				SubjectClaim:  strings.TrimSpace(getenv("KODEMA_OIDC_SUBJECT_CLAIM")),
-				TenantClaim:   values["KODEMA_OIDC_TENANT_CLAIM"],
-				ProjectClaim:  strings.TrimSpace(getenv("KODEMA_OIDC_PROJECT_CLAIM")),
-			},
-			Registry:      registry.Config{Transport: http.DefaultTransport},
-			NATSTLS:       natsTLS,
-			ControllerURL: values["KODEMA_CONTROLLER_DATABASE_URL"],
-			PublisherURL:  values["KODEMA_PUBLISHER_DATABASE_URL"],
-			AuthURL:       values["KODEMA_AUTH_DATABASE_URL"],
-		},
+		Test:                 testConfig,
 	}
+
+	if runtimeKind == installation.RuntimePodman {
+		socket := values["KODEMA_PODMAN_SOCKET"]
+		if !filepath.IsAbs(socket) {
+			return productionBuild{}, fmt.Errorf("KODEMA_PODMAN_SOCKET must be an absolute path")
+		}
+		if info, err := os.Stat(socket); err != nil || info.Mode()&os.ModeSocket == 0 {
+			return productionBuild{}, fmt.Errorf("KODEMA_PODMAN_SOCKET does not name an existing Unix socket")
+		}
+		workloadCAFile, err := resolveTestWorkloadCAFile(options, values["KODEMA_TLS_DIR"], getenv)
+		if err != nil {
+			return productionBuild{}, err
+		}
+		libpod, err := podmandriver.NewLibpod(podmandriver.LibpodConfig{SocketPath: socket})
+		if err != nil {
+			return productionBuild{}, fmt.Errorf("podman client: %w", err)
+		}
+		runtimeRoot := filepath.Join(options.DataDir, "runtime")
+		files, err := podmandriver.NewFiles(runtimeRoot)
+		if err != nil {
+			return productionBuild{}, fmt.Errorf("podman runtime root under the data directory: %w", err)
+		}
+		toolboxFile, err := resolveTestToolboxFile(options.ToolboxFile, runtime.GOOS, os.Executable)
+		if err != nil {
+			return productionBuild{}, err
+		}
+		workloadResources, err := resolveTestWorkloadResources(options, getenv)
+		if err != nil {
+			return productionBuild{}, err
+		}
+		adapter, err := runtimepodman.New(runtimepodman.Config{
+			Libpod:         libpod,
+			Files:          files,
+			Root:           runtimeRoot,
+			KodemaURL:      workloadURL,
+			WorkloadCAFile: workloadCAFile,
+			ToolboxFile:    toolboxFile,
+			GitURL:         options.WorkloadGitURL,
+			Resources:      workloadResources,
+			Cleanup:        runtimepodman.CleanupPolicy{Attempts: 3, Backoff: time.Second},
+		})
+		if err != nil {
+			return productionBuild{}, fmt.Errorf("podman runtime: %w", err)
+		}
+		testConfig.Runtime = adapter
+		testConfig.Workspace = adapter
+		testConfig.VolumeProvisioner = libpod
+		testConfig.RuntimeReady = libpod.Ping
+		testConfig.RuntimeCloser = libpod.Close
+	} else {
+		tenants, err := parseProductionTenants(getenv)
+		if err != nil {
+			return productionBuild{}, err
+		}
+		kubeConfig := kube
+		if kubeConfig.Server == "" {
+			host, port := getenv("KUBERNETES_SERVICE_HOST"), getenv("KUBERNETES_SERVICE_PORT")
+			if host == "" || port == "" {
+				return productionBuild{}, fmt.Errorf("test profile with KODEMA_RUNTIME=kubernetes runs inside the cluster: KUBERNETES_SERVICE_HOST/PORT are unset")
+			}
+			kubeConfig.Server = "https://" + net.JoinHostPort(host, port)
+		}
+		cluster, err := driverkube.NewCluster(driverkube.ClusterConfig{InCluster: &kubeConfig, Timeout: 2 * time.Minute})
+		if err != nil {
+			return productionBuild{}, fmt.Errorf("kubernetes client: %w", err)
+		}
+		workspaceStorageClass := strings.TrimSpace(getenv("KODEMA_WORKSPACE_PVC_STORAGE_CLASS"))
+		template := func(namespace string, tenant id.TenantID) *shellapp.WorkspacePVC {
+			return &shellapp.WorkspacePVC{
+				Namespace:    namespace,
+				TenantID:     tenant,
+				StorageClass: workspaceStorageClass,
+				Size:         values["KODEMA_WORKSPACE_PVC_SIZE"],
+				AccessMode:   values["KODEMA_WORKSPACE_PVC_ACCESS_MODE"],
+			}
+		}
+		kubeOptions := options
+		kubeOptions.PublicURL = workloadURL
+		namespaces := make([]string, 0, len(tenants.entries))
+		if tenants.list {
+			testConfig.Tenants = make([]shellapp.ProductionTenant, 0, len(tenants.entries))
+			for _, entry := range tenants.entries {
+				adapter, err := newProductionTenantAdapter(getenv, cluster, entry, kubeOptions)
+				if err != nil {
+					return productionBuild{}, err
+				}
+				testConfig.Tenants = append(testConfig.Tenants, shellapp.ProductionTenant{
+					TenantID:     entry.ID,
+					Runtime:      adapter,
+					Workspace:    adapter,
+					WorkspacePVC: template(entry.Namespace, entry.ID),
+				})
+				namespaces = append(namespaces, entry.Namespace)
+			}
+		} else {
+			entry := tenants.entries[0]
+			adapter, err := newProductionTenantAdapter(getenv, cluster, entry, kubeOptions)
+			if err != nil {
+				return productionBuild{}, err
+			}
+			testConfig.Runtime = adapter
+			testConfig.Workspace = adapter
+			config.WorkspacePVC = template(entry.Namespace, entry.ID)
+			namespaces = append(namespaces, entry.Namespace)
+		}
+		testConfig.ClaimProvisioner = cluster
+		testConfig.RuntimeCloser = func(context.Context) error { return nil }
+		testConfig.RuntimeReady = func(ctx context.Context) error {
+			for _, ns := range namespaces {
+				if _, err := cluster.GetNamespace(ctx, ns); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
 	return productionBuild{Config: config, TLS: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}}, nil
 }
 
@@ -478,7 +600,11 @@ func runTestProfile(ctx context.Context, options serverOptions, stderr io.Writer
 		fmt.Fprintf(stderr, "kodema: %v\n", err)
 		return 2
 	}
-	fmt.Fprintln(stderr, "kodema: test profile: single host, local keyfile; not a production installation")
+	if built.Config.Installation.Runtime == installation.RuntimeKubernetes {
+		fmt.Fprintln(stderr, "kodema: test profile: kubernetes runtime, local keyfile; not a production installation")
+	} else {
+		fmt.Fprintln(stderr, "kodema: test profile: single host, local keyfile; not a production installation")
+	}
 	// A dependency failure may quote a credential or a DSN in its private
 	// diagnostic, so these branches render fixed text naming only the step.
 	app, err := deps.newApp(ctx, built.Config)

@@ -16,6 +16,9 @@ infrastructure, following the [production deployment guide](../docs/runbooks/pro
   ([values.yaml](charts/kodema-stack/values.yaml)).
 - [podman/](podman/): single-host rootless Podman install of the `test`
   environment ([quickstart](../docs/runbooks/podman-quickstart.md)).
+- [k3s/](k3s/README.md): cloud-free single-node k3s / local Kubernetes bootstrap
+  ([values.yaml](k3s/values.yaml), [install.sh](k3s/install.sh),
+  [down.sh](k3s/down.sh)).
 - [modules/context](modules/context/main.tf): shared OpenTofu module enforcing
   cluster naming (`cluster_name` defaulting to `stage`), resource prefixes,
   common labels, and state key conventions.
@@ -45,11 +48,14 @@ infrastructure, following the [production deployment guide](../docs/runbooks/pro
   secrets by name only (`existingSecret`) and never ships, templates or prints a
   secret value.
 - A PostgreSQL database and a NATS broker reachable over TLS.
-- Exactly one explicitly selected cloud KMS for production, with the matching
-  key reference prefix. The production entry accepts `scw-kms`, `aws-kms` and
-  `gcp-kms`. Scaleway is the only live-qualified target: the AWS and GCP KMS
-  clients, roots and scripts are implemented but have no live evidence yet
-  (DEF-11).
+- Exactly one explicitly selected KMS for production, with the matching
+  key reference prefix. The production entry accepts `scw-kms`, `aws-kms`,
+  `gcp-kms`, and `vault-transit` (OpenBao / HashiCorp Vault Transit for
+  self-hosted Kubernetes). Scaleway is the only live-qualified cloud target:
+  the AWS and GCP KMS clients, roots and scripts are implemented but have no
+  live evidence yet (DEF-11). For local/CI Kubernetes testing without a KMS,
+  use `environment: "test"` with `config.keyAdapter: "keyfile"` (see
+  [deploy/k3s/](k3s/README.md)).
 - Network reachability to Kodema, the configured Git endpoint and
   policy-allowed services. Tenant namespaces start from a default-deny
   network policy.
@@ -68,11 +74,12 @@ infrastructure, following the [production deployment guide](../docs/runbooks/pro
 Select exactly **one** cloud KMS for a production installation by setting both
 the key adapter and the key reference to the same provider family:
 
-| Selected adapter | Required `KODEMA_KEY_REF` prefix | Root that creates the key |
+| Selected adapter | Required `KODEMA_KEY_REF` prefix | Root / backend that creates the key |
 |---|---|---|
 | `scw-kms` | `scw-kms:` | `deploy/scw` (Scaleway Key Manager) |
 | `gcp-kms` | `gcp-kms:` | `deploy/gcp` (Cloud KMS) |
 | `aws-kms` | `aws-kms:` | `deploy/aws` (AWS KMS) |
+| `vault-transit` | `vault-transit:` | Self-hosted OpenBao / HashiCorp Vault Transit (`vault-transit:<mount>/<key-name>`) |
 
 The adapter name, the reference prefix, the descriptor's
 `kms.key_adapter`/`kms.key_ref` and the root that created the key must agree.
@@ -194,18 +201,22 @@ The chart also has two optional blocks, off by default: `gitService` (one
   tenant: DNS to `kube-system/kube-dns` on port 53 restricted to the configured
   names, and `toFQDNs` with `matchName` only on TCP 443. It never adds a CIDR,
   entity (cluster/world), service, port-only or allow-all rule and no ingress;
-  it can only widen the default-deny policy for the listed hosts on 443. It
-  renders only when the list is non-empty **and** the
-  `cilium.io/v2/CiliumNetworkPolicy` CRD is available; on a cluster without
-  Cilium FQDN support nothing renders rather than an approximation, and
-  Cilium's L7 DNS proxy must be enabled for the DNS rule to take effect.
-- **Production requires OIDC.** `cmd/kodema/production.go` refuses to start
-  without `KODEMA_OIDC_ISSUER`, `KODEMA_OIDC_AUDIENCE`, `KODEMA_OIDC_JWKS_URL`
-  and `KODEMA_OIDC_TENANT_CLAIM`. Set all four in the operator extra values
-  (`kodema.config.extraEnv.*` for the stack chart). The values schema
-  (`allOf`/`if`/`then`) and the template guard abort a `production` render when
-  one is missing **or empty**; an empty value is a named configuration error,
-  not a silent default. A `development` or `test` profile does not require them.
+  it can only widen the default-deny policy for the listed hosts on 443. When
+  the list is non-empty and the cluster does not advertise
+  `cilium.io/v2/CiliumNetworkPolicy`, rendering fails explicitly rather than
+  approximating or silently leaving tenant workloads blocked behind
+  `kodema-tenant-default-deny`. Cilium's L7 DNS proxy must be enabled for the
+  DNS rule to take effect (on k3s, run with `--flannel-backend=none
+  --disable-network-policy` + Cilium; see [deploy/k3s/README.md](k3s/README.md)).
+- **In-cluster profiles require OIDC.** Both `cmd/kodema/production.go` and
+  `cmd/kodema/test_profile.go` refuse to start without `KODEMA_OIDC_ISSUER`,
+  `KODEMA_OIDC_AUDIENCE`, `KODEMA_OIDC_JWKS_URL` and `KODEMA_OIDC_TENANT_CLAIM`.
+  Set all four in the operator extra values (`kodema.config.extraEnv.*` for the
+  stack chart). The chart accepts only `environment: "production"` and
+  `environment: "test"` (`"development"` cannot boot in-cluster and is refused).
+  The values schema (`allOf`/`if`/`then`) and the template guard abort a render
+  when any required OIDC variable is missing **or empty**; an empty value is a
+  named configuration error, not a silent default.
   `KODEMA_OIDC_{SUBJECT_CLAIM,PROJECT_CLAIM,CA_FILE}` stay optional, and any
   OIDC or discovery value that is present must be non-empty.
 - `config.extraEnv` is a narrow pass-through for the server variables the Go

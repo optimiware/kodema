@@ -40,13 +40,64 @@ spec:
         fsGroup: {{ .Values.securityContext.runAsUser }}
         seccompProfile:
           type: RuntimeDefault
-      {{- if and .Values.gitService .Values.gitService.enabled }}
-      # The server mounts each Git PVC through a subPath. A freshly provisioned
-      # claim has no directories yet, and a missing subPath makes the whole Pod
-      # fail to start, so this init container creates them before the server
-      # container starts. It is idempotent and touches only
-      # <claim>/repos/<tenant>, exactly the directory `git serve` serves.
+      {{- $isTest := eq .Values.environment "test" }}
+      {{- $isKeyfile := and $isTest (eq (.Values.config.keyAdapter | default "") "keyfile") }}
+      {{- $hasGit := and .Values.gitService .Values.gitService.enabled }}
+      {{- if or $isKeyfile $hasGit }}
       initContainers:
+        {{- if $isKeyfile }}
+        # keys.NewKeyfile refuses symlinks and group/world-readable files.
+        # Kubernetes Secret mounts are symlinks owned by root:fsGroup, so this
+        # initContainer stages the 32-byte key into a mode-0400 regular file on
+        # a memory-backed emptyDir owned by the pod UID (65532).
+        - name: prepare-keyfile
+          image: {{ if .Values.image.digest }}"{{ .Values.image.repository }}@{{ .Values.image.digest }}"{{ else }}"{{ .Values.image.repository }}:{{ .Values.image.tag }}"{{ end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              umask 077
+              if [ -f /etc/kodema/keys/kek-v1.key ]; then
+                src=/etc/kodema/keys/kek-v1.key
+              elif [ -f /etc/kodema/keys/kek-v1.blob ]; then
+                src=/etc/kodema/keys/kek-v1.blob
+              else
+                echo "missing kek-v1.key in kodema-keys Secret" >&2
+                exit 1
+              fi
+              cp "$src" /etc/kodema/keyfile/kek-v1.key
+              chmod 0400 /etc/kodema/keyfile/kek-v1.key
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          volumeMounts:
+            - name: keys
+              mountPath: /etc/kodema/keys
+              readOnly: true
+            - name: keyfile
+              mountPath: /etc/kodema/keyfile
+        {{- end }}
+        {{- if and .Values.gitService .Values.gitService.enabled }}
+        # The server mounts each Git PVC through a subPath. A freshly provisioned
+        # claim has no directories yet, and a missing subPath makes the whole Pod
+        # fail to start, so this init container creates them before the server
+        # container starts. It is idempotent and touches only
+        # <claim>/repos/<tenant>, exactly the directory `git serve` serves.
         - name: prepare-git-repos
           image: {{ if .Values.image.digest }}"{{ .Values.image.repository }}@{{ .Values.image.digest }}"{{ else }}"{{ .Values.image.repository }}:{{ .Values.image.tag }}"{{ end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -79,6 +130,7 @@ spec:
             - name: git-repos-{{ $entry.tenant }}
               mountPath: /data/{{ $entry.tenant }}
             {{- end }}
+        {{- end }}
       {{- end }}
       containers:
         - name: kodema
@@ -93,6 +145,10 @@ spec:
           env:
             - name: KODEMA_PROFILE
               value: {{ .Values.environment | quote }}
+            {{- if $isTest }}
+            - name: KODEMA_RUNTIME
+              value: "kubernetes"
+            {{- end }}
             - name: KODEMA_INSTALLATION_ID
               value: {{ .Values.config.installationID | default "kodema-stage" | quote }}
             - name: KODEMA_PUBLIC_URL
@@ -176,6 +232,10 @@ spec:
               value: {{ .Values.config.keyCurrentVersion | default 1 | quote }}
             - name: KODEMA_KEY_BLOBS_DIR
               value: "/etc/kodema/keys"
+            {{- if $isKeyfile }}
+            - name: KODEMA_KEYFILE
+              value: "/etc/kodema/keyfile/kek-v1.key"
+            {{- end }}
             - name: KODEMA_TLS_DIR
               value: "/etc/kodema/tls"
             # The tenant configuration comes from the chart's tenant list. A
@@ -228,14 +288,10 @@ spec:
           # names no Secret renders no reference either.
           {{- $production := eq .Values.environment "production" }}
           {{- $workloadIdentity := and $production (has .Values.config.keyAdapter (list "aws-kms" "gcp-kms")) }}
-          {{- $kmsCredentialsNamed := and .Values.secrets.kmsCredentials .Values.secrets.kmsCredentials.existingSecret }}
-          {{- if and (not $workloadIdentity) (or $production $kmsCredentialsNamed) }}
+          {{- if and $production (not $workloadIdentity) }}
           envFrom:
             - secretRef:
                 name: {{ .Values.secrets.kmsCredentials.existingSecret }}
-                {{- if ne .Values.environment "production" }}
-                optional: true
-                {{- end }}
           {{- end }}
           securityContext:
             runAsNonRoot: true
@@ -283,6 +339,11 @@ spec:
             - name: keys
               mountPath: /etc/kodema/keys
               readOnly: true
+            {{- if $isKeyfile }}
+            - name: keyfile
+              mountPath: /etc/kodema/keyfile
+              readOnly: true
+            {{- end }}
             - name: database-ca
               mountPath: /etc/kodema/pg-ca
               readOnly: true
@@ -316,6 +377,11 @@ spec:
         - name: keys
           secret:
             secretName: {{ .Values.secrets.keys.existingSecret }}
+        {{- if $isKeyfile }}
+        - name: keyfile
+          emptyDir:
+            medium: Memory
+        {{- end }}
         - name: database-ca
           secret:
             secretName: {{ .Values.secrets.database.existingSecret }}
