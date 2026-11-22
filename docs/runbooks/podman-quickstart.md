@@ -482,7 +482,8 @@ earlier action declares and submits an output here: a `{from: …}` lookup
 resolves only from an earlier succeeded action's declared outputs, and the
 product refuses an unavailable subject value before the request becomes
 answerable. Every Podman workload receives the installation's public CA
-certificate read-only at `/kodema/ca.crt` (`KODEMA_CA_FILE=/kodema/ca.crt`) and
+certificate read-only at `/etc/kodema/ca/ca.crt`
+(`KODEMA_CA_FILE=/etc/kodema/ca/ca.crt`) and
 the `kodema` toolbox at `/kodema/bin/kodema`, so an action that declares
 outputs can write files under `/kodema/outputs/<action>` and `kodema output
 push` submits them over verified HTTPS automatically.
@@ -711,7 +712,7 @@ containers, volumes or images.
 - A workload cannot reach the server: confirm the server listens on
   `0.0.0.0:18443`, that the certificate has `host.containers.internal` as a
   subject alternative name, and that the workload trusts `$STATE/tls/ca.crt`
-  (projected automatically at `/kodema/ca.crt` as `KODEMA_CA_FILE`).
+  (projected automatically at `/etc/kodema/ca/ca.crt` as `KODEMA_CA_FILE`).
   The image must also already be in the same Podman store.
 - A workload cannot reach Git: use `https://host.containers.internal:18445`
   (never the loopback `127.0.0.1:18081` listener), trust the same installation
@@ -761,9 +762,10 @@ installation bugs:
   with `forbidden: secret name is not authorized`; workloads read only the
   mounted execution credential at `/kodema/secrets/KODEMA_TOKEN`. The
   installation's **public** CA certificate (`$STATE/tls/ca.crt`) is projected
-  automatically read-only into Podman workloads at `/kodema/ca.crt` with
-  `KODEMA_CA_FILE=/kodema/ca.crt` (the certificate is public data, never a
-  key), and `/workspace` is shared across actions of one execution.
+  automatically read-only into Podman workloads at `/etc/kodema/ca/ca.crt` with
+  `KODEMA_CA_FILE=/etc/kodema/ca/ca.crt` (aligned with Kubernetes; the
+  certificate is public data, never a key), and `/workspace` is shared across
+  actions of one execution.
 - A workload can submit declared outputs over HTTPS with its mounted execution
   token and projected CA (`KODEMA_CA_FILE`) — either by writing files to
   `/kodema/outputs/<action>` for `kodema output push` or by calling the API

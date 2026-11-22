@@ -561,8 +561,8 @@ func TestDurableTestCompositionSupportsKubernetesRuntime(t *testing.T) {
 		}
 		t.Cleanup(func() { builder.cleanup(context.Background()) })
 
-		if _, ok := environment.workspace.(*kubeProvisioningWorkspace); !ok {
-			t.Fatalf("workspace = %T; want *kubeProvisioningWorkspace", environment.workspace)
+		if _, ok := environment.workspace.(*provisioningWorkspace); !ok {
+			t.Fatalf("workspace = %T; want *provisioningWorkspace", environment.workspace)
 		}
 		if environment.readiness == nil || len(environment.readiness.pools) != 4 || len(environment.readiness.local) != 2 || environment.readiness.kms != nil {
 			t.Fatalf("readiness dependencies = %+v; want four pools, NATS and the two local probes", environment.readiness)

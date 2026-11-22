@@ -93,7 +93,7 @@ func TestProductionClaimProvisioningUsesBothHalves(t *testing.T) {
 	}
 	t.Cleanup(func() { builder.cleanup(context.Background()) })
 
-	if _, ok := environment.workspace.(*kubeProvisioningWorkspace); !ok {
+	if _, ok := environment.workspace.(*provisioningWorkspace); !ok {
 		t.Fatalf("production workspace = %T; want the claim-provisioning decorator", environment.workspace)
 	}
 }
@@ -230,7 +230,7 @@ func TestProductionBuildsEachPoolFromItsOwnRoleDSN(t *testing.T) {
 	if consumers.Identity == nil || consumers.Receipts == nil || consumers.Deliverer == nil {
 		t.Fatal("the production composition did not build every store-backed consumer")
 	}
-	provisioning, ok := environment.workspace.(*kubeProvisioningWorkspace)
+	provisioning, ok := environment.workspace.(*provisioningWorkspace)
 	if !ok {
 		t.Fatalf("production workspace = %T; want the claim-provisioning decorator", environment.workspace)
 	}
@@ -723,7 +723,7 @@ func TestProductionComposesMultiTenantRouting(t *testing.T) {
 	}
 	originalWorkspaces := map[id.TenantID]kernelengine.Workspace{"tenant-a": workspaceA, "tenant-b": workspaceB}
 	for tenant, inner := range workspaceDispatcher.tenants {
-		provisioning, ok := inner.(*kubeProvisioningWorkspace)
+		provisioning, ok := inner.(*provisioningWorkspace)
 		if !ok {
 			t.Fatalf("tenant %s workspace = %T; want the claim-provisioning decorator", tenant, inner)
 		}

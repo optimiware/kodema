@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -436,18 +436,18 @@ func TestLogsFlushesTrailingPartialPrefixOnStreamCappedEOF(t *testing.T) {
 }
 
 func TestLogsCursorOverflowBounds(t *testing.T) {
-	if pos, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, adapterutil.MaxStdoutLogCursorPosition, 0); err != nil || pos != adapterutil.MaxStdoutLogCursorPosition {
-		t.Fatalf("stdout boundary = (%d, %v); want (%d, nil)", pos, err, adapterutil.MaxStdoutLogCursorPosition)
+	if pos, err := container.NextStreamLogPosition(reconcile.LogStdout, container.MaxStdoutLogCursorPosition, 0); err != nil || pos != container.MaxStdoutLogCursorPosition {
+		t.Fatalf("stdout boundary = (%d, %v); want (%d, nil)", pos, err, container.MaxStdoutLogCursorPosition)
 	}
-	if _, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, adapterutil.MaxStdoutLogCursorPosition, 1); err == nil {
+	if _, err := container.NextStreamLogPosition(reconcile.LogStdout, container.MaxStdoutLogCursorPosition, 1); err == nil {
 		t.Fatal("stdout accepted position past 2^31-1")
 	} else {
 		assertRefusedClass(t, err, fault.InvalidInput)
 	}
-	if pos, err := adapterutil.NextStreamLogPosition(reconcile.LogStderr, adapterutil.MaxStderrLogCursorPosition, 0); err != nil || pos != adapterutil.MaxStderrLogCursorPosition {
-		t.Fatalf("stderr boundary = (%d, %v); want (%d, nil)", pos, err, adapterutil.MaxStderrLogCursorPosition)
+	if pos, err := container.NextStreamLogPosition(reconcile.LogStderr, container.MaxStderrLogCursorPosition, 0); err != nil || pos != container.MaxStderrLogCursorPosition {
+		t.Fatalf("stderr boundary = (%d, %v); want (%d, nil)", pos, err, container.MaxStderrLogCursorPosition)
 	}
-	if _, err := adapterutil.NextStreamLogPosition(reconcile.LogStderr, adapterutil.MaxStderrLogCursorPosition, 1); err == nil {
+	if _, err := container.NextStreamLogPosition(reconcile.LogStderr, container.MaxStderrLogCursorPosition, 1); err == nil {
 		t.Fatal("stderr accepted position past 2^32-1")
 	} else {
 		assertRefusedClass(t, err, fault.InvalidInput)

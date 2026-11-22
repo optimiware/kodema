@@ -13,10 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime"
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
@@ -25,9 +24,9 @@ import (
 const (
 	// MaxLogBytes bounds one log read. A request above this bound is refused
 	// before any external call.
-	MaxLogBytes = 1 << 20
+	MaxLogBytes = container.MaxLogBytes
 	// Redacted replaces configured credential and secret values in log output.
-	Redacted = "[REDACTED]"
+	Redacted = container.Redacted
 )
 
 // GroupID is the stable identity of one host process group.
@@ -130,18 +129,10 @@ type Files interface {
 
 // Clock is the injected time source. Production uses the real clock; tests use
 // a deterministic clock that never sleeps in wall-clock time.
-type Clock interface {
-	Now() time.Time
-	Sleep(context.Context, time.Duration) error
-}
+type Clock = container.Clock
 
 // CleanupPolicy bounds one Remove call.
-type CleanupPolicy struct {
-	// Attempts is the total RemoveAll attempts per Remove call; at least 1.
-	Attempts int
-	// Backoff is the delay between attempts, applied through Clock.Sleep.
-	Backoff time.Duration
-}
+type CleanupPolicy = container.CleanupPolicy
 
 // Config binds one adapter instance to disjoint resource and workspace roots.
 type Config struct {
@@ -204,15 +195,12 @@ func New(config Config) (*Adapter, error) {
 	if strings.TrimSpace(config.KodemaURL) == "" {
 		return nil, fault.New(fault.InvalidInput, "process adapter requires the Kodema URL")
 	}
-	if config.Cleanup.Attempts < 1 {
-		return nil, fault.New(fault.InvalidInput, "process adapter requires at least one cleanup attempt")
-	}
-	if config.Cleanup.Backoff < 0 {
-		return nil, fault.New(fault.InvalidInput, "process adapter cleanup backoff is negative")
+	if err := config.Cleanup.Validate(); err != nil {
+		return nil, err
 	}
 	clock := config.Clock
 	if clock == nil {
-		clock = adapterutil.RealClock{}
+		clock = container.RealClock{}
 	}
 	return &Adapter{
 		root:          root,
@@ -244,16 +232,11 @@ func (a *Adapter) Capabilities(context.Context) (reconcile.Capabilities, error) 
 
 // CheckRequirements refuses admitted work the Process family cannot run.
 func CheckRequirements(required []string) error {
-	supported := make(map[string]bool)
-	for _, capability := range runtime.CapabilitiesFor(runtime.AdapterProcess) {
-		supported[string(capability)] = true
+	capabilities := make([]runtime.Capability, len(required))
+	for index, name := range required {
+		capabilities[index] = runtime.Capability(name)
 	}
-	for _, name := range required {
-		if !supported[name] {
-			return fault.New(fault.UnsupportedCapability, "process adapter does not support required capability "+name)
-		}
-	}
-	return nil
+	return container.CheckRequirements(runtime.AdapterProcess, capabilities)
 }
 
 // GroupName returns the stable process-group name for one workload identity.
@@ -261,7 +244,7 @@ func GroupName(workload id.WorkloadID) (GroupID, error) {
 	if _, err := id.ParseWorkloadID(string(workload)); err != nil {
 		return "", fault.Wrap(fault.InvalidInput, "workload id is invalid", err)
 	}
-	return GroupID("kodema-process-" + adapterutil.StableDigest(string(workload))), nil
+	return GroupID("kodema-process-" + container.StableDigest(string(workload))), nil
 }
 
 // ResourceRoot returns the adapter-owned resource root for one workload

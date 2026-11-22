@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
@@ -28,11 +29,11 @@ import (
 
 const (
 	// readOnlyMode is the explicit read-only mode for every prepared file.
-	readOnlyMode os.FileMode = 0o444
+	readOnlyMode os.FileMode = container.ReadOnlyFileMode
 	// bookkeepingMode is the mode for adapter-owned mutable bookkeeping.
 	bookkeepingMode os.FileMode = 0o644
 	// directoryMode is the explicit mode for adapter-owned directories.
-	directoryMode os.FileMode = 0o755
+	directoryMode os.FileMode = container.DirectoryMode
 
 	// manifestName is the completed-preparation marker and activation summary.
 	manifestName = "manifest.json"
