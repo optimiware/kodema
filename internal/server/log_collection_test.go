@@ -95,6 +95,7 @@ import (
 	"testing"
 	"time"
 
+	runtimecontainer "github.com/optimiware/kodema/internal/adapter/runtime/container"
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	shelllog "github.com/optimiware/kodema/internal/control/log"
 	"github.com/optimiware/kodema/internal/control/tenancy"
@@ -1237,7 +1238,8 @@ func TestRetainedLogFailureCauseVocabulary(t *testing.T) {
 		{name: "pod log not found", err: errors.Join(runtimekube.ErrNotFound, runtimekube.ErrPodLogNotFound), want: "pod_log_not_found"},
 		{name: "pod log bad request", err: errors.Join(errors.New("body s3cr3t"), runtimekube.ErrPodLogBadRequest), want: "pod_log_bad_request"},
 		{name: "pod log server error", err: errors.Join(errors.New("body s3cr3t"), runtimekube.ErrPodLogServerError), want: "pod_log_server_error"},
-		{name: "redaction source", err: errors.Join(errors.New("secret name"), runtimekube.ErrRedactionSourceUnavailable), want: "redaction_source_missing"},
+		{name: "redaction source (kube)", err: errors.Join(errors.New("secret name"), runtimekube.ErrRedactionSourceUnavailable), want: "redaction_source_missing"},
+		{name: "redaction source (container)", err: errors.Join(errors.New("secret name"), runtimecontainer.ErrRedactionSourceUnavailable), want: "redaction_source_missing"},
 		{name: "unknown failure", err: errors.New("transport reset"), want: "log_read_failed"},
 	}
 	for _, testCase := range cases {

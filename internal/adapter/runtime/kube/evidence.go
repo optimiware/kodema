@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
@@ -258,5 +258,5 @@ func redactionValues(secret Secret) []string {
 		}
 		values = append(values, string(value))
 	}
-	return adapterutil.SortRedactionValues(values)
+	return container.SortRedactionValues(values)
 }

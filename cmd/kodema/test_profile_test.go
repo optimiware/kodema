@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -636,48 +637,340 @@ func TestBuildTestProfileWiresTheToolboxAndGitURL(t *testing.T) {
 }
 
 func TestBuildTestProfileWiresWorkloadResourceLimits(t *testing.T) {
-	fixture := newTestProfileFixture(t)
-	fixture.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "3Gi"
-	fixture.values["KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"] = "6Gi"
-	fixture.values["KODEMA_WORKLOAD_CPU_LIMIT"] = "2500m"
-	fixture.values["KODEMA_WORKLOAD_MAX_CPU_LIMIT"] = "4"
+	newKubeFixture := func(t *testing.T) (*testProfileFixture, driverkube.InClusterConfig) {
+		t.Helper()
+		fixture := newTestProfileFixture(t)
+		delete(fixture.values, "KODEMA_PODMAN_SOCKET")
+		fixture.values["KODEMA_RUNTIME"] = "kubernetes"
+		fixture.values["KODEMA_TENANT"] = "tenant-a"
+		fixture.values["KODEMA_WORKSPACE_PVC_STORAGE_CLASS"] = ""
+		fixture.values["KODEMA_WORKSPACE_PVC_SIZE"] = "10Gi"
+		fixture.values["KODEMA_WORKSPACE_PVC_ACCESS_MODE"] = "ReadWriteOnce"
+		fixture.options.WorkloadURL = ""
+		fixture.options.PublicURL = "https://kodema.kodema-system.svc.cluster.local:8443"
 
-	build, err := buildTestProfile(fixture.options, fixture.getenv)
-	if err != nil {
-		t.Fatalf("buildTestProfile: %v", err)
-	}
-	adapter, ok := build.Config.Test.Runtime.(*runtimepodman.Adapter)
-	if !ok {
-		t.Fatalf("Runtime = %T; want *runtimepodman.Adapter", build.Config.Test.Runtime)
-	}
-	resourcesField := unexportedField(t, adapter, "resources")
-	gotResources := runtimepodman.ResourcePolicy{
-		DefaultMemoryBytes:   resourcesField.FieldByName("DefaultMemoryBytes").Int(),
-		MaxMemoryBytes:       resourcesField.FieldByName("MaxMemoryBytes").Int(),
-		DefaultCPUMillicores: resourcesField.FieldByName("DefaultCPUMillicores").Int(),
-		MaxCPUMillicores:     resourcesField.FieldByName("MaxCPUMillicores").Int(),
-	}
-	wantResources := runtimepodman.ResourcePolicy{
-		DefaultMemoryBytes:   3 << 30,
-		MaxMemoryBytes:       6 << 30,
-		DefaultCPUMillicores: 2500,
-		MaxCPUMillicores:     4000,
-	}
-	if gotResources != wantResources {
-		t.Fatalf("adapter resources = %+v; want %+v", gotResources, wantResources)
+		saDir := t.TempDir()
+		selfSigned(t, saDir)
+		tokenPath := filepath.Join(saDir, "token")
+		if err := os.WriteFile(tokenPath, []byte("sa-token"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		kube := driverkube.InClusterConfig{
+			Server:    "https://kubernetes.default.svc:443",
+			CAFile:    filepath.Join(saDir, "tls.crt"),
+			TokenFile: tokenPath,
+		}
+		return fixture, kube
 	}
 
-	bad := newTestProfileFixture(t)
-	bad.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "not-a-size"
-	if _, err := buildTestProfile(bad.options, bad.getenv); err == nil || !strings.Contains(err.Error(), "KODEMA_WORKLOAD_MEMORY_LIMIT") {
-		t.Fatalf("invalid workload memory = %v; want refusal naming KODEMA_WORKLOAD_MEMORY_LIMIT", err)
+	inspectKubePolicy := func(t *testing.T, rt any) runtimekube.Policy {
+		t.Helper()
+		adapter, ok := rt.(*runtimekube.Adapter)
+		if !ok {
+			t.Fatalf("Runtime = %T; want *runtimekube.Adapter", rt)
+		}
+		policyField := unexportedField(t, adapter, "policy")
+		return runtimekube.Policy{
+			CPURequest:     policyField.FieldByName("CPURequest").String(),
+			CPULimit:       policyField.FieldByName("CPULimit").String(),
+			MaxCPULimit:    policyField.FieldByName("MaxCPULimit").String(),
+			MemoryRequest:  policyField.FieldByName("MemoryRequest").String(),
+			MemoryLimit:    policyField.FieldByName("MemoryLimit").String(),
+			MaxMemoryLimit: policyField.FieldByName("MaxMemoryLimit").String(),
+			JobTTLSeconds:  int(policyField.FieldByName("JobTTLSeconds").Int()),
+		}
 	}
 
-	over := newTestProfileFixture(t)
-	over.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "8Gi"
-	over.values["KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"] = "4Gi"
-	if _, err := buildTestProfile(over.options, over.getenv); err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
-		t.Fatalf("default > max workload memory = %v; want refusal", err)
+	inspectPodmanResources := func(t *testing.T, rt any) runtimepodman.ResourcePolicy {
+		t.Helper()
+		adapter, ok := rt.(*runtimepodman.Adapter)
+		if !ok {
+			t.Fatalf("Runtime = %T; want *runtimepodman.Adapter", rt)
+		}
+		resourcesField := unexportedField(t, adapter, "resources")
+		return runtimepodman.ResourcePolicy{
+			DefaultMemoryBytes:   resourcesField.FieldByName("DefaultMemoryBytes").Int(),
+			MaxMemoryBytes:       resourcesField.FieldByName("MaxMemoryBytes").Int(),
+			DefaultCPUMillicores: resourcesField.FieldByName("DefaultCPUMillicores").Int(),
+			MaxCPUMillicores:     resourcesField.FieldByName("MaxCPUMillicores").Int(),
+		}
+	}
+
+	t.Run("podman env var fallback", func(t *testing.T) {
+		fixture := newTestProfileFixture(t)
+		fixture.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "3Gi"
+		fixture.values["KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"] = "6Gi"
+		fixture.values["KODEMA_WORKLOAD_CPU_LIMIT"] = "2500m"
+		fixture.values["KODEMA_WORKLOAD_MAX_CPU_LIMIT"] = "4"
+
+		build, err := buildTestProfile(fixture.options, fixture.getenv)
+		if err != nil {
+			t.Fatalf("buildTestProfile: %v", err)
+		}
+		got := inspectPodmanResources(t, build.Config.Test.Runtime)
+		want := runtimepodman.ResourcePolicy{
+			DefaultMemoryBytes:   3 << 30,
+			MaxMemoryBytes:       6 << 30,
+			DefaultCPUMillicores: 2500,
+			MaxCPUMillicores:     4000,
+		}
+		if got != want {
+			t.Fatalf("adapter resources = %+v; want %+v", got, want)
+		}
+	})
+
+	t.Run("podman CLI flags override env vars", func(t *testing.T) {
+		fixture := newTestProfileFixture(t)
+		fixture.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "3Gi"
+		fixture.values["KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"] = "6Gi"
+		fixture.values["KODEMA_WORKLOAD_CPU_LIMIT"] = "2500m"
+		fixture.values["KODEMA_WORKLOAD_MAX_CPU_LIMIT"] = "4"
+		fixture.options.WorkloadMemory = "1Gi"
+		fixture.options.WorkloadMaxMemory = "2Gi"
+		fixture.options.WorkloadCPUs = "1500m"
+		fixture.options.WorkloadMaxCPUs = "3"
+
+		build, err := buildTestProfile(fixture.options, fixture.getenv)
+		if err != nil {
+			t.Fatalf("buildTestProfile: %v", err)
+		}
+		got := inspectPodmanResources(t, build.Config.Test.Runtime)
+		want := runtimepodman.ResourcePolicy{
+			DefaultMemoryBytes:   1 << 30,
+			MaxMemoryBytes:       2 << 30,
+			DefaultCPUMillicores: 1500,
+			MaxCPUMillicores:     3000,
+		}
+		if got != want {
+			t.Fatalf("adapter resources = %+v; want %+v", got, want)
+		}
+	})
+
+	t.Run("kubernetes env var fallback", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		fixture.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "3Gi"
+		fixture.values["KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"] = "6Gi"
+		fixture.values["KODEMA_WORKLOAD_CPU_LIMIT"] = "2500m"
+		fixture.values["KODEMA_WORKLOAD_MAX_CPU_LIMIT"] = "4"
+
+		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err != nil {
+			t.Fatalf("buildTestProfileWithKube: %v", err)
+		}
+		got := inspectKubePolicy(t, build.Config.Test.Runtime)
+		want := runtimekube.Policy{
+			CPURequest:     "250m",
+			CPULimit:       "2500m",
+			MaxCPULimit:    "4",
+			MemoryRequest:  "256Mi",
+			MemoryLimit:    "3Gi",
+			MaxMemoryLimit: "6Gi",
+			JobTTLSeconds:  600,
+		}
+		if got != want {
+			t.Fatalf("kube policy = %+v; want %+v", got, want)
+		}
+	})
+
+	t.Run("kubernetes CLI flags override env vars", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		fixture.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "3Gi"
+		fixture.values["KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"] = "6Gi"
+		fixture.values["KODEMA_WORKLOAD_CPU_LIMIT"] = "2500m"
+		fixture.values["KODEMA_WORKLOAD_MAX_CPU_LIMIT"] = "4"
+		fixture.options.WorkloadMemory = "2Gi"
+		fixture.options.WorkloadMaxMemory = "4Gi"
+		fixture.options.WorkloadCPUs = "1500m"
+		fixture.options.WorkloadMaxCPUs = "3"
+
+		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err != nil {
+			t.Fatalf("buildTestProfileWithKube: %v", err)
+		}
+		got := inspectKubePolicy(t, build.Config.Test.Runtime)
+		want := runtimekube.Policy{
+			CPURequest:     "250m",
+			CPULimit:       "1500m",
+			MaxCPULimit:    "3",
+			MemoryRequest:  "256Mi",
+			MemoryLimit:    "2Gi",
+			MaxMemoryLimit: "4Gi",
+			JobTTLSeconds:  600,
+		}
+		if got != want {
+			t.Fatalf("kube policy = %+v; want %+v", got, want)
+		}
+	})
+
+	t.Run("kubernetes preserves default-equals-max ceiling when max is omitted", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err != nil {
+			t.Fatalf("default kube build: %v", err)
+		}
+		gotDefault := inspectKubePolicy(t, build.Config.Test.Runtime)
+		wantDefault := runtimekube.Policy{
+			CPURequest:     "250m",
+			CPULimit:       "1",
+			MaxCPULimit:    "1",
+			MemoryRequest:  "256Mi",
+			MemoryLimit:    "1Gi",
+			MaxMemoryLimit: "1Gi",
+			JobTTLSeconds:  600,
+		}
+		if gotDefault != wantDefault {
+			t.Fatalf("default kube policy = %+v; want %+v (ceiling must not widen)", gotDefault, wantDefault)
+		}
+
+		overrideFixture, overrideKube := newKubeFixture(t)
+		overrideFixture.options.WorkloadMemory = "2Gi"
+		overrideFixture.options.WorkloadCPUs = "1500m"
+		buildOverride, err := buildTestProfileWithKube(overrideFixture.options, overrideFixture.getenv, overrideKube)
+		if err != nil {
+			t.Fatalf("override kube build: %v", err)
+		}
+		gotOverride := inspectKubePolicy(t, buildOverride.Config.Test.Runtime)
+		wantOverride := runtimekube.Policy{
+			CPURequest:     "250m",
+			CPULimit:       "1500m",
+			MaxCPULimit:    "1500m",
+			MemoryRequest:  "256Mi",
+			MemoryLimit:    "2Gi",
+			MaxMemoryLimit: "2Gi",
+			JobTTLSeconds:  600,
+		}
+		if gotOverride != wantOverride {
+			t.Fatalf("override kube policy = %+v; want %+v (omitted max must pin ceiling to default)", gotOverride, wantOverride)
+		}
+	})
+
+	t.Run("kubernetes clamps requests when configured limit is lower than default request", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		fixture.options.WorkloadMemory = "128Mi"
+		fixture.options.WorkloadCPUs = "100m"
+		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err != nil {
+			t.Fatalf("clamped kube build: %v", err)
+		}
+		got := inspectKubePolicy(t, build.Config.Test.Runtime)
+		want := runtimekube.Policy{
+			CPURequest:     "100m",
+			CPULimit:       "100m",
+			MaxCPULimit:    "100m",
+			MemoryRequest:  "128Mi",
+			MemoryLimit:    "128Mi",
+			MaxMemoryLimit: "128Mi",
+			JobTTLSeconds:  600,
+		}
+		if got != want {
+			t.Fatalf("clamped kube policy = %+v; want %+v", got, want)
+		}
+	})
+
+	t.Run("kubernetes multi-tenant applies resolved resource policy to every tenant", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		delete(fixture.values, "KODEMA_TENANT")
+		fixture.values["KODEMA_TENANTS"] = `["tenant-a","tenant-b"]`
+		fixture.options.WorkloadMemory = "2Gi"
+		fixture.options.WorkloadMaxMemory = "4Gi"
+		fixture.options.WorkloadCPUs = "2"
+		fixture.options.WorkloadMaxCPUs = "4"
+
+		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
+		if err != nil {
+			t.Fatalf("multi-tenant kube build: %v", err)
+		}
+		if len(build.Config.Test.Tenants) != 2 {
+			t.Fatalf("len(Tenants) = %d; want 2", len(build.Config.Test.Tenants))
+		}
+		want := runtimekube.Policy{
+			CPURequest:     "250m",
+			CPULimit:       "2",
+			MaxCPULimit:    "4",
+			MemoryRequest:  "256Mi",
+			MemoryLimit:    "2Gi",
+			MaxMemoryLimit: "4Gi",
+			JobTTLSeconds:  600,
+		}
+		for _, tenant := range build.Config.Test.Tenants {
+			if got := inspectKubePolicy(t, tenant.Runtime); got != want {
+				t.Fatalf("tenant %s policy = %+v; want %+v", tenant.TenantID, got, want)
+			}
+		}
+	})
+
+	invalidCases := []struct {
+		name   string
+		mutate func(*testProfileFixture)
+		want   string
+	}{
+		{
+			name:   "invalid memory env",
+			mutate: func(f *testProfileFixture) { f.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "not-a-size" },
+			want:   "KODEMA_WORKLOAD_MEMORY_LIMIT",
+		},
+		{
+			name:   "invalid max memory flag",
+			mutate: func(f *testProfileFixture) { f.options.WorkloadMaxMemory = "not-a-size" },
+			want:   "KODEMA_WORKLOAD_MAX_MEMORY_LIMIT",
+		},
+		{
+			name:   "invalid CPU flag",
+			mutate: func(f *testProfileFixture) { f.options.WorkloadCPUs = "not-a-cpu" },
+			want:   "KODEMA_WORKLOAD_CPU_LIMIT",
+		},
+		{
+			name:   "invalid max CPU env",
+			mutate: func(f *testProfileFixture) { f.values["KODEMA_WORKLOAD_MAX_CPU_LIMIT"] = "not-a-cpu" },
+			want:   "KODEMA_WORKLOAD_MAX_CPU_LIMIT",
+		},
+		{
+			name: "default memory exceeds max memory",
+			mutate: func(f *testProfileFixture) {
+				f.values["KODEMA_WORKLOAD_MEMORY_LIMIT"] = "8Gi"
+				f.values["KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"] = "4Gi"
+			},
+			want: "exceeds maximum",
+		},
+		{
+			name: "default CPU exceeds max CPU",
+			mutate: func(f *testProfileFixture) {
+				f.options.WorkloadCPUs = "4"
+				f.options.WorkloadMaxCPUs = "2"
+			},
+			want: "exceeds maximum",
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run("podman refuses "+tc.name, func(t *testing.T) {
+			fixture := newTestProfileFixture(t)
+			tc.mutate(fixture)
+			if _, err := buildTestProfile(fixture.options, fixture.getenv); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("podman %s = %v; want refusal containing %q", tc.name, err, tc.want)
+			}
+		})
+		t.Run("kubernetes refuses "+tc.name, func(t *testing.T) {
+			fixture, kube := newKubeFixture(t)
+			tc.mutate(fixture)
+			if _, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("kubernetes %s = %v; want refusal containing %q", tc.name, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestServeWorkloadCAFileHelpTextUsesCanonicalPath(t *testing.T) {
+	var stderr bytes.Buffer
+	_, code := parseServerOptions([]string{"--help"}, &stderr)
+	if code != 2 {
+		t.Fatalf("parseServerOptions(--help) code = %d; want 2", code)
+	}
+	help := stderr.String()
+	if !strings.Contains(help, "/etc/kodema/ca/ca.crt") {
+		t.Fatalf("serve --help did not mention /etc/kodema/ca/ca.crt:\n%s", help)
+	}
+	if strings.Contains(help, "/kodema/ca.crt") {
+		t.Fatalf("serve --help still references legacy /kodema/ca.crt:\n%s", help)
 	}
 }
 

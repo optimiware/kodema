@@ -1198,6 +1198,14 @@ func (f *fixture) kodemaRoot() string {
 	return filepath.Join(f.workloadRoot(), "kodema")
 }
 
+func (f *fixture) secretsRoot() string {
+	return filepath.Join(f.workloadRoot(), secretsDirectoryName)
+}
+
+func (f *fixture) secretPath(name id.SecretName) string {
+	return filepath.Join(f.secretsRoot(), string(name))
+}
+
 func (f *fixture) hostPath(logical string) string {
 	return filepath.Join(f.workloadRoot(), logical)
 }
@@ -1207,7 +1215,7 @@ func (f *fixture) scriptPath() string {
 }
 
 func (f *fixture) credentialPath() string {
-	return filepath.Join(f.kodemaRoot(), "secrets", "KODEMA_TOKEN")
+	return filepath.Join(f.secretsRoot(), "KODEMA_TOKEN")
 }
 
 func (f *fixture) prepare(t *testing.T) reconcile.Preparation {

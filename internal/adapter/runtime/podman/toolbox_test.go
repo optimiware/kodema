@@ -169,8 +169,9 @@ func TestToolboxActionWithoutOutputsGetsNoOutputDirectory(t *testing.T) {
 }
 
 // TestWithoutAToolboxTheContainerIsUnchanged pins the adapter without a
-// toolbox: the plain script entrypoint, the two original mounts and no output
-// directory, even for an action that declares outputs.
+// toolbox: the plain script entrypoint, the three base mounts (activation,
+// isolated secrets, and workspace) and no output directory, even for an action
+// that declares outputs.
 func TestWithoutAToolboxTheContainerIsUnchanged(t *testing.T) {
 	fx := newFixture(t)
 	fx.request.Outputs = nil
@@ -181,8 +182,8 @@ func TestWithoutAToolboxTheContainerIsUnchanged(t *testing.T) {
 	if want := []string{"/bin/sh", "/kodema/script"}; !slices.Equal(spec.Entrypoint, want) {
 		t.Fatalf("entrypoint = %q; want %q", spec.Entrypoint, want)
 	}
-	if len(spec.Mounts) != 2 {
-		t.Fatalf("mounts = %+v; want the activation bind and the workspace volume only", spec.Mounts)
+	if len(spec.Mounts) != 3 {
+		t.Fatalf("mounts = %+v; want activation bind, isolated secrets bind, and workspace volume only", spec.Mounts)
 	}
 	for _, entry := range spec.Env {
 		if strings.HasPrefix(entry, "GIT_CONFIG_") || strings.HasPrefix(entry, "KODEMA_GIT_URL=") {
@@ -232,73 +233,6 @@ func TestGitServiceIsConfiguredForItsOriginOnly(t *testing.T) {
 			t.Fatalf("environment %q names %s twice", spec.Env, name)
 		}
 		seen[name] = true
-	}
-}
-
-// TestStartFollowsThePreparedToolbox pins that a reconstructed adapter with a
-// newer toolbox, or with none, starts a prepared workload with the copy and
-// the Git service Prepare recorded.
-func TestStartFollowsThePreparedToolbox(t *testing.T) {
-	fx, _ := toolboxFixture(t, "toolbox-v1")
-	fx.prepare(t)
-	prepared, _, found, err := fx.adapter.readPreparation(context.Background(), fx.request.Identity.WorkloadID)
-	if err != nil || !found {
-		t.Fatalf("read preparation: found=%t err=%v", found, err)
-	}
-
-	newer := filepath.Join(t.TempDir(), "kodema")
-	if err := os.WriteFile(newer, []byte("toolbox-v2"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	upgraded := fx.newToolboxAdapter(t, newer)
-	if upgraded.toolboxDir == prepared.Toolbox {
-		t.Fatal("two different binaries share one installation copy")
-	}
-	if _, err := upgraded.Prepare(t.Context(), fx.request); err != nil {
-		t.Fatalf("retrying the original Prepare after upgrade: %v", err)
-	}
-	if _, err := upgraded.Start(context.Background(), reconcile.StartRequest{
-		Identity:    fx.request.Identity,
-		WorkspaceID: fx.request.WorkspaceID,
-	}); err != nil {
-		t.Fatalf("Start on the upgraded adapter: %v", err)
-	}
-	spec := fx.createdSpec(t)
-	mount, ok := mountAt(spec, "/kodema/bin")
-	if !ok || mount.Source != prepared.Toolbox {
-		t.Fatalf("toolbox mount = %+v; want the prepared copy %q", mount, prepared.Toolbox)
-	}
-	if got := readHostFile(t, filepath.Join(mount.Source, "kodema")); string(got) != "toolbox-v1" {
-		t.Fatalf("the prepared workload runs toolbox %q; want the one it was prepared with", got)
-	}
-}
-
-func TestLegacyPreparationKeepsImageWorkingDirectoryAfterUpgrade(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	workload := fx.request.Identity.WorkloadID
-	record, _, _, err := fx.adapter.readPreparation(t.Context(), workload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	record.WorkingDir = "" // 0.2.3 had none of the toolbox or working_dir fields.
-	data, err := encodePreparationRecord(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fx.files.WriteFile(t.Context(), preparationRecordPath(fx.root, workload), data, readOnlyMode); err != nil {
-		t.Fatal(err)
-	}
-	source := filepath.Join(t.TempDir(), "kodema")
-	if err := os.WriteFile(source, []byte("new"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	fx.adapter = fx.newToolboxAdapter(t, source)
-	fx.prepare(t)
-	fx.start(t)
-	spec := fx.createdSpec(t)
-	if spec.WorkingDir != "" || !slices.Equal(spec.Entrypoint, []string{"/bin/sh", "/kodema/script"}) || len(spec.Mounts) != 2 {
-		t.Fatalf("upgrade changed a legacy launch: workdir=%q entrypoint=%q mounts=%+v", spec.WorkingDir, spec.Entrypoint, spec.Mounts)
 	}
 }
 

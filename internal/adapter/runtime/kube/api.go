@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime"
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
@@ -27,51 +27,51 @@ import (
 // selectors, so a tenant network policy and the adapter agree.
 const (
 	// LabelTenant names the owning tenant.
-	LabelTenant = "kodema.dev/tenant"
+	LabelTenant = container.LabelTenant
 	// LabelProject names the owning project when supplied by the Shell.
-	LabelProject = "kodema.dev/project"
+	LabelProject = container.LabelProject
 	// LabelRole names the optional workload role (for example "sandbox").
-	LabelRole = "kodema.dev/role"
+	LabelRole = container.LabelRole
 	// RoleSandbox is the pinned LabelRole value for ephemeral OpenCode sandbox
 	// workloads (`kodema sandbox serve`).
-	RoleSandbox = "sandbox"
+	RoleSandbox = container.RoleSandbox
 	// LabelExecution names the execution.
-	LabelExecution = "kodema.dev/execution"
+	LabelExecution = container.LabelExecution
 	// LabelAction names the action.
-	LabelAction = "kodema.dev/action"
+	LabelAction = container.LabelAction
 	// LabelWorkload names the stable runtime workload identity.
-	LabelWorkload = "kodema.dev/workload"
+	LabelWorkload = container.LabelWorkload
 	// LabelWorkspace names the retained execution workspace.
-	LabelWorkspace = "kodema.dev/workspace"
+	LabelWorkspace = container.LabelWorkspace
 	// LabelRetained marks a workspace claim whose retention must survive a
 	// stale release.
-	LabelRetained = "kodema.dev/retained"
+	LabelRetained = container.LabelRetained
 	// LabelPreparation carries the deterministic preparation declaration
 	// digest on the immutable activation ConfigMap.
-	LabelPreparation = "kodema.dev/preparation"
+	LabelPreparation = container.LabelPreparation
 	// AnnotationIdempotencyKey carries the persisted idempotency key so a
 	// retry can be attributed to the original effect.
-	AnnotationIdempotencyKey = "kodema.dev/idempotency-key"
+	AnnotationIdempotencyKey = container.LabelIdempotencyKey
 	// AnnotationRetained carries the durable workspace-retention marker.
-	AnnotationRetained = "kodema.dev/retained"
+	AnnotationRetained = container.LabelRetained
 )
 
 const (
 	// MaxLogBytes bounds one log read. A request above this bound is refused
 	// before any external call.
-	MaxLogBytes = 1 << 20
+	MaxLogBytes = container.MaxLogBytes
 	// Redacted replaces configured credential and secret values in log output.
-	Redacted = "[REDACTED]"
+	Redacted = container.Redacted
 )
 
 const (
 	// WorkloadCAKey is the literal Secret key carrying the installation CA
 	// bundle. Secret keys are not path-encoded.
-	WorkloadCAKey = "ca.crt"
+	WorkloadCAKey = container.WorkloadCAKey
 	// WorkloadCAMountPath is the fixed read-only mount root of the workload CA.
-	WorkloadCAMountPath = "/etc/kodema/ca"
+	WorkloadCAMountPath = container.WorkloadCAMountPath
 	// WorkloadCAPath is the fixed absolute path of the mounted CA bundle.
-	WorkloadCAPath = WorkloadCAMountPath + "/" + WorkloadCAKey
+	WorkloadCAPath = container.WorkloadCAPath
 )
 
 // WorkloadCAConfig configures the installation-provided CA bundle projected
@@ -97,10 +97,7 @@ var (
 
 // Clock is the injected time source. Production uses the real clock; tests use
 // a deterministic clock that never sleeps in wall-clock time.
-type Clock interface {
-	Now() time.Time
-	Sleep(context.Context, time.Duration) error
-}
+type Clock = container.Clock
 
 // Config binds one adapter instance to one tenant namespace.
 type Config struct {
@@ -150,12 +147,7 @@ type Policy struct {
 }
 
 // CleanupPolicy bounds one Remove call.
-type CleanupPolicy struct {
-	// Attempts is the total attempts per resource per Remove call; at least 1.
-	Attempts int
-	// Backoff is the delay between attempts, applied through Clock.Sleep.
-	Backoff time.Duration
-}
+type CleanupPolicy = container.CleanupPolicy
 
 // Namespace is the tenant namespace and its ownership labels.
 type Namespace struct {
@@ -401,7 +393,7 @@ type preparedWorkload struct {
 	secretNames     []id.SecretName
 	toolboxImage    string
 	caSecret        string
-	gitEnv          []string
+	gitURL          string
 	outputDir       string
 	caches          []preparedCache
 	resources       Resources
@@ -411,9 +403,8 @@ type preparedWorkload struct {
 // adapter needs after Prepare. Values are copied so later mutation by a caller
 // cannot change an already-prepared workload.
 type containerDeclaration struct {
-	image  string
-	script string
-	env    []EnvVar
+	image string
+	env   []definition.EnvVar
 }
 
 // Adapter implements runtime.Client and engine.Workspace for the Kubernetes Job
@@ -426,6 +417,7 @@ type Adapter struct {
 	toolboxImage     string
 	gitURL           string
 	policy           Policy
+	resourcePolicy   container.ResourcePolicy
 	cleanup          CleanupPolicy
 	workloadCA       WorkloadCAConfig
 	imagePullSecrets []string
@@ -435,16 +427,7 @@ type Adapter struct {
 	mu       sync.Mutex
 	prepared map[id.WorkloadID]preparedWorkload
 
-	locksMu sync.Mutex
-	locks   map[id.WorkspaceID]*workspaceLock
-}
-
-// workspaceLock serializes the lifecycle of one retained workspace inside this
-// adapter. Start, Remove, Retain and Release share it so a claim is never
-// deleted while a workload is being created or removed.
-type workspaceLock struct {
-	mu   sync.Mutex
-	refs int
+	locks container.KeyedLock[id.WorkspaceID]
 }
 
 // New validates one adapter configuration. An incomplete configuration is
@@ -476,37 +459,21 @@ func New(config Config) (*Adapter, error) {
 	if config.Policy.JobTTLSeconds <= 0 {
 		return nil, fault.New(fault.InvalidInput, "kubernetes adapter requires a positive Job TTL")
 	}
-	if maxCPU := strings.TrimSpace(config.Policy.MaxCPULimit); maxCPU != "" {
-		maxParsed, err := definition.ParseCPUQuantity(maxCPU)
-		if err != nil {
-			return nil, fault.Wrap(fault.InvalidInput, "kubernetes adapter maximum CPU limit is invalid", err)
-		}
-		defParsed, err := definition.ParseCPUQuantity(strings.TrimSpace(config.Policy.CPULimit))
-		if err != nil {
-			return nil, fault.Wrap(fault.InvalidInput, "kubernetes adapter default CPU limit is invalid", err)
-		}
-		if defParsed > maxParsed {
-			return nil, fault.New(fault.InvalidInput, "kubernetes adapter default CPU limit exceeds maximum CPU limit")
-		}
+	rawPolicy, err := container.ParseRawResourcePolicy(
+		config.Policy.MemoryLimit,
+		config.Policy.MaxMemoryLimit,
+		config.Policy.CPULimit,
+		config.Policy.MaxCPULimit,
+	)
+	if err != nil {
+		return nil, err
 	}
-	if maxMemory := strings.TrimSpace(config.Policy.MaxMemoryLimit); maxMemory != "" {
-		maxParsed, err := definition.ParseMemoryQuantity(maxMemory)
-		if err != nil {
-			return nil, fault.Wrap(fault.InvalidInput, "kubernetes adapter maximum memory limit is invalid", err)
-		}
-		defParsed, err := definition.ParseMemoryQuantity(strings.TrimSpace(config.Policy.MemoryLimit))
-		if err != nil {
-			return nil, fault.Wrap(fault.InvalidInput, "kubernetes adapter default memory limit is invalid", err)
-		}
-		if defParsed > maxParsed {
-			return nil, fault.New(fault.InvalidInput, "kubernetes adapter default memory limit exceeds maximum memory limit")
-		}
+	resourcePolicy, err := container.NormalizeCeilingPolicy(rawPolicy)
+	if err != nil {
+		return nil, err
 	}
-	if config.Cleanup.Attempts < 1 {
-		return nil, fault.New(fault.InvalidInput, "kubernetes adapter requires at least one cleanup attempt")
-	}
-	if config.Cleanup.Backoff < 0 {
-		return nil, fault.New(fault.InvalidInput, "kubernetes adapter cleanup backoff is negative")
+	if err := config.Cleanup.Validate(); err != nil {
+		return nil, err
 	}
 	if config.WorkloadCA.SecretName != "" {
 		if err := validateWorkloadCASecretName(config.WorkloadCA.SecretName); err != nil {
@@ -524,7 +491,7 @@ func New(config Config) (*Adapter, error) {
 	}
 	clock := config.Clock
 	if clock == nil {
-		clock = adapterutil.RealClock{}
+		clock = container.RealClock{}
 	}
 	return &Adapter{
 		cluster:          config.Cluster,
@@ -534,13 +501,13 @@ func New(config Config) (*Adapter, error) {
 		toolboxImage:     config.ToolboxImage,
 		gitURL:           config.GitURL,
 		policy:           config.Policy,
+		resourcePolicy:   resourcePolicy,
 		cleanup:          config.Cleanup,
 		workloadCA:       config.WorkloadCA,
 		imagePullSecrets: append([]string(nil), config.ImagePullSecrets...),
 		cacheClaimName:   config.CacheClaimName,
 		clock:            clock,
 		prepared:         map[id.WorkloadID]preparedWorkload{},
-		locks:            map[id.WorkspaceID]*workspaceLock{},
 	}, nil
 }
 
@@ -616,24 +583,16 @@ func (a *Adapter) Capabilities(context.Context) (reconcile.Capabilities, error) 
 
 // CheckRequirements refuses admitted work the Kubernetes family cannot run.
 func CheckRequirements(required []string) error {
-	supported := make(map[string]bool)
-	for _, capability := range runtime.CapabilitiesFor(runtime.AdapterKubernetes) {
-		supported[string(capability)] = true
+	caps := make([]runtime.Capability, len(required))
+	for index, name := range required {
+		caps[index] = runtime.Capability(name)
 	}
-	for _, name := range required {
-		if !supported[name] {
-			return fault.New(fault.UnsupportedCapability, "kubernetes adapter does not support required capability "+name)
-		}
-	}
-	return nil
+	return container.CheckRequirements(runtime.AdapterKubernetes, caps)
 }
 
 // WorkspaceClaimName returns the deterministic claim name for one retained
 // workspace. The Shell provisions this claim before Prepare and the adapter
 // attaches exactly this claim after a restart.
 func WorkspaceClaimName(workspace id.WorkspaceID) (string, error) {
-	if _, err := id.ParseWorkspaceID(string(workspace)); err != nil {
-		return "", fault.Wrap(fault.InvalidInput, "workspace id is invalid", err)
-	}
-	return "kodema-workspace-" + adapterutil.StableDigest(string(workspace)), nil
+	return container.WorkspaceResourceName(workspace)
 }

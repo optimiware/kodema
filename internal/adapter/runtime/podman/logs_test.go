@@ -1,18 +1,18 @@
 // Log behavior: bounded ordered stdout/stderr chunks, a shared continuation
-// token that never skips the quieter stream, redaction of configured values and
-// fail-closed reads without a redaction source. Logs carry no lifecycle
-// authority.
+// token that never skips the quieter stream, redaction of configured values
+// from the isolated secrets directory, and fail-closed reads without a
+// redaction source. Logs carry no lifecycle authority.
 package podman
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
-	"github.com/optimiware/kodema/internal/control/workspace"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -78,6 +78,16 @@ func TestLogsAreOrderedBoundedAndRedacted(t *testing.T) {
 	}
 	if want := packCursor(int64(len(stdout)), int64(len(stderr))); batch.NextOffset != want {
 		t.Fatalf("NextOffset = %d, want %d", batch.NextOffset, want)
+	}
+
+	// Logs also work after controller reconstruction without prepared.json.
+	reconstructed := newAdapterWithRoot(t, fx)
+	afterRestart, err := reconstructed.Logs(context.Background(), logsRequest(fx, 0, 64))
+	if err != nil {
+		t.Fatalf("reconstructed Logs returned error: %v", err)
+	}
+	if len(afterRestart.Chunks) != 2 || strings.Contains(string(afterRestart.Chunks[0].Data), "s3cr3t") || strings.Contains(string(afterRestart.Chunks[1].Data), "tok-abc") {
+		t.Fatalf("reconstructed Logs failed to redact: %+v", afterRestart.Chunks)
 	}
 
 	for _, operation := range []string{"CreateContainer", "StartContainer", "StopContainer", "RemoveContainer"} {
@@ -190,25 +200,71 @@ func TestLogsRefusesUnboundedOrUnpreparedReads(t *testing.T) {
 }
 
 func TestLogsFailClosedWithoutRedactionSource(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedRunning(t)
-	fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("s3cr3t"))
-	secretPath := fx.hostPath(filepath.Join(workspace.SecretRoot, "API_KEY"))
-	if err := os.Remove(secretPath); err != nil {
-		t.Fatalf("removing redaction source: %v", err)
+	assertRefused := func(t *testing.T, fx *fixture, adapter *Adapter) {
+		t.Helper()
+		batch, err := adapter.Logs(context.Background(), logsRequest(fx, 0, 16))
+		assertFaultClass(t, err, fault.DependencyUnavailable)
+		if !errors.Is(err, ErrRedactionSourceUnavailable) {
+			t.Fatalf("Logs error %v does not wrap ErrRedactionSourceUnavailable", err)
+		}
+		if errors.Is(err, ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Logs error %v leaked NotFound/ErrNotExist cause", err)
+		}
+		if len(batch.Chunks) != 0 {
+			t.Fatalf("Logs emitted %d chunks without a redaction source", len(batch.Chunks))
+		}
+		if calls := len(fx.libpod.seenLogRequests()); calls != 0 {
+			t.Fatalf("Logs read the daemon before proving redaction: %d calls", calls)
+		}
 	}
 
-	batch, err := fx.adapter.Logs(context.Background(), logsRequest(fx, 0, 16))
-	if err == nil {
-		t.Fatal("Logs read output without a redaction source")
-	}
-	if len(batch.Chunks) != 0 {
-		t.Fatalf("Logs emitted %d chunks without a redaction source", len(batch.Chunks))
-	}
-	if calls := len(fx.libpod.seenLogRequests()); calls != 0 {
-		t.Fatalf("Logs read the daemon before proving redaction: %d calls", calls)
-	}
+	t.Run("missing declared secret file", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedRunning(t)
+		fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("s3cr3t"))
+		if err := os.Remove(fx.secretPath("API_KEY")); err != nil {
+			t.Fatalf("removing redaction source: %v", err)
+		}
+		assertRefused(t, fx, fx.adapter)
+	})
+
+	t.Run("missing KODEMA_TOKEN", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedRunning(t)
+		fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("tok-abc"))
+		if err := os.Remove(fx.credentialPath()); err != nil {
+			t.Fatalf("removing credential: %v", err)
+		}
+		assertRefused(t, fx, newAdapterWithRoot(t, fx))
+	})
+
+	t.Run("missing secrets directory", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedRunning(t)
+		fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("s3cr3t"))
+		if err := os.RemoveAll(fx.secretsRoot()); err != nil {
+			t.Fatalf("removing secrets dir: %v", err)
+		}
+		assertRefused(t, fx, newAdapterWithRoot(t, fx))
+	})
+
+	t.Run("symlink inside secrets directory", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedRunning(t)
+		fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("s3cr3t"))
+		outside := filepath.Join(t.TempDir(), "escape")
+		if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(fx.secretsRoot(), "LINK")); err != nil {
+			t.Fatal(err)
+		}
+		assertRefused(t, fx, fx.adapter)
+	})
 }
 
 func collectPodmanLogStreams(t *testing.T, fx *fixture, limit int) (stdout, stderr []byte) {
@@ -286,18 +342,18 @@ func TestLogsSplitSecretAcrossPageBoundary(t *testing.T) {
 }
 
 func TestLogsCursorOverflowBounds(t *testing.T) {
-	if pos, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, adapterutil.MaxStdoutLogCursorPosition, 0); err != nil || pos != adapterutil.MaxStdoutLogCursorPosition {
-		t.Fatalf("stdout boundary = (%d, %v); want (%d, nil)", pos, err, adapterutil.MaxStdoutLogCursorPosition)
+	if pos, err := container.NextStreamLogPosition(reconcile.LogStdout, container.MaxStdoutLogCursorPosition, 0); err != nil || pos != container.MaxStdoutLogCursorPosition {
+		t.Fatalf("stdout boundary = (%d, %v); want (%d, nil)", pos, err, container.MaxStdoutLogCursorPosition)
 	}
-	if _, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, adapterutil.MaxStdoutLogCursorPosition, 1); err == nil {
+	if _, err := container.NextStreamLogPosition(reconcile.LogStdout, container.MaxStdoutLogCursorPosition, 1); err == nil {
 		t.Fatal("stdout accepted position past 2^31-1")
 	} else {
 		assertFaultClass(t, err, fault.InvalidInput)
 	}
-	if pos, err := adapterutil.NextStreamLogPosition(reconcile.LogStderr, adapterutil.MaxStderrLogCursorPosition, 0); err != nil || pos != adapterutil.MaxStderrLogCursorPosition {
-		t.Fatalf("stderr boundary = (%d, %v); want (%d, nil)", pos, err, adapterutil.MaxStderrLogCursorPosition)
+	if pos, err := container.NextStreamLogPosition(reconcile.LogStderr, container.MaxStderrLogCursorPosition, 0); err != nil || pos != container.MaxStderrLogCursorPosition {
+		t.Fatalf("stderr boundary = (%d, %v); want (%d, nil)", pos, err, container.MaxStderrLogCursorPosition)
 	}
-	if _, err := adapterutil.NextStreamLogPosition(reconcile.LogStderr, adapterutil.MaxStderrLogCursorPosition, 1); err == nil {
+	if _, err := container.NextStreamLogPosition(reconcile.LogStderr, container.MaxStderrLogCursorPosition, 1); err == nil {
 		t.Fatal("stderr accepted position past 2^32-1")
 	} else {
 		assertFaultClass(t, err, fault.InvalidInput)

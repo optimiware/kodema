@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
@@ -125,10 +126,15 @@ func TestPrepareMaterializesConfinedActivationSnapshot(t *testing.T) {
 			configMap.Labels[LabelPreparation], len(configMap.Labels[LabelPreparation]))
 	}
 
+	wantScript, err := script.Render(request.Container.Commands)
+	if err != nil {
+		t.Fatalf("script.Render returned error: %v", err)
+	}
 	wantFiles := map[string]string{
 		"/kodema/inputs/input-a":      "line1\nline2",
 		"/kodema/outputs/build/out-a": "out",
 		"/kodema/task.json":           `{"id":"task-1"}`,
+		container.WorkloadScriptPath:  wantScript,
 	}
 	if len(configMap.Data) != len(wantFiles) {
 		t.Fatalf("activation configmap has %d files; want %d: %v", len(configMap.Data), len(wantFiles), configMap.Data)
@@ -142,8 +148,10 @@ func TestPrepareMaterializesConfinedActivationSnapshot(t *testing.T) {
 		if string(got) != want {
 			t.Errorf("activation file %q = %q; want %q (no appended newline or reinterpretation)", path, got, want)
 		}
-		if err := workspace.ValidatePath(path); err != nil {
-			t.Errorf("activation file %q is not confined: %v", path, err)
+		if path != container.WorkloadScriptPath {
+			if err := workspace.ValidatePath(path); err != nil {
+				t.Errorf("activation file %q is not confined: %v", path, err)
+			}
 		}
 		if strings.HasPrefix(path, workspace.WorkspaceRoot) {
 			t.Errorf("activation file %q was materialized inside the writable workspace", path)
@@ -264,6 +272,8 @@ func TestPrepareRefusesInvalidActionContext(t *testing.T) {
 		{name: "invalid action name", mutate: func(request *reconcile.PrepareRequest) { request.ActionName = "Build Mode" }},
 		{name: "invalid task id", mutate: func(request *reconcile.PrepareRequest) { request.TaskID = "../escape" }},
 		{name: "empty image", mutate: func(request *reconcile.PrepareRequest) { request.Container.Image = "   " }},
+		{name: "tag-only image", mutate: func(request *reconcile.PrepareRequest) { request.Container.Image = "alpine:3.24" }},
+		{name: "bare image", mutate: func(request *reconcile.PrepareRequest) { request.Container.Image = "busybox" }},
 		{name: "invalid env name", mutate: func(request *reconcile.PrepareRequest) {
 			request.Container.Env = []definition.EnvVar{{Name: "BAD NAME", Value: "x"}}
 		}},
@@ -343,7 +353,7 @@ func TestPrepareIsIdempotentAndRefusesChangedContent(t *testing.T) {
 			name:      "changed image",
 			wantClass: fault.ChangedIdempotencyContent,
 			mutate: func(_ *fakeCluster, req *reconcile.PrepareRequest) {
-				req.Container.Image = "alpine:3.24"
+				req.Container.Image = "registry.example.com/tools/build@sha256:" + strings.Repeat("f", 64)
 			},
 		},
 		{
@@ -396,21 +406,28 @@ func TestPrepareIsIdempotentAndRefusesChangedContent(t *testing.T) {
 		}
 	}
 
-	t.Run("accepts tag image and clears prepared entry on confirmed remove", func(t *testing.T) {
+	t.Run("refuses unpinned image and clears prepared entry on confirmed remove", func(t *testing.T) {
 		cluster, _, localAdapter := testSetup(t)
 		tagged := testPrepareRequest()
 		tagged.Container.Image = "alpine:3.24"
-		prepareTestWorkload(t, localAdapter, tagged)
+		if _, err := localAdapter.Prepare(context.Background(), tagged); err == nil {
+			t.Fatal("Prepare accepted an unpinned tag-only image")
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("unpinned image fault class = (%v, %v) for %v; want %q", class, ok, err, fault.InvalidInput)
+		}
+
+		pinned := testPrepareRequest()
+		prepareTestWorkload(t, localAdapter, pinned)
 
 		removal, removeErr := localAdapter.Remove(context.Background(), reconcile.RemoveRequest{
-			Identity:    tagged.Identity,
-			WorkspaceID: tagged.WorkspaceID,
+			Identity:    pinned.Identity,
+			WorkspaceID: pinned.WorkspaceID,
 		})
 		if removeErr != nil || !removal.Removed {
 			t.Fatalf("Remove = (%+v, %v); want Removed=true", removal, removeErr)
 		}
 		localAdapter.mu.Lock()
-		_, stillPrepared := localAdapter.prepared[tagged.Identity.WorkloadID]
+		_, stillPrepared := localAdapter.prepared[pinned.Identity.WorkloadID]
 		localAdapter.mu.Unlock()
 		if stillPrepared {
 			t.Fatal("confirmed Remove left the workload in Adapter.prepared")
@@ -472,7 +489,20 @@ func TestStartBuildsPinnedFailFastJob(t *testing.T) {
 	if spec.Image != testImage {
 		t.Errorf("job image = %q; want the pinned digest %q", spec.Image, testImage)
 	}
-	rendered := testJobScript(t, spec.Command)
+	if spec.WorkingDir != workspace.WorkspaceRoot {
+		t.Errorf("job workingDir = %q; want %q", spec.WorkingDir, workspace.WorkspaceRoot)
+	}
+	wantCommand := workspace.Entrypoint(container.WorkloadScriptPath, workspace.Launch{})
+	if len(spec.Command) != len(wantCommand) {
+		t.Fatalf("job command = %v; want %v", spec.Command, wantCommand)
+	}
+	for index := range wantCommand {
+		if spec.Command[index] != wantCommand[index] {
+			t.Fatalf("job command = %v; want %v", spec.Command, wantCommand)
+		}
+	}
+	configMap := fake.configMapsSnapshot()[0]
+	rendered := string(configMap.Data[container.WorkloadScriptPath])
 	wantScript, err := script.Render(request.Container.Commands)
 	if err != nil {
 		t.Fatalf("script.Render returned error: %v", err)
@@ -542,8 +572,7 @@ func TestStartBuildsPinnedFailFastJob(t *testing.T) {
 		t.Error("workspace volume is read-only")
 	}
 
-	configMap := fake.configMapsSnapshot()[0]
-	activationVolume := testVolumeAt(t, spec, "/kodema")
+	activationVolume := testVolumeAt(t, spec, container.ActivationRoot)
 	if !activationVolume.ReadOnly {
 		t.Error("activation volume is writable")
 	}
@@ -557,8 +586,10 @@ func TestStartBuildsPinnedFailFastJob(t *testing.T) {
 		if _, ok := configMap.Data[item.Path]; !ok {
 			t.Errorf("activation volume item path %q is not in the snapshot", item.Path)
 		}
-		if err := workspace.ValidatePath(item.Path); err != nil {
-			t.Errorf("activation volume item path %q is not confined: %v", item.Path, err)
+		if item.Path != container.WorkloadScriptPath {
+			if err := workspace.ValidatePath(item.Path); err != nil {
+				t.Errorf("activation volume item path %q is not confined: %v", item.Path, err)
+			}
 		}
 		if item.Mode&0o222 != 0 {
 			t.Errorf("activation volume item %q mode %#o is writable", item.Path, item.Mode)
@@ -768,24 +799,6 @@ func TestStartRefusesWithoutCompletePreparation(t *testing.T) {
 			t.Fatal("Start created a job bound to a different workspace")
 		}
 	})
-}
-
-// testJobScript extracts the fail-fast script from the pinned shell invocation.
-func testJobScript(t *testing.T, command []string) string {
-	t.Helper()
-	if len(command) < 3 || command[0] != "/bin/sh" {
-		t.Fatalf("job command = %v; want a /bin/sh fail-fast invocation", command)
-	}
-	switch command[1] {
-	case "-ec":
-		return command[2]
-	case "-e":
-		if len(command) >= 4 && command[2] == "-c" {
-			return command[3]
-		}
-	}
-	t.Fatalf("job command = %v; want a fail-fast -e/-c invocation", command)
-	return ""
 }
 
 func TestJobPodLabelsEmitProjectAndSandboxRole(t *testing.T) {

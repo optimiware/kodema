@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/definition"
@@ -62,7 +63,10 @@ func TestPrepareMaterializesConfinedSnapshot(t *testing.T) {
 		t.Fatalf("task bytes = %q, want the exact task snapshot", got)
 	}
 
-	secret := fx.hostPath(filepath.Join(workspace.SecretRoot, "API_KEY"))
+	if mode := hostFileMode(t, fx.secretsRoot()); mode != 0o700 {
+		t.Fatalf("secrets directory mode = %o, want 0700", mode)
+	}
+	secret := fx.secretPath("API_KEY")
 	if got := readHostFile(t, secret); string(got) != "s3cr3t" {
 		t.Fatalf("secret bytes = %q, want exact declared value", got)
 	}
@@ -77,6 +81,15 @@ func TestPrepareMaterializesConfinedSnapshot(t *testing.T) {
 		t.Fatalf("credential mode = %o, want 0444", mode)
 	}
 
+	// /kodema/secrets inside the activation bind must be an empty mount point;
+	// secrets and KODEMA_TOKEN must never be written into <root>/<workload>/kodema.
+	mountPoint := fx.hostPath(workspace.SecretRoot)
+	if entries, err := os.ReadDir(mountPoint); err != nil {
+		t.Fatalf("reading /kodema/secrets mount point: %v", err)
+	} else if len(entries) != 0 {
+		t.Fatalf("/kodema/secrets mount point holds %d entries; want empty", len(entries))
+	}
+
 	wantScript, err := script.Render(fx.request.Container.Commands)
 	if err != nil {
 		t.Fatalf("script.Render returned error: %v", err)
@@ -88,7 +101,7 @@ func TestPrepareMaterializesConfinedSnapshot(t *testing.T) {
 		t.Fatalf("script mode = %o, want 0444", mode)
 	}
 
-	for _, operation := range []string{"CreateContainer", "InspectContainer", "StartContainer", "StopContainer", "RemoveContainer", "ReadLogs"} {
+	for _, operation := range []string{"CreateContainer", "StartContainer", "StopContainer", "RemoveContainer", "ReadLogs"} {
 		if calls := fx.libpod.callsFor(operation); calls != 0 {
 			t.Fatalf("Prepare called %s %d times, want 0", operation, calls)
 		}
@@ -399,42 +412,41 @@ func TestStartBuildsPinnedContainerSpec(t *testing.T) {
 			t.Fatalf("label %q = %q, want %q", key, spec.Labels[key], want)
 		}
 	}
+	if len(spec.Labels[LabelPreparation]) != 48 {
+		t.Fatalf("label %q = %q, want 48-char preparation digest", LabelPreparation, spec.Labels[LabelPreparation])
+	}
 
-	if len(spec.Mounts) != 2 {
-		t.Fatalf("mounts = %+v, want exactly the kodema bind and the workspace volume", spec.Mounts)
+	if len(spec.Mounts) != 3 {
+		t.Fatalf("mounts = %+v, want activation bind, isolated secrets bind, and workspace volume", spec.Mounts)
 	}
-	var bind, volume *Mount
-	for index := range spec.Mounts {
-		switch spec.Mounts[index].Type {
-		case "bind":
-			bind = &spec.Mounts[index]
-		case "volume":
-			volume = &spec.Mounts[index]
-		}
+	bind, ok := mountAt(spec, "/kodema")
+	if !ok {
+		t.Fatalf("mounts = %+v, want /kodema bind", spec.Mounts)
 	}
-	if bind == nil {
-		t.Fatalf("mounts = %+v, want a directory bind", spec.Mounts)
-	}
-	if bind.Source != fx.kodemaRoot() {
-		t.Fatalf("bind source = %q, want the daemon-visible directory %q", bind.Source, fx.kodemaRoot())
-	}
-	if bind.Destination != "/kodema" || !bind.ReadOnly {
-		t.Fatalf("bind = %+v, want /kodema read-only", *bind)
+	if bind.Type != "bind" || bind.Source != fx.kodemaRoot() || !bind.ReadOnly {
+		t.Fatalf("activation bind = %+v, want read-only bind from %q", bind, fx.kodemaRoot())
 	}
 	if info, err := os.Stat(bind.Source); err != nil || !info.IsDir() {
 		t.Fatalf("bind source %q is not a directory: %v", bind.Source, err)
 	}
-	if !hostFileExists(t, filepath.Join(bind.Source, "secrets", "KODEMA_TOKEN")) {
-		t.Fatal("the credential is not inside the daemon-visible bind directory")
+
+	secBind, ok := mountAt(spec, workspace.SecretRoot)
+	if !ok {
+		t.Fatalf("mounts = %+v, want /kodema/secrets bind", spec.Mounts)
 	}
-	if volume == nil {
-		t.Fatalf("mounts = %+v, want the workspace volume", spec.Mounts)
+	if secBind.Type != "bind" || secBind.Source != fx.secretsRoot() || !secBind.ReadOnly {
+		t.Fatalf("secrets bind = %+v, want read-only bind from %q", secBind, fx.secretsRoot())
 	}
-	if volume.Source != fx.volumeName {
-		t.Fatalf("volume source = %q, want retained volume %q", volume.Source, fx.volumeName)
+	if !hostFileExists(t, filepath.Join(secBind.Source, "KODEMA_TOKEN")) {
+		t.Fatal("the credential is not inside the isolated secrets bind directory")
 	}
-	if volume.Destination != "/workspace" || volume.ReadOnly {
-		t.Fatalf("volume mount = %+v, want /workspace read-write", *volume)
+
+	volume, ok := mountAt(spec, "/workspace")
+	if !ok {
+		t.Fatalf("mounts = %+v, want /workspace volume", spec.Mounts)
+	}
+	if volume.Type != "volume" || volume.Source != fx.volumeName || volume.ReadOnly {
+		t.Fatalf("volume mount = %+v, want read-write volume %q", volume, fx.volumeName)
 	}
 
 	serialized := strings.Join(append(append([]string{}, spec.Env...), spec.Entrypoint...), "\n")
@@ -545,4 +557,39 @@ func TestPrepareRefusesWithoutStartingOrWritingTheWorkspace(t *testing.T) {
 	if calls := fx.libpod.callsFor("StartContainer"); calls != 0 {
 		t.Fatalf("Prepare started %d containers", calls)
 	}
+}
+
+func TestPrepareEmitsProjectAndRoleLabels(t *testing.T) {
+	fx := newFixture(t)
+	fx.request.ActionName = RoleSandbox
+	fx.request.Container.Commands = []string{"exec /kodema/bin/kodema sandbox serve --port 8080"}
+	fx.request.Container.Secrets = []id.SecretName{"KODEMA_SBOX_TOK_1"}
+	fx.request.Secrets = []reconcile.SecretValue{{Name: "KODEMA_SBOX_TOK_1", Value: "tok"}}
+	fx.request.Outputs = nil
+
+	ctx := runtime.WithExecutionProject(context.Background(), "proj-alpha")
+	if _, err := fx.adapter.Prepare(ctx, fx.request); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	fx.start(t)
+
+	spec := fx.createdSpec(t)
+	if spec.Labels[LabelProject] != "proj-alpha" {
+		t.Fatalf("label %q = %q; want proj-alpha", LabelProject, spec.Labels[LabelProject])
+	}
+	if spec.Labels[LabelRole] != RoleSandbox {
+		t.Fatalf("label %q = %q; want %q", LabelRole, spec.Labels[LabelRole], RoleSandbox)
+	}
+}
+
+func TestPrepareRefusesPostRestartContainerDigestConflict(t *testing.T) {
+	fx := newFixture(t)
+	fx.prepare(t)
+	fx.start(t)
+
+	reconstructed := newAdapterWithRoot(t, fx)
+	changed := fx.request
+	changed.Inputs = map[id.InputKey]string{"input-a": "mutated\n"}
+	_, err := reconstructed.Prepare(context.Background(), changed)
+	assertFaultClass(t, err, fault.ChangedIdempotencyContent)
 }

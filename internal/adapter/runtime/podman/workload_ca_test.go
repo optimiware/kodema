@@ -52,7 +52,6 @@ func TestPodmanWorkloadCAMountsReadOnlyCertAndExposesEnvOptIn(t *testing.T) {
 	}
 
 	fx := newFixture(t)
-	withoutCA := fx.adapter
 	adapter, err := New(Config{
 		Libpod:         fx.libpod,
 		Files:          fx.files,
@@ -67,30 +66,39 @@ func TestPodmanWorkloadCAMountsReadOnlyCertAndExposesEnvOptIn(t *testing.T) {
 	}
 	fx.adapter = adapter
 	// Attempt to spoof KODEMA_CA_FILE in literal env; the adapter must override
-	// it with the authoritative /kodema/ca.crt path.
+	// it with the authoritative /etc/kodema/ca/ca.crt path.
 	fx.request.Container.Env = append(fx.request.Container.Env,
 		definition.EnvVar{Name: EnvWorkloadCAFile, Value: "/tmp/evil.crt"})
 
 	fx.prepare(t)
 
-	mountedHostCA := fx.hostPath(WorkloadCAPath)
-	if got := readHostFile(t, mountedHostCA); string(got) != string(caPEM) {
-		t.Fatalf("materialized /kodema/ca.crt mismatch")
+	// The CA bundle must live under <root>/.ca/<digest>/ca.crt and never be
+	// copied into <root>/<workload>/kodema.
+	sharedCA := filepath.Join(fx.adapter.caDir, WorkloadCAKey)
+	if filepath.Dir(fx.adapter.caDir) != filepath.Join(fx.root, caDirectory) {
+		t.Fatalf("caDir = %q; want under %q", fx.adapter.caDir, filepath.Join(fx.root, caDirectory))
 	}
-	if mode := hostFileMode(t, mountedHostCA); mode != 0o444 {
-		t.Fatalf("/kodema/ca.crt mode = %o; want 0444", mode)
+	if got := readHostFile(t, sharedCA); string(got) != string(caPEM) {
+		t.Fatalf("shared CA bundle mismatch")
+	}
+	if mode := hostFileMode(t, sharedCA); mode != 0o444 {
+		t.Fatalf("shared CA bundle mode = %o; want 0444", mode)
+	}
+	if hostFileExists(t, filepath.Join(fx.kodemaRoot(), WorkloadCAKey)) {
+		t.Fatal("Prepare copied ca.crt into <root>/<workload>/kodema; must use shared /etc/kodema/ca bind mount")
 	}
 
-	// Start follows what Prepare wrote, not the adapter's current configuration.
-	if _, err := withoutCA.Start(context.Background(), reconcile.StartRequest{
-		Identity:    fx.request.Identity,
-		WorkspaceID: fx.request.WorkspaceID,
-	}); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	fx.start(t)
 	specs := fx.libpod.createSpecs()
 	if len(specs) != 1 {
 		t.Fatalf("createSpecs = %d; want 1", len(specs))
+	}
+	caMount, ok := mountAt(specs[0], WorkloadCAMountPath)
+	if !ok {
+		t.Fatalf("mounts %+v missing %s bind mount", specs[0].Mounts, WorkloadCAMountPath)
+	}
+	if caMount.Type != "bind" || !caMount.ReadOnly || caMount.Source != fx.adapter.caDir {
+		t.Fatalf("CA mount = %+v; want read-only bind from %q", caMount, fx.adapter.caDir)
 	}
 	wantCAEnv := EnvWorkloadCAFile + "=" + WorkloadCAPath
 	if !slices.Contains(specs[0].Env, wantCAEnv) {
@@ -98,6 +106,30 @@ func TestPodmanWorkloadCAMountsReadOnlyCertAndExposesEnvOptIn(t *testing.T) {
 	}
 	if slices.Contains(specs[0].Env, EnvWorkloadCAFile+"=/tmp/evil.crt") {
 		t.Fatalf("container env %v allowed spoofing %s", specs[0].Env, EnvWorkloadCAFile)
+	}
+
+	// A second workload reuses the shared CA file without rewriting it, and
+	// removing the first workload keeps the shared CA intact.
+	writes := fx.files.countPath("WriteFile", sharedCA)
+	second := fx.request
+	second.Identity = reconcile.EffectIdentity{
+		ExecutionID:    "exec-1",
+		ActionID:       "action-2",
+		WorkloadID:     "workload-2",
+		IdempotencyKey: "idem-2",
+	}
+	if _, err := fx.adapter.Prepare(context.Background(), second); err != nil {
+		t.Fatalf("Prepare of second workload: %v", err)
+	}
+	if got := fx.files.countPath("WriteFile", sharedCA); got != writes {
+		t.Fatalf("shared CA was written %d more time(s) for a second workload", got-writes)
+	}
+	fx.seedExited(t, 0, true)
+	if removal := fx.remove(t); !removal.Removed {
+		t.Fatalf("Remove = %+v; want success", removal)
+	}
+	if !hostFileExists(t, sharedCA) {
+		t.Fatal("Remove deleted the shared CA bundle")
 	}
 }
 

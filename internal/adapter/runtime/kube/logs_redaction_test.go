@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -313,23 +313,23 @@ func TestLogsPagesCarryTruncationSequenceAndForwardedLimit(t *testing.T) {
 // high half cannot carry is refused instead of surfacing as a negative cursor:
 // 2^31-1 is accepted, 2^31 is refused.
 func TestLogsRefusesCursorPositionOutsideTokenRange(t *testing.T) {
-	const maxPos = adapterutil.MaxStdoutLogCursorPosition
-	accepted := adapterutil.EncodeLogCursor(maxPos, 0)
+	const maxPos = container.MaxStdoutLogCursorPosition
+	accepted := container.EncodeLogCursor(maxPos, 0)
 	if accepted <= 0 {
 		t.Fatalf("EncodeLogCursor(2^31-1) = %d; want a positive token", accepted)
 	}
-	if position, stderr := adapterutil.DecodeLogCursor(accepted); position != maxPos || stderr != 0 {
+	if position, stderr := container.DecodeLogCursor(accepted); position != maxPos || stderr != 0 {
 		t.Fatalf("decoded boundary token = (%d,%d); want (%d,0)", position, stderr, maxPos)
 	}
-	if next, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, maxPos, 0); err != nil || adapterutil.EncodeLogCursor(next, 0) != accepted {
+	if next, err := container.NextStreamLogPosition(reconcile.LogStdout, maxPos, 0); err != nil || container.EncodeLogCursor(next, 0) != accepted {
 		t.Fatalf("NextStreamLogPosition(2^31-1,0) = (%d,%v); want (%d,nil)", next, err, maxPos)
 	}
-	if _, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, maxPos, 1); err == nil {
+	if _, err := container.NextStreamLogPosition(reconcile.LogStdout, maxPos, 1); err == nil {
 		t.Fatal("NextStreamLogPosition accepted a position at 2^31")
 	} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
 		t.Fatalf("overflow class = %v (present=%v); want %q", class, ok, fault.InvalidInput)
 	}
-	if next, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, maxPos-1, 1); err != nil || adapterutil.EncodeLogCursor(next, 0) != accepted {
+	if next, err := container.NextStreamLogPosition(reconcile.LogStdout, maxPos-1, 1); err != nil || container.EncodeLogCursor(next, 0) != accepted {
 		t.Fatalf("NextStreamLogPosition(2^31-2,1) = (%d,%v); want (%d,nil)", next, err, maxPos)
 	}
 
@@ -357,7 +357,7 @@ func TestLogsRefusesCursorPositionOutsideTokenRange(t *testing.T) {
 	}
 
 	readsBefore := fake.callCount("ReadPodLogs")
-	overflow := adapterutil.EncodeLogCursor(maxPos+1, 0)
+	overflow := container.EncodeLogCursor(maxPos+1, 0)
 	if overflow >= 0 {
 		t.Fatalf("EncodeLogCursor(2^31) = %d; expected a negative token for the test", overflow)
 	}

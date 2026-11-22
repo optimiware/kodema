@@ -1,17 +1,20 @@
 // Observation, stop, ownership and redaction evidence for the Podman adapter.
 //
 // The rules here keep uncertainty visible: an absent container, an unreachable
-// daemon, a created container whose start may still be delayed and an exited
-// main process without whole-container evidence never collapse into
-// nonexecution or stop confirmation.
+// daemon, a container in "created" status, and an exited main process without
+// whole-container evidence never collapse into nonexecution or stop
+// confirmation.
 package podman
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
-	"github.com/optimiware/kodema/internal/control/workspace"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
@@ -62,20 +65,13 @@ func checkExistingContainer(state ContainerState, identity reconcile.EffectIdent
 }
 
 // observationFor maps libpod container evidence to the declared Kernel
-// vocabulary. A created container is affirmative never-started proof only when
-// no start attempt was durably recorded and none is pending; an attempted start
-// whose outcome was lost stays uncertain.
-func observationFor(state ContainerState, attempted bool, memoryLimitBytes int64) engine.Observation {
+// vocabulary. A container in "created" status stays unknown conservatively:
+// without external side-band state, a libpod client cannot prove whether a
+// start request is still in flight.
+func observationFor(state ContainerState, memoryLimitBytes int64) engine.Observation {
 	switch state.Status {
 	case ContainerStatusCreated:
-		if attempted || state.Started || state.StartPending {
-			// A start was attempted, accepted or may still be delivered: the
-			// command may run, so nonexecution is not proven.
-			return engine.UnknownObservation()
-		}
-		return engine.NeverStarted(fmt.Sprintf(
-			"container %q exists in status %q with no start attempt, no accepted start and no pending start",
-			state.Name, state.Status))
+		return engine.UnknownObservation()
 	case ContainerStatusRunning:
 		return engine.RunningObservation()
 	case ContainerStatusExited:
@@ -105,19 +101,10 @@ func observationFor(state ContainerState, attempted bool, memoryLimitBytes int64
 }
 
 // removable reports whether cleanup may proceed for one observed container.
-// Only affirmative never-started evidence (no recorded start attempt) or
-// affirmative whole-container termination qualifies; a running, attempted-start,
-// delayed-start, ambiguous or partially stopped container retains every owned
-// resource.
-func removable(state ContainerState, attempted bool) bool {
-	switch state.Status {
-	case ContainerStatusCreated:
-		return !attempted && !state.Started && !state.StartPending
-	case ContainerStatusExited:
-		return state.WholeStopped
-	default:
-		return false
-	}
+// Only affirmative whole-container termination qualifies; a running, created,
+// ambiguous, or partially stopped container retains every owned resource.
+func removable(state ContainerState) bool {
+	return state.Status == ContainerStatusExited && state.WholeStopped
 }
 
 // describeContainerState renders an operator-facing, non-secret state summary.
@@ -126,31 +113,68 @@ func describeContainerState(state ContainerState) string {
 		state.Status, state.Started, state.StartPending, state.WholeStopped)
 }
 
-// redactionValues returns every configured value that must be removed from log
-// output, longest first so a shorter value cannot partially obscure a longer
-// one. A missing or unreadable source is an error: log output is never emitted
-// without redaction.
-func (a *Adapter) redactionValues(ctx context.Context, workload id.WorkloadID, record preparationRecord) ([]string, error) {
-	logicalPaths := make([]string, 0, len(record.Secrets)+1)
-	for _, name := range record.Secrets {
-		path, err := workspace.SecretPath(name)
-		if err != nil {
-			return nil, err
-		}
-		logicalPaths = append(logicalPaths, path)
+// redactionValues reads every configured secret and credential file directly
+// from the isolated <root>/<workload>/secrets directory, returning non-empty
+// values longest first. A missing/unreadable/non-directory secrets root, a
+// symlink or non-regular entry, a missing KODEMA_TOKEN, or any missing declared
+// secret fails closed so log output is never emitted without redaction.
+func (a *Adapter) redactionValues(ctx context.Context, workload id.WorkloadID) ([]string, error) {
+	dir := secretsDir(a.root, workload)
+	dirInfo, err := a.files.Lstat(ctx, dir)
+	if err != nil {
+		return nil, err
 	}
-	logicalPaths = append(logicalPaths, workspace.ReservedCredentialPath)
+	if dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() {
+		return nil, fault.New(fault.Forbidden, "redaction source directory is not a directory")
+	}
+	entries, err := a.files.ReadDir(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
 
-	values := make([]string, 0, len(logicalPaths))
-	for _, logical := range logicalPaths {
-		data, err := a.files.ReadFile(ctx, hostPath(a.root, workload, logical))
+	tempPrefix := string(id.SecretTokenName) + ".tmp-"
+	present := make(map[string]bool, len(entries))
+	values := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil, fault.New(fault.Forbidden, "redaction source entry is a symlink")
+		}
+		path := filepath.Join(dir, name)
+		info, err := a.files.Lstat(ctx, path)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && strings.HasPrefix(name, tempPrefix) {
+				continue
+			}
 			return nil, err
 		}
-		if len(data) == 0 {
-			continue
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, fault.New(fault.Forbidden, "redaction source entry is not a regular file")
 		}
-		values = append(values, string(data))
+		data, err := a.files.ReadFile(ctx, path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) && strings.HasPrefix(name, tempPrefix) {
+				continue
+			}
+			return nil, err
+		}
+		present[name] = true
+		if len(data) > 0 {
+			values = append(values, string(data))
+		}
 	}
-	return adapterutil.SortRedactionValues(values), nil
+	if !present[string(id.SecretTokenName)] {
+		return nil, os.ErrNotExist
+	}
+	a.mu.Lock()
+	prepared, ok := a.prepared[workload]
+	a.mu.Unlock()
+	if ok {
+		for _, secretName := range prepared.secretNames {
+			if !present[string(secretName)] {
+				return nil, os.ErrNotExist
+			}
+		}
+	}
+	return container.SortRedactionValues(values), nil
 }

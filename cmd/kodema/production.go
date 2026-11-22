@@ -413,30 +413,47 @@ func parseProductionTenants(getenv productionEnv) (productionTenantSet, error) {
 	return productionTenantSet{entries: entries, list: true}, nil
 }
 
+const (
+	defaultKubeCPURequest    = "250m"
+	defaultKubeCPULimit      = "1"
+	defaultKubeCPUMillicores = int64(1000)
+	defaultKubeMemoryRequest = "256Mi"
+	defaultKubeMemoryLimit   = "1Gi"
+	defaultKubeMemoryBytes   = int64(1 << 30)
+	defaultKubeJobTTLSeconds = 600
+)
+
 // newProductionTenantAdapter builds one tenant's Kubernetes runtime and
 // workspace adapter from the shared cluster client and the installation
 // workload policy.
 func newProductionTenantAdapter(getenv productionEnv, cluster *driverkube.Cluster, tenant productionTenantEntry, options serverOptions) (*runtimekube.Adapter, error) {
+	policy := runtimekube.Policy{
+		CPURequest:     envOrGetenv(getenv, "KODEMA_WORKLOAD_CPU_REQUEST", defaultKubeCPURequest),
+		CPULimit:       envOrGetenv(getenv, "KODEMA_WORKLOAD_CPU_LIMIT", defaultKubeCPULimit),
+		MaxCPULimit:    strings.TrimSpace(getenv("KODEMA_WORKLOAD_MAX_CPU_LIMIT")),
+		MemoryRequest:  envOrGetenv(getenv, "KODEMA_WORKLOAD_MEMORY_REQUEST", defaultKubeMemoryRequest),
+		MemoryLimit:    envOrGetenv(getenv, "KODEMA_WORKLOAD_MEMORY_LIMIT", defaultKubeMemoryLimit),
+		MaxMemoryLimit: strings.TrimSpace(getenv("KODEMA_WORKLOAD_MAX_MEMORY_LIMIT")),
+		JobTTLSeconds:  defaultKubeJobTTLSeconds,
+	}
+	return newTenantAdapterWithPolicy(getenv, cluster, tenant, options, policy)
+}
+
+// newTenantAdapterWithPolicy builds one tenant's Kubernetes runtime and
+// workspace adapter using an explicitly resolved resource policy.
+func newTenantAdapterWithPolicy(getenv productionEnv, cluster *driverkube.Cluster, tenant productionTenantEntry, options serverOptions, policy runtimekube.Policy) (*runtimekube.Adapter, error) {
 	imagePullSecrets, err := parseImagePullSecrets(getenv("KODEMA_WORKLOAD_IMAGE_PULL_SECRETS"))
 	if err != nil {
 		return nil, err
 	}
 	adapter, err := runtimekube.New(runtimekube.Config{
-		Cluster:      cluster,
-		Namespace:    tenant.Namespace,
-		TenantID:     tenant.ID,
-		KodemaURL:    options.PublicURL,
-		ToolboxImage: strings.TrimSpace(getenv("KODEMA_TOOLBOX_IMAGE")),
-		GitURL:       strings.ReplaceAll(options.WorkloadGitURL, "{tenant}", string(tenant.ID)),
-		Policy: runtimekube.Policy{
-			CPURequest:     envOrGetenv(getenv, "KODEMA_WORKLOAD_CPU_REQUEST", "250m"),
-			CPULimit:       envOrGetenv(getenv, "KODEMA_WORKLOAD_CPU_LIMIT", "1"),
-			MaxCPULimit:    strings.TrimSpace(getenv("KODEMA_WORKLOAD_MAX_CPU_LIMIT")),
-			MemoryRequest:  envOrGetenv(getenv, "KODEMA_WORKLOAD_MEMORY_REQUEST", "256Mi"),
-			MemoryLimit:    envOrGetenv(getenv, "KODEMA_WORKLOAD_MEMORY_LIMIT", "1Gi"),
-			MaxMemoryLimit: strings.TrimSpace(getenv("KODEMA_WORKLOAD_MAX_MEMORY_LIMIT")),
-			JobTTLSeconds:  600,
-		},
+		Cluster:          cluster,
+		Namespace:        tenant.Namespace,
+		TenantID:         tenant.ID,
+		KodemaURL:        options.PublicURL,
+		ToolboxImage:     strings.TrimSpace(getenv("KODEMA_TOOLBOX_IMAGE")),
+		GitURL:           strings.ReplaceAll(options.WorkloadGitURL, "{tenant}", string(tenant.ID)),
+		Policy:           policy,
 		Cleanup:          runtimekube.CleanupPolicy{Attempts: 3, Backoff: time.Second},
 		WorkloadCA:       runtimekube.WorkloadCAConfig{SecretName: strings.TrimSpace(getenv("KODEMA_WORKLOAD_CA_SECRET"))},
 		ImagePullSecrets: imagePullSecrets,

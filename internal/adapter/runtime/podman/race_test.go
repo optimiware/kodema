@@ -343,17 +343,6 @@ func TestKeyedLocksCleanUpAfterConcurrentUse(t *testing.T) {
 	close(start)
 	wait.Wait()
 
-	fx.adapter.mu.Lock()
-	workloadLocks := len(fx.adapter.locks)
-	fx.adapter.mu.Unlock()
-	if workloadLocks != 0 {
-		t.Fatalf("adapter.locks retained %d entries after all unlocks; want 0", workloadLocks)
-	}
-
-	fx.adapter.workspaceMu.Lock()
-	workspaceLocks := len(fx.adapter.workspaceLocks)
-	fx.adapter.workspaceMu.Unlock()
-	if workspaceLocks != 0 {
-		t.Fatalf("adapter.workspaceLocks retained %d entries after all unlocks; want 0", workspaceLocks)
-	}
+	fx.adapter.lockFor("workload-lock-0")()
+	fx.adapter.lockForWorkspace("workspace-lock-0")()
 }

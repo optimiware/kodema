@@ -139,88 +139,54 @@
 //	<root>/<workload>/kodema/inputs/<key>              exact admitted input bytes
 //	<root>/<workload>/kodema/outputs/<action>/<key>    earlier succeeded outputs only
 //	<root>/<workload>/kodema/task.json                 only when the request has a task
-//	<root>/<workload>/kodema/secrets/<NAME>            declared activation-time values
-//	<root>/<workload>/kodema/secrets/KODEMA_TOKEN      the sole mutable mounted file
 //	<root>/<workload>/kodema/script                    script.Render output
+//	<root>/<workload>/kodema/secrets/                  empty mount-point directory
+//	<root>/<workload>/secrets/<NAME>                   declared activation-time values (0700 dir)
+//	<root>/<workload>/secrets/KODEMA_TOKEN             the sole mutable mounted file (0700 dir)
+//	<root>/.ca/<digest>/ca.crt                         shared CA bundle (mounted at /etc/kodema/ca)
 //
-// Every materialized logical path P under /kodema is written at
-// filepath.Join(<root>/<workload>, P). Prepared files are regular read-only
-// (0o444) files. The generated script is <root>/<workload>/kodema/script. The
-// execution workspace is the pre-existing named Podman volume returned by
-// WorkspaceVolumeName(WorkspaceID); Prepare and Start attach it at /workspace
-// and never create it. Only the separate engine.Workspace Release operation may
-// remove it, and only after every reference and retention guard is clear.
-//
-// The container mounts exactly two things: the directory
-// <root>/<workload>/kodema as a read-only bind at /kodema (a DIRECTORY bind so
-// an atomic token-file replacement is visible without a restart) and the
-// retained workspace volume read-write at /workspace.
+// Non-secret logical paths P under /kodema are written at
+// filepath.Join(<root>/<workload>, P) and bind-mounted read-only at /kodema.
+// Declared secrets and KODEMA_TOKEN live in the isolated 0700 directory
+// <root>/<workload>/secrets and are bind-mounted read-only at /kodema/secrets
+// (a directory bind so atomic token replacement is visible without a restart).
+// The execution workspace is the pre-existing named Podman volume returned by
+// WorkspaceVolumeName(WorkspaceID); Prepare and Start attach it read-write at
+// /workspace and never create it. Only the separate reconcile.Workspace Release
+// operation may remove it, and only when no container references it.
 //
 // Behavior rules these tests pin (S02 §5–6 and S07 §1–3):
 //   - Version/Capabilities/CheckRequirements are declaration-only and make no
-//     libpod call. The family pins libpod/v4 and exactly the container,
-//     retained-workspace, credential-refresh and process-group-stop
-//     capabilities; unsupported admitted requirements are refused before
-//     dispatch with unsupported_capability.
-//   - Prepare reuses workspace.Materialization.Validate and script.Render. It
-//     requires a digest-pinned image, a non-empty valid command list, a valid
-//     action slug/task id, a non-empty credential, an existing workspace volume
-//     owned by the workspace label and confined, non-symlinked read-only files.
-//     It writes the activation snapshot once, is idempotent for unchanged
-//     content, refuses changed content for the same identity with
-//     changed_idempotency_content, and never starts a container. A partial or
-//     unsafe preparation never authorizes a start.
-//   - The container spec carries the pinned image, the rendered fail-fast
-//     entrypoint, the admitted literal environment in declaration order
-//     followed by the unshadowable reserved context KODEMA_URL,
-//     KODEMA_EXECUTION, KODEMA_ACTION (the action slug, never the action id)
-//     and KODEMA_TASK (omitted when task-free), the stable labels and
-//     RestartPolicy "no". Secrets and the credential never appear in argv,
-//     environment, labels or diagnostics.
-//   - Start consumes the persisted engine.EffectIdentity and the completed
-//     on-disk preparation. A lost create or start response is StartUnknown and
-//     is never replayed as a fresh command: a retry inspects the same stable
-//     container and reuses it. Start reports StartProvenNotStarted only for an
-//     affirmative never-started observation with no delayed start pending, and
-//     StartUnknown for any ambiguous outcome or cancellation.
-//   - Observe reports the declared Kernel vocabulary. never_started requires
-//     affirmative proof: either a created container with no accepted start and
-//     no pending start, or an absent container whose per-workload durable facts
-//     show StartContainer could never have been issued (no preparation record,
-//     or a preparation record with no start-attempt marker). An absent
-//     container with a recorded start attempt stays absent: absence alone is
-//     never proof. running, exited(status) and unknown follow the daemon
-//     evidence. A confirmed stop requires affirmative whole-container
-//     termination (exited AND WholeStopped); a stop acknowledgment alone never
-//     confirms.
+//     libpod call.
+//   - Prepare reuses container.BuildMaterialization and script.Render. It
+//     requires a digest-pinned image present in the local store, valid commands,
+//     action slug/task id, non-empty credential, existing owned workspace volume
+//     and confined, non-symlinked files. It is idempotent for unchanged content,
+//     refuses changed content with changed_idempotency_content, refuses
+//     workspace conflicts with forbidden, and never starts a container.
+//   - Start consumes the persisted reconcile.EffectIdentity and the completed
+//     in-process preparation (or reuses an existing running/exited container
+//     after controller restart). A lost create or start response stays
+//     StartUnknown, and an existing container in "created" status stays
+//     StartUnknown conservatively.
+//   - Observe reports AbsentObservation for any absent container,
+//     UnknownObservation for "created" status or daemon errors, Running, and
+//     Exited with confirmed stop only on whole-container termination.
 //   - Remove is idempotent, identity-scoped and bounded by Cleanup.Attempts
 //     with Clock.Sleep(Backoff) between attempts. It removes only that
-//     identity's container and materialization, writes a durable removal fence
-//     outside the removed root, and NEVER removes or writes the retained
-//     workspace volume. A live or unconfirmed container retains every owned
-//     resource and names the container. Exhaustion returns Removed=false with a
-//     detail naming the retained resource, never a false success. A removed
-//     identity is refused by Prepare/Start even after adapter reconstruction,
-//     and Observe reports absent.
+//     identity's container and materialization tree and NEVER removes or writes
+//     the retained workspace volume.
 //   - Workspace is separate from Runtime. Status reports availability only for
-//     an existing volume labelled for that workspace; a missing, foreign or
-//     unlabelled volume is unavailable evidence and is never recreated. Retain
-//     is idempotent and persists a durable retained marker, so a stale Release
-//     cannot drop a retained workspace across adapter reconstruction. Release
-//     removes the volume only when it is owned, unretained and unreferenced by
-//     any container or start-attempt marker; an absent volume is idempotent
-//     success, and an uncertain removal returns an error without fabricating
-//     success. Status/Retain/Release never touch another identity's volume.
+//     an existing owned volume; Retain verifies the owned volume exists;
+//     Release removes the volume only when owned and unreferenced by any
+//     container.
 //   - RefreshCredential atomically replaces only
-//     <root>/<workload>/kodema/secrets/KODEMA_TOKEN (write-temp-then-rename)
-//     and never creates, starts, stops or removes the container. A failed or
-//     lost replacement leaves the previous token intact and a retry recovers.
-//   - Logs are ordered stdout/stderr chunks with a single continuation token
-//     packing the stdout position in the high 32 bits and the stderr position
-//     in the low 32 bits, so a later read never skips the quieter stream. Each
-//     read is bounded by Limit, redacts configured secret/credential values and
-//     fails closed when the redaction source is unavailable. Logs carry no
-//     lifecycle authority.
+//     <root>/<workload>/secrets/KODEMA_TOKEN (write-temp-then-rename) without
+//     creating, starting, stopping or removing the container.
+//   - Logs are ordered stdout/stderr chunks with a packed continuation token,
+//     bounded by Limit, redacted from <root>/<workload>/secrets, and fail
+//     closed with ErrRedactionSourceUnavailable when the redaction source is
+//     unavailable.
 package podman
 
 import (
@@ -449,19 +415,36 @@ func TestPinnedLabelVocabulary(t *testing.T) {
 		"LabelAction":         "kodema.dev/action",
 		"LabelWorkload":       "kodema.dev/workload",
 		"LabelWorkspace":      "kodema.dev/workspace",
+		"LabelProject":        "kodema.dev/project",
+		"LabelRole":           "kodema.dev/role",
+		"RoleSandbox":         "sandbox",
 		"LabelIdempotencyKey": "kodema.dev/idempotency-key",
+		"LabelPreparation":    "kodema.dev/preparation",
+		"WorkloadCAPath":      "/etc/kodema/ca/ca.crt",
+		"WorkloadCAMountPath": "/etc/kodema/ca",
+		"WorkloadCAKey":       "ca.crt",
 	}
 	got := map[string]string{
 		"LabelExecution":      LabelExecution,
 		"LabelAction":         LabelAction,
 		"LabelWorkload":       LabelWorkload,
 		"LabelWorkspace":      LabelWorkspace,
+		"LabelProject":        LabelProject,
+		"LabelRole":           LabelRole,
+		"RoleSandbox":         RoleSandbox,
 		"LabelIdempotencyKey": LabelIdempotencyKey,
+		"LabelPreparation":    LabelPreparation,
+		"WorkloadCAPath":      WorkloadCAPath,
+		"WorkloadCAMountPath": WorkloadCAMountPath,
+		"WorkloadCAKey":       WorkloadCAKey,
 	}
 	for name, value := range want {
 		if got[name] != value {
 			t.Fatalf("%s = %q, want %q", name, got[name], value)
 		}
+	}
+	if ErrRedactionSourceUnavailable == nil {
+		t.Fatal("ErrRedactionSourceUnavailable is nil")
 	}
 }
 

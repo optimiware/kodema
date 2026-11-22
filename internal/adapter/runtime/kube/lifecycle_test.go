@@ -987,6 +987,31 @@ func TestPrepareAppliesBoundedResourcesAndEnforcesPolicyMaximum(t *testing.T) {
 		}
 	})
 
+	t.Run("omitted Policy maximum pins ceiling to default limit rather than widening", func(t *testing.T) {
+		// testSetup sets MemoryLimit=256Mi, CPULimit=1, MaxMemoryLimit="", MaxCPULimit="".
+		// Requesting above those defaults (even below Podman's 4Gi / 4 CPU defaults)
+		// must be refused.
+		_, _, adapter := testSetup(t)
+		request := testPrepareRequest()
+		request.Container.Resources = &definition.Resources{Memory: "512Mi"}
+		_, err := adapter.Prepare(context.Background(), request)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("Prepare memory above default ceiling = %v; want invalid_input", err)
+		}
+		if !strings.Contains(err.Error(), "exceeds installation maximum") {
+			t.Fatalf("error = %v; want installation maximum diagnostic", err)
+		}
+
+		request.Container.Resources = &definition.Resources{CPU: "2"}
+		_, err = adapter.Prepare(context.Background(), request)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("Prepare cpu above default ceiling = %v; want invalid_input", err)
+		}
+		if !strings.Contains(err.Error(), "exceeds installation maximum") {
+			t.Fatalf("error = %v; want installation maximum diagnostic", err)
+		}
+	})
+
 	t.Run("refuses per-action resources exceeding Policy maximum", func(t *testing.T) {
 		_, _, adapter := testSetup(t)
 		request := testPrepareRequest()

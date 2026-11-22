@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -194,7 +194,7 @@ func TestLogsCursorHighHalfAdvancesAndStderrHalfStaysZero(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step %d Logs returned error: %v", step, err)
 		}
-		stdoutPos, stderrPos := adapterutil.DecodeLogCursor(batch.NextOffset)
+		stdoutPos, stderrPos := container.DecodeLogCursor(batch.NextOffset)
 		if stdoutPos != want {
 			t.Fatalf("step %d high half = %d; want the stdout position %d",
 				step, stdoutPos, want)
@@ -369,7 +369,7 @@ func TestLogsRedactsValueEndingAtThePageBoundary(t *testing.T) {
 func TestLogsRefusesLegacySplitStreamCursor(t *testing.T) {
 	fake, _, adapter := testSetup(t)
 	request := testPrepareRequest()
-	legacy := adapterutil.EncodeLogCursor(7, 5)
+	legacy := container.EncodeLogCursor(7, 5)
 
 	batch, err := adapter.Logs(context.Background(), reconcile.LogsRequest{
 		Identity:    request.Identity,
@@ -403,7 +403,7 @@ func TestLogsAcceptsCombinedCursor(t *testing.T) {
 
 	batch, err := adapter.Logs(context.Background(), reconcile.LogsRequest{
 		Identity:    request.Identity,
-		AfterOffset: adapterutil.EncodeLogCursor(3, 0),
+		AfterOffset: container.EncodeLogCursor(3, 0),
 		Limit:       4,
 	})
 	if err != nil {
@@ -412,7 +412,7 @@ func TestLogsAcceptsCombinedCursor(t *testing.T) {
 	if len(batch.Chunks) != 1 || batch.Chunks[0].Offset != 3 || string(batch.Chunks[0].Data) != "3456" {
 		t.Fatalf("resumed chunks = %+v; want offset 3 data 3456", batch.Chunks)
 	}
-	if want := adapterutil.EncodeLogCursor(7, 0); batch.NextOffset != want {
+	if want := container.EncodeLogCursor(7, 0); batch.NextOffset != want {
 		t.Fatalf("NextOffset = %d; want %d", batch.NextOffset, want)
 	}
 }

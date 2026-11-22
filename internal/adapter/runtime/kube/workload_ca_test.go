@@ -25,6 +25,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -107,8 +108,8 @@ func TestWorkloadCAMountUsesTrustedConfiguration(t *testing.T) {
 	if item.Path != WorkloadCAPath {
 		t.Errorf("CA volume item path = %q; want the fixed path %q", item.Path, WorkloadCAPath)
 	}
-	if item.Mode != readOnlyMode || item.Mode&0o222 != 0 {
-		t.Errorf("CA volume item mode = %#o; want read-only %#o", item.Mode, readOnlyMode)
+	if item.Mode != container.ReadOnlyFileMode || item.Mode&0o222 != 0 {
+		t.Errorf("CA volume item mode = %#o; want read-only %#o", item.Mode, container.ReadOnlyFileMode)
 	}
 
 	// The trust bundle must not become an unshadowable standard environment
@@ -158,7 +159,7 @@ func TestWorkloadCAMountIsConfined(t *testing.T) {
 
 	reserved := []string{
 		workspace.WorkspaceRoot,
-		activationRoot,
+		container.ActivationRoot,
 		workspace.SecretRoot,
 		workspace.ReservedCredentialPath,
 	}
