@@ -1019,3 +1019,61 @@ func TestKodemaSessionFlagAndServerAliases(t *testing.T) {
 		t.Fatalf("environment aliases did not select the session: %d/%q", recorder.count(), recorder.authorization(0))
 	}
 }
+
+// TestKodemaRelativeSessionPathWorksForLoginAndLogout verifies that relative
+// --session paths (such as sess/session.json) are absolutized before building
+// the cross-process session lock so both login persistence and unverified
+// logout deletion succeed instead of failing after the IdP flow.
+func TestKodemaRelativeSessionPathWorksForLoginAndLogout(t *testing.T) {
+	isolateUserConfig(t)
+	workDir := t.TempDir()
+	t.Chdir(workDir)
+	relSession := filepath.Join("sess", "session.json")
+
+	provider := newFakeProvider(t)
+	recorder := &resultRecorder{}
+	document := api.DiscoveryDocument{}
+	apiServer := newPublicServer(t, "task.read", &document, recorder)
+	t.Cleanup(apiServer.Close)
+	document = provider.document(apiServer.URL)
+
+	clock := fixedClock{now: time.Now()}
+	deps := defaultCLIDeps()
+	deps.oidc = &cli.HTTPOIDCClient{RoundTripper: provider.client().Transport}
+	deps.clock = clock
+	deps.environment = mapEnvironment(map[string]string{})
+
+	code, stdout, stderr := runEntry(t, []string{
+		"-server", apiServer.URL,
+		"-session", relSession,
+		"login", "--device",
+	}, deps)
+	if code != cli.ExitSuccess {
+		t.Fatalf("relative-path device login exit = %d; stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stdout, "logged in") {
+		t.Fatalf("stdout = %q; want login acknowledgement", stdout)
+	}
+	absSession := filepath.Join(workDir, relSession)
+	if _, err := os.Stat(absSession); err != nil {
+		t.Fatalf("Stat(%q): %v", absSession, err)
+	}
+
+	// Unverified logout (discovery unreachable) must still acquire the lock and
+	// remove the relative session file.
+	apiServer.Close()
+	code, _, stderr = runEntry(t, []string{
+		"-server", apiServer.URL,
+		"-session", relSession,
+		"logout",
+	}, deps)
+	if code != cli.ExitFailure {
+		t.Fatalf("unverified logout exit = %d; want failure", code)
+	}
+	if !strings.Contains(stderr, "login required") {
+		t.Fatalf("unverified logout stderr = %q; want login required", stderr)
+	}
+	if _, err := os.Stat(absSession); !os.IsNotExist(err) {
+		t.Fatalf("expected session file %q to be deleted on unverified logout; stat err=%v", absSession, err)
+	}
+}

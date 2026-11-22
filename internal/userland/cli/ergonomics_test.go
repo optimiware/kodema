@@ -799,3 +799,161 @@ func TestInboxFallsBackCleanlyWhenInspectForbidden(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveEnvPrecedenceAcrossCommands pins that deps.Env takes precedence
+// over deps.Login.Environment across resolveProject, task ask, and output push.
+func TestResolveEnvPrecedenceAcrossCommands(t *testing.T) {
+	t.Run("task list resolves project from deps.Env before deps.Login.Environment", func(t *testing.T) {
+		var capturedProject string
+		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			var req api.TaskListRequest
+			_ = json.Unmarshal(inv.Request.Input, &req)
+			capturedProject = req.ProjectID
+			body, _ := json.Marshal(api.TaskListResult{Tasks: []api.TaskSummaryView{}})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		}}
+		ports, _, errOut := testPorts(transport)
+		cfg := testConfig()
+		cfg.Project = ""
+		code := cli.RunWithDeps(context.Background(), cfg, []string{"task", "list"}, ports, cli.CommandDeps{
+			Env: envMap(map[string]string{"KODEMA_PROJECT": "proj-from-env"}),
+			Login: cli.LoginRuntime{
+				Environment: envMap(map[string]string{"KODEMA_PROJECT": "proj-from-login"}),
+			},
+		})
+		if code != cli.ExitSuccess {
+			t.Fatalf("task list exit=%d stderr=%q", code, errOut.String())
+		}
+		if capturedProject != "proj-from-env" {
+			t.Fatalf("project = %q; want proj-from-env", capturedProject)
+		}
+	})
+
+	t.Run("task ask resolves KODEMA_TASK from deps.Env", func(t *testing.T) {
+		var capturedTask string
+		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			switch inv.Operation {
+			case "task.read":
+				body, _ := json.Marshal(api.TaskReadResult{TaskID: "tsk-env-1", LifecycleVersion: 3})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case "task.ask":
+				var req api.TaskAskRequest
+				_ = json.Unmarshal(inv.Request.Input, &req)
+				capturedTask = req.TaskID
+				body, _ := json.Marshal(api.TaskAskResult{LifecycleVersion: 4})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			default:
+				t.Fatalf("unexpected op %s", inv.Operation)
+				return api.Result{}, nil
+			}
+		}}
+		ports, _, errOut := testPorts(transport)
+		code := cli.RunWithDeps(context.Background(), testConfig(),
+			[]string{"task", "ask", "--question", "proceed?", "--to", "role/reviewer"},
+			ports, cli.CommandDeps{
+				Env: envMap(map[string]string{"KODEMA_TASK": "tsk-env-1"}),
+			})
+		if code != cli.ExitSuccess {
+			t.Fatalf("task ask exit=%d stderr=%q", code, errOut.String())
+		}
+		if capturedTask != "tsk-env-1" {
+			t.Fatalf("task_id = %q; want tsk-env-1", capturedTask)
+		}
+	})
+
+	t.Run("output push resolves KODEMA_EXECUTION and KODEMA_ACTION from deps.Env", func(t *testing.T) {
+		fs := newFakeFS()
+		fs.files["/kodema/outputs/build/artifact"] = []byte("ok\n")
+		fs.entries["/kodema/outputs/build"] = []cli.DirEntry{{Name: "artifact"}}
+		var pushed api.ExecutionActionOutputsRequest
+		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			switch inv.Operation {
+			case "execution.inspect":
+				body := []byte(`{"execution_id":"exec-env-1","version":2,"actions":[{"action_id":"act-1","name":"build"}]}`)
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case "execution.action.outputs":
+				_ = json.Unmarshal(inv.Request.Input, &pushed)
+				return api.Result{Operation: inv.Operation, Body: []byte(`{}`)}, nil
+			default:
+				t.Fatalf("unexpected op %s", inv.Operation)
+				return api.Result{}, nil
+			}
+		}}
+		ports, _, errOut := testPorts(transport)
+		ports.Files = fs
+		code := cli.RunWithDeps(context.Background(), testConfig(), []string{"output", "push"}, ports, cli.CommandDeps{
+			Env: envMap(map[string]string{
+				"KODEMA_EXECUTION": "exec-env-1",
+				"KODEMA_ACTION":    "build",
+			}),
+		})
+		if code != cli.ExitSuccess {
+			t.Fatalf("output push exit=%d stderr=%q", code, errOut.String())
+		}
+		if pushed.ExecutionID != "exec-env-1" || pushed.ActionID != "act-1" || pushed.Outputs["artifact"] != "ok" {
+			t.Fatalf("pushed = %+v", pushed)
+		}
+	})
+}
+
+// TestMemberGrantValidatesGitHubUsername pins that --github validates usernames
+// via principal.SubjectForGitHub and refuses malformed usernames as usage errors.
+func TestMemberGrantValidatesGitHubUsername(t *testing.T) {
+	for _, bad := range []string{"-leading", "trailing-", "has space", "bad/slash", strings.Repeat("a", 40)} {
+		ports, _, errOut := testPorts(&scriptedTransport{})
+		code := cli.RunWithDeps(context.Background(), testConfig(),
+			[]string{"member", "grant", "--project", "proj-1", "--github", bad, "--role", "developer"},
+			ports, cli.CommandDeps{Login: cli.LoginRuntime{Issuer: "https://auth.example"}})
+		if code != cli.ExitUsage {
+			t.Errorf("--github %q: exit=%d stderr=%q; want ExitUsage", bad, code, errOut.String())
+		}
+	}
+}
+
+// TestLogsOnceResolvesActionNameWithoutRedundantInspect pins that
+// `kodema logs <exec> --action <yaml-name>` resolves the action name from the
+// already-fetched execution inspection without making a second inspect RPC.
+func TestLogsOnceResolvesActionNameWithoutRedundantInspect(t *testing.T) {
+	inspectCalls := 0
+	logCalls := 0
+	var requestedActionID string
+	transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+		switch inv.Operation {
+		case "execution.inspect":
+			inspectCalls++
+			body := []byte(`{"execution_id":"exec-1","state":"succeeded","actions":[{"action_id":"act-build-1","name":"build","state":"succeeded"}]}`)
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		case "execution.logs.read":
+			logCalls++
+			var req api.ExecutionLogsReadRequest
+			_ = json.Unmarshal(inv.Request.Input, &req)
+			requestedActionID = req.ActionID
+			body, _ := json.Marshal(api.ExecutionLogsReadResult{
+				Chunks: []api.LogChunk{{Sequence: 1, Offset: 0, Data: []byte("build ok\n")}},
+			})
+			return api.Result{Operation: inv.Operation, Body: body}, nil
+		default:
+			t.Fatalf("unexpected op %s", inv.Operation)
+			return api.Result{}, nil
+		}
+	}}
+	ports, out, errOut := testPorts(transport)
+	cfg := testConfig()
+	cfg.Output = cli.OutputTable
+	code := cli.Run(context.Background(), cfg, []string{"logs", "exec-1", "--action", "build"}, ports)
+	if code != cli.ExitSuccess {
+		t.Fatalf("logs exit=%d stderr=%q", code, errOut.String())
+	}
+	if out.String() != "build ok\n" {
+		t.Fatalf("stdout = %q; want %q", out.String(), "build ok\n")
+	}
+	if requestedActionID != "act-build-1" {
+		t.Fatalf("requested action_id = %q; want act-build-1", requestedActionID)
+	}
+	if inspectCalls != 1 {
+		t.Fatalf("execution.inspect calls = %d; want 1 (no redundant inspect)", inspectCalls)
+	}
+	if logCalls != 1 {
+		t.Fatalf("execution.logs.read calls = %d; want 1", logCalls)
+	}
+}

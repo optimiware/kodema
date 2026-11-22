@@ -560,3 +560,35 @@ func TestStageOutputsRefusesServiceAndHumanPrincipals(t *testing.T) {
 		})
 	}
 }
+
+// TestStageOutputsRefusesUnauthorizedBeforeStateLoad proves authorization runs
+// before loading execution state so an unauthorized caller cannot probe whether
+// an execution or action exists.
+func TestStageOutputsRefusesUnauthorizedBeforeStateLoad(t *testing.T) {
+	scope := projectScope("tenant-1", "project-1")
+	cases := map[string]authorize.Principal{
+		"human":             humanActor("tenant-1", "project-1", "principal-1", tenancy.RoleEngineer),
+		"service":           serviceActor("tenant-1", "project-1", "service-1"),
+		"foreign execution": executionActor("tenant-1", "project-1", "principal-other", id.ExecutionID("exec-other")),
+	}
+	for name, actor := range cases {
+		t.Run(name, func(t *testing.T) {
+			fixture := newTestService(t)
+			// Deliberately do not seed exec-missing in the store.
+			_, err := fixture.service.StageOutputs(context.Background(), execution.OutputsCommand{
+				Actor:                    actor,
+				Scope:                    scope,
+				ExecutionID:              id.ExecutionID("exec-missing"),
+				ActionID:                 id.ActionID("act-missing"),
+				ExpectedExecutionVersion: 1,
+				Outputs:                  kernel.Outputs{"candidate": "v"},
+				CallerKey:                "outputs-key-1",
+				Content:                  receiptContent(`{}`),
+			})
+			requireFaultClass(t, err, fault.Forbidden)
+			if fixture.transitions.callCount() != 0 {
+				t.Fatalf("transition port calls = %d; want zero", fixture.transitions.callCount())
+			}
+		})
+	}
+}

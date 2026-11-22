@@ -11,6 +11,7 @@ import (
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 // TestLogsAreOrderedBoundedAndRedacted proves a read returns ordered identified
@@ -435,18 +436,18 @@ func TestLogsFlushesTrailingPartialPrefixOnStreamCappedEOF(t *testing.T) {
 }
 
 func TestLogsCursorOverflowBounds(t *testing.T) {
-	if pos, err := nextStreamLogPosition(engine.LogStdout, maxStdoutLogCursorPosition, 0); err != nil || pos != maxStdoutLogCursorPosition {
-		t.Fatalf("stdout boundary = (%d, %v); want (%d, nil)", pos, err, maxStdoutLogCursorPosition)
+	if pos, err := adapterutil.NextStreamLogPosition(engine.LogStdout, adapterutil.MaxStdoutLogCursorPosition, 0); err != nil || pos != adapterutil.MaxStdoutLogCursorPosition {
+		t.Fatalf("stdout boundary = (%d, %v); want (%d, nil)", pos, err, adapterutil.MaxStdoutLogCursorPosition)
 	}
-	if _, err := nextStreamLogPosition(engine.LogStdout, maxStdoutLogCursorPosition, 1); err == nil {
+	if _, err := adapterutil.NextStreamLogPosition(engine.LogStdout, adapterutil.MaxStdoutLogCursorPosition, 1); err == nil {
 		t.Fatal("stdout accepted position past 2^31-1")
 	} else {
 		assertRefusedClass(t, err, fault.InvalidInput)
 	}
-	if pos, err := nextStreamLogPosition(engine.LogStderr, maxStderrLogCursorPosition, 0); err != nil || pos != maxStderrLogCursorPosition {
-		t.Fatalf("stderr boundary = (%d, %v); want (%d, nil)", pos, err, maxStderrLogCursorPosition)
+	if pos, err := adapterutil.NextStreamLogPosition(engine.LogStderr, adapterutil.MaxStderrLogCursorPosition, 0); err != nil || pos != adapterutil.MaxStderrLogCursorPosition {
+		t.Fatalf("stderr boundary = (%d, %v); want (%d, nil)", pos, err, adapterutil.MaxStderrLogCursorPosition)
 	}
-	if _, err := nextStreamLogPosition(engine.LogStderr, maxStderrLogCursorPosition, 1); err == nil {
+	if _, err := adapterutil.NextStreamLogPosition(engine.LogStderr, adapterutil.MaxStderrLogCursorPosition, 1); err == nil {
 		t.Fatal("stderr accepted position past 2^32-1")
 	} else {
 		assertRefusedClass(t, err, fault.InvalidInput)

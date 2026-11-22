@@ -1,6 +1,7 @@
 package enginetest
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -219,5 +220,83 @@ func TestScanProcessesMultipleKinds(t *testing.T) {
 	}
 	if mustAction(t, windowAfter, "review").State != kernel.ActionRunning {
 		t.Fatal("unfinished execution was not resumed by the scan")
+	}
+}
+
+type scanSpyState struct {
+	engine.State
+	scanCounts      map[engine.ScanKind]int
+	scanResults     map[engine.ScanKind][]id.ExecutionID
+	afterUnfinished bool
+	loadsAfter      int
+}
+
+func (s *scanSpyState) Scan(ctx context.Context, req engine.ScanRequest) ([]id.ExecutionID, error) {
+	ids, err := s.State.Scan(ctx, req)
+	if err == nil {
+		s.scanCounts[req.Kind]++
+		s.scanResults[req.Kind] = append([]id.ExecutionID(nil), ids...)
+		if req.Kind == engine.ScanUnfinished {
+			s.afterUnfinished = true
+		}
+	}
+	return ids, err
+}
+
+func (s *scanSpyState) Load(ctx context.Context, executionID id.ExecutionID) (kernel.Execution, error) {
+	if s.afterUnfinished {
+		s.loadsAfter++
+	}
+	return s.State.Load(ctx, executionID)
+}
+
+// TestScanDeduplicatesDueAndUnfinishedExecutions pins that an execution
+// returned by both ScanDue and ScanUnfinished is reconciled only once in a
+// single Scan pass.
+func TestScanDeduplicatesDueAndUnfinishedExecutions(t *testing.T) {
+	fixture := testkit.NewFixture(testNow)
+	due := runningContainerExecution("exec-scan-dedup", "ws-scan-dedup", testNow)
+	action := due.Actions[0]
+	identity := identityFor(due.ID, action)
+	fixture.Store.Seed(due)
+	if err := fixture.Workspace.Retain(t.Context(), due.WorkspaceID); err != nil {
+		t.Fatalf("Retain() error = %v", err)
+	}
+	if _, err := fixture.Runtime.Prepare(t.Context(), engine.PrepareRequest{
+		Identity:    identity,
+		WorkspaceID: due.WorkspaceID,
+		Container:   action.Container.Definition,
+	}); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if _, err := fixture.Runtime.Start(t.Context(), engine.StartRequest{
+		Identity:    identity,
+		WorkspaceID: due.WorkspaceID,
+	}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	spy := &scanSpyState{
+		State:       fixture.State,
+		scanCounts:  make(map[engine.ScanKind]int),
+		scanResults: make(map[engine.ScanKind][]id.ExecutionID),
+	}
+	runtime := &recordingRuntime{Runtime: fixture.Runtime}
+	reconciler := engine.New(spy, runtime, fixture.Workspace, fixture.Clock)
+
+	if err := reconciler.Scan(t.Context()); err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	if len(spy.scanResults[engine.ScanDue]) != 1 || spy.scanResults[engine.ScanDue][0] != due.ID {
+		t.Fatalf("ScanDue results = %v; want [%s]", spy.scanResults[engine.ScanDue], due.ID)
+	}
+	if len(spy.scanResults[engine.ScanUnfinished]) != 1 || spy.scanResults[engine.ScanUnfinished][0] != due.ID {
+		t.Fatalf("ScanUnfinished results = %v; want [%s]", spy.scanResults[engine.ScanUnfinished], due.ID)
+	}
+	if spy.loadsAfter != 0 {
+		t.Fatalf("loads after ScanUnfinished = %d; want 0 (duplicate execution must be skipped)", spy.loadsAfter)
+	}
+	if runtime.stopCount() != 1 {
+		t.Fatalf("runtime stop calls = %d; want 1", runtime.stopCount())
 	}
 }

@@ -2,10 +2,13 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
+	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/event"
+	"github.com/optimiware/kodema/internal/shell/store"
 )
 
 // Pending returns at most limit committed, unacknowledged event rows in durable
@@ -19,6 +22,9 @@ func (s *Store) Pending(ctx context.Context, after event.Sequence, limit int) ([
 	}
 	if limit <= 0 {
 		return nil, faultInvalid("outbox pending limit must be positive")
+	}
+	if limit > store.MaxQueryLimit {
+		limit = store.MaxQueryLimit
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -43,26 +49,29 @@ func (s *Store) Pending(ctx context.Context, after event.Sequence, limit int) ([
 }
 
 // MarkPublished acknowledges exactly one committed event row by its identity
-// and durable sequence. A missing row is not_found and a mismatched sequence is
-// version_conflict, so an acknowledgement can never settle another row. An
-// already-published row is a successful no-op, which makes a retried
-// acknowledgement after a lost response safe.
+// and durable sequence. A missing row or mismatched sequence is not_found, so
+// an acknowledgement can never settle another row. An already-published row is
+// a successful no-op, which makes a retried acknowledgement after a lost
+// response safe.
 func (s *Store) MarkPublished(ctx context.Context, eventID id.EventID, sequence event.Sequence) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if _, err := id.ParseEventID(string(eventID)); err != nil {
+		return fault.Wrap(fault.InvalidInput, "event id is invalid", err)
+	}
+	if sequence == 0 {
+		return faultInvalid("event sequence is zero")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for index := range s.state.events {
 		committed := &s.state.events[index]
-		if committed.Envelope.ID != eventID {
+		if committed.Envelope.ID != eventID || committed.Sequence != uint64(sequence) {
 			continue
-		}
-		if committed.Sequence != uint64(sequence) {
-			return faultConflict("the acknowledged event sequence does not match the stored row")
 		}
 		committed.Published = true
 		return nil
 	}
-	return faultNotFound("the acknowledged event row is missing")
+	return faultNotFound(fmt.Sprintf("event %q at sequence %d is not pending", eventID, sequence))
 }

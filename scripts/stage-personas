@@ -221,7 +221,7 @@ PY
 # memberships_json reads the complete membership set, following every page
 # cursor. The output is the concatenated memberships array as JSON.
 memberships_json() {
-	local cursor="" page=0 body="" envelope next
+	local cursor="" page=0 envelope next
 	local out="$work/memberships.json"
 	: >"$out"
 	while :; do
@@ -230,9 +230,12 @@ memberships_json() {
 		else
 			envelope="$(printf '{"input":{"project_id":"%s"}}' "$project")"
 		fi
-		local status
+		local status code
 		status="$(api GET "/api/v1/projects/${project}/memberships" "$envelope")"
-		[[ "$status" == "200" ]] || die "membership.list failed with HTTP ${status} (${body:-no code})"
+		if [[ "$status" != "200" ]]; then
+			code="$(error_code)"
+			die "membership.list failed with HTTP ${status} (${code:-no code})"
+		fi
 		next="$(python3 - "$response" "$out" <<'PY'
 import json
 import sys

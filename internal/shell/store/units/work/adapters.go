@@ -50,14 +50,11 @@ func NewInbox(executor store.Executor, scanner store.Scanner) (*Inbox, error) {
 	return &Inbox{executor: executor, scanner: scanner, refHeads: refHeads}, nil
 }
 
-// Pipelines adapts pipeline management commits. newID allocates the identity of
-// a new apply because ChangeUnit carries no pipeline identity for a first
-// create; it defaults to secure randomness.
-//
-// pipeline.Reader is deliberately absent: the stored on.push trigger lives only
-// inside the YAML bytes, the pipeline package exposes no push decoder and the
-// adapter layer may not import go.yaml.in/yaml/v3, so a Definition with a
-// non-nil Push cannot be reconstructed without duplicating decode policy.
+// Pipelines adapts pipeline management commits and implements pipeline.Reader
+// over the pipelines table (including the persisted push_triggers projection)
+// without parsing YAML. newID allocates the identity of a new apply because
+// ChangeUnit carries no pipeline identity for a first create; it defaults to
+// secure randomness.
 type Pipelines struct {
 	executor store.Executor
 	scanner  store.Scanner

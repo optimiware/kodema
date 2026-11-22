@@ -60,6 +60,7 @@ type persistedChunk struct {
 type persistedStream struct {
 	Chunks         []persistedChunk `json:"chunks"`
 	DroppedThrough uint64           `json:"dropped_through"`
+	HasDropped     bool             `json:"has_dropped,omitempty"`
 	Pending        []byte           `json:"pending,omitempty"`
 }
 
@@ -105,7 +106,7 @@ func NewFileSink(config SinkConfig) (*FileSink, error) {
 
 // Append stores one bounded chunk in the supplied ownership scope.
 func (sink *FileSink) Append(ctx context.Context, scope tenancy.Scope, chunk Chunk) (AppendResult, error) {
-	if err := validateScope(scope); err != nil {
+	if err := ValidateScope(scope); err != nil {
 		return AppendResult{}, err
 	}
 	if err := validateChunk(chunk, sink.limits.MaxChunkBytes); err != nil {
@@ -150,6 +151,7 @@ func (sink *FileSink) Append(ctx context.Context, scope tenancy.Scope, chunk Chu
 	for len(stream.Chunks) > sink.limits.MaxStoredChunks {
 		dropped := stream.Chunks[0]
 		stream.Chunks = stream.Chunks[1:]
+		stream.HasDropped = true
 		if dropped.Offset > stream.DroppedThrough {
 			stream.DroppedThrough = dropped.Offset
 		}
@@ -206,6 +208,7 @@ func (sink *FileSink) read(ctx context.Context, request ReadRequest, after *chun
 	dropped := false
 	for _, chunk := range stream.Chunks {
 		if !now.Before(chunk.StoredAt.Add(sink.retention.RetainFor)) {
+			stream.HasDropped = true
 			if chunk.Offset > stream.DroppedThrough {
 				stream.DroppedThrough = chunk.Offset
 			}
@@ -268,7 +271,7 @@ func (sink *FileSink) read(ctx context.Context, request ReadRequest, after *chun
 	return ReadResult{
 		Chunks:     chunks,
 		NextOffset: nextOffset,
-		Truncated:  stream.DroppedThrough > request.AfterOffset,
+		Truncated:  stream.DroppedThrough > request.AfterOffset || (after == nil && request.AfterOffset == 0 && stream.HasDropped),
 	}, nil
 }
 
@@ -361,6 +364,7 @@ func clonePersistedStream(stream persistedStream) persistedStream {
 	return persistedStream{
 		Chunks:         chunks,
 		DroppedThrough: stream.DroppedThrough,
+		HasDropped:     stream.HasDropped,
 		Pending:        bytes.Clone(stream.Pending),
 	}
 }

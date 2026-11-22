@@ -63,10 +63,22 @@ type KodemaExecutionSandboxConfig struct {
 
 type managedSandboxMonitor struct {
 	stopOnce sync.Once
-	stopCh   chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 	doneCh   chan struct{}
+	exited   chan struct{}
 	mu       sync.Mutex
 	err      error
+}
+
+func newManagedSandboxMonitor() *managedSandboxMonitor {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &managedSandboxMonitor{
+		ctx:    ctx,
+		cancel: cancel,
+		doneCh: make(chan struct{}),
+		exited: make(chan struct{}),
+	}
 }
 
 type sandboxSecretRef struct {
@@ -90,7 +102,7 @@ func (m *managedSandboxMonitor) Err() error {
 
 func (m *managedSandboxMonitor) stop() {
 	m.stopOnce.Do(func() {
-		close(m.stopCh)
+		m.cancel()
 	})
 }
 
@@ -101,10 +113,8 @@ func (m *managedSandboxMonitor) stop() {
 // scheduling, cgroups, OOM diagnostics, NetworkPolicy, secret mounting/redaction,
 // and hard SIGKILL cleanup.
 type KodemaExecutionSandboxManager struct {
-	tenant                 id.TenantID
 	project                id.ProjectID
 	handler                api.Handler
-	clock                  Clock
 	httpClient             *http.Client
 	endpointResolver       func(ctx context.Context, executionID string, port int) (string, error)
 	endpointTemplate       string
@@ -154,10 +164,8 @@ func NewKodemaExecutionSandboxManager(cfg KodemaExecutionSandboxConfig) (*Kodema
 		sandboxTTL = defaultSandboxTTL
 	}
 	return &KodemaExecutionSandboxManager{
-		tenant:  cfg.TenantID,
 		project: cfg.ProjectID,
 		handler: cfg.Handler,
-		clock:   cfg.Clock,
 		httpClient: &http.Client{
 			Transport: rt,
 			Timeout:   5 * time.Second,
@@ -225,7 +233,7 @@ func (m *KodemaExecutionSandboxManager) Acquire(ctx context.Context, req OpenCod
 	// it is mounted out-of-band at /kodema/secrets/<name>, automatically redacted
 	// from logs, and never persisted into pipeline YAML or /kodema/script.
 	secretWriteIdem := deriveIdemKey("oc-sbox-secw:", fmt.Sprintf("%s:%s:%s:%s", req.ExecutionID, req.ActionID, tokenSecretName, attemptNonce))
-	secDecoded, err := m.invoke(ctx, OperationSecretWrite, api.SecretWriteRequest{
+	secDecoded, err := invokePublicOperation(ctx, m.handler, OperationSecretWrite, api.SecretWriteRequest{
 		ProjectID: string(m.project),
 		SecretID:  tokenSecretName,
 		Value:     token,
@@ -245,7 +253,7 @@ func (m *KodemaExecutionSandboxManager) Acquire(ctx context.Context, req OpenCod
 	idemScope := fmt.Sprintf("opencode-sandbox:%s:%s:%s:%s", req.ExecutionID, req.ActionID, req.TaskID, attemptNonce)
 	idemKey := deriveIdemKey("oc-sbox:", idemScope)
 
-	decoded, err := m.invoke(ctx, OperationPipelineStart, api.PipelineStartRequest{
+	decoded, err := invokePublicOperation(ctx, m.handler, OperationPipelineStart, api.PipelineStartRequest{
 		ProjectID: string(m.project),
 		YAML:      yamlBytes,
 	}, nil, idemKey)
@@ -273,10 +281,7 @@ func (m *KodemaExecutionSandboxManager) Acquire(ctx context.Context, req OpenCod
 	}
 
 	cleanBase := strings.TrimRight(baseURL, "/")
-	mon := &managedSandboxMonitor{
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
-	}
+	mon := newManagedSandboxMonitor()
 	sandboxID := "sbox-" + execID
 	m.mu.Lock()
 	m.monitors[sandboxID] = mon
@@ -312,6 +317,7 @@ func (m *KodemaExecutionSandboxManager) Release(ctx context.Context, lease OpenC
 		m.mu.Unlock()
 		if mon != nil {
 			mon.stop()
+			<-mon.exited
 		}
 	}
 	if ctx == nil {
@@ -341,7 +347,7 @@ func (m *KodemaExecutionSandboxManager) deleteSandboxSecret(ctx context.Context,
 	nonce, _ := randomHexBytes(8)
 	idemKey := deriveIdemKey("oc-sbox-secd:", fmt.Sprintf("%s:v%d:%s", ref.name, ref.version, nonce))
 	version := ref.version
-	_, err := m.invoke(delCtx, OperationSecretDelete, api.SecretDeleteRequest{
+	_, err := invokePublicOperation(delCtx, m.handler, OperationSecretDelete, api.SecretDeleteRequest{
 		ProjectID: string(m.project),
 		SecretID:  ref.name,
 	}, &version, idemKey)
@@ -356,19 +362,24 @@ func (m *KodemaExecutionSandboxManager) deleteSandboxSecret(ctx context.Context,
 }
 
 func (m *KodemaExecutionSandboxManager) watchSandbox(lease OpenCodeSandboxLease, mon *managedSandboxMonitor) {
+	defer close(mon.exited)
 	ticker := time.NewTicker(m.healthInterval)
 	defer ticker.Stop()
 	consecutiveHealthFailures := 0
 
 	for {
 		select {
-		case <-mon.stopCh:
+		case <-mon.ctx.Done():
 			return
 		case <-ticker.C:
 		}
 
-		checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		inspected, inspectErr := m.inspectExecution(checkCtx, lease.ExecutionID)
+		checkCtx, cancel := context.WithTimeout(mon.ctx, 5*time.Second)
+		inspected, inspectErr := inspectExecution(checkCtx, m.handler, lease.ExecutionID)
+		if mon.ctx.Err() != nil {
+			cancel()
+			return
+		}
 		if inspectErr == nil {
 			if isTerminalExecutionState(inspected.State) {
 				cancel()
@@ -381,6 +392,9 @@ func (m *KodemaExecutionSandboxManager) watchSandbox(lease OpenCodeSandboxLease,
 
 		healthErr := m.probeHealthz(checkCtx, lease.HealthURL)
 		cancel()
+		if mon.ctx.Err() != nil {
+			return
+		}
 		if healthErr == nil {
 			consecutiveHealthFailures = 0
 			continue
@@ -410,7 +424,7 @@ func (m *KodemaExecutionSandboxManager) waitForSandboxReady(ctx context.Context,
 		lineCarry    string
 	)
 	for {
-		inspected, err := m.inspectExecution(ctx, executionID)
+		inspected, err := inspectExecution(ctx, m.handler, executionID)
 		if err == nil {
 			if isTerminalExecutionState(inspected.State) {
 				return "", fmt.Errorf("%w: sandbox execution %s terminated before becoming ready (state=%s%s)",
@@ -497,7 +511,7 @@ func (m *KodemaExecutionSandboxManager) resolveEndpoint(
 		if cursor != nil && *cursor != "" {
 			logReq.Page = &api.Page{Cursor: *cursor}
 		}
-		decoded, err := m.invoke(ctx, OperationExecutionLogsRead, logReq, nil, "")
+		decoded, err := invokePublicOperation(ctx, m.handler, OperationExecutionLogsRead, logReq, nil, "")
 		if err != nil {
 			return "", err
 		}
@@ -619,7 +633,7 @@ func (m *KodemaExecutionSandboxManager) cancelAndConfirmStop(ctx context.Context
 
 	// Step 1: Inspect and request cancellation if non-terminal.
 	for attempt := 0; attempt < 2; attempt++ {
-		inspected, err := m.inspectExecution(stopCtx, executionID)
+		inspected, err := inspectExecution(stopCtx, m.handler, executionID)
 		if err != nil {
 			var pubErr *api.Error
 			if errors.As(err, &pubErr) && pubErr.Code == api.CodeNotFound {
@@ -633,7 +647,7 @@ func (m *KodemaExecutionSandboxManager) cancelAndConfirmStop(ctx context.Context
 		expected := inspected.Version
 		sum := sha256.Sum256([]byte(fmt.Sprintf("cancel-sandbox:%s:v%d", executionID, expected)))
 		idemKey := "oc-sbox-cancel:" + hex.EncodeToString(sum[:])[:28]
-		_, cancelErr := m.invoke(stopCtx, OperationExecutionCancel, api.ExecutionCancelRequest{
+		_, cancelErr := invokePublicOperation(stopCtx, m.handler, OperationExecutionCancel, api.ExecutionCancelRequest{
 			ExecutionID: executionID,
 		}, &expected, idemKey)
 		if cancelErr == nil {
@@ -656,7 +670,7 @@ func (m *KodemaExecutionSandboxManager) cancelAndConfirmStop(ctx context.Context
 	defer ticker.Stop()
 
 	for {
-		inspected, err := m.inspectExecution(stopCtx, executionID)
+		inspected, err := inspectExecution(stopCtx, m.handler, executionID)
 		if err != nil {
 			var pubErr *api.Error
 			if errors.As(err, &pubErr) && pubErr.Code == api.CodeNotFound {
@@ -671,46 +685,6 @@ func (m *KodemaExecutionSandboxManager) cancelAndConfirmStop(ctx context.Context
 		case <-ticker.C:
 		}
 	}
-}
-
-func (m *KodemaExecutionSandboxManager) inspectExecution(ctx context.Context, executionID string) (api.ExecutionInspectResult, error) {
-	decoded, err := m.invoke(ctx, OperationInspect, api.ExecutionInspectRequest{
-		ExecutionID: executionID,
-	}, nil, "")
-	if err != nil {
-		return api.ExecutionInspectResult{}, err
-	}
-	res, ok := decoded.(api.ExecutionInspectResult)
-	if !ok {
-		return api.ExecutionInspectResult{}, fmt.Errorf("execution.inspect returned unexpected %T", decoded)
-	}
-	return res, nil
-}
-
-func (m *KodemaExecutionSandboxManager) invoke(ctx context.Context, operation string, request any, expectedVersion *uint64, idempotencyKey string) (any, error) {
-	codec, ok := publicCodecs[operation]
-	if !ok {
-		return nil, fmt.Errorf("operation %q has no public codec", operation)
-	}
-	input, err := codec.EncodeRequest(request)
-	if err != nil {
-		return nil, fmt.Errorf("encode %s request: %w", operation, err)
-	}
-	result, err := m.handler.Invoke(ctx, api.Invocation{
-		Operation: operation,
-		Request: api.Request{
-			Input:           input,
-			ExpectedVersion: expectedVersion,
-			IdempotencyKey:  idempotencyKey,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	if result.Operation != operation {
-		return nil, fmt.Errorf("operation %q returned result for %q", operation, result.Operation)
-	}
-	return codec.DecodeResult(result.Body)
 }
 
 func isTerminalExecutionState(state string) bool {

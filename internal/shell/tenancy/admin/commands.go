@@ -81,22 +81,6 @@ type MembershipListCommand struct {
 	Limit       int                 `json:"limit"`
 }
 
-// withinScope reports whether target is inside the actor's verified scope. A
-// tenant-scoped actor covers every project of its tenant; a project-scoped
-// actor covers exactly its own project and never widens to the tenant.
-func withinScope(actor, target tenancy.Scope) bool {
-	if actor.TenantID == "" || target.TenantID == "" {
-		return false
-	}
-	if actor.TenantID != target.TenantID {
-		return false
-	}
-	if actor.ProjectID == "" {
-		return true
-	}
-	return actor.ProjectID == target.ProjectID
-}
-
 // cloneTenantKey returns an independent copy of the encrypted key so a caller
 // cannot mutate committed key material after the unit was built.
 func cloneTenantKey(key token.TenantKey) token.TenantKey {

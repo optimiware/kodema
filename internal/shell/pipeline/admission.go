@@ -415,14 +415,17 @@ func validateTaskContext(task TaskContext) (map[string]string, error) {
 	if len(task.Conversation) > maxTaskConversationBytes {
 		return nil, fault.New(fault.InvalidInput, fmt.Sprintf("task conversation is %d bytes; at most %d are allowed", len(task.Conversation), maxTaskConversationBytes))
 	}
-	metadata, err := parseTaskMetadata(task.Metadata)
+	metadata, err := ParseTaskMetadata(task.Metadata)
 	if err != nil {
 		return nil, err
 	}
 	return metadata, nil
 }
 
-func parseTaskMetadata(raw []byte) (map[string]string, error) {
+// ParseTaskMetadata validates and parses one opaque task metadata JSON object
+// of string values. Invalid JSON, a non-object, a non-string value, a duplicate
+// key, trailing bytes and oversize input are refused as invalid_input.
+func ParseTaskMetadata(raw []byte) (map[string]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}

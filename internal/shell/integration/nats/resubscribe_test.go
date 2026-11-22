@@ -277,3 +277,220 @@ func TestSubscribeLiveResubscribesAfterFailedReconnect(t *testing.T) {
 		t.Fatalf("Next returned %+v; want %+v", received, chunk)
 	}
 }
+
+// gatedSubscribeClient wraps a fakeClient and pauses its Nth Subscribe call
+// (defaulting to the first) at a barrier so tests can deterministically
+// interleave a client reconnect right before registration under broker.mu.
+type gatedSubscribeClient struct {
+	*fakeClient
+	gateCall int
+	mu       sync.Mutex
+	calls    int
+	entered  chan struct{}
+	release  chan struct{}
+}
+
+func (c *gatedSubscribeClient) Subscribe(ctx context.Context, subject nats.Subject, handler func(context.Context, []byte) error) (nats.Subscription, error) {
+	sub, err := c.fakeClient.Subscribe(ctx, subject, handler)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.calls++
+	target := c.gateCall
+	if target <= 0 {
+		target = 1
+	}
+	shouldGate := c.calls == target
+	c.mu.Unlock()
+	if shouldGate {
+		close(c.entered)
+		<-c.release
+	}
+	return sub, nil
+}
+
+// TestSubscribeReestablishesWhenClientChangesDuringSubscribe pins that if the
+// broker reconnects to a replacement client while Subscribe is registering on
+// the old client, the newly registered subscription is moved to the current
+// client rather than staying orphaned on the discarded client.
+func TestSubscribeReestablishesWhenClientChangesDuringSubscribe(t *testing.T) {
+	scope := testScope()
+	human := humanPrincipal(scope)
+	first := &gatedSubscribeClient{
+		fakeClient: newFakeClient(),
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	second := newFakeClient()
+	connector := &fakeConnector{clients: []nats.Client{first, second}}
+	resolver := &fakePrincipalResolver{byToken: map[string]identity.Principal{testCredential: human}}
+	env := newBrokerEnv(t, brokerOptions{connector: connector, resolver: resolver, maxAttempts: 2})
+	calls := &counter{}
+
+	type result struct {
+		sub nats.Subscription
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sub, err := env.broker.Subscribe(context.Background(), subscribeRequest(testCredential, scope, loggingHandler(calls)))
+		done <- result{sub: sub, err: err}
+	}()
+
+	select {
+	case <-first.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Subscribe did not reach gated client.Subscribe")
+	}
+
+	// While Subscribe is paused on first, fail a publish so broker discards
+	// first and reconnects to second.
+	first.failJetStream(errBrokerDown)
+	if err := env.broker.PublishEvent(context.Background(), validEnvelope(scope, id.EventID("event-swap-sub"))); err != nil {
+		close(first.release)
+		t.Fatalf("PublishEvent reconnect: %v", err)
+	}
+	close(first.release)
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("Subscribe: %v", res.err)
+	}
+	defer func() { _ = res.sub.Close(context.Background()) }()
+
+	wantSubject, err := nats.InvalidationSubject(scope)
+	if err != nil {
+		t.Fatalf("InvalidationSubject: %v", err)
+	}
+	oldSub := subscriptionWithSubject(t, first.fakeClient, wantSubject)
+	oldSub.waitClosed(t)
+
+	newSub := subscriptionWithSubject(t, second, wantSubject)
+	payload := mustJSON(t, validInvalidation(scope, id.PrincipalID("other-human"), service.ServiceID("other-service")))
+	if err := newSub.deliver(context.Background(), payload); err != nil {
+		t.Fatalf("delivery on re-established subscription: %v", err)
+	}
+	if got := calls.get(); got != 1 {
+		t.Fatalf("handler calls = %d; want 1", got)
+	}
+}
+
+// TestSubscribeLiveReestablishesWhenClientChangesDuringSubscribe mirrors the
+// mid-subscribe client swap check for SubscribeLive.
+func TestSubscribeLiveReestablishesWhenClientChangesDuringSubscribe(t *testing.T) {
+	scope := testScope()
+	executionID := id.ExecutionID("exec-live-swap")
+	first := &gatedSubscribeClient{
+		fakeClient: newFakeClient(),
+		gateCall:   2,
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	second := newFakeClient()
+	connector := &fakeConnector{clients: []nats.Client{first, second}}
+	env := newBrokerEnv(t, brokerOptions{connector: connector, maxAttempts: 2})
+
+	type result struct {
+		sub interface{ Close(context.Context) error }
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sub, err := env.broker.SubscribeLive(context.Background(), scope, executionID)
+		done <- result{sub: sub, err: err}
+	}()
+
+	select {
+	case <-first.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SubscribeLive did not reach gated client.Subscribe")
+	}
+
+	first.failJetStream(errBrokerDown)
+	if err := env.broker.PublishEvent(context.Background(), validEnvelope(scope, id.EventID("event-swap-live"))); err != nil {
+		close(first.release)
+		t.Fatalf("PublishEvent reconnect: %v", err)
+	}
+	close(first.release)
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("SubscribeLive: %v", res.err)
+	}
+	defer func() { _ = res.sub.Close(context.Background()) }()
+
+	logSubject, err := nats.LogSubject(scope, executionID)
+	if err != nil {
+		t.Fatalf("LogSubject: %v", err)
+	}
+	oldLog := subscriptionWithSubject(t, first.fakeClient, logSubject)
+	oldLog.waitClosed(t)
+	subscriptionWithSubject(t, second, logSubject)
+}
+
+// TestBrokerCloseDoesNotBlockOnDialAndClosesDialedClient proves broker.mu is
+// not held across Connect(ctx): Close returns promptly while a dial is in
+// flight, and when the dial completes the newly dialed client is closed rather
+// than leaked or installed.
+func TestBrokerCloseDoesNotBlockOnDialAndClosesDialedClient(t *testing.T) {
+	dialEntered := make(chan struct{})
+	dialRelease := make(chan struct{})
+	dialedClient := newFakeClient()
+
+	broker, err := nats.NewBroker(nats.BrokerConfig{
+		Connect: func(context.Context) (nats.Client, error) {
+			close(dialEntered)
+			<-dialRelease
+			return dialedClient, nil
+		},
+		Clock:               newAutoClock(),
+		Principal:           &fakePrincipalResolver{},
+		Authorizer:          &fakeAuthorizer{},
+		Sink:                &fakeSink{},
+		MaxReconnectBackoff: 50 * time.Millisecond,
+		IdleValidation:      time.Second,
+		MaxPublishAttempts:  1,
+	})
+	if err != nil {
+		t.Fatalf("NewBroker: %v", err)
+	}
+
+	publishErr := make(chan error, 1)
+	go func() {
+		publishErr <- broker.PublishEvent(context.Background(), validEnvelope(testScope(), id.EventID("event-dial-close")))
+	}()
+
+	select {
+	case <-dialEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Connect was not invoked")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- broker.Close(context.Background())
+	}()
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			close(dialRelease)
+			t.Fatalf("Broker.Close during dial: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(dialRelease)
+		t.Fatal("Broker.Close blocked while Connect was in flight")
+	}
+
+	close(dialRelease)
+	select {
+	case err := <-publishErr:
+		requireClass(t, err, fault.DependencyUnavailable)
+	case <-time.After(5 * time.Second):
+		t.Fatal("PublishEvent did not return after dial released")
+	}
+	if got := dialedClient.closeCount(); got != 1 {
+		t.Fatalf("late dialed client Close calls = %d; want 1", got)
+	}
+}

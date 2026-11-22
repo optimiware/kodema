@@ -372,3 +372,82 @@ func TestServerConfigPropagatesBinaryVersion(t *testing.T) {
 		t.Fatalf("ServerVersion = %q; want 0.4.0", cfg.ServerVersion)
 	}
 }
+
+func TestServerRejectsMalformedDevExpiryInConfigFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.json")
+	if err := os.WriteFile(path, []byte(`{"profile":"development","dev_expiry":"not-a-duration"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	var stderr lockedBuffer
+	_, code := parseServerOptions([]string{"--config", path}, &stderr)
+	if code != 2 {
+		t.Fatalf("parseServerOptions exit code = %d; want 2 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "dev_expiry") {
+		t.Fatalf("stderr = %q; want dev_expiry named", stderr.String())
+	}
+}
+
+func TestServerRejectsMalformedDevExpiryInEnv(t *testing.T) {
+	t.Setenv("KODEMA_DEV_EXPIRY", "not-a-duration")
+	var stderr lockedBuffer
+	_, code := parseServerOptions([]string{"--profile", "development"}, &stderr)
+	if code != 2 {
+		t.Fatalf("parseServerOptions exit code = %d; want 2 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "KODEMA_DEV_EXPIRY") {
+		t.Fatalf("stderr = %q; want KODEMA_DEV_EXPIRY named", stderr.String())
+	}
+}
+
+func TestServerRepeatableFlagsOverrideConfigAndEnv(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.json")
+	if err := os.WriteFile(path, []byte(`{
+		"profile": "development",
+		"dev_tokens": ["file-token-1", "file-token-2"],
+		"llm_providers": ["file-prov=https://file.example/v1"],
+		"discovery": {
+			"scopes": ["file-scope"]
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv("KODEMA_DEV_TOKEN", "env-token")
+	t.Setenv("KODEMA_DISCOVERY_SCOPES", "env-scope-1 env-scope-2")
+
+	// Without CLI flags, env overrides file (dev_tokens, discovery.scopes) and file supplies llm_providers.
+	options, code := parseServerOptions([]string{"--config", path}, io.Discard)
+	if code != 0 {
+		t.Fatalf("parseServerOptions(no flags) exit = %d", code)
+	}
+	if strings.Join(options.DevTokens, ",") != "env-token" {
+		t.Fatalf("inherited DevTokens = %v; want [env-token]", options.DevTokens)
+	}
+	if strings.Join(options.LLMProviders, ",") != "file-prov=https://file.example/v1" {
+		t.Fatalf("inherited LLMProviders = %v; want file provider", options.LLMProviders)
+	}
+	if strings.Join(options.Discovery.Scopes, ",") != "env-scope-1,env-scope-2" {
+		t.Fatalf("inherited Discovery.Scopes = %v; want env scopes", options.Discovery.Scopes)
+	}
+
+	// Passing CLI flags overrides env/config slices rather than appending.
+	options, code = parseServerOptions([]string{
+		"--config", path,
+		"--dev-token", "flag-token-1",
+		"--dev-token", "flag-token-2",
+		"--llm-provider", "flag-prov=https://flag.example/v1",
+		"--discovery-scope", "openid",
+	}, io.Discard)
+	if code != 0 {
+		t.Fatalf("parseServerOptions(with flags) exit = %d", code)
+	}
+	if strings.Join(options.DevTokens, ",") != "flag-token-1,flag-token-2" {
+		t.Fatalf("overridden DevTokens = %v; want [flag-token-1 flag-token-2]", options.DevTokens)
+	}
+	if strings.Join(options.LLMProviders, ",") != "flag-prov=https://flag.example/v1" {
+		t.Fatalf("overridden LLMProviders = %v; want [flag-prov=https://flag.example/v1]", options.LLMProviders)
+	}
+	if strings.Join(options.Discovery.Scopes, ",") != "openid" {
+		t.Fatalf("overridden Discovery.Scopes = %v; want [openid]", options.Discovery.Scopes)
+	}
+}

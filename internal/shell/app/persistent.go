@@ -34,10 +34,6 @@ type persistentDatabases struct {
 	controller string
 	publisher  string
 	auth       string
-	// closePools registers each pool that owns connections for reverse
-	// cleanup as soon as it exists. The durable test profile sets it;
-	// production keeps its own shutdown sequence.
-	closePools bool
 }
 
 // persistentStores are the PostgreSQL store consumers, each holding its own
@@ -51,9 +47,9 @@ type persistentStores struct {
 }
 
 // openPersistentStores builds the four role pools and their store consumers.
-// With closePools, each pool that owns connections is registered for reverse
-// cleanup as soon as it exists, so a later construction failure or shutdown
-// closes it exactly once.
+// Each pool that owns connections is registered for reverse cleanup as soon as
+// it exists, so a later construction failure or shutdown closes it exactly
+// once.
 func openPersistentStores(builder *builder, databases persistentDatabases) (persistentStores, error) {
 	pools := make([]postgresPool, 0, 4)
 	for _, database := range []struct {
@@ -69,7 +65,7 @@ func openPersistentStores(builder *builder, databases persistentDatabases) (pers
 		if err != nil {
 			return persistentStores{}, err
 		}
-		if closer, ok := pool.(interface{ Close() }); ok && databases.closePools {
+		if closer, ok := pool.(interface{ Close() }); ok {
 			builder.addStop("postgres-"+database.name, func(context.Context) error {
 				closer.Close()
 				return nil

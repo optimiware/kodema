@@ -20,7 +20,7 @@ func runSandbox(ctx context.Context, args []string, ports Ports, deps CommandDep
 	}
 	switch args[0] {
 	case "serve":
-		if hasSandboxHelpFlag(args[1:]) {
+		if hasHelpFlag(args[1:]) {
 			return runHelp(ports.Out, ports.Err, []string{"sandbox", "serve"})
 		}
 		return runSandboxServe(ctx, args[1:], ports, deps)
@@ -29,23 +29,12 @@ func runSandbox(ctx context.Context, args []string, ports Ports, deps CommandDep
 	}
 }
 
-func hasSandboxHelpFlag(args []string) bool {
-	for _, arg := range args {
-		if arg == "--" {
-			return false
-		}
-		if arg == "-h" || arg == "--help" {
-			return true
-		}
-	}
-	return false
-}
-
 func runSandboxServe(ctx context.Context, args []string, ports Ports, deps CommandDeps) int {
 	envLookup := os.LookupEnv
-	if deps.Env != nil {
+	if deps.Env != nil || deps.Login.Environment != nil {
+		getenv := resolveEnv(deps)
 		envLookup = func(key string) (string, bool) {
-			v := deps.Env(key)
+			v := getenv(key)
 			if v == "" {
 				return "", false
 			}

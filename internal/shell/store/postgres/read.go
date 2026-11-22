@@ -24,7 +24,7 @@ func ReadRow(ctx context.Context, tx store.Transaction, scope tenancy.Scope, tab
 	if err := scope.Validate(); err != nil {
 		return store.Row{}, err
 	}
-	if !validIdentity(id) {
+	if !store.ValidIdentity(id) {
 		return store.Row{}, faultInvalid(fmt.Sprintf("row id %q is not a valid identity", id))
 	}
 	if err := checkActiveScope(tx, scope); err != nil {
@@ -86,6 +86,18 @@ func scopedReadQuery(meta *tableMeta, scope tenancy.Scope, id string) (store.Que
 			predicates = append(predicates, "project_id IS NULL")
 		} else {
 			add("project_id", string(scope.ProjectID))
+		}
+	} else {
+		switch meta.table.Name {
+		case "tenants":
+			// The tenant root row carries its identity instead of tenant_id.
+			add("id", string(scope.TenantID))
+		case "projects":
+			// tenant_id is applied above; a project scope also reads only its
+			// own project row so cross-project existence is never revealed.
+			if scope.ProjectScoped() {
+				add("id", string(scope.ProjectID))
+			}
 		}
 	}
 	add("id", id)

@@ -182,24 +182,28 @@ func validateContainer(action Action) error {
 	if err := validateContainerResources(action.Name, container.Resources); err != nil {
 		return err
 	}
-	if err := validateContainerCaches(string(action.Name), container.Caches); err != nil {
+	if err := validateContainerCaches(action.Name, container.Caches); err != nil {
 		return err
 	}
-	if err := validateContainerBudget(string(action.Name), container.Budget); err != nil {
+	if err := validateContainerBudget(action.Name, container.Budget); err != nil {
 		return err
 	}
 	return validateOutputKeys(action.Name, container.Outputs)
 }
 
-func validateContainerResources(action id.ActionName, resources *Resources) error {
-	if err := ValidateResources(resources); err != nil {
-		detail, ok := fault.MessageOf(err)
-		if !ok {
-			detail = err.Error()
-		}
-		return fault.Wrap(fault.InvalidInput, fmt.Sprintf("action %q: %s", action, detail), err)
+func wrapActionInvalid(action id.ActionName, err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	detail, ok := fault.MessageOf(err)
+	if !ok {
+		detail = err.Error()
+	}
+	return fault.Wrap(fault.InvalidInput, fmt.Sprintf("action %q: %s", action, detail), err)
+}
+
+func validateContainerResources(action id.ActionName, resources *Resources) error {
+	return wrapActionInvalid(action, ValidateResources(resources))
 }
 
 // validateRequest checks the supported request fields. Assignment stays an

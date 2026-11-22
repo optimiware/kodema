@@ -57,13 +57,10 @@ type WorkspaceID string
 // DecisionID identifies one immutable persisted approval decision.
 type DecisionID string
 
-// validID reports whether value is a bounded, ASCII identity payload.
-func validID(value string) bool {
+// Valid reports whether value is a bounded, ASCII identity payload composed
+// strictly of [A-Za-z0-9_-] (excluding path separators, dots, and control characters).
+func Valid(value string) bool {
 	if value == "" || len(value) > MaxIDLength {
-		return false
-	}
-	// A bare dot or dot-dot is a path component, not an identity.
-	if value == "." || value == ".." {
 		return false
 	}
 	for index := 0; index < len(value); index++ {
@@ -78,6 +75,10 @@ func validID(value string) bool {
 		}
 	}
 	return true
+}
+
+func validID(value string) bool {
+	return Valid(value)
 }
 
 func invalidID(kind, value string) error {

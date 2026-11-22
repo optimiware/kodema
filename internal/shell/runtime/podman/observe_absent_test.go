@@ -69,7 +69,7 @@ func assertNeverStartedProof(t *testing.T, observation kernel.Observation) {
 func TestObserveAbsentWithoutPreparationProvesNonexecution(t *testing.T) {
 	fx := newFixture(t)
 	workload := fx.request.Identity.WorkloadID
-	if hostFileExists(t, preparationPath(fx.root, workload)) {
+	if hostFileExists(t, preparationRecordPath(fx.root, workload)) {
 		t.Fatal("fixture wrote a preparation record for a never-prepared identity")
 	}
 	if hostFileExists(t, startAttemptPath(fx.root, workload)) {
@@ -233,7 +233,7 @@ func TestObserveAbsentUnreadableStateStaysUnknown(t *testing.T) {
 		if err := os.MkdirAll(fx.workloadRoot(), 0o755); err != nil {
 			t.Fatalf("creating the workload root: %v", err)
 		}
-		if err := os.WriteFile(preparationPath(fx.root, workload), []byte("{not json"), 0o444); err != nil {
+		if err := os.WriteFile(preparationRecordPath(fx.root, workload), []byte("{not json"), 0o444); err != nil {
 			t.Fatalf("writing an undecodable preparation marker: %v", err)
 		}
 
@@ -261,7 +261,7 @@ func TestObserveAbsentUnreadableStateStaysUnknown(t *testing.T) {
 		if err := os.WriteFile(target, []byte("{}"), 0o444); err != nil {
 			t.Fatalf("writing the symlink target: %v", err)
 		}
-		if err := os.Symlink(target, preparationPath(fx.root, workload)); err != nil {
+		if err := os.Symlink(target, preparationRecordPath(fx.root, workload)); err != nil {
 			t.Fatalf("creating the preparation marker symlink: %v", err)
 		}
 

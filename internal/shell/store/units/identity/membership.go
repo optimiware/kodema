@@ -212,9 +212,10 @@ func (a *Adapter) serviceMembershipFact(read authorize.AuthorityRead, fact autho
 	return fact, []store.Lock{lock}, nil
 }
 
-// humanMembershipFact evaluates the union of the human's tenant-wide and
-// exact-project rows, then re-reads both rows and confirms the observed pins
-// through authorize.ConfirmMembership before translating them into guards. A
+// humanMembershipFact observes the human's tenant-wide and exact-project rows
+// once, confirms any caller-supplied pins through authorize.ConfirmMembership
+// (or evaluates the union through authorize.EvaluateMembership when no pins
+// were carried) and translates the observed targets into commit-unit guards. A
 // union that no longer grants the required role is a fact with Allowed false; a
 // pin change is returned as a refusal.
 func (a *Adapter) humanMembershipFact(ctx context.Context, read authorize.AuthorityRead, fact authorize.AuthorityFact) (authorize.AuthorityFact, []store.Lock, error) {
@@ -233,23 +234,30 @@ func (a *Adapter) humanMembershipFact(ctx context.Context, read authorize.Author
 		}
 		return fact, nil, err
 	}
-	pinned := evaluated.PinnedRead()
 	if len(read.Targets) > 0 {
 		// The capability already confirmed the union and attached its pins to
 		// the commit-unit read. Those pins are the ones the atomic boundary must
 		// compare, never a freshly derived set that would silently accept a
 		// change between the capability's confirmation and this re-read.
-		pinned = evalRead
+		pinned := evalRead
 		pinned.Targets = append([]authorize.AuthorityTarget(nil), read.Targets...)
+		if err := authorize.ConfirmMembership(pinned, false, rows); err != nil {
+			if class, ok := fault.ClassOf(err); ok && class == fault.Forbidden {
+				fact.Allowed = false
+				fact.Detail = err.Error()
+				return fact, nil, nil
+			}
+			return fact, nil, err
+		}
+		guards, err := membershipLocks(evalRead, pinned.Targets)
+		if err != nil {
+			return fact, nil, err
+		}
+		fact.Allowed = evaluated.Allowed
+		fact.Detail = evaluated.Detail
+		return fact, guards, nil
 	}
-	confirmed, err := a.readMembershipRows(ctx, pinned.Scope, pinned.PrincipalID)
-	if err != nil {
-		return fact, nil, err
-	}
-	if err := authorize.ConfirmMembership(pinned, false, confirmed); err != nil {
-		return fact, nil, err
-	}
-	guards, err := membershipLocks(evalRead, pinned.Targets)
+	guards, err := membershipLocks(evalRead, evaluated.Targets)
 	if err != nil {
 		return fact, nil, err
 	}

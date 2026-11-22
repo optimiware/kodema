@@ -14,6 +14,7 @@ package identity_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -91,6 +92,7 @@ type registrationProbe struct {
 	store.Executor
 	beforeFirst     func()
 	failFirst       error
+	failSecond      error
 	attempts        int
 	resourceInserts int
 }
@@ -106,9 +108,14 @@ func (probe *registrationProbe) Execute(ctx context.Context, scope tenancy.Scope
 				probe.resourceInserts++
 			}
 		}
-		if probe.failFirst != nil {
+		if probe.attempts == 1 && probe.failFirst != nil {
 			failure := probe.failFirst
 			probe.failFirst = nil
+			return store.UnitResult{}, failure
+		}
+		if probe.attempts == 2 && probe.failSecond != nil {
+			failure := probe.failSecond
+			probe.failSecond = nil
 			return store.UnitResult{}, failure
 		}
 	}
@@ -781,5 +788,66 @@ func TestRegisterRollbackLeavesNoResourceRow(t *testing.T) {
 		requireResourceAbsent(t, h, scope, "resource-new")
 		h.requireNoRows(scope, "resource_bindings", "binding-a")
 		h.requireNoPublications(scope)
+	})
+}
+
+// TestResolveRegisterConflictPreservesNonConflictAndCancellationErrors proves
+// context cancellations and non-conflict errors on either the initial insert or
+// its retry are returned unchanged instead of being swallowed as not_found.
+func TestResolveRegisterConflictPreservesNonConflictAndCancellationErrors(t *testing.T) {
+	scope := projectScope("tenant-a", "project-a")
+
+	t.Run("first attempt context.Canceled is returned unchanged", func(t *testing.T) {
+		h := newHarness(t)
+		h.seedMembership(scope, "membership-admin", "principal-admin", 1, tenancy.RoleAdmin)
+		probe := &registrationProbe{
+			Executor:  h.store,
+			failFirst: context.Canceled,
+		}
+		svc := newBindingService(t, newBindingAdapter(t, probe, h.store), &commitIDs{})
+		_, err := svc.RegisterBinding(context.Background(),
+			registerCommand(scope, "principal-admin", "binding-cancel-1", "resource-cancel-1", "caller-cancel-1"))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RegisterBinding error = %v; want context.Canceled", err)
+		}
+		if probe.attempts != 1 {
+			t.Fatalf("registration attempts = %d; want 1 (must not retry on context.Canceled)", probe.attempts)
+		}
+	})
+
+	t.Run("retry dependency_unavailable is returned unchanged", func(t *testing.T) {
+		h := newHarness(t)
+		h.seedMembership(scope, "membership-admin", "principal-admin", 1, tenancy.RoleAdmin)
+		probe := &registrationProbe{
+			Executor:   h.store,
+			failFirst:  fault.New(fault.VersionConflict, "initial conflict"),
+			failSecond: fault.New(fault.DependencyUnavailable, "database unavailable on retry"),
+		}
+		svc := newBindingService(t, newBindingAdapter(t, probe, h.store), &commitIDs{})
+		_, err := svc.RegisterBinding(context.Background(),
+			registerCommand(scope, "principal-admin", "binding-retry-err", "resource-retry-err", "caller-retry-err"))
+		requireFaultClass(t, err, fault.DependencyUnavailable)
+		if probe.attempts != 2 {
+			t.Fatalf("registration attempts = %d; want 2", probe.attempts)
+		}
+	})
+
+	t.Run("retry context.Canceled is returned unchanged", func(t *testing.T) {
+		h := newHarness(t)
+		h.seedMembership(scope, "membership-admin", "principal-admin", 1, tenancy.RoleAdmin)
+		probe := &registrationProbe{
+			Executor:   h.store,
+			failFirst:  fault.New(fault.VersionConflict, "initial conflict"),
+			failSecond: context.Canceled,
+		}
+		svc := newBindingService(t, newBindingAdapter(t, probe, h.store), &commitIDs{})
+		_, err := svc.RegisterBinding(context.Background(),
+			registerCommand(scope, "principal-admin", "binding-retry-cancel", "resource-retry-cancel", "caller-retry-cancel"))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RegisterBinding retry error = %v; want context.Canceled", err)
+		}
+		if probe.attempts != 2 {
+			t.Fatalf("registration attempts = %d; want 2", probe.attempts)
+		}
 	})
 }

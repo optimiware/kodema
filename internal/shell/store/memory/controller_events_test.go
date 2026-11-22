@@ -826,3 +826,69 @@ func TestControllerEngineCommitRefusesRawPublicationInsert(t *testing.T) {
 		})
 	}
 }
+
+// TestControllerExecuteParityWithPostgres pins controller refusal parity:
+// deletes, non-zero receipt mode/expectation (checked before Unit.Validate),
+// unguarded execution locks on event/audit units, and raw events/audit writes
+// without a guarded execution lock are all refused as Forbidden.
+func TestControllerExecuteParityWithPostgres(t *testing.T) {
+	enableControllerEventCommit(t)
+	scope := projectScope()
+
+	t.Run("refuses delete on controller state tables", func(t *testing.T) {
+		s := New()
+		seedRow(t, s, scope, "executions", testExecutionID, executionValues(1, "running"))
+		seedRow(t, s, scope, "actions", testActionID, actionValues(1, "running"))
+		_, err := s.Controller().Execute(context.Background(), testExecutionID, store.Unit{
+			Writes: []store.Write{{Table: "actions", ID: testActionID, Delete: true, ExpectVersion: 1}},
+		})
+		assertFault(t, err, fault.Forbidden)
+		mustSnapshot(t, s, scope, "actions", testActionID)
+	})
+
+	t.Run("refuses non-zero receipt mode and expectation before Unit.Validate", func(t *testing.T) {
+		s := New()
+		seedRow(t, s, scope, "executions", testExecutionID, executionValues(1, "running"))
+		cases := []struct {
+			name string
+			unit store.Unit
+		}{
+			{"receipt mode without receipt", store.Unit{ReceiptMode: store.ReceiptComplete}},
+			{"incomplete mode without receipt", store.Unit{ReceiptMode: store.ReceiptInsertIncomplete}},
+			{"receipt expect without receipt", store.Unit{ReceiptExpect: &store.ReceiptExpect{ContentHash: "bad"}}},
+			{"receipt with nil result", store.Unit{Receipt: &receipt.Record{}}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := s.Controller().Execute(context.Background(), testExecutionID, tc.unit)
+				assertFault(t, err, fault.Forbidden)
+			})
+		}
+	})
+
+	t.Run("requires ExpectVersion on execution lock for event and audit units", func(t *testing.T) {
+		s := New()
+		seedRow(t, s, scope, "executions", testExecutionID, executionValues(1, "queued"))
+		_, err := s.Controller().Execute(context.Background(), testExecutionID, store.Unit{
+			Locks:  []store.Lock{{Table: "executions", IDs: []string{testExecutionID}}},
+			Writes: []store.Write{{Table: "executions", ID: testExecutionID, ExpectVersion: 1, Values: map[string]any{"state": "running"}}},
+			Events: []event.Envelope{controllerLifecycleEvent(scope, "event-1", event.TypeExecutionStarted, testExecutionID, 2, `{}`)},
+		})
+		assertFault(t, err, fault.Forbidden)
+		assertAbsent(t, s, scope, "events", "event-1")
+	})
+
+	t.Run("raw events or audit write requires guarded execution lock", func(t *testing.T) {
+		s := New()
+		seedRow(t, s, scope, "executions", testExecutionID, executionValues(1, "running"))
+		for _, write := range []store.Write{
+			{Table: "events", ID: "event-9", Insert: true, Values: map[string]any{"type": "execution.started"}},
+			{Table: "audit", ID: "audit-9", Insert: true, Values: map[string]any{"actor": "system", "operation": "op"}},
+		} {
+			_, err := s.Controller().Execute(context.Background(), testExecutionID, store.Unit{
+				Writes: []store.Write{write},
+			})
+			assertFault(t, err, fault.Forbidden)
+		}
+	})
+}

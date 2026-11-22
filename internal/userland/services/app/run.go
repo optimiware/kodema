@@ -104,7 +104,6 @@ func Run(ctx context.Context, config Config) error {
 type PublicEventSource struct {
 	transport client.Transport
 	projectID string
-	limit     int
 }
 
 var _ services.EventSource = (*PublicEventSource)(nil)
@@ -125,9 +124,6 @@ func (source *PublicEventSource) Poll(ctx context.Context, cursor string) (servi
 		return services.NotificationPage{}, fmt.Errorf("event source is not configured")
 	}
 	page := api.Page{Cursor: cursor}
-	if source.limit > 0 {
-		page.Limit = source.limit
-	}
 	input, err := json.Marshal(api.EventReadRequest{ProjectID: source.projectID, Page: &page})
 	if err != nil {
 		return services.NotificationPage{}, fmt.Errorf("encode event read request: %w", err)

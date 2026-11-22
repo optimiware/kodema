@@ -1,8 +1,9 @@
 package definition
 
 import (
-	"fmt"
 	"math"
+
+	"github.com/optimiware/kodema/internal/id"
 )
 
 const (
@@ -39,12 +40,9 @@ func ValidateBudget(budget *Budget) error {
 	return nil
 }
 
-func validateContainerBudget(action string, budget *Budget) error {
+func validateContainerBudget(action id.ActionName, budget *Budget) error {
 	if budget == nil {
 		return nil
 	}
-	if err := ValidateBudget(budget); err != nil {
-		return invalidInput("action %q: %s", action, fmt.Sprint(err))
-	}
-	return nil
+	return wrapActionInvalid(action, ValidateBudget(budget))
 }

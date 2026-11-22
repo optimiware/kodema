@@ -162,7 +162,6 @@ func ProvisionAdminRepository(ctx context.Context, config AdminProvisionConfig) 
 		return AdminProvisionResult{}, err
 	}
 	provisioner := &adminProvisioner{
-		tenantID:         config.TenantID,
 		tenantDirectory:  tenantDirectory,
 		repositoryPath:   repositoryPath,
 		journalDirectory: journalDirectory,
@@ -252,7 +251,6 @@ func requireInitialAdminPolicy() error {
 
 // adminProvisioner owns one provisioning attempt's private state.
 type adminProvisioner struct {
-	tenantID         id.TenantID
 	tenantDirectory  string
 	repositoryPath   string
 	journalDirectory string
@@ -336,7 +334,7 @@ func (provisioner *adminProvisioner) create(ctx context.Context) (AdminProvision
 	if err := os.Mkdir(templateDirectory, 0o700); err != nil {
 		return AdminProvisionResult{}, fmt.Errorf("create empty init template: %w", err)
 	}
-	if _, err := provisioner.require(ctx, "init", "--bare", "--quiet",
+	if _, err := runRequiredCommand(ctx, provisioner.executor, "init", "--bare", "--quiet",
 		"--ref-format="+refStorageFiles, "--initial-branch="+provisioningInitialBranch,
 		"--template="+templateDirectory, staging); err != nil {
 		return AdminProvisionResult{}, fmt.Errorf("initialize bare admin repository: %w", err)
@@ -350,10 +348,10 @@ func (provisioner *adminProvisioner) create(ctx context.Context) (AdminProvision
 	// The served repository must accept a smart-HTTP receive-pack and advertise
 	// atomic support exactly like every other provisioned repository. Ref policy
 	// still belongs to Kodema's ordered rules and the hooks, never to git config.
-	if _, err := provisioner.require(ctx, "--git-dir="+staging, "config", "receive.advertiseAtomic", "true"); err != nil {
+	if _, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+staging, "config", "receive.advertiseAtomic", "true"); err != nil {
 		return AdminProvisionResult{}, fmt.Errorf("configure atomic receives: %w", err)
 	}
-	if _, err := provisioner.require(ctx, "--git-dir="+staging, "config", "http.receivepack", "true"); err != nil {
+	if _, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+staging, "config", "http.receivepack", "true"); err != nil {
 		return AdminProvisionResult{}, fmt.Errorf("configure smart-HTTP receives: %w", err)
 	}
 
@@ -423,14 +421,14 @@ func (provisioner *adminProvisioner) create(ctx context.Context) (AdminProvision
 // verifyFreshRepository proves the explicit initialization produced the files
 // ref backend and the `main` HEAD this service requires.
 func (provisioner *adminProvisioner) verifyFreshRepository(ctx context.Context, staging string) error {
-	format, err := provisioner.require(ctx, "--git-dir="+staging, "rev-parse", "--show-ref-format")
+	format, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+staging, "rev-parse", "--show-ref-format")
 	if err != nil {
 		return fmt.Errorf("verify admin repository ref backend: %w", err)
 	}
 	if format != refStorageFiles {
 		return fmt.Errorf("admin repository ref storage is %q; want %s", format, refStorageFiles)
 	}
-	head, err := provisioner.require(ctx, "--git-dir="+staging, "symbolic-ref", "HEAD")
+	head, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+staging, "symbolic-ref", "HEAD")
 	if err != nil {
 		return fmt.Errorf("verify admin repository HEAD: %w", err)
 	}
@@ -449,7 +447,7 @@ func (provisioner *adminProvisioner) writeInitialCommit(ctx context.Context, sta
 	if err := os.WriteFile(policyPath, []byte(initialAdminPolicy), 0o600); err != nil {
 		return "", fmt.Errorf("write initial policy: %w", err)
 	}
-	blob, err := provisioner.require(ctx, "--git-dir="+staging, "hash-object", "-w", "--no-filters", policyPath)
+	blob, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+staging, "hash-object", "-w", "--no-filters", policyPath)
 	if err != nil {
 		return "", fmt.Errorf("store initial policy blob: %w", err)
 	}
@@ -462,11 +460,11 @@ func (provisioner *adminProvisioner) writeInitialCommit(ctx context.Context, sta
 
 	indexPath := filepath.Join(staging, provisioningIndexFile)
 	indexContext := WithCommandEnvironment(ctx, []string{"GIT_INDEX_FILE=" + indexPath})
-	if _, err := provisioner.require(indexContext, "--git-dir="+staging,
+	if _, err := runRequiredCommand(indexContext, provisioner.executor, "--git-dir="+staging,
 		"update-index", "--add", "--cacheinfo", "100644,"+blob+","+CommittedPolicyFile); err != nil {
 		return "", fmt.Errorf("index initial policy: %w", err)
 	}
-	tree, err := provisioner.require(indexContext, "--git-dir="+staging, "write-tree")
+	tree, err := runRequiredCommand(indexContext, provisioner.executor, "--git-dir="+staging, "write-tree")
 	if err != nil {
 		return "", fmt.Errorf("write initial policy tree: %w", err)
 	}
@@ -486,7 +484,7 @@ func (provisioner *adminProvisioner) writeInitialCommit(ctx context.Context, sta
 		"GIT_AUTHOR_DATE=" + date,
 		"GIT_COMMITTER_DATE=" + date,
 	})
-	commit, err := provisioner.require(identityContext, "--git-dir="+staging,
+	commit, err := runRequiredCommand(identityContext, provisioner.executor, "--git-dir="+staging,
 		"-c", "user.name="+provisioningAgentName,
 		"-c", "user.email="+provisioningAgentEmail,
 		"commit-tree", tree, "-m", provisioningCommitMessage)
@@ -496,7 +494,7 @@ func (provisioner *adminProvisioner) writeInitialCommit(ctx context.Context, sta
 	if !validPolicyCommit(commit) {
 		return "", fmt.Errorf("initial policy commit id %q is not an object id", commit)
 	}
-	if _, err := provisioner.require(ctx, "--git-dir="+staging,
+	if _, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+staging,
 		"update-ref", CommittedPolicyRef, commit); err != nil {
 		return "", fmt.Errorf("point %s at the initial policy commit: %w", CommittedPolicyRef, err)
 	}
@@ -534,7 +532,7 @@ func (provisioner *adminProvisioner) validateExistingRepository(ctx context.Cont
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("%w: inspect admin repository %q ref store: %v", ErrProvisionDestination, repositoryPath, err)
 	}
-	format, err := provisioner.require(ctx, "--git-dir="+repositoryPath, "rev-parse", "--show-ref-format")
+	format, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+repositoryPath, "rev-parse", "--show-ref-format")
 	if err != nil {
 		return fmt.Errorf("%w: admin repository %q is not the provisioned files-backend repository: %v",
 			ErrProvisionDestination, repositoryPath, err)
@@ -542,11 +540,11 @@ func (provisioner *adminProvisioner) validateExistingRepository(ctx context.Cont
 	if format != refStorageFiles {
 		return fmt.Errorf("%w: admin repository %q uses ref storage %q", ErrProvisionDestination, repositoryPath, format)
 	}
-	bare, err := provisioner.require(ctx, "--git-dir="+repositoryPath, "rev-parse", "--is-bare-repository")
+	bare, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+repositoryPath, "rev-parse", "--is-bare-repository")
 	if err != nil || bare != "true" {
 		return fmt.Errorf("%w: admin repository %q is not a bare repository", ErrProvisionDestination, repositoryPath)
 	}
-	head, err := provisioner.require(ctx, "--git-dir="+repositoryPath, "symbolic-ref", "HEAD")
+	head, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+repositoryPath, "symbolic-ref", "HEAD")
 	if err != nil || head != CommittedPolicyRef {
 		return fmt.Errorf("%w: admin repository %q HEAD is not %s", ErrProvisionDestination, repositoryPath, CommittedPolicyRef)
 	}
@@ -563,7 +561,7 @@ func (provisioner *adminProvisioner) validateExistingRepository(ctx context.Cont
 	if !validPolicyCommit(commit) {
 		return fmt.Errorf("%w: admin repository %q trusted ref is not an object id", ErrProvisionDestination, repositoryPath)
 	}
-	kind, err := provisioner.require(ctx, "--git-dir="+repositoryPath, "cat-file", "-t", commit)
+	kind, err := runRequiredCommand(ctx, provisioner.executor, "--git-dir="+repositoryPath, "cat-file", "-t", commit)
 	if err != nil || kind != "commit" {
 		return fmt.Errorf("%w: admin repository %q trusted ref does not point at a commit", ErrProvisionDestination, repositoryPath)
 	}
@@ -619,20 +617,6 @@ func (provisioner *adminProvisioner) invokeStep(ctx context.Context, step Provis
 // invoke runs one native git command through the exact executor seam.
 func (provisioner *adminProvisioner) invoke(ctx context.Context, args ...string) (git.CommandResult, error) {
 	return provisioner.executor.Run(ctx, git.Command{Name: "git", Args: args})
-}
-
-// require runs one command and requires a zero exit code. Diagnostics are
-// bounded to the command's own stderr; no credential is ever echoed.
-func (provisioner *adminProvisioner) require(ctx context.Context, args ...string) (string, error) {
-	result, err := provisioner.invoke(ctx, args...)
-	if err != nil {
-		return "", err
-	}
-	if result.ExitCode != 0 {
-		return "", fmt.Errorf("git %s exited %d: %s", strings.Join(args, " "), result.ExitCode,
-			strings.TrimSpace(string(result.Stderr)))
-	}
-	return strings.TrimSpace(string(result.Stdout)), nil
 }
 
 // prepareJournalDirectory creates the receive-journal directory before

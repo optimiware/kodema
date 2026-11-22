@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -669,11 +670,7 @@ func (adapters *Adapters) hasDevelopmentAdapter() bool {
 	}
 	// A production caller supplies only ProductionConfig. Any explicit Adapters
 	// override is treated as a weaker/test composition and refused.
-	return adapters.Store != nil || adapters.Runtime != nil || adapters.Keys != nil ||
-		adapters.Principal != nil || adapters.Publisher != nil || adapters.LivePublisher != nil ||
-		adapters.Clock != nil ||
-		adapters.VolumeProvisioner != nil || adapters.WorkspaceActivation != nil ||
-		adapters.ClaimProvisioner != nil
+	return !reflect.ValueOf(*adapters).IsZero()
 }
 
 func validateKubernetesAdapters(

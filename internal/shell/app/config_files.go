@@ -21,6 +21,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -514,11 +515,12 @@ func decodeTrustedConfigFile(path, setting string, target any) error {
 	}
 }
 
-// readTrustedConfigFile reads one bounded regular file. The file is opened and
-// checked before any byte is read, and the read stops one byte past the bound so
-// an oversized file is refused instead of materialized.
+// readTrustedConfigFile reads one bounded regular file. The file is opened
+// non-blocking and checked via its descriptor before any byte is read (so a
+// FIFO never hangs and cannot race a pre-open stat), and the read stops one
+// byte past the bound so an oversized file is refused instead of materialized.
 func readTrustedConfigFile(path, setting string) ([]byte, error) {
-	file, err := os.Open(path)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fault.Wrap(fault.InvalidInput,
 			fmt.Sprintf("%s file %q is unreadable: %v", setting, path, err), err)

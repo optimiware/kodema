@@ -172,7 +172,7 @@ func TestGCPReadResponseStopsAtTheBound(t *testing.T) {
 	}
 	for _, bound := range []int64{gcpKMSMaxResponse, gcpMetadataMaxResponse} {
 		reader := &gcpEndlessReader{ceiling: bound * 4}
-		payload, err := gcpReadResponse(reader, bound, "gcp test")
+		payload, err := readBoundedResponse(reader, bound, "gcp test")
 		if err == nil {
 			t.Fatalf("endless body was accepted and returned %d bytes", len(payload))
 		}
@@ -185,7 +185,7 @@ func TestGCPReadResponseStopsAtTheBound(t *testing.T) {
 		}
 
 		exact := bytes.Repeat([]byte{'x'}, int(bound))
-		payload, err = gcpReadResponse(bytes.NewReader(exact), bound, "gcp test")
+		payload, err = readBoundedResponse(bytes.NewReader(exact), bound, "gcp test")
 		if err != nil {
 			t.Fatalf("exactly the bound was refused: %v", err)
 		}

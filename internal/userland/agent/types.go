@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"time"
 )
@@ -232,14 +233,14 @@ func (call ToolCall) Validate() error {
 	return nil
 }
 
-// validToolFunctionName reports whether name is the OpenAI-compatible
-// 1–64-character [A-Za-z0-9_-] function-name grammar.
-func validToolFunctionName(name string) bool {
-	if name == "" || len(name) > MaxToolNameBytes {
+// validASCIIIdentifier reports whether value is a 1..maxLen string composed
+// solely of ASCII [A-Za-z0-9_-]. Dots are excluded by the character set.
+func validASCIIIdentifier(value string, maxLen int) bool {
+	if value == "" || len(value) > maxLen {
 		return false
 	}
-	for index := 0; index < len(name); index++ {
-		character := name[index]
+	for index := 0; index < len(value); index++ {
+		character := value[index]
 		switch {
 		case character >= 'a' && character <= 'z':
 		case character >= 'A' && character <= 'Z':
@@ -250,6 +251,12 @@ func validToolFunctionName(name string) bool {
 		}
 	}
 	return true
+}
+
+// validToolFunctionName reports whether name is the OpenAI-compatible
+// 1–64-character [A-Za-z0-9_-] function-name grammar.
+func validToolFunctionName(name string) bool {
+	return validASCIIIdentifier(name, MaxToolNameBytes)
 }
 
 // Provider function names accept only [A-Za-z0-9_-], while native Kodema tool
@@ -338,24 +345,7 @@ func NativeToolName(provider string) (string, error) {
 
 // validCallID reports whether value is a bounded ASCII call identity.
 func validCallID(value string) bool {
-	if value == "" || len(value) > 128 {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
+	return validASCIIIdentifier(value, 128)
 }
 
 // boundedJSONObject reports whether value is a bounded JSON object.
@@ -413,7 +403,7 @@ func (request ModelRequest) Validate() error {
 	if request.MaxTokens < 0 || request.MaxTokens > MaxModelTokens {
 		return fmt.Errorf("max tokens %d is outside 0..%d", request.MaxTokens, MaxModelTokens)
 	}
-	if request.Temperature != nil && (*request.Temperature < 0 || *request.Temperature > 2) {
+	if request.Temperature != nil && (math.IsNaN(*request.Temperature) || *request.Temperature < 0 || *request.Temperature > 2) {
 		return fmt.Errorf("temperature must be within 0..2")
 	}
 	return nil

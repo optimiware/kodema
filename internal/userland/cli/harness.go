@@ -157,10 +157,7 @@ func runHarnessExec(ctx context.Context, config Config, args []string, ports Por
 		return usage(ports.Err, err.Error())
 	}
 
-	getenv := deps.Env
-	if getenv == nil {
-		getenv = os.Getenv
-	}
+	getenv := resolveEnv(deps)
 
 	serverRaw := strings.TrimSpace(opts.serverURL)
 	if serverRaw == "" {
@@ -404,9 +401,10 @@ func collectHarnessParentEnv(deps CommandDeps) []string {
 		return deps.Environ()
 	}
 	base := os.Environ()
-	if deps.Env == nil {
+	if deps.Env == nil && deps.Login.Environment == nil {
 		return base
 	}
+	getenv := resolveEnv(deps)
 	out := make([]string, 0, len(base)+3)
 	seen := make(map[string]bool, len(base))
 	for _, entry := range base {
@@ -415,7 +413,7 @@ func collectHarnessParentEnv(deps CommandDeps) []string {
 			continue
 		}
 		seen[key] = true
-		if val := deps.Env(key); val != "" {
+		if val := getenv(key); val != "" {
 			out = append(out, key+"="+val)
 		} else if (strings.HasPrefix(key, "KODEMA_LLM_") && strings.HasSuffix(key, "_BASE_URL")) || key == harnessOpenCodeConfigEnv {
 			continue
@@ -432,7 +430,7 @@ func collectHarnessParentEnv(deps CommandDeps) []string {
 		if seen[key] {
 			continue
 		}
-		if val := deps.Env(key); val != "" {
+		if val := getenv(key); val != "" {
 			out = append(out, key+"="+val)
 		}
 	}

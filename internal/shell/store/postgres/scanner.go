@@ -44,7 +44,7 @@ func (s *Store) Query(ctx context.Context, scope tenancy.Scope, query store.Scan
 	if !ok {
 		return store.QueryPage{}, faultInvalid(fmt.Sprintf("query table %q is not in the frozen schema", query.Table))
 	}
-	statement, err := buildScanStatement(meta, scope, query)
+	statement, err := buildScanStatement(meta, &scope, query)
 	if err != nil {
 		return store.QueryPage{}, err
 	}
@@ -52,7 +52,7 @@ func (s *Store) Query(ctx context.Context, scope tenancy.Scope, query store.Scan
 	if err != nil {
 		return store.QueryPage{}, err
 	}
-	page, err := readScanPage(ctx, tx, meta, scope, query.Table, statement, query.Limit)
+	page, err := readScanPage(ctx, tx, meta, &scope, statement, query.Limit)
 	if err != nil {
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 		return store.QueryPage{}, err
@@ -71,14 +71,21 @@ type scanStatement struct {
 	order []store.Order
 }
 
-func buildScanStatement(meta *tableMeta, scope tenancy.Scope, query store.ScanQuery) (scanStatement, error) {
-	if meta.projectRequired && scope.TenantScoped() {
+// buildScanStatement renders one bounded keyset SELECT. A non-nil scope applies
+// the adapter's mandatory scope predicates and binds the cursor to that scope;
+// a nil scope renders the cross-scope controller scan without scope predicates.
+func buildScanStatement(meta *tableMeta, scope *tenancy.Scope, query store.ScanQuery) (scanStatement, error) {
+	if scope != nil && meta.projectRequired && scope.TenantScoped() {
 		return scanStatement{}, faultInvalid(fmt.Sprintf("table %q is project scoped; a tenant-scope query is not allowed", meta.table.Name))
+	}
+	cursorScope := tenancy.Scope{}
+	if scope != nil {
+		cursorScope = *scope
 	}
 	order := canonicalScanOrder(query.OrderBy)
 	var cursor *queryCursor
 	if query.After != "" {
-		decoded, err := decodeQueryCursor(query.After, meta, scope, order, query.Table)
+		decoded, err := decodeQueryCursor(query.After, meta, cursorScope, order, query.Table)
 		if err != nil {
 			return scanStatement{}, err
 		}
@@ -99,27 +106,29 @@ func buildScanStatement(meta *tableMeta, scope tenancy.Scope, query store.ScanQu
 		addPredicate(fmt.Sprintf("%s %s $%d", quoteIdentifier(column), operator, index))
 	}
 
-	// The adapter always applies the scope predicate. A caller equality on the
-	// same columns is ANDed with it and can only narrow the read.
-	if meta.hasTenant {
-		addComparison("tenant_id", "=", string(scope.TenantID))
-	}
-	if meta.hasProject {
-		if scope.TenantScoped() {
-			addPredicate(fmt.Sprintf("%s IS NULL", quoteIdentifier("project_id")))
-		} else {
-			addComparison("project_id", "=", string(scope.ProjectID))
+	if scope != nil {
+		// The adapter always applies the scope predicate. A caller equality on
+		// the same columns is ANDed with it and can only narrow the read.
+		if meta.hasTenant {
+			addComparison("tenant_id", "=", string(scope.TenantID))
 		}
-	} else {
-		switch meta.table.Name {
-		case "tenants":
-			// The tenant root row carries its identity instead of tenant_id.
-			addComparison("id", "=", string(scope.TenantID))
-		case "projects":
-			// tenant_id is applied above; a project scope also reads only its
-			// own project row.
-			if scope.ProjectScoped() {
-				addComparison("id", "=", string(scope.ProjectID))
+		if meta.hasProject {
+			if scope.TenantScoped() {
+				addPredicate(fmt.Sprintf("%s IS NULL", quoteIdentifier("project_id")))
+			} else {
+				addComparison("project_id", "=", string(scope.ProjectID))
+			}
+		} else {
+			switch meta.table.Name {
+			case "tenants":
+				// The tenant root row carries its identity instead of tenant_id.
+				addComparison("id", "=", string(scope.TenantID))
+			case "projects":
+				// tenant_id is applied above; a project scope also reads only its
+				// own project row.
+				if scope.ProjectScoped() {
+					addComparison("id", "=", string(scope.ProjectID))
+				}
 			}
 		}
 	}
@@ -248,10 +257,11 @@ func quoteIdentifier(name string) string {
 }
 
 // readScanPage reads at most limit+1 rows, computes HasMore and builds the
-// opaque next cursor from the last returned row. Every decoded row is checked
-// against the transaction scope as a second line of defence behind the SQL
-// predicate.
-func readScanPage(ctx context.Context, tx store.Transaction, meta *tableMeta, scope tenancy.Scope, table string, statement scanStatement, limit int) (store.QueryPage, error) {
+// opaque next cursor from the last returned row. When scope is non-nil, every
+// decoded row is checked against the transaction scope as a second line of
+// defence behind the SQL predicate; when scope is nil (cross-scope controller
+// scan), no row-scope recheck is applied.
+func readScanPage(ctx context.Context, tx store.Transaction, meta *tableMeta, scope *tenancy.Scope, statement scanStatement, limit int) (store.QueryPage, error) {
 	rows, err := tx.Query(ctx, statement.query)
 	if err != nil {
 		return store.QueryPage{}, err
@@ -264,8 +274,10 @@ func readScanPage(ctx context.Context, tx store.Transaction, meta *tableMeta, sc
 		if err != nil {
 			return store.QueryPage{}, err
 		}
-		if err := checkRowScope(meta, scope, values); err != nil {
-			return store.QueryPage{}, err
+		if scope != nil {
+			if err := checkRowScope(meta, *scope, values); err != nil {
+				return store.QueryPage{}, err
+			}
 		}
 		decoded = append(decoded, values)
 	}
@@ -280,10 +292,14 @@ func readScanPage(ctx context.Context, tx store.Transaction, meta *tableMeta, sc
 	}
 	page.Rows = make([]store.Row, len(decoded))
 	for index, values := range decoded {
-		page.Rows[index] = store.Row{Table: table, Values: values}
+		page.Rows[index] = store.Row{Table: meta.table.Name, Values: values}
 	}
 	if page.HasMore {
-		cursor := encodeQueryCursor(scope, table, statement.order, decoded[len(decoded)-1])
+		cursorScope := tenancy.Scope{}
+		if scope != nil {
+			cursorScope = *scope
+		}
+		cursor := encodeQueryCursor(cursorScope, meta.table.Name, statement.order, decoded[len(decoded)-1])
 		if cursor == "" {
 			return store.QueryPage{}, faultInternal("scanner could not encode the next cursor")
 		}

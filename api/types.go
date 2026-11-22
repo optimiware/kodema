@@ -408,12 +408,10 @@ func validIdempotencyKey(key string) bool {
 	return true
 }
 
-// validID reports whether value is a bounded ASCII identity payload.
+// validID reports whether value is a bounded ASCII identity payload matching
+// [A-Za-z0-9_-] (which also excludes dot segments and path separators).
 func validID(value string) bool {
 	if value == "" || len(value) > maxIDLength {
-		return false
-	}
-	if value == "." || value == ".." {
 		return false
 	}
 	for index := 0; index < len(value); index++ {

@@ -107,21 +107,17 @@ func (authenticator *DevAuthenticator) ValidUntil(ctx context.Context, principal
 // capability that still authenticates its own input (event ingress, model
 // gateway, MCP proxy).
 type bindingAuthenticator struct {
-	base  authorize.CurrentPrincipal
-	clock Clock
+	base authorize.CurrentPrincipal
 
 	mu    sync.Mutex
 	bound map[string]identity.Principal
 }
 
-func newBindingAuthenticator(base authorize.CurrentPrincipal, clock Clock) (*bindingAuthenticator, error) {
+func newBindingAuthenticator(base authorize.CurrentPrincipal) (*bindingAuthenticator, error) {
 	if base == nil {
 		return nil, fault.New(fault.InvalidInput, "binding authenticator requires a base principal resolver")
 	}
-	if clock == nil {
-		return nil, fault.New(fault.InvalidInput, "binding authenticator requires a clock")
-	}
-	return &bindingAuthenticator{base: base, clock: clock, bound: make(map[string]identity.Principal)}, nil
+	return &bindingAuthenticator{base: base, bound: make(map[string]identity.Principal)}, nil
 }
 
 // Resolve authenticates one credential, preferring a request-local binding.

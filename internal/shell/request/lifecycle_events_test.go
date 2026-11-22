@@ -364,3 +364,29 @@ func TestResolveProjectionIdentitiesAreDeterministicAcrossReplays(t *testing.T) 
 		}
 	}
 }
+
+func TestResolveEventSubjectVersionUsesExecutionVersion(t *testing.T) {
+	scope := projectScope("tenant-1", "project-1")
+	subject := literalSubject(map[string]string{"operation": "git.ref.update"})
+	aggregate := runningRequestExecution(requestAction("act-0", "review", 0, 2*time.Hour, "role/reviewer", subject, "approved"))
+	// Give execution and action distinct versions to prove request.resolved
+	// stamps the execution version (matching SubjectID == ExecutionID).
+	aggregate.Version = 7
+	aggregate.Actions[0].Version = 2
+	fixture := newTestService(t)
+	fixture.store.Seed(scope, aggregate)
+	fixture.clock.now = testNow.Add(time.Minute)
+	actor := humanActor("tenant-1", "project-1", "principal-1", tenancy.RoleReviewer)
+
+	_, err := fixture.service.Resolve(context.Background(), resolveCommand(scope, aggregate, 0, actor, request.DecisionPass, kernel.Outputs{"approved": "yes"}))
+	requireNoError(t, err, "Resolve")
+	unit := fixture.resolutions.captured()[0]
+	resolved := unit.Events[0]
+	if resolved.Type != event.TypeRequestResolved || resolved.SubjectID != string(aggregate.ID) {
+		t.Fatalf("event[0] = %+v; want request.resolved for %q", resolved, aggregate.ID)
+	}
+	if resolved.SubjectVersion != aggregate.Version+1 {
+		t.Fatalf("request.resolved SubjectVersion = %d; want execution version+1 (%d), not action version+1 (%d)",
+			resolved.SubjectVersion, aggregate.Version+1, aggregate.Actions[0].Version+1)
+	}
+}

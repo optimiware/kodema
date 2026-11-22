@@ -19,6 +19,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strings"
@@ -112,13 +113,13 @@ func (s *Store) Query(ctx context.Context, scope tenancy.Scope, query store.Scan
 	if err := ctx.Err(); err != nil {
 		return store.QueryPage{}, err
 	}
-	return buildScanPage(query, prepared, scope, candidates), nil
+	return buildScanPage(query, prepared, scope, candidates)
 }
 
 // buildScanPage filters, orders, pages and encodes one consistent candidate
 // snapshot. The scope is carried only by the opaque cursor binding; the
 // candidates were already scope-filtered when the snapshot was taken.
-func buildScanPage(query store.ScanQuery, prepared *preparedScanQuery, scope tenancy.Scope, candidates []scanRow) store.QueryPage {
+func buildScanPage(query store.ScanQuery, prepared *preparedScanQuery, scope tenancy.Scope, candidates []scanRow) (store.QueryPage, error) {
 	filtered := make([]scanRow, 0, len(candidates))
 	for _, row := range candidates {
 		if prepared.matches(row.values) {
@@ -148,9 +149,13 @@ func buildScanPage(query store.ScanQuery, prepared *preparedScanQuery, scope ten
 		page.Rows = append(page.Rows, store.Row{Table: query.Table, Values: copyValues(row.values)})
 	}
 	if page.HasMore {
-		page.Next = encodeScanCursor(scope, query.Table, prepared.terms, filtered[len(filtered)-1])
+		next, err := encodeScanCursor(scope, query.Table, prepared.terms, filtered[len(filtered)-1])
+		if err != nil {
+			return store.QueryPage{}, err
+		}
+		page.Next = next
 	}
-	return page
+	return page, nil
 }
 
 // prepareScanQuery resolves every bound value against the declared schema
@@ -463,8 +468,14 @@ func normalizeScanValue(column store.Column, value any) (any, error) {
 				return nil, faultInvalid(fmt.Sprintf("column %q value overflows int64", column.Name))
 			}
 			return int64(typed), nil
+		case json.Number:
+			parsed, err := typed.Int64()
+			if err != nil {
+				return nil, faultInvalid(fmt.Sprintf("column %q value %q is not an int64", column.Name, typed.String()))
+			}
+			return parsed, nil
 		case float64:
-			if math.Trunc(typed) != typed || typed < math.MinInt64 || typed > math.MaxInt64 {
+			if math.IsNaN(typed) || math.IsInf(typed, 0) || math.Trunc(typed) != typed || typed < math.MinInt64 || typed >= math.MaxInt64 {
 				return nil, faultInvalid(fmt.Sprintf("column %q value %v is not an integer", column.Name, typed))
 			}
 			return int64(typed), nil
@@ -523,7 +534,7 @@ func decodeScanBytes(text string) ([]byte, bool) {
 }
 
 // encodeScanCursor builds the opaque keyset token for the last row of a page.
-func encodeScanCursor(scope tenancy.Scope, table string, terms []scanTerm, row scanRow) string {
+func encodeScanCursor(scope tenancy.Scope, table string, terms []scanTerm, row scanRow) (string, error) {
 	cursor := scanCursor{
 		TenantID:  string(scope.TenantID),
 		ProjectID: string(scope.ProjectID),
@@ -537,9 +548,9 @@ func encodeScanCursor(scope tenancy.Scope, table string, terms []scanTerm, row s
 	}
 	data, err := json.Marshal(cursor)
 	if err != nil {
-		return ""
+		return "", faultInternal("scanner could not encode the next cursor")
 	}
-	return base64.RawURLEncoding.EncodeToString(data)
+	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
 // decodeScanCursor parses a keyset token and binds it to the caller's scope,
@@ -550,9 +561,18 @@ func decodeScanCursor(token string, scope tenancy.Scope, table string, terms []s
 	if err != nil {
 		return scanCursor{}, faultInvalid("query cursor is not a valid opaque token")
 	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
 	var cursor scanCursor
-	if err := json.Unmarshal(data, &cursor); err != nil {
+	if err := decoder.Decode(&cursor); err != nil {
 		return scanCursor{}, faultInvalid("query cursor is not a valid opaque token")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return scanCursor{}, faultInvalid("query cursor has trailing content")
+	}
+	if cursor.Table == "" || len(cursor.Order) == 0 || len(cursor.Key) != len(cursor.Order) {
+		return scanCursor{}, faultInvalid("query cursor has no complete keyset")
 	}
 	if cursor.TenantID != string(scope.TenantID) || cursor.ProjectID != string(scope.ProjectID) {
 		return scanCursor{}, faultForbidden("query cursor belongs to another scope")
@@ -560,10 +580,10 @@ func decodeScanCursor(token string, scope tenancy.Scope, table string, terms []s
 	if cursor.Table != table || !sameScanOrder(cursor.Order, terms) {
 		return scanCursor{}, faultInvalid("query cursor belongs to another table or order")
 	}
-	if len(cursor.Order) == 0 || len(cursor.Key) != len(cursor.Order) {
-		return scanCursor{}, faultInvalid("query cursor has no keyset")
-	}
 	for index := range cursor.Key {
+		if cursor.Key[index] == nil {
+			return scanCursor{}, faultInvalid("query cursor key contains a null element")
+		}
 		normalized, err := normalizeScanValue(terms[index].column, cursor.Key[index])
 		if err != nil {
 			return scanCursor{}, faultInvalid("query cursor key is not usable")

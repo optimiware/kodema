@@ -66,19 +66,8 @@ func (invalidation Invalidation) Validate() error {
 	if _, err := id.ParsePrincipalID(string(invalidation.PrincipalID)); err != nil {
 		return fault.Wrap(fault.InvalidInput, "invalidation principal id is invalid", err)
 	}
-	switch {
-	case invalidation.ExecutionID != "" && invalidation.ServiceID != "":
-		return fault.New(fault.InvalidInput, "invalidation names both an execution and a service")
-	case invalidation.ExecutionID != "":
-		if _, err := id.ParseExecutionID(string(invalidation.ExecutionID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "invalidation execution id is invalid", err)
-		}
-	case invalidation.ServiceID != "":
-		if _, err := service.ParseServiceID(string(invalidation.ServiceID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "invalidation service id is invalid", err)
-		}
-	default:
-		return fault.New(fault.InvalidInput, "invalidation names neither an execution nor a service")
+	if err := validateTarget("invalidation", invalidation.ExecutionID, invalidation.ServiceID); err != nil {
+		return err
 	}
 	if !invalidation.Reason.Valid() {
 		return fault.New(fault.InvalidInput, "invalidation reason is not frozen")

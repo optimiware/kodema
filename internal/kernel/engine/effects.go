@@ -189,7 +189,7 @@ func (e *Engine) markUnknownAfterStart(ctx context.Context, executionID id.Execu
 			return current, err
 		}
 		last = current
-		index := actionIndex(current, actionID)
+		index := current.ActionIndex(actionID)
 		if index < 0 {
 			return current, nil
 		}
@@ -252,7 +252,7 @@ func (e *Engine) observe(ctx context.Context, execution kernel.Execution, index 
 	if !observation.Valid() {
 		observation = kernel.UnknownObservation()
 	}
-	if observationsEqual(action.Container.Observation, observation) {
+	if action.Container.Observation.Equal(observation) {
 		return false, true, nil
 	}
 
@@ -353,7 +353,7 @@ func (e *Engine) prepareRequest(execution kernel.Execution, index int) PrepareRe
 		if candidate.State != kernel.ActionSucceeded {
 			continue
 		}
-		outputs[candidate.Name] = cloneOutputs(candidate.Outputs)
+		outputs[candidate.Name] = candidate.Outputs.Clone()
 	}
 	task, _ := execution.Snapshot.Task()
 	pipeline := execution.Snapshot.Pipeline()

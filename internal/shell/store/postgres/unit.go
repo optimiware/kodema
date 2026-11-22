@@ -1,12 +1,9 @@
 package postgres
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
-	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -74,12 +71,12 @@ func ExecuteUnit(ctx context.Context, connector store.ScopedConnection, scope te
 	// the lock phase before any statement runs.
 	locks = addInsertAdvisories(locks, writes)
 	for _, audit := range unit.Audit {
-		if err := validateAudit(scope, audit); err != nil {
+		if err := store.ValidateAudit(scope, audit); err != nil {
 			return store.UnitResult{}, err
 		}
 	}
 	for _, envelope := range unit.Events {
-		if err := validateEvent(scope, envelope); err != nil {
+		if err := store.ValidateEvent(scope, envelope); err != nil {
 			return store.UnitResult{}, err
 		}
 	}
@@ -88,12 +85,9 @@ func ExecuteUnit(ctx context.Context, connector store.ScopedConnection, scope te
 	hasReceipt := unit.Receipt != nil
 	if hasReceipt {
 		record = *unit.Receipt
-		if err := validateReceipt(scope, record); err != nil {
+		if err := store.ValidateReceipt(scope, record); err != nil {
 			return store.UnitResult{}, err
 		}
-	}
-	if err := validateReceiptMode(unit); err != nil {
-		return store.UnitResult{}, err
 	}
 
 	tx, err := connector.Begin(ctx, scope)
@@ -116,7 +110,7 @@ func ExecuteUnit(ctx context.Context, connector store.ScopedConnection, scope te
 	switch unit.ReceiptMode {
 	case store.ReceiptInsert, store.ReceiptInsertIncomplete:
 		if found {
-			if !sameContentHash(existing.ContentHash, record.ContentHash) {
+			if !store.SameContentHash(existing.ContentHash, record.ContentHash) {
 				return store.UnitResult{}, fault.New(fault.ChangedIdempotencyContent,
 					"a receipt with the same caller key already holds different request content")
 			}
@@ -143,6 +137,24 @@ func ExecuteUnit(ctx context.Context, connector store.ScopedConnection, scope te
 		if !applied {
 			return store.UnitResult{}, faultConflict("the receipt to complete is missing")
 		}
+		// Build the coalesced durable receipt matching the row just updated so
+		// the first completion returns the same ID, At, coalesced SnapshotHash
+		// and non-nil Result that a subsequent replay returns.
+		completed := existing
+		if record.Result != nil {
+			completed.Result = append([]byte(nil), record.Result...)
+		} else {
+			completed.Result = []byte{}
+		}
+		completed.ExecutionID = record.ExecutionID
+		if record.SnapshotHash != nil {
+			digest := *record.SnapshotHash
+			completed.SnapshotHash = &digest
+		} else if existing.SnapshotHash != nil {
+			digest := *existing.SnapshotHash
+			completed.SnapshotHash = &digest
+		}
+		record = completed
 	}
 
 	if err := applyLocks(ctx, tx, locks); err != nil {
@@ -208,41 +220,6 @@ func hasKVObjectInsert(writes []plannedWrite) bool {
 	return false
 }
 
-// validateReceiptMode checks the adapter-level receipt shape the neutral seam
-// leaves open: a non-insert mode must carry a receipt. store.Unit.Validate
-// is enforced separately and owns the receipt result rules.
-func validateReceiptMode(unit store.Unit) error {
-	if !unit.ReceiptMode.Valid() {
-		return faultInvalid("receipt mode is not frozen")
-	}
-	if unit.Receipt == nil {
-		if unit.ReceiptMode != store.ReceiptInsert {
-			return faultInvalid("a receipt mode requires a receipt")
-		}
-		if unit.ReceiptExpect != nil {
-			return faultInvalid("a receipt expectation requires a receipt")
-		}
-		return nil
-	}
-	switch unit.ReceiptMode {
-	case store.ReceiptInsert, store.ReceiptInsertIncomplete:
-		if unit.ReceiptExpect != nil {
-			return faultInvalid("an insert-mode unit cannot carry a receipt expectation")
-		}
-		if unit.Receipt == nil {
-			return faultInvalid("an insert-mode unit requires a receipt")
-		}
-	case store.ReceiptComplete:
-		if unit.Receipt == nil || unit.ReceiptExpect == nil {
-			return faultInvalid("a completion-mode unit requires a receipt and its expectation")
-		}
-		if err := unit.ReceiptExpect.Validate(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // completeReceipt runs the single compare-and-set that advances an incomplete
 // receipt. It returns applied=true when the update matched, replayed=true with
 // the original record when the receipt was already completed with equal content,
@@ -259,7 +236,7 @@ func completeReceipt(
 	if !found {
 		return false, false, receipt.Record{}, nil
 	}
-	if !sameContentHash(existing.ContentHash, expect.ContentHash) || !sameContentHash(existing.ContentHash, record.ContentHash) {
+	if !store.SameContentHash(existing.ContentHash, expect.ContentHash) || !store.SameContentHash(existing.ContentHash, record.ContentHash) {
 		return false, false, receipt.Record{}, fault.New(fault.ChangedIdempotencyContent,
 			"a receipt with the same caller key already holds different request content")
 	}
@@ -289,7 +266,7 @@ func completeReceipt(
 	if !currentFound {
 		return false, false, receipt.Record{}, nil
 	}
-	if !sameContentHash(current.ContentHash, record.ContentHash) {
+	if !store.SameContentHash(current.ContentHash, record.ContentHash) {
 		return false, false, receipt.Record{}, fault.New(fault.ChangedIdempotencyContent,
 			"a receipt with the same caller key already holds different request content")
 	}
@@ -315,62 +292,6 @@ func planUnitWrites(scope tenancy.Scope, writes []store.Write) ([]plannedWrite, 
 		return planned[left].rank < planned[right].rank
 	})
 	return planned, nil
-}
-
-// validateAudit refuses an audit row outside the unit scope or with an unusable
-// identity, actor, operation or time.
-func validateAudit(scope tenancy.Scope, audit event.Audit) error {
-	if audit.Scope != scope {
-		return faultForbidden("audit record scope does not match the commit unit scope")
-	}
-	if _, err := id.ParseEventID(string(audit.ID)); err != nil {
-		return faultInvalid("audit record id is invalid")
-	}
-	if audit.Actor == "" {
-		return faultInvalid("audit record actor is empty")
-	}
-	if audit.Operation == "" {
-		return faultInvalid("audit record operation is empty")
-	}
-	if audit.At.IsZero() {
-		return faultInvalid("audit record time is zero")
-	}
-	return nil
-}
-
-// validateEvent refuses an event envelope outside the unit scope or with an
-// unusable type, source, time or payload. The envelope rules themselves are the
-// event contract's.
-func validateEvent(scope tenancy.Scope, envelope event.Envelope) error {
-	if err := envelope.Validate(); err != nil {
-		return err
-	}
-	if envelope.Scope != scope {
-		return faultForbidden("event scope does not match the commit unit scope")
-	}
-	return nil
-}
-
-// validateReceipt refuses a receipt whose identity, content hash or scope cannot
-// protect the unit. Receipt identity is (tenant, project, principal, operation,
-// caller key), and the project must be exactly the unit scope's project.
-func validateReceipt(scope tenancy.Scope, record receipt.Record) error {
-	if err := record.Key.Validate(); err != nil {
-		return err
-	}
-	if _, err := id.ParseReceiptID(string(record.ID)); err != nil {
-		return faultInvalid("receipt id is invalid")
-	}
-	if _, err := contentHashBytes(record.ContentHash); err != nil {
-		return faultInvalid("receipt content hash is not a sha256 fingerprint")
-	}
-	if record.At.IsZero() {
-		return faultInvalid("receipt time is zero")
-	}
-	if string(record.Key.TenantID) != string(scope.TenantID) || string(record.Key.ProjectID) != string(scope.ProjectID) {
-		return faultForbidden("receipt identity does not match the commit unit scope")
-	}
-	return nil
 }
 
 // receiptLookupSQL reads the durable receipt for one idempotency identity.
@@ -455,33 +376,6 @@ func receiptFromValues(values map[string]any) (receipt.Record, bool, error) {
 	return record, completed, nil
 }
 
-// contentHashBytes decodes a receipt content fingerprint into its bytea form.
-func contentHashBytes(value string) ([]byte, error) {
-	const prefix = "sha256:"
-	if !strings.HasPrefix(value, prefix) {
-		return nil, fmt.Errorf("receipt content hash has no sha256 prefix")
-	}
-	decoded, err := hex.DecodeString(value[len(prefix):])
-	if err != nil {
-		return nil, err
-	}
-	if len(decoded) != 32 {
-		return nil, fmt.Errorf("receipt content hash is %d bytes; want 32", len(decoded))
-	}
-	return decoded, nil
-}
-
-// sameContentHash compares two receipt fingerprints byte-exactly, falling back
-// to text equality only if a stored value is not a well-formed fingerprint.
-func sameContentHash(left, right string) bool {
-	leftBytes, leftErr := contentHashBytes(left)
-	rightBytes, rightErr := contentHashBytes(right)
-	if leftErr != nil || rightErr != nil {
-		return left == right
-	}
-	return bytes.Equal(leftBytes, rightBytes)
-}
-
 const receiptInsertSQL = `INSERT INTO receipts (id, tenant_id, project_id, principal_id, operation, caller_key, content_sha256, result, completed_at, execution_id, snapshot_sha256, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`
 
 // receiptInsertStatement renders the receipt row committed with the unit. A
@@ -489,7 +383,7 @@ const receiptInsertSQL = `INSERT INTO receipts (id, tenant_id, project_id, princ
 // NULL completion marker and, when the unit carries one, its in-progress
 // result (the trigger Select's persisted selection).
 func receiptInsertStatement(record receipt.Record, mode store.ReceiptMode) (store.Statement, error) {
-	contentHash, err := contentHashBytes(record.ContentHash)
+	contentHash, err := store.ContentHashBytes(record.ContentHash)
 	if err != nil {
 		return store.Statement{}, faultInvalid("receipt content hash is not a sha256 fingerprint")
 	}
@@ -536,7 +430,7 @@ const receiptCompleteSQL = `UPDATE receipts SET result = $1, completed_at = $2, 
 // incomplete receipt under its existing key, its NULL completion marker and its
 // expected content hash. A zero-row outcome is reclassified by the caller.
 func receiptCompleteStatement(record receipt.Record, expect store.ReceiptExpect) (store.Statement, error) {
-	contentHash, err := contentHashBytes(expect.ContentHash)
+	contentHash, err := store.ContentHashBytes(expect.ContentHash)
 	if err != nil {
 		return store.Statement{}, faultInvalid("receipt expectation content hash is not a sha256 fingerprint")
 	}

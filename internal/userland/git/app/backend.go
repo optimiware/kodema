@@ -486,11 +486,14 @@ func appendGitConfigEnv(environment []string, key, value string) []string {
 // splitCGIResponse splits a CGI response into its header block and body. A nil
 // header block reports a missing terminator.
 func splitCGIResponse(data []byte) ([]byte, []byte) {
-	if before, after, ok := bytes.Cut(data, []byte("\r\n\r\n")); ok {
-		return before, after
+	crlf := bytes.Index(data, []byte("\r\n\r\n"))
+	lf := bytes.Index(data, []byte("\n\n"))
+	switch {
+	case crlf >= 0 && (lf < 0 || crlf < lf):
+		return data[:crlf], data[crlf+4:]
+	case lf >= 0:
+		return data[:lf], data[lf+2:]
+	default:
+		return nil, nil
 	}
-	if before, after, ok := bytes.Cut(data, []byte("\n\n")); ok {
-		return before, after
-	}
-	return nil, nil
 }

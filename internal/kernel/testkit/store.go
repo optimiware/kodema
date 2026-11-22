@@ -186,7 +186,7 @@ func (s *State) Commit(ctx context.Context, commit flow.Commit) (kernel.Executio
 	// execution version and every pending-action version, and any conflict
 	// rolls back the whole payload before anything is written.
 	if commit.ActionID != "" {
-		primaryIndex := actionIndex(current, commit.ActionID)
+		primaryIndex := current.ActionIndex(commit.ActionID)
 		if primaryIndex < 0 {
 			return kernel.Execution{}, versionConflict("action %q is not part of execution %q", commit.ActionID, commit.ExecutionID)
 		}
@@ -198,7 +198,7 @@ func (s *State) Commit(ctx context.Context, commit flow.Commit) (kernel.Executio
 		}
 	}
 	for _, update := range commit.PendingCancellations {
-		index := actionIndex(current, update.ActionID)
+		index := current.ActionIndex(update.ActionID)
 		if index < 0 {
 			return kernel.Execution{}, versionConflict("action %q is not part of execution %q", update.ActionID, commit.ExecutionID)
 		}
@@ -284,7 +284,7 @@ func validateCommit(current kernel.Execution, commit flow.Commit) error {
 		if !commit.NextActionState.Valid() {
 			return fault.New(fault.InvalidInput, fmt.Sprintf("unknown next action state %q", commit.NextActionState))
 		}
-		primary := current.Actions[actionIndex(current, commit.ActionID)]
+		primary := current.Actions[current.ActionIndex(commit.ActionID)]
 		if commit.Launch != nil {
 			if primary.Container == nil {
 				return fault.New(fault.InvalidInput, "launch intent was committed for a non-container action")
@@ -405,36 +405,13 @@ func validateRetireCommit(primary kernel.Action, commit flow.Commit) error {
 
 	// Without a replacement launch, the only observation a retiring identity
 	// may accept is the identical persisted proof.
-	if commit.Observation != nil && !observationsEqual(container.Observation, *commit.Observation) {
+	if commit.Observation != nil && !container.Observation.Equal(*commit.Observation) {
 		return fault.New(fault.InvalidInput, fmt.Sprintf(
 			"observation of kind %q conflicts with the persisted proof of retiring action %q",
 			commit.Observation.Kind, primary.ID,
 		))
 	}
 	return nil
-}
-
-// observationsEqual compares recorded and candidate evidence the same way the
-// reducer and engine do: kind and proof must match exactly, and any exit status
-// or stop barrier must match too.
-func observationsEqual(recorded, candidate kernel.Observation) bool {
-	if recorded.Kind != candidate.Kind || recorded.Proof != candidate.Proof ||
-		recorded.OOMKilled != candidate.OOMKilled || recorded.MemoryLimit != candidate.MemoryLimit {
-		return false
-	}
-	if (recorded.ExitCode == nil) != (candidate.ExitCode == nil) {
-		return false
-	}
-	if recorded.ExitCode != nil && *recorded.ExitCode != *candidate.ExitCode {
-		return false
-	}
-	if (recorded.Stop == nil) != (candidate.Stop == nil) {
-		return false
-	}
-	if recorded.Stop != nil && *recorded.Stop != *candidate.Stop {
-		return false
-	}
-	return true
 }
 
 func applyCommit(current kernel.Execution, commit flow.Commit) kernel.Execution {
@@ -449,7 +426,7 @@ func applyCommit(current kernel.Execution, commit flow.Commit) kernel.Execution 
 	// execution version/state, current index, failure, cleanup progress and
 	// pending-action cancellations are still applied atomically below.
 	if commit.ActionID != "" {
-		action := &updated.Actions[actionIndex(updated, commit.ActionID)]
+		action := &updated.Actions[updated.ActionIndex(commit.ActionID)]
 		previousState := action.State
 		action.Version = commit.ExpectedActionVersion + 1
 		action.State = commit.NextActionState
@@ -462,10 +439,10 @@ func applyCommit(current kernel.Execution, commit flow.Commit) kernel.Execution 
 
 		switch commit.Output.Action {
 		case flow.OutputStage:
-			action.StagedOutputs = cloneOutputs(commit.Output.Values)
+			action.StagedOutputs = commit.Output.Values.Clone()
 			action.StagedOutputsSet = true
 		case flow.OutputPromote:
-			action.Outputs = cloneOutputs(commit.Output.Values)
+			action.Outputs = commit.Output.Values.Clone()
 			action.StagedOutputs = nil
 			action.StagedOutputsSet = false
 		case flow.OutputDiscard:
@@ -504,7 +481,7 @@ func applyCommit(current kernel.Execution, commit flow.Commit) kernel.Execution 
 		}
 	}
 	for _, update := range commit.PendingCancellations {
-		pending := &updated.Actions[actionIndex(updated, update.ActionID)]
+		pending := &updated.Actions[updated.ActionIndex(update.ActionID)]
 		pending.Version = update.ExpectedVersion + 1
 		pending.State = update.NextState
 	}
@@ -590,15 +567,6 @@ func unfinished(store *Store, execution kernel.Execution) bool {
 		}
 	}
 	return false
-}
-
-func actionIndex(execution kernel.Execution, actionID id.ActionID) int {
-	for index, action := range execution.Actions {
-		if action.ID == actionID {
-			return index
-		}
-	}
-	return -1
 }
 
 func versionConflict(format string, arguments ...any) error {

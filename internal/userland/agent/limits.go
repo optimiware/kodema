@@ -238,24 +238,7 @@ type PublicClient interface {
 
 // validAgentID reports whether value is a bounded ASCII identity.
 func validAgentID(value string) bool {
-	if value == "" || len(value) > 128 {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
+	return validASCIIIdentifier(value, 128)
 }
 
 // validKnowledgePath reports whether path is a bounded relative knowledge path.

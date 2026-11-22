@@ -28,6 +28,7 @@ import (
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 const (
@@ -65,7 +66,7 @@ func (a *Adapter) workspaceDirFor(workspace id.WorkspaceID) (string, error) {
 // it is never recreated, followed or repaired.
 func (a *Adapter) Status(ctx context.Context, workspaceID id.WorkspaceID) (engine.WorkspaceObservation, error) {
 	observation := engine.WorkspaceObservation{WorkspaceID: workspaceID}
-	if err := validateWorkspaceID(workspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
 		return observation, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -100,7 +101,7 @@ func (a *Adapter) Status(ctx context.Context, workspaceID id.WorkspaceID) (engin
 // already retained workspace is idempotent. A missing or symlinked workspace is
 // refused and never created.
 func (a *Adapter) Retain(ctx context.Context, workspaceID id.WorkspaceID) error {
-	if err := validateWorkspaceID(workspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -150,7 +151,7 @@ func (a *Adapter) Retain(ctx context.Context, workspaceID id.WorkspaceID) error 
 // workspace is a clean release. A failed or partial removal is returned as an
 // error with the workspace and marker left observable for a retry.
 func (a *Adapter) Release(ctx context.Context, workspaceID id.WorkspaceID) error {
-	if err := validateWorkspaceID(workspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {

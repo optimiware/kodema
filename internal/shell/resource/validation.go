@@ -53,7 +53,7 @@ func validateTrustedOrigin(origin string) error {
 		host = authority[:index]
 		port := authority[index+1:]
 		number, err := strconv.Atoi(port)
-		if err != nil || number < 1 || number > 65535 {
+		if err != nil || number < 1 || number > 65535 || strconv.Itoa(number) != port {
 			return fault.New(fault.InvalidInput, fmt.Sprintf("trusted origin %q has an invalid port", origin))
 		}
 	}

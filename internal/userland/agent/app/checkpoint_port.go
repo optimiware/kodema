@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"sync"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -302,7 +303,7 @@ func agentUsage(usage []session.Usage) agent.Usage {
 
 func restoreFault(err error) error {
 	var restoreErr session.RestoreError
-	if ok := asRestoreError(err, &restoreErr); ok {
+	if errors.As(err, &restoreErr) {
 		switch restoreErr.Reason {
 		case session.ReasonMissing, session.ReasonContextMissing:
 			return fault.Wrap(fault.NotFound, "checkpoint was not found", err)
@@ -314,19 +315,4 @@ func restoreFault(err error) error {
 		return err
 	}
 	return fault.Wrap(fault.DependencyUnavailable, "checkpoint restore failed", err)
-}
-
-func asRestoreError(err error, target *session.RestoreError) bool {
-	for err != nil {
-		if value, ok := err.(session.RestoreError); ok {
-			*target = value
-			return true
-		}
-		unwrapper, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = unwrapper.Unwrap()
-	}
-	return false
 }

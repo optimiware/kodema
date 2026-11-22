@@ -23,8 +23,6 @@ import (
 	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
 	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
 	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
 	"github.com/optimiware/kodema/internal/shell/integration/registry"
 	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
 )
@@ -211,19 +209,8 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 	}
 
 	testConfig := &shellapp.TestConfig{
-		KeyfilePath: keyfilePath,
-		OIDC: oidc.Config{
-			OIDCConfig:    identity.OIDCConfig{Issuer: values["KODEMA_OIDC_ISSUER"], Audience: values["KODEMA_OIDC_AUDIENCE"], ClockSkew: time.Minute},
-			JWKSURL:       values["KODEMA_OIDC_JWKS_URL"],
-			Algorithms:    []string{oidc.AlgorithmRS256, oidc.AlgorithmES256},
-			HTTPClient:    oidcClient,
-			MaxJWKSBytes:  1 << 20,
-			MaxTokenBytes: 1 << 20,
-			CacheTTL:      10 * time.Minute,
-			SubjectClaim:  strings.TrimSpace(getenv("KODEMA_OIDC_SUBJECT_CLAIM")),
-			TenantClaim:   values["KODEMA_OIDC_TENANT_CLAIM"],
-			ProjectClaim:  strings.TrimSpace(getenv("KODEMA_OIDC_PROJECT_CLAIM")),
-		},
+		KeyfilePath:   keyfilePath,
+		OIDC:          oidcConfigFromEnv(getenv, oidcClient),
 		Registry:      registry.Config{Transport: http.DefaultTransport, Credentials: registryCredentials},
 		NATSTLS:       natsTLS,
 		ControllerURL: values["KODEMA_CONTROLLER_DATABASE_URL"],
@@ -595,32 +582,10 @@ func runTestProfile(ctx context.Context, options serverOptions, stderr io.Writer
 			return buildTestProfile(options, os.Getenv)
 		}
 	}
-	built, err := build(options)
-	if err != nil {
-		fmt.Fprintf(stderr, "kodema: %v\n", err)
-		return 2
-	}
-	if built.Config.Installation.Runtime == installation.RuntimeKubernetes {
-		fmt.Fprintln(stderr, "kodema: test profile: kubernetes runtime, local keyfile; not a production installation")
-	} else {
-		fmt.Fprintln(stderr, "kodema: test profile: single host, local keyfile; not a production installation")
-	}
-	// A dependency failure may quote a credential or a DSN in its private
-	// diagnostic, so these branches render fixed text naming only the step.
-	app, err := deps.newApp(ctx, built.Config)
-	if err != nil {
-		fmt.Fprintln(stderr, "kodema: composition failed to start")
-		return 1
-	}
-	listener, err := deps.listen("tcp", options.Address)
-	if err != nil {
-		_ = app.Close(context.Background())
-		fmt.Fprintf(stderr, "kodema: listen %q failed\n", options.Address)
-		return 1
-	}
-	if err := app.Serve(ctx, tls.NewListener(listener, built.TLS)); err != nil {
-		fmt.Fprintln(stderr, "kodema: server failed")
-		return 1
-	}
-	return 0
+	return runTLSProfile(ctx, options, stderr, deps, build, func(built productionBuild) string {
+		if built.Config.Installation.Runtime == installation.RuntimeKubernetes {
+			return "kodema: test profile: kubernetes runtime, local keyfile; not a production installation"
+		}
+		return "kodema: test profile: single host, local keyfile; not a production installation"
+	})
 }

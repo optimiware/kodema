@@ -132,18 +132,9 @@ func NewGitMergeEffects(config GitMergeEffectsConfig) (*GitMergeEffects, error) 
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create git merge effects work directory: %w", err)
 	}
-	caFile := strings.TrimSpace(config.CAFile)
-	if caFile != "" {
-		for i := 0; i < len(caFile); i++ {
-			if ch := caFile[i]; ch < 0x20 || ch == 0x7f {
-				return nil, fmt.Errorf("git merge effects CA file contains a control character")
-			}
-		}
-		absCAFile, err := filepath.Abs(filepath.Clean(caFile))
-		if err != nil {
-			return nil, fmt.Errorf("resolve git merge effects CA file: %w", err)
-		}
-		caFile = absCAFile
+	caFile, err := normalizeGitCAFile(config.CAFile, "git merge effects")
+	if err != nil {
+		return nil, err
 	}
 	return &GitMergeEffects{
 		remoteBaseURL: strings.TrimRight(base, "/"),
@@ -153,6 +144,85 @@ func NewGitMergeEffects(config GitMergeEffectsConfig) (*GitMergeEffects, error) 
 		caFile:        caFile,
 		executor:      config.Executor,
 	}, nil
+}
+
+// normalizeGitCAFile validates and absolutizes an optional CA bundle path so
+// child Git invocations running inside scratch directories still resolve it.
+func normalizeGitCAFile(raw, label string) (string, error) {
+	for i := 0; i < len(raw); i++ {
+		if ch := raw[i]; ch < 0x20 || ch == 0x7f {
+			return "", fmt.Errorf("%s CA file contains a control character", label)
+		}
+	}
+	caFile := strings.TrimSpace(raw)
+	if caFile == "" {
+		return "", nil
+	}
+	absCAFile, err := filepath.Abs(filepath.Clean(caFile))
+	if err != nil {
+		return "", fmt.Errorf("resolve %s CA file: %w", label, err)
+	}
+	return absCAFile, nil
+}
+
+// buildGitRemoteEnv injects HTTP(S) credentials and an optional origin-scoped
+// CA bundle purely via GIT_CONFIG_* environment variables (never writing
+// secrets to .git/config or command arguments), and optionally returns
+// origin-scoped credential helper `-c` overrides when credentialHelper is used
+// without credentialFile.
+func buildGitRemoteEnv(remoteURL, credentialFile, credentialHelper, caFile string) ([]string, []string, error) {
+	parsed, err := url.Parse(remoteURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse git remote URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, nil, nil
+	}
+	type cfgPair struct {
+		k, v string
+	}
+	pairs := make([]cfgPair, 0, 2)
+	var extraArgs []string
+	if caFile != "" && parsed.Scheme == "https" && parsed.Host != "" {
+		origin := parsed.Scheme + "://" + parsed.Host
+		pairs = append(pairs, cfgPair{
+			k: "http." + origin + ".sslCAInfo",
+			v: caFile,
+		})
+	}
+	switch {
+	case credentialFile != "":
+		data, err := os.ReadFile(credentialFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read git credential: %w", err)
+		}
+		token := strings.TrimSpace(string(data))
+		if token == "" {
+			return nil, nil, fmt.Errorf("git credential file is empty")
+		}
+		basic := base64.StdEncoding.EncodeToString([]byte("kodema:" + token))
+		pairs = append(pairs, cfgPair{
+			k: "http." + remoteURL + ".extraHeader",
+			v: "Authorization: Basic " + basic,
+		})
+	case credentialHelper != "":
+		origin := parsed.Scheme + "://" + parsed.Host
+		extraArgs = append(extraArgs, "-c", "credential."+origin+".helper="+credentialHelper)
+	default:
+		return nil, nil, fmt.Errorf("an HTTP(S) git remote requires a credential file or credential helper")
+	}
+	if len(pairs) == 0 {
+		return nil, extraArgs, nil
+	}
+	env := make([]string, 0, 1+2*len(pairs))
+	env = append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(pairs)))
+	for i, pair := range pairs {
+		env = append(env,
+			fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, pair.k),
+			fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, pair.v),
+		)
+	}
+	return env, extraArgs, nil
 }
 
 // Execute performs at most one merge/rebase and push. A failure before the push
@@ -374,51 +444,8 @@ func (effects *GitMergeEffects) repositoryURL(repository string) string {
 // origin-scoped http.<origin>.sslCAInfo setting. A file or SSH remote needs
 // neither.
 func (effects *GitMergeEffects) remoteEnvironment(remoteURL string) ([]string, error) {
-	parsed, err := url.Parse(remoteURL)
-	if err != nil {
-		return nil, fmt.Errorf("parse merge remote URL: %w", err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, nil
-	}
-	if effects.credential == "" {
-		return nil, fmt.Errorf("an HTTP merge remote requires a credential file")
-	}
-	data, err := os.ReadFile(effects.credential)
-	if err != nil {
-		return nil, fmt.Errorf("read merge credential: %w", err)
-	}
-	token := strings.TrimSpace(string(data))
-	if token == "" {
-		return nil, fmt.Errorf("merge credential file is empty")
-	}
-	basic := base64.StdEncoding.EncodeToString([]byte("kodema:" + token))
-
-	type cfgPair struct {
-		k, v string
-	}
-	pairs := make([]cfgPair, 0, 2)
-	if effects.caFile != "" && parsed.Scheme == "https" && parsed.Host != "" {
-		origin := parsed.Scheme + "://" + parsed.Host
-		pairs = append(pairs, cfgPair{
-			k: "http." + origin + ".sslCAInfo",
-			v: effects.caFile,
-		})
-	}
-	pairs = append(pairs, cfgPair{
-		k: "http." + remoteURL + ".extraHeader",
-		v: "Authorization: Basic " + basic,
-	})
-
-	env := make([]string, 0, 1+2*len(pairs))
-	env = append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(pairs)))
-	for i, pair := range pairs {
-		env = append(env,
-			fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, pair.k),
-			fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, pair.v),
-		)
-	}
-	return env, nil
+	env, _, err := buildGitRemoteEnv(remoteURL, effects.credential, "", effects.caFile)
+	return env, err
 }
 
 // resolveCommit maps an exact revision to its commit identity.
@@ -501,10 +528,7 @@ func commandDetail(result GitCommandResult) string {
 		detail = strings.TrimSpace(string(result.Stdout))
 	}
 	detail = strings.Join(strings.Fields(detail), " ")
-	if len(detail) > 512 {
-		detail = detail[:512]
-	}
-	return detail
+	return truncateString(detail, 512)
 }
 
 // recordPath is the durable effect record of one operation identity.
@@ -515,38 +539,7 @@ func (effects *GitMergeEffects) recordPath(operationID id.OperationID) string {
 // writeRecord publishes the computed result before the push, so a crash during
 // the push leaves decisive observation evidence.
 func (effects *GitMergeEffects) writeRecord(operationID id.OperationID, record gitEffectRecord) error {
-	data, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(effects.stateDir, ".merge-effect-*")
-	if err != nil {
-		return fmt.Errorf("create merge effect record: %w", err)
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-	if err := temp.Chmod(0o600); err != nil {
-		temp.Close()
-		return err
-	}
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tempPath, effects.recordPath(operationID)); err != nil {
-		return fmt.Errorf("publish merge effect record: %w", err)
-	}
-	if err := syncDirectory(effects.stateDir); err != nil {
-		return fmt.Errorf("make merge effect record durable: %w", err)
-	}
-	return nil
+	return writeAtomicJSON(effects.stateDir, ".merge-effect-*", effects.recordPath(operationID), record, syncDirectory)
 }
 
 // readRecord reads one durable effect record. A missing record is (zero, false).

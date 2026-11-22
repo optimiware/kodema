@@ -44,6 +44,17 @@ func (s *Store) Execute(ctx context.Context, scope tenancy.Scope, unit store.Uni
 // the owning scope from the execution row and the unit may contain only state
 // rows inside that scope.
 func (s *Store) executeLocked(scope tenancy.Scope, unit store.Unit, controller bool) (store.UnitResult, error) {
+	if controller {
+		// The controller holds execution-bound event/audit authority and never
+		// commits receipts. Check before unit.Validate so a non-zero receipt
+		// mode or expectation is always forbidden, never invalid_input.
+		if unit.Receipt != nil || unit.ReceiptExpect != nil || unit.ReceiptMode != store.ReceiptInsert {
+			return store.UnitResult{}, faultForbidden("the controller cannot commit a receipt")
+		}
+		if !controllerEventCommit && (len(unit.Audit) > 0 || len(unit.Events) > 0) {
+			return store.UnitResult{}, faultForbidden("the controller cannot commit an audit row or event until the controller event write path is implemented")
+		}
+	}
 	// The absence guard is declared and implemented by this adapter. While
 	// the single declaration-derived gate is off the adapter refuses such a
 	// unit before it stages anything, so a declared-but-unimplemented guard can
@@ -65,17 +76,6 @@ func (s *Store) executeLocked(scope tenancy.Scope, unit store.Unit, controller b
 	if err != nil {
 		return store.UnitResult{}, err
 	}
-	if controller {
-		// The controller holds execution-bound event/audit authority. While
-		// the declaration-derived gate is off the adapter refuses those rows;
-		// the single declaration is the only place the refusal is lifted.
-		if unit.Receipt != nil {
-			return store.UnitResult{}, faultForbidden("the controller cannot commit a receipt")
-		}
-		if !controllerEventCommit && (len(unit.Audit) > 0 || len(unit.Events) > 0) {
-			return store.UnitResult{}, faultForbidden("the controller cannot commit an audit row or event until the controller event write path is implemented")
-		}
-	}
 
 	plan := receiptPlan{}
 	if unit.Receipt != nil {
@@ -90,12 +90,12 @@ func (s *Store) executeLocked(scope tenancy.Scope, unit store.Unit, controller b
 	// guarded execution row inside this atomic section, so a row in another
 	// tenant or project refuses the whole unit before anything is staged.
 	for _, audit := range unit.Audit {
-		if err := validateAudit(scope, audit); err != nil {
+		if err := store.ValidateAudit(scope, audit); err != nil {
 			return store.UnitResult{}, err
 		}
 	}
 	for _, envelope := range unit.Events {
-		if err := validateEvent(scope, envelope); err != nil {
+		if err := store.ValidateEvent(scope, envelope); err != nil {
 			return store.UnitResult{}, err
 		}
 	}
@@ -111,7 +111,7 @@ func (s *Store) executeLocked(scope tenancy.Scope, unit store.Unit, controller b
 		switch plan.mode {
 		case store.ReceiptInsert, store.ReceiptInsertIncomplete:
 			if existing, found := s.state.receipts[plan.record.Key]; found {
-				if !sameContentHash(existing.ContentHash, plan.record.ContentHash) {
+				if !store.SameContentHash(existing.ContentHash, plan.record.ContentHash) {
 					return store.UnitResult{}, fault.New(fault.ChangedIdempotencyContent,
 						"a receipt with the same caller key already holds different request content")
 				}
@@ -122,8 +122,8 @@ func (s *Store) executeLocked(scope tenancy.Scope, unit store.Unit, controller b
 			if !found {
 				return store.UnitResult{}, faultConflict("the receipt to complete is missing")
 			}
-			if !sameContentHash(existing.ContentHash, plan.expect.ContentHash) ||
-				!sameContentHash(existing.ContentHash, plan.record.ContentHash) {
+			if !store.SameContentHash(existing.ContentHash, plan.expect.ContentHash) ||
+				!store.SameContentHash(existing.ContentHash, plan.record.ContentHash) {
 				return store.UnitResult{}, fault.New(fault.ChangedIdempotencyContent,
 					"a receipt with the same caller key already holds different request content")
 			}
@@ -230,7 +230,7 @@ type receiptPlan struct {
 // receipt-mode shape is already checked by store.Unit.Validate; the durable
 // completion marker is resolved later, inside the same atomic section.
 func planReceipt(scope tenancy.Scope, record receipt.Record, mode store.ReceiptMode) (receiptPlan, error) {
-	if err := validateReceipt(scope, record); err != nil {
+	if err := store.ValidateReceipt(scope, record); err != nil {
 		return receiptPlan{}, err
 	}
 	return receiptPlan{has: true, mode: mode, record: record}, nil

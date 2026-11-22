@@ -44,7 +44,6 @@ type StorageConfig struct {
 // the expected revision.
 type CheckpointStorage struct {
 	root string
-	now  func() time.Time
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -72,11 +71,7 @@ func NewCheckpointStorage(config StorageConfig) (*CheckpointStorage, error) {
 	if err := os.Chmod(absolute, 0o700); err != nil {
 		return nil, fmt.Errorf("restrict checkpoint root permissions: %w", err)
 	}
-	now := config.Now
-	if now == nil {
-		now = time.Now
-	}
-	return &CheckpointStorage{root: absolute, now: now, locks: make(map[string]*sync.Mutex)}, nil
+	return &CheckpointStorage{root: absolute, locks: make(map[string]*sync.Mutex)}, nil
 }
 
 // Root returns the absolute checkpoint directory.

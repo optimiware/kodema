@@ -19,9 +19,9 @@ import (
 )
 
 // HTTPTransport is the concrete public REST transport. It implements Transport
-// over an injected http.RoundTripper and reads Source on every attempt. Zero
-// Now/Sleep fields fall back to time.Now/time.Sleep; a zero MaxResponseBytes
-// falls back to api.MaxResponseBytes.
+// over an injected http.RoundTripper and reads Source on every attempt. A zero
+// Now falls back to time.Now, a zero Sleep uses a context-aware time.Timer, and
+// a zero MaxResponseBytes falls back to api.MaxOperationResponseBytes.
 type HTTPTransport struct {
 	BaseURL          string
 	RoundTripper     http.RoundTripper
@@ -359,20 +359,30 @@ func expandRoute(route api.Route, input json.RawMessage) (string, error) {
 	return "/" + strings.Join(expanded, "/"), nil
 }
 
-// routeParamFields returns the route-template name to canonical request field
-// table of one operation.
-func routeParamFields(operation string) (map[string]string, error) {
-	for _, codec := range api.OperationCodecs() {
-		if codec.Operation != operation {
-			continue
-		}
+// routeParamFieldsByOp maps each registered operation to its route-template
+// name to canonical request field table, precomputed once from
+// api.OperationCodecs().
+var routeParamFieldsByOp = func() map[string]map[string]string {
+	codecs := api.OperationCodecs()
+	table := make(map[string]map[string]string, len(codecs))
+	for _, codec := range codecs {
 		fields := make(map[string]string, len(codec.RouteParams))
 		for _, param := range codec.RouteParams {
 			fields[param.Name] = param.Field
 		}
-		return fields, nil
+		table[codec.Operation] = fields
 	}
-	return nil, fmt.Errorf("operation %q has no public codec", operation)
+	return table
+}()
+
+// routeParamFields returns the route-template name to canonical request field
+// table of one operation.
+func routeParamFields(operation string) (map[string]string, error) {
+	fields, ok := routeParamFieldsByOp[operation]
+	if !ok {
+		return nil, fmt.Errorf("operation %q has no public codec", operation)
+	}
+	return fields, nil
 }
 
 // jsonField resolves one dotted JSON field path inside a decoded input object.

@@ -91,20 +91,6 @@ func requireProjectScope(scope tenancy.Scope) error {
 	return nil
 }
 
-// scopeContains reports whether the actor scope covers the target scope.
-func scopeContains(actor, target tenancy.Scope) bool {
-	if actor.TenantID == "" || target.TenantID == "" {
-		return false
-	}
-	if actor.TenantID != target.TenantID {
-		return false
-	}
-	if actor.ProjectID == "" {
-		return true
-	}
-	return actor.ProjectID == target.ProjectID
-}
-
 // authorizeOperation asks the shared authorizer for the operation grant and
 // refuses a deny.
 func (s *Service) authorizeOperation(ctx context.Context, actor authorize.Principal, operation authorize.OperationName, scope tenancy.Scope) (authorize.Operation, error) {
@@ -398,9 +384,9 @@ func (s *Service) Activate(ctx context.Context, command ActivateCommand) (Activa
 	// The owner emits action.requested; the unit appends the projected
 	// pending->running action.transition and carries the Kernel reduction it
 	// projects.
-	events, err := appendLifecycleProjection(
+	events, err := event.AppendLifecycleProjection(
 		[]event.Envelope{envelope},
-		lifecyclePreImage(command.Scope, current),
+		event.NewExecutionPreImage(command.Scope, current),
 		*activation,
 		event.OwnedEvent{Type: event.TypeActionRequested},
 	)
@@ -547,7 +533,7 @@ func (s *Service) Resolve(ctx context.Context, command ResolveCommand) (ResolveR
 	if err := requireProjectScope(command.Scope); err != nil {
 		return ResolveResult{}, err
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return ResolveResult{}, fault.New(fault.Forbidden, "request resolution scope is outside the actor scope")
 	}
 	if !command.Decision.Valid() {
@@ -647,6 +633,13 @@ func (s *Service) Resolve(ctx context.Context, command ResolveCommand) (ResolveR
 	if !ok {
 		return ResolveResult{}, fault.New(fault.InvalidInput, fmt.Sprintf("request decision %q is not supported", command.Decision))
 	}
+	if len(command.Response) == 0 {
+		command.Response = nil
+	}
+	answerOutputs := command.Response
+	if answered && len(answerOutputs) == 0 && len(action.Request.Answer.Outputs) == 0 {
+		answerOutputs = action.Request.Answer.Outputs
+	}
 	// The Kernel reduction is the only source of the settled action/execution
 	// state. On a first settlement it is attached to the unit so the adapter
 	// persists exactly what the reducer produced; an equal-content retry of an
@@ -657,7 +650,7 @@ func (s *Service) Resolve(ctx context.Context, command ResolveCommand) (ResolveR
 		ActionID:    command.ActionID,
 		Answer: kernel.Answer{
 			Decision: kernelDecision,
-			Outputs:  command.Response,
+			Outputs:  answerOutputs,
 			Note:     command.Note,
 			Actor:    command.Actor.ID,
 			At:       at,
@@ -717,7 +710,7 @@ func (s *Service) Resolve(ctx context.Context, command ResolveCommand) (ResolveR
 	}
 	envelope, err := s.buildEvent(
 		event.TypeRequestResolved, command.Scope, string(command.ExecutionID),
-		action.Version+1, command.Actor.ID, at,
+		current.Version+1, command.Actor.ID, at,
 	)
 	if err != nil {
 		return ResolveResult{}, err
@@ -743,9 +736,9 @@ func (s *Service) Resolve(ctx context.Context, command ResolveCommand) (ResolveR
 	// replay carries a zero commit and appends nothing.
 	events := []event.Envelope{envelope}
 	if reduction != nil {
-		events, err = appendLifecycleProjection(
+		events, err = event.AppendLifecycleProjection(
 			events,
-			lifecyclePreImage(command.Scope, current),
+			event.NewExecutionPreImage(command.Scope, current),
 			*reduction,
 			event.OwnedEvent{Type: event.TypeRequestResolved, SubjectID: string(command.ExecutionID)},
 		)

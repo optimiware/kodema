@@ -22,22 +22,5 @@ func ParseSessionID(value string) (SessionID, error) {
 // validSessionID reports whether value is a bounded ASCII identity. Dots are
 // refused so an identity can never be confused with a path component.
 func validSessionID(value string) bool {
-	if value == "" || len(value) > maxSessionIDBytes {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
+	return validASCIIIdentifier(value, maxSessionIDBytes)
 }

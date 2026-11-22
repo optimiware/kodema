@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -501,7 +502,7 @@ func (subject Subject) Validate() error {
 		switch field.Kind {
 		case "number":
 			var number json.Number
-			if err := json.Unmarshal([]byte(field.Value), &number); err != nil {
+			if err := json.Unmarshal([]byte(field.Value), &number); err != nil || number == "" || string(number) != field.Value {
 				return invalid("subject field %q is not a JSON number", field.Name)
 			}
 		case "boolean":
@@ -515,6 +516,34 @@ func (subject Subject) Validate() error {
 		}
 	}
 	return nil
+}
+
+// decodeStrictSubject decodes an optional typed Subject strictly with member
+// presence so a field missing its name, kind or value is refused rather than
+// defaulting to an empty string.
+func decodeStrictSubject(raw json.RawMessage) (*Subject, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	var subjectWire struct {
+		Fields []struct {
+			Name  *string `json:"name"`
+			Kind  *string `json:"kind"`
+			Value *string `json:"value"`
+		} `json:"fields"`
+	}
+	if err := decodeStrict(trimmed, &subjectWire); err != nil {
+		return nil, err
+	}
+	subject := Subject{Fields: make([]SubjectField, 0, len(subjectWire.Fields))}
+	for _, field := range subjectWire.Fields {
+		if field.Name == nil || field.Kind == nil || field.Value == nil {
+			return nil, invalid("subject field is missing a required member")
+		}
+		subject.Fields = append(subject.Fields, SubjectField{Name: *field.Name, Kind: *field.Kind, Value: *field.Value})
+	}
+	return &subject, nil
 }
 
 // ResourceOperation is one verifiable effect an enforcing service performs

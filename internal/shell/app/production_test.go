@@ -751,3 +751,50 @@ func TestProductionComposesMultiTenantRouting(t *testing.T) {
 		t.Fatalf("capabilities = %v; want the capability both fake adapters support", capabilities.Names)
 	}
 }
+
+// TestProductionClosesAllRolePoolsOnShutdownAndPartialFailure proves every
+// production PostgreSQL role pool is closed exactly once on normal shutdown
+// (including repeated Close calls) and on partial-startup failure.
+func TestProductionClosesAllRolePoolsOnShutdownAndPartialFailure(t *testing.T) {
+	t.Run("shutdown closes all four pools once", func(t *testing.T) {
+		pools := installClosingPools(t)
+		server := &fakeNATSServer{}
+		config := productionConfigWithServer(t, server)
+		app, err := New(context.Background(), config)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		for range 2 {
+			if err := app.Close(context.Background()); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		}
+		if len(*pools) != 4 {
+			t.Fatalf("pools = %d; want 4", len(*pools))
+		}
+		for index, pool := range *pools {
+			if closes := pool.closes.Load(); closes != 1 {
+				t.Fatalf("pool %d closed %d times; want 1", index, closes)
+			}
+		}
+	})
+
+	t.Run("partial startup closes all opened pools once", func(t *testing.T) {
+		pools := installClosingPools(t)
+		server := &fakeNATSServer{
+			ensureErr: fault.New(fault.VersionConflict, "stream conflict"),
+		}
+		config := productionConfigWithServer(t, server)
+		if app, err := New(context.Background(), config); err == nil || app != nil {
+			t.Fatalf("New succeeded despite stream conflict: app=%v err=%v", app, err)
+		}
+		if len(*pools) != 4 {
+			t.Fatalf("pools = %d; want 4", len(*pools))
+		}
+		for index, pool := range *pools {
+			if closes := pool.closes.Load(); closes != 1 {
+				t.Fatalf("pool %d closed %d times after partial startup; want 1", index, closes)
+			}
+		}
+	})
+}

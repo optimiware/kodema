@@ -294,10 +294,10 @@ func tenancyHandlers(deps Dependencies) map[authorize.OperationName]ops.Handler 
 			if err != nil {
 				return api.Result{}, err
 			}
-			page := request.Page
-			if page == nil {
-				page = &api.Page{}
+			if err := confirmReadAuthority(ctx, deps, call, call.Scope); err != nil {
+				return api.Result{}, err
 			}
+			page := pageOrDefault(request.Page)
 			committed, err := deps.Tenancy.ListMemberships(ctx, tenancyadmin.MembershipListCommand{
 				Actor:  call.Principal,
 				Scope:  scope,
@@ -416,30 +416,11 @@ func listMemberProjects(
 	principalID id.PrincipalID,
 	page api.Page,
 ) ([]api.ProjectView, string, error) {
-	wantLimit := page.EffectiveLimit()
-	projects := make([]api.ProjectView, 0, wantLimit)
-	after := page.Cursor
-	var nextCursor string
-	batchLimit := store.MaxQueryLimit
-	foundAny := false
-
-	for {
-		committed, err := scanner.Query(ctx, tenantScope, store.ScanQuery{
-			Table:   "projects",
-			OrderBy: []store.Order{{Column: "id"}},
-			After:   after,
-			Limit:   batchLimit,
-		})
-		if err != nil {
-			return nil, "", err
-		}
-		kept := len(projects)
-		reread := false
-		foundExtra := false
-		for index, row := range committed.Rows {
+	projects, nextCursor, err := scanFilteredPage(ctx, scanner, tenantScope, "projects", page,
+		func(row store.Row) (api.ProjectView, bool, error) {
 			projectID, err := scanRowString(row, "id")
 			if err != nil {
-				return nil, "", err
+				return api.ProjectView{}, false, err
 			}
 			projectScope := tenancy.Scope{
 				TenantID:  tenantScope.TenantID,
@@ -447,56 +428,31 @@ func listMemberProjects(
 			}
 			roles, found, err := scanPrincipalMembershipRoles(ctx, scanner, projectScope, principalID)
 			if err != nil {
-				return nil, "", err
+				return api.ProjectView{}, false, err
 			}
 			if !found || len(roles) == 0 {
-				continue
+				return api.ProjectView{}, false, nil
 			}
-			foundAny = true
-			if len(projects) < wantLimit {
-				name, err := scanRowString(row, "name")
-				if err != nil {
-					return nil, "", err
-				}
-				version, err := scanRowUint(row, "version")
-				if err != nil {
-					return nil, "", err
-				}
-				projects = append(projects, api.ProjectView{
-					ProjectID: projectID,
-					Name:      name,
-					Version:   version,
-				})
-				if len(projects) < wantLimit {
-					continue
-				}
-				if index < len(committed.Rows)-1 {
-					projects = projects[:kept]
-					batchLimit = index + 1
-					reread = true
-					break
-				}
-				nextCursor = committed.Next
-			} else {
-				foundExtra = true
-				break
+			name, err := scanRowString(row, "name")
+			if err != nil {
+				return api.ProjectView{}, false, err
 			}
-		}
-		if foundExtra {
-			break
-		}
-		if reread {
-			continue
-		}
-		batchLimit = store.MaxQueryLimit
-		if !committed.HasMore {
-			nextCursor = ""
-			break
-		}
-		after = committed.Next
+			version, err := scanRowUint(row, "version")
+			if err != nil {
+				return api.ProjectView{}, false, err
+			}
+			return api.ProjectView{
+				ProjectID: projectID,
+				Name:      name,
+				Version:   version,
+			}, true, nil
+		},
+	)
+	if err != nil {
+		return nil, "", err
 	}
 
-	if !foundAny {
+	if len(projects) == 0 {
 		if page.Cursor == "" {
 			return nil, "", fault.New(fault.Unauthenticated, "presented credential is invalid")
 		}

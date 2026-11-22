@@ -694,7 +694,7 @@ func (service *Service) Restart(ctx context.Context, command RestartCommand) (Re
 	}
 	events := []event.Envelope{queued}
 	if cancelCommit != nil {
-		events, err = appendCancellationProjection(events, command.Scope, aggregate, *cancelCommit)
+		events, err = event.AppendLifecycleProjection(events, event.NewExecutionPreImage(command.Scope, aggregate), *cancelCommit)
 		if err != nil {
 			return RestartResult{}, err
 		}
@@ -840,7 +840,7 @@ func (service *Service) Ask(ctx context.Context, command AskCommand) (AskResult,
 	}
 	events := []event.Envelope{questionEvent}
 	if unit.Commit != nil {
-		events, err = appendCancellationProjection(events, command.Scope, aggregate, *unit.Commit)
+		events, err = event.AppendLifecycleProjection(events, event.NewExecutionPreImage(command.Scope, aggregate), *unit.Commit)
 		if err != nil {
 			return AskResult{}, err
 		}
@@ -1080,7 +1080,7 @@ func (service *Service) Cancel(ctx context.Context, command CancelCommand) (Canc
 	}
 	events := []event.Envelope{cancelled}
 	if unit.Commit != nil {
-		events, err = appendCancellationProjection(events, command.Scope, aggregate, *unit.Commit)
+		events, err = event.AppendLifecycleProjection(events, event.NewExecutionPreImage(command.Scope, aggregate), *unit.Commit)
 		if err != nil {
 			return CancelResult{}, err
 		}
@@ -1305,8 +1305,8 @@ type ReadCommand struct {
 }
 
 // Read authorizes one scoped task read and returns the authoritative task
-// unchanged. The declared registry grants task.read to human and service
-// engineers and viewers and binds an execution principal to its own task's
+// unchanged. The declared registry grants task.read to all human roles and any
+// enabled service in scope, and binds an execution principal to its own task's
 // current execution; like History it is a pure read with no receipt, unit or
 // event.
 func (service *Service) Read(ctx context.Context, command ReadCommand) (Task, error) {
@@ -1374,7 +1374,7 @@ func (service *Service) predecessor(ctx context.Context, scope tenancy.Scope, ex
 }
 
 func (service *Service) authorize(ctx context.Context, actor authorize.Principal, operation authorize.OperationName, scope tenancy.Scope) error {
-	if !scopeContains(actor.Scope, scope) {
+	if !actor.Scope.Contains(scope) {
 		return fault.New(fault.Forbidden, "actor scope does not match command scope")
 	}
 	var (
@@ -1423,13 +1423,6 @@ func executionOwnTaskOperation(operation authorize.OperationName) bool {
 	default:
 		return false
 	}
-}
-
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
-	}
-	return owner.ProjectID == "" || owner.ProjectID == target.ProjectID
 }
 
 // confirmActor re-reads the actor's current principal so a previously

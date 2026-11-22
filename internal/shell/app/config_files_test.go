@@ -16,9 +16,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/secret"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
@@ -657,4 +659,30 @@ func TestLoadSecretRulesFile(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestReadTrustedConfigFileRejectsFIFOWithoutHanging(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "models.fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := LoadModelsConfigFile(fifo, ProfileDevelopment)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("LoadModelsConfigFile accepted a FIFO")
+		}
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("FIFO error = %v (class=%v); want InvalidInput", err, class)
+		}
+		if !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("FIFO error = %q; want not a regular file", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("LoadModelsConfigFile hung opening a FIFO")
+	}
 }

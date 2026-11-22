@@ -72,7 +72,7 @@ func (s *Store) Read(ctx context.Context, scope tenancy.Scope, table, identity s
 	if err := scope.Validate(); err != nil {
 		return store.Row{}, err
 	}
-	if !validIdentity(identity) {
+	if !store.ValidIdentity(identity) {
 		return store.Row{}, faultInvalid(fmt.Sprintf("row id %q is not a valid identity", identity))
 	}
 	if meta.projectRequired && scope.TenantScoped() {
@@ -112,7 +112,7 @@ func (s *Store) Snapshot(scope tenancy.Scope, table, identity string) (store.Row
 	if err := scope.Validate(); err != nil {
 		return store.Row{}, false
 	}
-	if !validIdentity(identity) {
+	if !store.ValidIdentity(identity) {
 		return store.Row{}, false
 	}
 	if meta.projectRequired && scope.TenantScoped() {

@@ -6,6 +6,7 @@ package mcpproxy_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -610,4 +611,58 @@ func hasCheck(reads []authorize.AuthorityRead, check authorize.AuthorityCheck) b
 		}
 	}
 	return false
+}
+
+// TestCallRedactsLongestSecretFirst proves that when one resolved secret is a
+// substring of another (and listed earlier), redaction replaces the longer
+// secret first so neither the shorter nor any fragment of the longer secret
+// leaks into the returned content.
+func TestCallRedactsLongestSecretFirst(t *testing.T) {
+	shortSecret := "tok"
+	longSecret := `prefix-tok-"quoted"-suffix`
+
+	fake := newFakes()
+	config := fake.config()
+	config.Servers[0].Secrets = []id.SecretName{id.SecretName("SHORT_SECRET"), id.SecretName("LONG_SECRET")}
+	fake.resolver.values = map[id.SecretName]string{
+		id.SecretName("SHORT_SECRET"): shortSecret,
+		id.SecretName("LONG_SECRET"):  longSecret,
+	}
+	rawBody, err := json.Marshal(struct {
+		Content map[string]string `json:"content"`
+		IsError bool              `json:"isError"`
+	}{
+		Content: map[string]string{
+			"long":  longSecret,
+			"short": shortSecret,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal upstream response: %v", err)
+	}
+	fake.transport.setResponse(func(context.Context, mcpproxy.UpstreamRequest) (io.ReadCloser, error) {
+		return newTrackedBody(rawBody), nil
+	})
+
+	proxy, err := mcpproxy.New(config)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	result, err := proxy.Call(context.Background(), readCallRequest())
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	text := string(result.Content)
+	for _, fragment := range []string{shortSecret, longSecret, "prefix-", "-suffix", "quoted"} {
+		if strings.Contains(text, fragment) {
+			t.Fatalf("redacted content %q leaked fragment %q", text, fragment)
+		}
+	}
+	var decoded map[string]string
+	if err := json.Unmarshal(result.Content, &decoded); err != nil {
+		t.Fatalf("redacted content is not valid JSON: %v (%q)", err, text)
+	}
+	if decoded["long"] != "[redacted]" || decoded["short"] != "[redacted]" {
+		t.Fatalf("decoded redacted content = %+v; want both values fully [redacted]", decoded)
+	}
 }

@@ -21,6 +21,7 @@ import (
 	"github.com/optimiware/kodema/internal/kernel"
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/kernel/script"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -28,13 +29,13 @@ import (
 // execution workspace. It never starts a process and never recreates a missing
 // workspace.
 func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (engine.Preparation, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.Preparation{}, err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.Preparation{}, err
 	}
-	if err := validatePrepareContext(request.ActionName, request.TaskID); err != nil {
+	if err := adapterutil.ValidatePrepareContext(request.ActionName, request.TaskID); err != nil {
 		return engine.Preparation{}, err
 	}
 	if err := workspace.ValidateCacheMounts(request.Container.Caches, request.Caches); err != nil {
@@ -60,7 +61,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 			}
 		}
 	}
-	renderedScript, err := prepareScript(request.Container.Commands)
+	renderedScript, err := script.Render(request.Container.Commands)
 	if err != nil {
 		return engine.Preparation{}, err
 	}
@@ -68,7 +69,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 	if err != nil {
 		return engine.Preparation{}, err
 	}
-	materialization, err := buildMaterialization(request)
+	materialization, err := adapterutil.BuildMaterialization(request, readOnlyMode)
 	if err != nil {
 		return engine.Preparation{}, err
 	}
@@ -113,7 +114,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 		}
 		return engine.Preparation{
 			WorkspaceID: request.WorkspaceID,
-			Detail:      fmt.Sprintf("reused activation snapshot for %s", describeIdentity(request.Identity)),
+			Detail:      fmt.Sprintf("reused activation snapshot for %s", adapterutil.DescribeIdentity(request.Identity)),
 		}, nil
 	}
 
@@ -148,7 +149,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 	}
 	return engine.Preparation{
 		WorkspaceID: request.WorkspaceID,
-		Detail:      fmt.Sprintf("materialized activation snapshot for %s", describeIdentity(request.Identity)),
+		Detail:      fmt.Sprintf("materialized activation snapshot for %s", adapterutil.DescribeIdentity(request.Identity)),
 	}, nil
 }
 
@@ -202,10 +203,10 @@ func (a *Adapter) Start(ctx context.Context, request engine.StartRequest) (engin
 			Detail:     detail,
 		}, err
 	}
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return unknown("start request identity is invalid", err)
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return unknown("start request workspace is invalid", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -401,10 +402,10 @@ func (a *Adapter) Start(ctx context.Context, request engine.StartRequest) (engin
 
 // Observe reports the declared Kernel vocabulary for the stable identity.
 func (a *Adapter) Observe(ctx context.Context, request engine.ObserveRequest) (kernel.Observation, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return kernel.UnknownObservation(), err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return kernel.UnknownObservation(), err
 	}
 
@@ -448,7 +449,7 @@ func (a *Adapter) Observe(ctx context.Context, request engine.ObserveRequest) (k
 // Logs returns ordered, bounded and redacted chunks. It carries no lifecycle
 // authority and fails closed when the redaction source is unavailable.
 func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.LogBatch, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.LogBatch{}, err
 	}
 	if request.Limit <= 0 || request.Limit > MaxLogBytes {
@@ -484,7 +485,7 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 		return engine.LogBatch{}, err
 	}
 
-	stdoutOffset, stderrOffset := decodeLogCursor(request.AfterOffset)
+	stdoutOffset, stderrOffset := adapterutil.DecodeLogCursor(request.AfterOffset)
 	positions := map[engine.LogStream]int64{
 		engine.LogStdout: stdoutOffset,
 		engine.LogStderr: stderrOffset,
@@ -503,8 +504,8 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 			return engine.LogBatch{}, fault.Wrap(fault.DependencyUnavailable, "process log read is unavailable", err)
 		}
 		mayGrow := page.Truncated && len(page.Data) == request.Limit
-		consumed, data := redactLogPage(page.Data, values, request.Limit, mayGrow)
-		nextPosition, err := nextStreamLogPosition(stream, offset, len(consumed))
+		consumed, data := adapterutil.RedactLogPage(page.Data, values, request.Limit, mayGrow)
+		nextPosition, err := adapterutil.NextStreamLogPosition(stream, offset, len(consumed))
 		if err != nil {
 			return engine.LogBatch{}, err
 		}
@@ -521,7 +522,7 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 			Truncated: page.Truncated || len(consumed) < len(page.Data),
 		})
 	}
-	batch.NextOffset = encodeLogCursor(positions[engine.LogStdout], positions[engine.LogStderr])
+	batch.NextOffset = adapterutil.EncodeLogCursor(positions[engine.LogStdout], positions[engine.LogStderr])
 	return batch, nil
 }
 
@@ -541,16 +542,16 @@ func (a *Adapter) redactionSource(ctx context.Context, resourceRoot string, load
 		return nil, fault.Wrap(fault.DependencyUnavailable, "redaction source is unavailable; log read refused", err)
 	}
 	values = append(values, string(credential))
-	return redactionValues(values), nil
+	return adapterutil.SortRedactionValues(values), nil
 }
 
 // Stop requests whole-process-group termination. A signal acknowledgment is
 // not confirmation; only affirmative whole-group termination confirms.
 func (a *Adapter) Stop(ctx context.Context, request engine.StopRequest) (kernel.StopEvidence, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return kernel.PendingStop("stop request identity is invalid"), err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return kernel.PendingStop("stop request workspace is invalid"), err
 	}
 
@@ -604,10 +605,10 @@ func (a *Adapter) Stop(ctx context.Context, request engine.StopRequest) (kernel.
 // the execution workspace and refuses to remove resources while the process
 // group may still run.
 func (a *Adapter) Remove(ctx context.Context, request engine.RemoveRequest) (engine.Removal, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.Removal{Detail: "removal request identity is invalid"}, err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.Removal{Detail: "removal request workspace is invalid"}, err
 	}
 
@@ -634,7 +635,7 @@ func (a *Adapter) Remove(ctx context.Context, request engine.RemoveRequest) (eng
 		if !rootExists {
 			return engine.Removal{
 				Removed: true,
-				Detail:  fmt.Sprintf("owned resources for %s were already removed", describeIdentity(request.Identity)),
+				Detail:  fmt.Sprintf("owned resources for %s were already removed", adapterutil.DescribeIdentity(request.Identity)),
 			}, nil
 		}
 		return a.cleanupRoot(ctx, resourceRoot, group)
@@ -648,7 +649,7 @@ func (a *Adapter) Remove(ctx context.Context, request engine.RemoveRequest) (eng
 		if !rootExists {
 			return engine.Removal{
 				Removed: true,
-				Detail:  fmt.Sprintf("no owned resources exist for %s", describeIdentity(request.Identity)),
+				Detail:  fmt.Sprintf("no owned resources exist for %s", adapterutil.DescribeIdentity(request.Identity)),
 			}, nil
 		}
 		if err := a.writeTombstone(ctx, request.Identity.WorkloadID); err != nil {
@@ -754,7 +755,7 @@ func retainedDetail(group GroupID, reason string) string {
 // restarts or re-signals the process group and never revives a removed
 // identity.
 func (a *Adapter) RefreshCredential(ctx context.Context, request engine.CredentialRequest) (engine.CredentialRefresh, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.CredentialRefresh{}, err
 	}
 	if strings.TrimSpace(request.Credential) == "" {
@@ -795,6 +796,6 @@ func (a *Adapter) RefreshCredential(ctx context.Context, request engine.Credenti
 	}
 	return engine.CredentialRefresh{
 		Delivered: true,
-		Detail:    fmt.Sprintf("replaced credential for %s without restarting the process group", describeIdentity(request.Identity)),
+		Detail:    fmt.Sprintf("replaced credential for %s without restarting the process group", adapterutil.DescribeIdentity(request.Identity)),
 	}, nil
 }

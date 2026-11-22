@@ -72,7 +72,7 @@ func (controller *Controller) Read(ctx context.Context, table, id string) (store
 	if !controllerReadTable(table) {
 		return store.Row{}, faultInvalid(fmt.Sprintf("controller read table %q is not in the controller authority", table))
 	}
-	if !validIdentity(id) {
+	if !store.ValidIdentity(id) {
 		return store.Row{}, faultInvalid(fmt.Sprintf("row id %q is not a valid identity", id))
 	}
 	meta, ok := lookupTable(table)
@@ -131,7 +131,7 @@ func (controller *Controller) Scan(ctx context.Context, scan store.ControllerSca
 	if !ok {
 		return store.QueryPage{}, faultInvalid(fmt.Sprintf("unknown table %q", scan.Table))
 	}
-	statement, err := buildControllerScanStatement(meta, scan.ScanQuery)
+	statement, err := buildScanStatement(meta, nil, scan.ScanQuery)
 	if err != nil {
 		return store.QueryPage{}, err
 	}
@@ -140,7 +140,7 @@ func (controller *Controller) Scan(ctx context.Context, scan store.ControllerSca
 		return store.QueryPage{}, err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	page, err := readControllerScanPage(ctx, tx, meta, statement, scan.Limit)
+	page, err := readScanPage(ctx, tx, meta, nil, statement, scan.Limit)
 	if err != nil {
 		return store.QueryPage{}, err
 	}
@@ -163,7 +163,7 @@ func (controller *Controller) Execute(ctx context.Context, executionID string, u
 	if err := ctx.Err(); err != nil {
 		return store.UnitResult{}, err
 	}
-	if !validIdentity(executionID) {
+	if !store.ValidIdentity(executionID) {
 		return store.UnitResult{}, faultInvalid(fmt.Sprintf("execution id %q is not a valid identity", executionID))
 	}
 	if unit.Receipt != nil || unit.ReceiptExpect != nil || unit.ReceiptMode != store.ReceiptInsert {
@@ -306,6 +306,33 @@ func (controller *Controller) executeEventUnit(ctx context.Context, executionID 
 		return store.UnitResult{}, err
 	}
 
+	locks, err := planLocks(scope, unit.Locks)
+	if err != nil {
+		return store.UnitResult{}, err
+	}
+	writes, err := planUnitWrites(scope, unit.Writes)
+	if err != nil {
+		return store.UnitResult{}, err
+	}
+	reclassify := func(ctx context.Context, tx store.Transaction, table, id string) error {
+		return controllerReclassify(ctx, tx, scope, table, id)
+	}
+	// If unit.Locks names another execution row with id < executionID, acquire
+	// its FOR UPDATE lock first so execution locks always follow ascending id
+	// order and cannot AB/BA deadlock.
+	for _, entry := range locks.entries {
+		if entry.table != "executions" || entry.absence || entry.insertAdvisory || entry.id >= executionID {
+			continue
+		}
+		result, err := tx.Exec(ctx, entry.statement)
+		if err != nil {
+			return store.UnitResult{}, err
+		}
+		if result.RowsAffected == 0 {
+			return store.UnitResult{}, reclassify(ctx, tx, entry.table, entry.id)
+		}
+	}
+
 	// Now that the scope is set, lock the execution row and re-read its scope
 	// and version from the locked row. A row that vanished or changed scope
 	// between derivation and lock is refused before any event/audit row is
@@ -320,24 +347,15 @@ func (controller *Controller) executeEventUnit(ctx context.Context, executionID 
 	if guard.ExpectVersion != version {
 		return store.UnitResult{}, faultConflict("the execution row is not at the expected version")
 	}
-
-	locks, err := planLocks(scope, unit.Locks)
-	if err != nil {
-		return store.UnitResult{}, err
-	}
-	writes, err := planUnitWrites(scope, unit.Writes)
-	if err != nil {
-		return store.UnitResult{}, err
-	}
 	// Validate every event and audit row against the derived scope before any
 	// row is staged, so a single foreign row refuses the whole unit.
 	for _, envelope := range unit.Events {
-		if err := validateEvent(scope, envelope); err != nil {
+		if err := store.ValidateEvent(scope, envelope); err != nil {
 			return store.UnitResult{}, err
 		}
 	}
 	for _, audit := range unit.Audit {
-		if err := validateAudit(scope, audit); err != nil {
+		if err := store.ValidateAudit(scope, audit); err != nil {
 			return store.UnitResult{}, err
 		}
 	}
@@ -357,9 +375,6 @@ func (controller *Controller) executeEventUnit(ctx context.Context, executionID 
 		}
 	}
 
-	reclassify := func(ctx context.Context, tx store.Transaction, table, id string) error {
-		return controllerReclassify(ctx, tx, scope, table, id)
-	}
 	if err := applyLocksWith(ctx, tx, locks, reclassify); err != nil {
 		return store.UnitResult{}, err
 	}
@@ -579,108 +594,4 @@ func controllerReclassify(ctx context.Context, tx store.Transaction, scope tenan
 		return err
 	}
 	return faultConflict("a locked or written row is missing or was not at the expected version")
-}
-
-// buildControllerScanStatement renders the same bounded keyset SELECT as the
-// scoped scanner without any transaction-scope predicate.
-func buildControllerScanStatement(meta *tableMeta, query store.ScanQuery) (scanStatement, error) {
-	order := canonicalScanOrder(query.OrderBy)
-	var cursor *queryCursor
-	if query.After != "" {
-		decoded, err := decodeQueryCursor(query.After, meta, tenancy.Scope{}, order, query.Table)
-		if err != nil {
-			return scanStatement{}, err
-		}
-		cursor = decoded
-	}
-	args := make([]any, 0, 8)
-	predicates := make([]string, 0, 8)
-	addArgument := func(value any) int {
-		args = append(args, value)
-		return len(args)
-	}
-	addComparison := func(column, operator string, value any) {
-		index := addArgument(value)
-		predicates = append(predicates, fmt.Sprintf("%s %s $%d", quoteIdentifier(column), operator, index))
-	}
-	for _, column := range sortedScanColumns(query.Equals) {
-		addComparison(column, "=", query.Equals[column])
-	}
-	for _, filter := range query.Range {
-		if filter.After != nil {
-			addComparison(filter.Column, ">", filter.After)
-		}
-		if filter.Before != nil {
-			addComparison(filter.Column, "<", filter.Before)
-		}
-	}
-	if cursor != nil {
-		predicates = append(predicates, keysetPredicate(order, cursor.Key, addArgument))
-	}
-	limitIndex := addArgument(query.Limit + 1)
-	selectList := make([]string, 0, len(meta.columnOrder))
-	for _, column := range meta.columnOrder {
-		selectList = append(selectList, quoteIdentifier(column))
-	}
-	orderList := make([]string, 0, len(order))
-	for _, term := range order {
-		direction := "ASC"
-		if term.Desc {
-			direction = "DESC"
-		}
-		orderList = append(orderList, fmt.Sprintf("%s %s", quoteIdentifier(term.Column), direction))
-	}
-	statement := fmt.Sprintf(
-		"SELECT %s FROM %s",
-		strings.Join(selectList, ", "),
-		quoteIdentifier(meta.table.Name),
-	)
-	if len(predicates) > 0 {
-		statement += " WHERE " + strings.Join(predicates, " AND ")
-	}
-	statement += fmt.Sprintf(
-		" ORDER BY %s LIMIT $%d",
-		strings.Join(orderList, ", "),
-		limitIndex,
-	)
-	return scanStatement{query: store.Query{SQL: statement, Args: args}, order: order}, nil
-}
-
-// readControllerScanPage reads at most limit+1 rows, computes HasMore and builds
-// the opaque next cursor. There is no row-scope recheck because the controller
-// is cross-scope by contract.
-func readControllerScanPage(ctx context.Context, tx store.Transaction, meta *tableMeta, statement scanStatement, limit int) (store.QueryPage, error) {
-	rows, err := tx.Query(ctx, statement.query)
-	if err != nil {
-		return store.QueryPage{}, err
-	}
-	defer func() { _ = rows.Close() }()
-	decoded := make([]map[string]any, 0, limit+1)
-	for rows.Next() {
-		values, err := scanColumns(meta, meta.columnOrder, rows)
-		if err != nil {
-			return store.QueryPage{}, err
-		}
-		decoded = append(decoded, values)
-	}
-	if err := rows.Err(); err != nil {
-		return store.QueryPage{}, err
-	}
-	page := store.QueryPage{}
-	if len(decoded) > limit {
-		page.HasMore = true
-		decoded = decoded[:limit]
-	}
-	page.Rows = make([]store.Row, len(decoded))
-	for index, values := range decoded {
-		page.Rows[index] = store.Row{Table: meta.table.Name, Values: values}
-	}
-	if page.HasMore {
-		cursor := encodeQueryCursor(tenancy.Scope{}, meta.table.Name, statement.order, decoded[len(decoded)-1])
-		if cursor == "" {
-			return store.QueryPage{}, faultInternal("controller scanner could not encode the next cursor")
-		}
-		page.Next = cursor
-	}
-	return page, nil
 }

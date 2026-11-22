@@ -36,7 +36,7 @@ type StreamEvent struct {
 }
 
 // ProjectEventStreamPath returns the HTTP SSE path for one project's live event
-// stream. It sits outside the 61-operation JSON RPC route table alongside /mcp
+// stream. It sits outside the 64-operation JSON RPC route table alongside /mcp
 // and /.well-known/kodema-configuration.
 func ProjectEventStreamPath(projectID string) (string, error) {
 	if !validID(projectID) {

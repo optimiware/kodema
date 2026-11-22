@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,4 +149,76 @@ func TestControllerReclassifyTenantWideProject(t *testing.T) {
 	} else {
 		assertRegressionFaultClass(t, err, fault.Forbidden)
 	}
+}
+
+// checkWriteDeadline must close its rows iterator and check rows.Err() before
+// invoking reclassify so a strict connection driver (like pgx) never fails with
+// conn busy when reclassify issues its own SELECT.
+func TestCheckWriteDeadlineClosesRowsBeforeReclassify(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	scope := testProjectScope()
+	planned, err := planWrite(scope, store.Write{
+		Table:         "actions",
+		ID:            "action-1",
+		ExpectVersion: 1,
+		Values:        map[string]any{"state": "succeeded"},
+		Deadline:      &store.DeadlineGuard{Column: "deadline"},
+	})
+	if err != nil {
+		t.Fatalf("planWrite: %v", err)
+	}
+
+	t.Run("closes empty deadline rows before reclassify query", func(t *testing.T) {
+		db := &strictCloseDB{
+			queryFn: func(sql string, _ []any) (*strictCloseRows, error) {
+				switch {
+				case sql == transactionClockSQL:
+					return &strictCloseRows{inner: &fakeRows{rows: [][]any{{now}}, index: -1}}, nil
+				case strings.Contains(strings.ToLower(sql), "not ("):
+					// Reclassify finds the row in another scope -> Forbidden.
+					return &strictCloseRows{inner: &fakeRows{rows: [][]any{{"action-1"}}, index: -1}}, nil
+				default:
+					// Deadline guard query returns 0 rows.
+					return &strictCloseRows{inner: &fakeRows{index: -1}}, nil
+				}
+			},
+		}
+		tx, err := beginUnscoped(context.Background(), db, false)
+		if err != nil {
+			t.Fatalf("beginUnscoped: %v", err)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+
+		err = checkWriteDeadline(context.Background(), tx, planned, func(ctx context.Context, tx store.Transaction, table, id string) error {
+			return controllerReclassify(ctx, tx, scope, table, id)
+		})
+		assertRegressionFaultClass(t, err, fault.Forbidden)
+	})
+
+	t.Run("surfaces rows close error before calling reclassify", func(t *testing.T) {
+		closeErr := fault.New(fault.DependencyUnavailable, "deadline rows close failed")
+		reclassified := false
+		db := &strictCloseDB{
+			queryFn: func(sql string, _ []any) (*strictCloseRows, error) {
+				if sql == transactionClockSQL {
+					return &strictCloseRows{inner: &fakeRows{rows: [][]any{{now}}, index: -1}}, nil
+				}
+				return &strictCloseRows{inner: &fakeRows{index: -1}, closeErr: closeErr}, nil
+			},
+		}
+		tx, err := beginUnscoped(context.Background(), db, false)
+		if err != nil {
+			t.Fatalf("beginUnscoped: %v", err)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+
+		err = checkWriteDeadline(context.Background(), tx, planned, func(context.Context, store.Transaction, string, string) error {
+			reclassified = true
+			return nil
+		})
+		assertRegressionFaultClass(t, err, fault.DependencyUnavailable)
+		if reclassified {
+			t.Fatal("reclassify was called after rows.Close failed")
+		}
+	})
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/optimiware/kodema/internal/kernel/flow"
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/event"
+	"github.com/optimiware/kodema/internal/shell/receipt"
 	"github.com/optimiware/kodema/internal/shell/request"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
@@ -881,4 +882,48 @@ func TestResolvePersistsDecisionNoteAndValidatesIdempotency(t *testing.T) {
 			t.Fatalf("resolve port calls = %d; want zero", fixture.resolutions.callCount())
 		}
 	})
+}
+
+func TestResolveNilAndEmptyResponseProduceSameReceiptHash(t *testing.T) {
+	actor := humanActor("tenant-1", "project-1", "principal-1", tenancy.RoleReviewer)
+	for _, tc := range []struct {
+		name   string
+		first  kernel.Outputs
+		second kernel.Outputs
+	}{
+		{name: "nil then empty map", first: nil, second: kernel.Outputs{}},
+		{name: "empty map then nil", first: kernel.Outputs{}, second: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture, scope, aggregate, _ := newResolveFixture(t, "role/reviewer")
+			firstRes, err := fixture.service.Resolve(context.Background(), resolveCommand(scope, aggregate, 0, actor, request.DecisionPass, tc.first))
+			requireNoError(t, err, "first Resolve")
+			if firstRes.Replayed {
+				t.Fatal("first resolve unexpectedly reported replay")
+			}
+
+			secondRes, err := fixture.service.Resolve(context.Background(), resolveCommand(scope, aggregate, 0, actor, request.DecisionPass, tc.second))
+			requireNoError(t, err, "retry Resolve")
+			if !secondRes.Replayed {
+				t.Fatal("retry with equivalent empty response did not replay")
+			}
+			units := fixture.resolutions.captured()
+			if len(units) != 2 {
+				t.Fatalf("resolve port calls = %d; want 2", len(units))
+			}
+			if units[0].Receipt.ContentHash != units[1].Receipt.ContentHash {
+				t.Fatalf("receipt hashes differ: %q vs %q", units[0].Receipt.ContentHash, units[1].Receipt.ContentHash)
+			}
+			// Pin exact wire compatibility with pre-upgrade nil-response receipts
+			// ({"decision":"pass","response":null}) so retries across upgrades replay.
+			wantHash, err := receipt.Fingerprint(receipt.Content{
+				MediaType: "application/json",
+				Bytes:     []byte(`{"decision":"pass","response":null}`),
+			})
+			requireNoError(t, err, "pre-upgrade nil fingerprint")
+			if units[0].Receipt.ContentHash != wantHash {
+				t.Fatalf("receipt hash = %q; want pre-upgrade nil hash %q", units[0].Receipt.ContentHash, wantHash)
+			}
+		})
+	}
 }

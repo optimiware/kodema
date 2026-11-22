@@ -829,3 +829,45 @@ func TestAuthServeCLIConfigWiringAndSecretFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthServeRedirectURIFlagOverridesEnv(t *testing.T) {
+	var captured authapp.Config
+	prevRun := runAuthApp
+	t.Cleanup(func() { runAuthApp = prevRun })
+	runAuthApp = func(_ context.Context, cfg authapp.Config) error {
+		captured = cfg
+		return nil
+	}
+
+	t.Setenv("KODEMA_AUTH_REDIRECT_URIS", "https://env-1.kodema.example/cb,https://env-2.kodema.example/cb")
+
+	// Without --redirect-uri, env value is inherited.
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{
+		"auth", "serve",
+		"--issuer", "https://auth.kodema.example",
+		"--local-personas", "admin",
+	}, &stdout, &stderr, defaultDeps())
+	if code != 0 {
+		t.Fatalf("auth serve(env only) exit=%d stderr=%s", code, stderr.String())
+	}
+	if strings.Join(captured.RedirectURIs, ",") != "https://env-1.kodema.example/cb,https://env-2.kodema.example/cb" {
+		t.Fatalf("inherited RedirectURIs = %v; want env values", captured.RedirectURIs)
+	}
+
+	// With --redirect-uri, CLI flags replace env rather than appending.
+	stdout.Reset()
+	stderr.Reset()
+	code = run(context.Background(), []string{
+		"auth", "serve",
+		"--issuer", "https://auth.kodema.example",
+		"--local-personas", "admin",
+		"--redirect-uri", "https://flag.kodema.example/cb",
+	}, &stdout, &stderr, defaultDeps())
+	if code != 0 {
+		t.Fatalf("auth serve(flag override) exit=%d stderr=%s", code, stderr.String())
+	}
+	if strings.Join(captured.RedirectURIs, ",") != "https://flag.kodema.example/cb" {
+		t.Fatalf("overridden RedirectURIs = %v; want [https://flag.kodema.example/cb]", captured.RedirectURIs)
+	}
+}

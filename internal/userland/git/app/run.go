@@ -759,7 +759,7 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if listener == nil {
 		return fmt.Errorf("git serve requires a listener")
 	}
-	if err := server.StartHooks(ctx); err != nil {
+	if err := server.StartHooks(context.Background()); err != nil {
 		return err
 	}
 	defer func() { _ = server.CloseHooks() }()
@@ -817,6 +817,7 @@ func Run(ctx context.Context, config Config) error {
 		if err != nil {
 			return err
 		}
+		defer func() { _ = listener.Close() }()
 	}
 	return server.Serve(ctx, listener)
 }

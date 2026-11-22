@@ -22,6 +22,7 @@ import (
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/kernel/script"
 	"github.com/optimiware/kodema/internal/shell/runtime"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -63,13 +64,13 @@ func (a *Adapter) checkPreparedWorkspace(identity engine.EffectIdentity, workspa
 // retained workspace claim. It never starts a workload and never recreates a
 // missing workspace.
 func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (engine.Preparation, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.Preparation{}, err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.Preparation{}, err
 	}
-	if err := validatePrepareContext(request.ActionName, request.TaskID); err != nil {
+	if err := adapterutil.ValidatePrepareContext(request.ActionName, request.TaskID); err != nil {
 		return engine.Preparation{}, err
 	}
 	if err := workspace.ValidateCacheMounts(request.Container.Caches, request.Caches); err != nil {
@@ -92,7 +93,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 	if err != nil {
 		return engine.Preparation{}, err
 	}
-	materialization, err := buildMaterialization(request)
+	materialization, err := adapterutil.BuildMaterialization(request, readOnlyMode)
 	if err != nil {
 		return engine.Preparation{}, err
 	}
@@ -118,12 +119,8 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 		}
 	}
 
-	namespace, err := a.cluster.GetNamespace(ctx, a.namespace)
-	if err != nil {
-		return engine.Preparation{}, fault.Wrap(fault.DependencyUnavailable, "tenant namespace is unavailable", err)
-	}
-	if namespace.Labels[LabelTenant] != string(a.tenant) {
-		return engine.Preparation{}, fault.New(fault.Forbidden, "namespace is not owned by this tenant")
+	if err := a.checkTenantNamespace(ctx); err != nil {
+		return engine.Preparation{}, err
 	}
 
 	claimName, err := WorkspaceClaimName(request.WorkspaceID)
@@ -255,7 +252,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 	return engine.Preparation{
 		WorkspaceID: request.WorkspaceID,
 		Detail: fmt.Sprintf("materialized activation snapshot %q and credential secret %q for %s",
-			configMap.Name, secret.Name, describeIdentity(request.Identity)),
+			configMap.Name, secret.Name, adapterutil.DescribeIdentity(request.Identity)),
 	}, nil
 }
 
@@ -387,10 +384,10 @@ func (a *Adapter) Start(ctx context.Context, request engine.StartRequest) (engin
 			Detail:     detail,
 		}, err
 	}
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return unknown("start request identity is invalid", err)
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return unknown("start request workspace is invalid", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -500,10 +497,10 @@ func (a *Adapter) Start(ctx context.Context, request engine.StartRequest) (engin
 // Observe reports the declared Kernel vocabulary for the stable identity.
 // Absence and node loss stay uncertain.
 func (a *Adapter) Observe(ctx context.Context, request engine.ObserveRequest) (kernel.Observation, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return kernel.UnknownObservation(), err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return kernel.UnknownObservation(), err
 	}
 	if err := a.checkPreparedWorkspace(request.Identity, request.WorkspaceID); err != nil {
@@ -543,7 +540,7 @@ func (a *Adapter) memoryLimitFor(workload id.WorkloadID) string {
 // Logs returns ordered, bounded and redacted chunks. It carries no lifecycle
 // authority and fails closed when the redaction source is unavailable.
 func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.LogBatch, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.LogBatch{}, err
 	}
 	if request.Limit <= 0 || request.Limit > MaxLogBytes {
@@ -555,7 +552,7 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 	// The pod log is one interleaved stream: stock clusters cannot separate
 	// stdout from stderr, so the combined log is attributed to stdout and the
 	// stderr position of the continuation token stays zero.
-	offset, stderrOffset := decodeLogCursor(request.AfterOffset)
+	offset, stderrOffset := adapterutil.DecodeLogCursor(request.AfterOffset)
 	if stderrOffset != 0 {
 		// A cursor from the retired two-stream reader carries a stderr
 		// position. Reinterpreting its high half as a combined-log offset would
@@ -620,14 +617,14 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 	// inside it may still complete after the page. Only the final page (no
 	// truncation) is known to hold the whole remaining log, so nothing there can
 	// extend past its last byte.
-	consumed, data := redactLogPage(page.Data, values, request.Limit, page.Truncated)
-	next, err := nextLogCursor(offset, len(consumed))
+	consumed, data := adapterutil.RedactLogPage(page.Data, values, request.Limit, page.Truncated)
+	nextPos, err := adapterutil.NextStreamLogPosition(engine.LogStdout, offset, len(consumed))
 	if err != nil {
 		// The page itself was already read, but a position that does not fit the
 		// token must never surface as a negative cursor.
 		return engine.LogBatch{}, err
 	}
-	batch := engine.LogBatch{NextOffset: next}
+	batch := engine.LogBatch{NextOffset: adapterutil.EncodeLogCursor(nextPos, 0)}
 	if len(consumed) == 0 {
 		return batch, nil
 	}
@@ -639,202 +636,6 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 		Truncated: page.Truncated,
 	})
 	return batch, nil
-}
-
-// logSegment is one decoded piece of a pod-log page: a raw byte range and the
-// bytes it contributes after redaction (a raw copy or the fixed marker).
-type logSegment struct {
-	start  int
-	end    int
-	marker bool
-	data   []byte
-}
-
-// scanLogSegments splits a page into raw runs and configured-value matches, left
-// to right and longest value first (redactionValues orders them that way). A
-// value is consumed atomically, so no page boundary can be placed inside one.
-func scanLogSegments(data []byte, values []string) []logSegment {
-	segments := make([]logSegment, 0, len(data))
-	for index := 0; index < len(data); {
-		matched := false
-		for _, value := range values {
-			if value == "" || len(value) > len(data)-index {
-				continue
-			}
-			if string(data[index:index+len(value)]) == value {
-				segments = append(segments, logSegment{
-					start:  index,
-					end:    index + len(value),
-					marker: true,
-					data:   []byte(Redacted),
-				})
-				index += len(value)
-				matched = true
-				break
-			}
-		}
-		if matched {
-			continue
-		}
-		segments = append(segments, logSegment{
-			start: index,
-			end:   index + 1,
-			data:  []byte{data[index]},
-		})
-		index++
-	}
-	return segments
-}
-
-// couldExtend reports whether tail is a proper prefix of a configured value, so
-// a longer match could still start there once the log grows past this page. The
-// whole visible tail must match, not just the bytes already recognised: every
-// byte the page does contain is fixed in the log.
-func couldExtend(tail []byte, values []string) bool {
-	for _, value := range values {
-		if len(value) <= len(tail) {
-			continue
-		}
-		if hasStringPrefix(value, tail) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasStringPrefix reports whether value starts with prefix without allocating.
-func hasStringPrefix(value string, prefix []byte) bool {
-	if len(prefix) > len(value) {
-		return false
-	}
-	for index := range prefix {
-		if value[index] != prefix[index] {
-			return false
-		}
-	}
-	return true
-}
-
-// redactLogPage redacts one bounded page without splitting a configured value
-// across the page boundary. It returns the raw prefix the cursor may advance
-// over and the redacted bytes to emit. mayGrow says the page is a strict prefix
-// of the log: more bytes exist past it, so a match near its end may still be
-// extended by a longer configured value on a later page.
-//
-// The scan walks the page left to right and stops at the first segment whose
-// remaining tail is a proper prefix of a configured value. That includes a
-// marker for a shorter value that a longer nested value could still extend, so
-// a marker is emitted only once no longer value can claim the position. The
-// cursor then names the held position and the next page re-reads the run whole.
-//
-// When the page is the end of the log nothing can extend it, so a final partial
-// prefix of a value is emitted as ordinary raw bytes instead of being lost.
-// When the log may still grow and the whole page is held, the call returns no
-// progress and no data: the raw bytes stay unread and the same cursor is
-// retried. A value longer than the page can never be advanced past safely under
-// that bound; a caller that wants progress beyond such a value must raise its
-// limit.
-//
-// Three limits of this byte-level reader are deliberate and documented rather
-// than fixed here:
-//
-//   - A live log that splits a value between two writes can still split it
-//     across polls when the first poll's page ends inside the value: the reader
-//     can only see the bytes written so far. The retained sink's cross-chunk
-//     redactor remains the backstop for that case.
-//   - Pages are byte-bounded, so a multi-byte UTF-8 rune can be split across
-//     two chunks. That is existing transport behaviour; redaction never splits
-//     a configured value.
-//   - A paginated read is quadratic in the number of pages: the driver asks the
-//     log API for the stream and discards the cursor prefix, so each page costs
-//     one offset-sized read. Memory stays bounded at one page, limit+1 bytes.
-//
-// Redaction can expand a value into a longer marker. Whole segments are dropped
-// from the end until the emitted bytes fit the bound, so the cursor re-reads
-// them; only a marker longer than the entire bound is clipped, and its raw bytes
-// are still consumed. Neither case drops raw content.
-func redactLogPage(raw []byte, values []string, limit int, mayGrow bool) ([]byte, []byte) {
-	segments := scanLogSegments(raw, values)
-	end := len(segments)
-	hold := end
-	if mayGrow {
-		for index, segment := range segments {
-			if couldExtend(raw[segment.start:], values) {
-				end = index
-				hold = index
-				break
-			}
-		}
-	}
-
-	size := 0
-	for _, segment := range segments[:end] {
-		size += len(segment.data)
-	}
-	for end > 0 && size > limit {
-		end--
-		size -= len(segments[end].data)
-	}
-	if end == 0 {
-		if len(segments) == 0 || hold == 0 {
-			// Nothing before the held position resolved, so no raw value bytes
-			// must be emitted and no bytes may be skipped.
-			return nil, nil
-		}
-		// Only reachable when the first segment is a marker that alone exceeds
-		// the bound. A held first segment returned above, so this marker is
-		// complete: its bytes may be clipped and the value consumed, while any
-		// held tail after it is re-read from the cursor.
-		first := segments[0]
-		data := first.data
-		if len(data) > limit {
-			data = data[:limit]
-		}
-		return raw[:first.end], data
-	}
-
-	consumed := raw[:segments[end-1].end]
-	data := make([]byte, 0, size)
-	for _, segment := range segments[:end] {
-		data = append(data, segment.data...)
-	}
-	return consumed, data
-}
-
-// logCursorStreamBits splits the single log continuation token into two 32-bit
-// halves: the high half carries the combined-log byte position, the low half is
-// the retired stderr position and is always zero for cursors this reader
-// produces. The packing is unchanged so the token stays an opaque int64.
-const logCursorStreamBits = 32
-
-const logCursorStreamMask int64 = (1 << logCursorStreamBits) - 1
-
-// decodeLogCursor returns the combined position and the retired stderr half of
-// one token. A non-zero stderr half is a legacy two-stream cursor.
-func decodeLogCursor(cursor int64) (stdout, stderr int64) {
-	return cursor >> logCursorStreamBits, cursor & logCursorStreamMask
-}
-
-// encodeLogCursor packs the combined position into one continuation token.
-func encodeLogCursor(stdout, stderr int64) int64 {
-	return stdout<<logCursorStreamBits | stderr
-}
-
-// maxLogCursorPosition is the largest combined-log byte position the high half
-// of the continuation token can carry. encodeLogCursor shifts the position by
-// 32 bits, so a position at or above 2^31 sets the sign bit and would surface
-// as a negative cursor.
-const maxLogCursorPosition int64 = (1 << 31) - 1
-
-// nextLogCursor packs the next combined-log position, refusing one the token
-// cannot represent instead of returning a cursor the caller cannot resume.
-func nextLogCursor(offset int64, consumed int) (int64, error) {
-	if offset < 0 || offset > maxLogCursorPosition ||
-		int64(consumed) > maxLogCursorPosition-offset {
-		return 0, fault.New(fault.InvalidInput,
-			"log position exceeds the continuation-token range")
-	}
-	return encodeLogCursor(offset+int64(consumed), 0), nil
 }
 
 // Stop requests suspension of the one stable Job and reports a stop barrier
@@ -853,10 +654,10 @@ func nextLogCursor(offset int64, consumed int) (int64, error) {
 // an affirmatively terminated container still confirms. Absence of pods is never
 // stop evidence.
 func (a *Adapter) Stop(ctx context.Context, request engine.StopRequest) (kernel.StopEvidence, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return kernel.PendingStop("stop request identity is invalid"), err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return kernel.PendingStop("stop request workspace is invalid"), err
 	}
 	if err := a.checkPreparedWorkspace(request.Identity, request.WorkspaceID); err != nil {
@@ -964,10 +765,10 @@ func (a *Adapter) Stop(ctx context.Context, request engine.StopRequest) (kernel.
 // decision. A live or unreachable workload retains the claim and names it in
 // Detail.
 func (a *Adapter) Remove(ctx context.Context, request engine.RemoveRequest) (engine.Removal, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.Removal{Detail: "removal request identity is invalid"}, err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.Removal{Detail: "removal request workspace is invalid"}, err
 	}
 	if err := a.checkPreparedWorkspace(request.Identity, request.WorkspaceID); err != nil {
@@ -1048,7 +849,7 @@ func retainedDetail(claimName, reason string) string {
 // restarts or replaces the Job and is recoverable after a lost update response
 // or a stale resource version.
 func (a *Adapter) RefreshCredential(ctx context.Context, request engine.CredentialRequest) (engine.CredentialRefresh, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.CredentialRefresh{}, err
 	}
 	if strings.TrimSpace(request.Credential) == "" {
@@ -1079,6 +880,6 @@ func (a *Adapter) RefreshCredential(ctx context.Context, request engine.Credenti
 	}
 	return engine.CredentialRefresh{
 		Delivered: true,
-		Detail:    fmt.Sprintf("replaced credential for %s without restarting the Job", describeIdentity(request.Identity)),
+		Detail:    fmt.Sprintf("replaced credential for %s without restarting the Job", adapterutil.DescribeIdentity(request.Identity)),
 	}, nil
 }

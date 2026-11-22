@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -152,16 +151,9 @@ func resolvePresentedToken(ctx context.Context, config Config, ports Ports, deps
 // payload of a compact JWT without verifying signatures. Non-JWT tokens and
 // JWTs without a string project_id claim return ("", false).
 func parseJWTProjectID(token string) (string, bool) {
-	parts := strings.Split(strings.TrimSpace(token), ".")
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+	payload, ok := decodeJWTPayload(token)
+	if !ok {
 		return "", false
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		payload, err = base64.URLEncoding.DecodeString(parts[1])
-		if err != nil {
-			return "", false
-		}
 	}
 	var claims map[string]any
 	if err := json.Unmarshal(payload, &claims); err != nil {

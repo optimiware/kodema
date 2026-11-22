@@ -262,9 +262,9 @@ func TestExecuteUnitAbsenceGuardsSortByCanonicalKey(t *testing.T) {
 	enableAbsenceGuard(t)
 	db := newFakeDB()
 	unit := store.Unit{Locks: []store.Lock{
-		membershipAbsenceLock(testTenantID, "project-2", testPrincipalID),
-		membershipAbsenceLock(testTenantID, "", testPrincipalID),
-		membershipAbsenceLock(testTenantID, "project-1", testPrincipalID),
+		membershipAbsenceLock(testTenantID, testProjectID, "principal-2"),
+		membershipAbsenceLock(testTenantID, "", "principal-1"),
+		membershipAbsenceLock(testTenantID, testProjectID, "principal-1"),
 	}}
 	if _, err := ExecuteUnit(context.Background(), New(db), testProjectScope(), unit); err != nil {
 		t.Fatalf("ExecuteUnit ordered absence guards: %v", err)
@@ -291,13 +291,17 @@ func TestExecuteUnitAbsenceGuardsSortByCanonicalKey(t *testing.T) {
 	if len(guards) != 3 {
 		t.Fatalf("absence guard SELECTs = %d; want 3", len(guards))
 	}
-	wantProjects := []any{nil, "project-1", "project-2"}
+	wantProjects := []any{nil, testProjectID, testProjectID}
+	wantPrincipals := []any{"principal-1", "principal-1", "principal-2"}
 	for index, guard := range guards {
-		if len(guard.args) < 2 {
+		if len(guard.args) < 3 {
 			t.Fatalf("guard %d args = %v; want tenant, project and principal", index, guard.args)
 		}
 		if guard.args[1] != wantProjects[index] {
 			t.Errorf("guard %d project arg = %v; want %v (NULL before any value)", index, guard.args[1], wantProjects[index])
+		}
+		if guard.args[2] != wantPrincipals[index] {
+			t.Errorf("guard %d principal arg = %v; want %v", index, guard.args[2], wantPrincipals[index])
 		}
 	}
 	// The same table's guards must precede the write phase entirely.

@@ -8,6 +8,7 @@ import (
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/authorize"
+	"github.com/optimiware/kodema/internal/shell/identity"
 	"github.com/optimiware/kodema/internal/shell/receipt"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/internal/shell/tenancy/admin"
@@ -389,5 +390,85 @@ func TestGrantMembershipDefensiveCopiesRoles(t *testing.T) {
 	command.Membership.Roles = append(command.Membership.Roles, tenancy.RoleReviewer)
 	if !reflect.DeepEqual(captured.Membership.Roles, []tenancy.Role{tenancy.RoleEngineer, tenancy.RoleViewer}) {
 		t.Fatalf("committed roles = %v; want an independent copy of engineer and viewer", captured.Membership.Roles)
+	}
+}
+
+func TestListMembershipsEnforcesActorGrant(t *testing.T) {
+	scope := tenantScope("tenant-a")
+	cases := []struct {
+		name    string
+		actor   authorize.Principal
+		allowed bool
+	}{
+		{
+			name:    "human admin allowed",
+			actor:   authorize.Principal{ID: "p-admin", Kind: identity.KindHuman, Scope: scope, Roles: []tenancy.Role{tenancy.RoleAdmin}, Enabled: true, Version: 1},
+			allowed: true,
+		},
+		{
+			name:    "human viewer allowed",
+			actor:   authorize.Principal{ID: "p-viewer", Kind: identity.KindHuman, Scope: scope, Roles: []tenancy.Role{tenancy.RoleViewer}, Enabled: true, Version: 1},
+			allowed: true,
+		},
+		{
+			name:    "service viewer allowed",
+			actor:   authorize.Principal{ID: "s-viewer", Kind: identity.KindService, Scope: scope, Roles: []tenancy.Role{tenancy.RoleViewer}, Enabled: true, Version: 1},
+			allowed: true,
+		},
+		{
+			name:    "human engineer refused",
+			actor:   authorize.Principal{ID: "p-eng", Kind: identity.KindHuman, Scope: scope, Roles: []tenancy.Role{tenancy.RoleEngineer}, Enabled: true, Version: 1},
+			allowed: false,
+		},
+		{
+			name:    "human reviewer refused",
+			actor:   authorize.Principal{ID: "p-rev", Kind: identity.KindHuman, Scope: scope, Roles: []tenancy.Role{tenancy.RoleReviewer}, Enabled: true, Version: 1},
+			allowed: false,
+		},
+		{
+			name:    "human without roles refused",
+			actor:   authorize.Principal{ID: "p-none", Kind: identity.KindHuman, Scope: scope, Enabled: true, Version: 1},
+			allowed: false,
+		},
+		{
+			name:    "service engineer refused",
+			actor:   authorize.Principal{ID: "s-eng", Kind: identity.KindService, Scope: scope, Roles: []tenancy.Role{tenancy.RoleEngineer}, Enabled: true, Version: 1},
+			allowed: false,
+		},
+		{
+			name:    "disabled human admin refused",
+			actor:   authorize.Principal{ID: "p-disabled", Kind: identity.KindHuman, Scope: scope, Roles: []tenancy.Role{tenancy.RoleAdmin}, Enabled: false, Version: 1},
+			allowed: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			ports := &fakeAdminPorts{
+				listMemberships: func(context.Context, tenancyadmin.MembershipQuery) (tenancyadmin.MembershipPage, error) {
+					calls++
+					return tenancyadmin.MembershipPage{}, nil
+				},
+			}
+			svc := newAdminService(t, ports)
+			_, err := svc.ListMemberships(context.Background(), tenancyadmin.MembershipListCommand{
+				Actor: tc.actor,
+				Scope: scope,
+				Limit: 10,
+			})
+			if tc.allowed {
+				if err != nil {
+					t.Fatalf("ListMemberships: %v", err)
+				}
+				if calls != 1 {
+					t.Fatalf("port calls = %d; want 1", calls)
+				}
+				return
+			}
+			requireFaultClass(t, err, fault.Forbidden)
+			if calls != 0 {
+				t.Fatalf("port calls = %d; want 0 on refusal", calls)
+			}
+		})
 	}
 }

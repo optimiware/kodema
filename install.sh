@@ -82,7 +82,16 @@ main() {
 	esac
 
 	work="$(mktemp -d)"
-	trap 'rm -rf "$work"' EXIT
+	staged=""
+	cleanup() {
+		rm -rf -- "$work"
+		if [ -n "${staged:-}" ]; then
+			rm -f -- "$staged"
+		fi
+	}
+	trap cleanup EXIT
+	trap 'cleanup; exit 130' INT
+	trap 'cleanup; exit 143' TERM
 
 	say "downloading Kodema ${version} for ${os}/${arch}"
 	fetch --output "${work}/SHA256SUMS" "${releases}/download/v${version}/SHA256SUMS" ||
@@ -112,9 +121,11 @@ main() {
 		[ -f "${work}/${name}/${binary}" ] || die "${name}.tar.gz does not contain ${binary}"
 		# Copy beside the destination and rename, so a binary that is running
 		# is replaced and never half-written.
-		cp "${work}/${name}/${binary}" "${directory}/.${binary}.install.$$"
-		chmod 0755 "${directory}/.${binary}.install.$$"
-		mv -f "${directory}/.${binary}.install.$$" "${directory}/${binary}"
+		staged="${directory}/.${binary}.install.$$"
+		cp "${work}/${name}/${binary}" "$staged"
+		chmod 0755 "$staged"
+		mv -f "$staged" "${directory}/${binary}"
+		staged=""
 	done
 	if [ "$binaries" = kodema ]; then
 		say "installed kodema ${version} in ${directory}"

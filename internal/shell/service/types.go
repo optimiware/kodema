@@ -37,31 +37,10 @@ type ServiceID string
 
 // ParseServiceID validates and converts a service-account identity.
 func ParseServiceID(value string) (ServiceID, error) {
-	if !validServiceID(value) {
+	if !id.Valid(value) {
 		return "", fault.New(fault.InvalidInput, fmt.Sprintf("invalid service id %q", value))
 	}
 	return ServiceID(value), nil
-}
-
-func validServiceID(value string) bool {
-	if value == "" || len(value) > id.MaxIDLength {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // State is the enablement state of a service account.

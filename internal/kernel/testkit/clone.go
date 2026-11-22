@@ -4,7 +4,6 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel"
 	"github.com/optimiware/kodema/internal/kernel/definition"
-	"maps"
 )
 
 // The clone helpers keep the fake state isolated from its callers. Seed, Load
@@ -27,8 +26,8 @@ func cloneExecution(in kernel.Execution) kernel.Execution {
 
 func cloneAction(in kernel.Action) kernel.Action {
 	out := in
-	out.Outputs = cloneOutputs(in.Outputs)
-	out.StagedOutputs = cloneOutputs(in.StagedOutputs)
+	out.Outputs = in.Outputs.Clone()
+	out.StagedOutputs = in.StagedOutputs.Clone()
 	out.Container = cloneContainerAction(in.Container)
 	out.Request = cloneRequestAction(in.Request)
 	return out
@@ -51,9 +50,14 @@ func cloneDefinitionContainer(in definition.Container) definition.Container {
 	out.Env = append([]definition.EnvVar(nil), in.Env...)
 	out.Secrets = append([]id.SecretName(nil), in.Secrets...)
 	out.Outputs = append([]id.OutputKey(nil), in.Outputs...)
+	out.Caches = append([]string(nil), in.Caches...)
 	if in.Resources != nil {
 		resources := *in.Resources
 		out.Resources = &resources
+	}
+	if in.Budget != nil {
+		budget := *in.Budget
+		out.Budget = &budget
 	}
 	return out
 }
@@ -88,15 +92,6 @@ func cloneSubjectPointer(in *definition.Subject) *definition.Subject {
 	return &subject
 }
 
-func cloneOutputs(in kernel.Outputs) kernel.Outputs {
-	if in == nil {
-		return nil
-	}
-	out := make(kernel.Outputs, len(in))
-	maps.Copy(out, in)
-	return out
-}
-
 func cloneObservation(in kernel.Observation) kernel.Observation {
 	out := in
 	if in.ExitCode != nil {
@@ -115,7 +110,7 @@ func cloneAnswer(in *kernel.Answer) *kernel.Answer {
 		return nil
 	}
 	out := *in
-	out.Outputs = cloneOutputs(in.Outputs)
+	out.Outputs = in.Outputs.Clone()
 	out.Provenance = append([]byte(nil), in.Provenance...)
 	return &out
 }

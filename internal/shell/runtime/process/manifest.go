@@ -23,7 +23,6 @@ import (
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/kernel/script"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -274,79 +273,6 @@ func (a *Adapter) requireWorkspace(ctx context.Context, workspaceDir string) err
 	return nil
 }
 
-// buildMaterialization validates and builds the complete all-or-nothing
-// activation snapshot. Validation happens before any host call.
-func buildMaterialization(request engine.PrepareRequest) (workspace.Materialization, error) {
-	if _, err := id.ParseWorkspaceID(string(request.WorkspaceID)); err != nil {
-		return workspace.Materialization{}, fault.Wrap(fault.InvalidInput, "preparation workspace id is invalid", err)
-	}
-	files := make([]workspace.File, 0, len(request.Inputs)+len(request.Outputs)+len(request.TaskFiles)+1)
-
-	inputKeys := make([]string, 0, len(request.Inputs))
-	for key := range request.Inputs {
-		inputKeys = append(inputKeys, string(key))
-	}
-	sort.Strings(inputKeys)
-	for _, raw := range inputKeys {
-		path, err := workspace.InputPath(id.InputKey(raw))
-		if err != nil {
-			return workspace.Materialization{}, err
-		}
-		files = append(files, workspace.File{Path: path, Data: []byte(request.Inputs[id.InputKey(raw)]), Mode: readOnlyMode})
-	}
-
-	actionNames := make([]string, 0, len(request.Outputs))
-	for action := range request.Outputs {
-		actionNames = append(actionNames, string(action))
-	}
-	sort.Strings(actionNames)
-	for _, rawAction := range actionNames {
-		action := id.ActionName(rawAction)
-		outputs := request.Outputs[action]
-		outputKeys := make([]string, 0, len(outputs))
-		for key := range outputs {
-			outputKeys = append(outputKeys, string(key))
-		}
-		sort.Strings(outputKeys)
-		for _, rawKey := range outputKeys {
-			path, err := workspace.OutputPath(action, id.OutputKey(rawKey))
-			if err != nil {
-				return workspace.Materialization{}, err
-			}
-			files = append(files, workspace.File{Path: path, Data: []byte(outputs[id.OutputKey(rawKey)]), Mode: readOnlyMode})
-		}
-	}
-
-	if request.Task != nil {
-		files = append(files, workspace.File{Path: workspace.TaskPath, Data: append([]byte(nil), request.Task...), Mode: readOnlyMode})
-	}
-	taskFiles, err := workspace.TaskMaterializationFiles(request.TaskFiles, readOnlyMode)
-	if err != nil {
-		return workspace.Materialization{}, err
-	}
-	files = append(files, taskFiles...)
-
-	secrets := make([]engine.SecretValue, len(request.Secrets))
-	for index, secret := range request.Secrets {
-		if _, err := workspace.SecretPath(secret.Name); err != nil {
-			return workspace.Materialization{}, err
-		}
-		secrets[index] = engine.SecretValue{Name: secret.Name, Value: secret.Value}
-	}
-
-	materialization := workspace.Materialization{
-		WorkspaceID: request.WorkspaceID,
-		Files:       files,
-		Secrets:     secrets,
-		Credential:  request.Credential,
-		Task:        request.Task,
-	}
-	if err := materialization.Validate(); err != nil {
-		return workspace.Materialization{}, err
-	}
-	return materialization, nil
-}
-
 // finalEnvironment merges the admitted literal environment in declaration
 // order and appends the unshadowable reserved context.
 func finalEnvironment(request engine.PrepareRequest, kodemaURL string) ([]string, error) {
@@ -432,19 +358,4 @@ func CacheDir(root, key string) (string, error) {
 func writeDigestString(digest hash.Hash, value string) {
 	fmt.Fprintf(digest, "%d:", len(value))
 	digest.Write([]byte(value))
-}
-
-// describeIdentity renders a stable, non-secret diagnostic identity.
-func describeIdentity(identity engine.EffectIdentity) string {
-	return fmt.Sprintf("workload %q (execution %q action %q)", identity.WorkloadID, identity.ExecutionID, identity.ActionID)
-}
-
-// prepareScript renders the fail-fast entrypoint or refuses an unusable
-// command list before any effect.
-func prepareScript(commands []string) (string, error) {
-	rendered, err := script.Render(commands)
-	if err != nil {
-		return "", err
-	}
-	return rendered, nil
 }

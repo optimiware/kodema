@@ -69,19 +69,8 @@ func (delivery Delivery) Validate() error {
 	if _, err := id.ParsePrincipalID(string(delivery.PrincipalID)); err != nil {
 		return fault.Wrap(fault.InvalidInput, "delivery principal id is invalid", err)
 	}
-	switch {
-	case delivery.ExecutionID != "" && delivery.ServiceID != "":
-		return fault.New(fault.InvalidInput, "delivery names both an execution and a service")
-	case delivery.ExecutionID != "":
-		if _, err := id.ParseExecutionID(string(delivery.ExecutionID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "delivery execution id is invalid", err)
-		}
-	case delivery.ServiceID != "":
-		if _, err := service.ParseServiceID(string(delivery.ServiceID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "delivery service id is invalid", err)
-		}
-	default:
-		return fault.New(fault.InvalidInput, "delivery names neither an execution nor a service")
+	if err := validateTarget("delivery", delivery.ExecutionID, delivery.ServiceID); err != nil {
+		return err
 	}
 	if !delivery.Kind.Valid() {
 		return fault.New(fault.InvalidInput, "delivery mutation kind is not frozen")
@@ -225,19 +214,8 @@ func (request IssueRequest) Validate() error {
 	if _, err := id.ParsePrincipalID(string(request.PrincipalID)); err != nil {
 		return fault.Wrap(fault.InvalidInput, "credential request principal id is invalid", err)
 	}
-	switch {
-	case request.ExecutionID != "" && request.ServiceID != "":
-		return fault.New(fault.InvalidInput, "credential request names both an execution and a service")
-	case request.ExecutionID != "":
-		if _, err := id.ParseExecutionID(string(request.ExecutionID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "credential request execution id is invalid", err)
-		}
-	case request.ServiceID != "":
-		if _, err := service.ParseServiceID(string(request.ServiceID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "credential request service id is invalid", err)
-		}
-	default:
-		return fault.New(fault.InvalidInput, "credential request names neither an execution nor a service")
+	if err := validateTarget("credential request", request.ExecutionID, request.ServiceID); err != nil {
+		return err
 	}
 	if request.ExpectedVersion == 0 {
 		return fault.New(fault.InvalidInput, "credential request expected version is zero")
@@ -310,19 +288,8 @@ func (request RevokeRequest) Validate() error {
 	if _, err := id.ParsePrincipalID(string(request.PrincipalID)); err != nil {
 		return fault.Wrap(fault.InvalidInput, "revocation principal id is invalid", err)
 	}
-	switch {
-	case request.ExecutionID != "" && request.ServiceID != "":
-		return fault.New(fault.InvalidInput, "revocation names both an execution and a service")
-	case request.ExecutionID != "":
-		if _, err := id.ParseExecutionID(string(request.ExecutionID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "revocation execution id is invalid", err)
-		}
-	case request.ServiceID != "":
-		if _, err := service.ParseServiceID(string(request.ServiceID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "revocation service id is invalid", err)
-		}
-	default:
-		return fault.New(fault.InvalidInput, "revocation names neither an execution nor a service")
+	if err := validateTarget("revocation", request.ExecutionID, request.ServiceID); err != nil {
+		return err
 	}
 	if request.ExpectedVersion == 0 {
 		return fault.New(fault.InvalidInput, "revocation expected version is zero")
@@ -368,21 +335,7 @@ func (request AuthenticateRequest) Validate() error {
 	if _, err := id.ParsePrincipalID(string(request.PrincipalID)); err != nil {
 		return fault.Wrap(fault.InvalidInput, "authentication principal id is invalid", err)
 	}
-	switch {
-	case request.ExecutionID != "" && request.ServiceID != "":
-		return fault.New(fault.InvalidInput, "authentication names both an execution and a service")
-	case request.ExecutionID != "":
-		if _, err := id.ParseExecutionID(string(request.ExecutionID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "authentication execution id is invalid", err)
-		}
-	case request.ServiceID != "":
-		if _, err := service.ParseServiceID(string(request.ServiceID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "authentication service id is invalid", err)
-		}
-	default:
-		return fault.New(fault.InvalidInput, "authentication names neither an execution nor a service")
-	}
-	return nil
+	return validateTarget("authentication", request.ExecutionID, request.ServiceID)
 }
 
 // Authenticated is the current authenticated identity of one derived
@@ -420,9 +373,6 @@ func (manager *Manager) EnsureExecution(ctx context.Context, request IssueReques
 	if request.ExecutionID == "" || request.ServiceID != "" {
 		return EnsureResult{}, fault.New(fault.InvalidInput, "execution activation requires exactly one execution target")
 	}
-	if request.Service != nil {
-		return EnsureResult{}, fault.New(fault.InvalidInput, "execution activation carries a service change")
-	}
 	now := manager.clock.Now()
 	if now.IsZero() {
 		return EnsureResult{}, fault.New(fault.InvalidInput, "credential clock returned zero time")
@@ -451,16 +401,6 @@ func (manager *Manager) EnsureExecution(ctx context.Context, request IssueReques
 		return EnsureResult{State: StateCurrent, Version: fact.Version, Reused: true}, nil
 	}
 	result, err := manager.mutate(ctx, request, MutationIssue, false)
-	if err != nil {
-		return EnsureResult{
-			State:     result.State,
-			Version:   result.Version,
-			Reused:    result.Replayed,
-			Token:     result.Token,
-			Delivery:  result.Delivery,
-			Delivered: result.Delivered,
-		}, err
-	}
 	return EnsureResult{
 		State:     result.State,
 		Version:   result.Version,
@@ -468,7 +408,7 @@ func (manager *Manager) EnsureExecution(ctx context.Context, request IssueReques
 		Token:     result.Token,
 		Delivery:  result.Delivery,
 		Delivered: result.Delivered,
-	}, nil
+	}, err
 }
 
 // Revoke clears the current pair atomically and only then invalidates live
@@ -575,7 +515,7 @@ func (manager *Manager) Authenticate(ctx context.Context, request AuthenticateRe
 	if err := checkFactCurrent(fact, request.Now); err != nil {
 		return Authenticated{}, err
 	}
-	key, err := manager.authenticateKey(ctx, request.Scope.TenantID)
+	key, err := manager.resolveKey(ctx, request.Scope.TenantID, true)
 	if err != nil {
 		return Authenticated{}, err
 	}
@@ -711,7 +651,7 @@ func (manager *Manager) mutate(ctx context.Context, request IssueRequest, kind M
 	if currentVersion != request.ExpectedVersion {
 		return IssueResult{}, versionConflict(currentVersion, request.ExpectedVersion)
 	}
-	key, err := manager.readKey(ctx, request.Scope.TenantID)
+	key, err := manager.resolveKey(ctx, request.Scope.TenantID, false)
 	if err != nil {
 		return IssueResult{}, err
 	}
@@ -858,20 +798,32 @@ func (manager *Manager) serviceAuthorityVersion(ctx context.Context, scope tenan
 	return current.Version, nil
 }
 
-func (manager *Manager) readKey(ctx context.Context, tenantID id.TenantID) ([]byte, error) {
+func (manager *Manager) resolveKey(ctx context.Context, tenantID id.TenantID, forAuth bool) ([]byte, error) {
+	mapRead := func(message string, err error) error {
+		if forAuth {
+			return authReadFault(message, err)
+		}
+		return publicFault(message, err, fault.DependencyUnavailable)
+	}
+	mapInvalid := func(message string, err error) error {
+		if forAuth {
+			return fault.Wrap(fault.Unauthenticated, message, err)
+		}
+		return publicFault(message, err, fault.Unauthenticated)
+	}
 	key, err := manager.keys.ReadTenantKey(ctx, TenantKeyRequest{TenantID: tenantID})
 	if err != nil {
-		return nil, publicFault("tenant derivation key is unavailable", err, fault.DependencyUnavailable)
+		return nil, mapRead("tenant derivation key is unavailable", err)
 	}
 	if key.TenantID != tenantID {
 		return nil, fault.New(fault.Unauthenticated, "tenant derivation key is outside the caller scope")
 	}
 	if err := key.Validate(); err != nil {
-		return nil, publicFault("tenant derivation key is invalid", err, fault.Unauthenticated)
+		return nil, mapInvalid("tenant derivation key is invalid", err)
 	}
 	plaintext, err := manager.resolver.ResolveDerivationKey(ctx, key)
 	if err != nil {
-		return nil, publicFault("tenant derivation key cannot be resolved", err, fault.DependencyUnavailable)
+		return nil, mapRead("tenant derivation key cannot be resolved", err)
 	}
 	if len(plaintext) < manager.bounds.MinNonceBytes {
 		return nil, fault.New(fault.Unauthenticated, "tenant derivation key is shorter than the minimum")
@@ -911,27 +863,6 @@ func (manager *Manager) currentPrincipal(ctx context.Context, request identity.P
 		return identity.Principal{}, fault.New(fault.Unauthenticated, "current principal is disabled")
 	}
 	return current, nil
-}
-
-func (manager *Manager) authenticateKey(ctx context.Context, tenantID id.TenantID) ([]byte, error) {
-	key, err := manager.keys.ReadTenantKey(ctx, TenantKeyRequest{TenantID: tenantID})
-	if err != nil {
-		return nil, authReadFault("tenant derivation key is unavailable", err)
-	}
-	if key.TenantID != tenantID {
-		return nil, fault.New(fault.Unauthenticated, "tenant derivation key is outside the caller scope")
-	}
-	if err := key.Validate(); err != nil {
-		return nil, fault.Wrap(fault.Unauthenticated, "tenant derivation key is invalid", err)
-	}
-	plaintext, err := manager.resolver.ResolveDerivationKey(ctx, key)
-	if err != nil {
-		return nil, authReadFault("tenant derivation key cannot be resolved", err)
-	}
-	if len(plaintext) < manager.bounds.MinNonceBytes {
-		return nil, fault.New(fault.Unauthenticated, "tenant derivation key is shorter than the minimum")
-	}
-	return plaintext, nil
 }
 
 func (manager *Manager) newNonce() ([]byte, error) {

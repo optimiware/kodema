@@ -67,6 +67,61 @@ type ExecutionPreImage struct {
 	Actions     []ActionPreImage
 }
 
+// NewExecutionPreImage builds the version-guarded pre-image of an execution
+// aggregate already loaded by a service. Actions stay in declaration order.
+func NewExecutionPreImage(scope tenancy.Scope, current kernel.Execution) ExecutionPreImage {
+	actions := make([]ActionPreImage, len(current.Actions))
+	for position, action := range current.Actions {
+		actions[position] = ActionPreImage{
+			ActionID: action.ID,
+			Index:    action.Index,
+			Kind:     action.Kind,
+			State:    action.State,
+			Version:  action.Version,
+		}
+	}
+	return ExecutionPreImage{
+		Scope:       scope,
+		ExecutionID: current.ID,
+		Version:     current.Version,
+		State:       current.State,
+		Actions:     actions,
+	}
+}
+
+// AppendLifecycleProjection returns own in its declared order followed by the
+// retained lifecycle projection envelopes in their total order. A projection
+// refusal is returned unchanged so the caller fails closed before commit.
+func AppendLifecycleProjection(
+	own []Envelope,
+	pre ExecutionPreImage,
+	commit flow.Commit,
+	owned ...OwnedEvent,
+) ([]Envelope, error) {
+	projected, err := ProjectLifecycle(pre, commit)
+	if err != nil {
+		return nil, err
+	}
+	remainder := ExcludeOwned(projected, owned...)
+	events := append([]Envelope(nil), own...)
+	for _, spec := range remainder {
+		envelope, err := NewEnvelope(
+			spec.ID, spec.Source, spec.Scope, spec.At,
+			EnvelopeInput{
+				Type:           spec.Type,
+				SubjectID:      spec.SubjectID,
+				SubjectVersion: spec.SubjectVersion,
+				Data:           spec.Data,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, envelope)
+	}
+	return events, nil
+}
+
 // LifecycleEvent is one projected lifecycle event spec. It is directly
 // publishable: the trusted source, scope, time, subject and bounded facts form
 // a valid event.Envelope through NewEnvelope.

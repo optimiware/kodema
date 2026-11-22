@@ -157,13 +157,9 @@ func validatePinnedImage(image string) error {
 	return nil
 }
 
-// buildPreparation validates the admitted declaration and returns every
+// buildPreparationWithCA validates the admitted declaration and returns every
 // activation file plus the resolved declared secrets. Validation is complete
 // before any effect so an unsafe declaration never reaches the filesystem.
-func buildPreparation(request engine.PrepareRequest) ([]preparedFile, []engine.SecretValue, error) {
-	return buildPreparationWithCA(request, nil)
-}
-
 func buildPreparationWithCA(request engine.PrepareRequest, workloadCAPEM []byte) ([]preparedFile, []engine.SecretValue, error) {
 	if err := validatePinnedImage(request.Container.Image); err != nil {
 		return nil, nil, err
@@ -522,10 +518,4 @@ func encodePreparationRecord(record preparationRecord) ([]byte, error) {
 		return nil, fault.Wrap(fault.InternalFailure, "preparation record is not encodable", err)
 	}
 	return data, nil
-}
-
-// describeIdentity renders a stable, non-secret diagnostic identity.
-func describeIdentity(identity engine.EffectIdentity) string {
-	return fmt.Sprintf("workload %q (execution %q action %q)",
-		identity.WorkloadID, identity.ExecutionID, identity.ActionID)
 }

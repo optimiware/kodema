@@ -33,15 +33,7 @@ func (broker *Broker) PublishEvent(ctx context.Context, envelope event.Envelope)
 	if err != nil {
 		return fault.Wrap(fault.InternalFailure, "event payload could not be encoded", err)
 	}
-	return broker.publishJetStream(ctx, subject, envelope.ID, payload)
-}
-
-// publishJetStream publishes with the stable identity and bounded retries. A
-// failed attempt discards the suspect client, so the next attempt dials again
-// through Connect and revalidates every live subscription. Retries keep the
-// same id and payload; the broker deduplicates.
-func (broker *Broker) publishJetStream(ctx context.Context, subject Subject, eventID id.EventID, payload []byte) error {
-	return broker.publishIdentified(ctx, subject, eventID, payload, "event publication")
+	return broker.publishIdentified(ctx, subject, envelope.ID, payload, "event publication")
 }
 
 // publishIdentified is the shared identity-preserving publication loop used by

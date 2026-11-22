@@ -24,6 +24,7 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel"
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -33,11 +34,6 @@ const fenceDirectory = ".removed"
 
 // tempSequence makes each atomic replacement use a distinct temporary name.
 var tempSequence atomic.Uint64
-
-// preparationPath is the durable marker path for one identity.
-func preparationPath(root string, workload id.WorkloadID) string {
-	return preparationRecordPath(root, workload)
-}
 
 // fencePath returns the durable removal fence path for one identity.
 func fencePath(root string, workload id.WorkloadID) string {
@@ -129,7 +125,7 @@ func (a *Adapter) writeStartAttempt(ctx context.Context, identity engine.EffectI
 
 // readPreparation loads the durable preparation marker for one identity.
 func (a *Adapter) readPreparation(ctx context.Context, workload id.WorkloadID) (preparationRecord, []byte, bool, error) {
-	path := preparationPath(a.root, workload)
+	path := preparationRecordPath(a.root, workload)
 	info, err := a.files.Lstat(ctx, path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -328,13 +324,13 @@ func (a *Adapter) verifyPreparedFiles(ctx context.Context, workload id.WorkloadI
 // retained workspace volume. It never starts a container and never recreates a
 // missing workspace.
 func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (engine.Preparation, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.Preparation{}, err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.Preparation{}, err
 	}
-	if err := validatePrepareContext(request.ActionName, request.TaskID); err != nil {
+	if err := adapterutil.ValidatePrepareContext(request.ActionName, request.TaskID); err != nil {
 		return engine.Preparation{}, err
 	}
 	if err := workspace.ValidateCacheMounts(request.Container.Caches, request.Caches); err != nil {
@@ -352,12 +348,10 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 		return engine.Preparation{}, fault.Wrap(fault.DependencyUnavailable, "preparation cancelled before any effect", err)
 	}
 
-	lock := a.lockFor(request.Identity.WorkloadID)
-	lock.Lock()
-	defer lock.Unlock()
-	workspaceLock := a.lockForWorkspace(request.WorkspaceID)
-	workspaceLock.Lock()
-	defer workspaceLock.Unlock()
+	unlock := a.lockFor(request.Identity.WorkloadID)
+	defer unlock()
+	unlockWorkspace := a.lockForWorkspace(request.WorkspaceID)
+	defer unlockWorkspace()
 
 	fenced, err := a.isFenced(ctx, request.Identity.WorkloadID)
 	if err != nil {
@@ -463,7 +457,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 		return engine.Preparation{}, err
 	}
 	if !found {
-		if err := a.files.WriteFile(ctx, preparationPath(a.root, request.Identity.WorkloadID), recordBytes, readOnlyMode); err != nil {
+		if err := a.files.WriteFile(ctx, preparationRecordPath(a.root, request.Identity.WorkloadID), recordBytes, readOnlyMode); err != nil {
 			return engine.Preparation{}, fault.Wrap(fault.DependencyUnavailable,
 				"preparation marker write outcome is unknown", err)
 		}
@@ -472,7 +466,7 @@ func (a *Adapter) Prepare(ctx context.Context, request engine.PrepareRequest) (e
 	return engine.Preparation{
 		WorkspaceID: request.WorkspaceID,
 		Detail: fmt.Sprintf("materialized %d activation files for %s",
-			len(files), describeIdentity(request.Identity)),
+			len(files), adapterutil.DescribeIdentity(request.Identity)),
 	}, nil
 }
 
@@ -495,10 +489,10 @@ func (a *Adapter) Start(ctx context.Context, request engine.StartRequest) (engin
 		}, nil
 	}
 
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return unknown("start request identity is invalid", err)
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return unknown("start request workspace is invalid", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -506,12 +500,10 @@ func (a *Adapter) Start(ctx context.Context, request engine.StartRequest) (engin
 			fault.Wrap(fault.DependencyUnavailable, "start cancelled before any effect", err))
 	}
 
-	lock := a.lockFor(request.Identity.WorkloadID)
-	lock.Lock()
-	defer lock.Unlock()
-	workspaceLock := a.lockForWorkspace(request.WorkspaceID)
-	workspaceLock.Lock()
-	defer workspaceLock.Unlock()
+	unlock := a.lockFor(request.Identity.WorkloadID)
+	defer unlock()
+	unlockWorkspace := a.lockForWorkspace(request.WorkspaceID)
+	defer unlockWorkspace()
 
 	fenced, err := a.isFenced(ctx, request.Identity.WorkloadID)
 	if err != nil {
@@ -670,16 +662,15 @@ func (a *Adapter) startExisting(
 // have been issued; otherwise absence is not proof and stays merely absent.
 // never-started also requires that no delayed start is pending.
 func (a *Adapter) Observe(ctx context.Context, request engine.ObserveRequest) (kernel.Observation, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return kernel.UnknownObservation(), err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return kernel.UnknownObservation(), err
 	}
 
-	lock := a.lockFor(request.Identity.WorkloadID)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := a.lockFor(request.Identity.WorkloadID)
+	defer unlock()
 
 	fenced, err := a.isFenced(ctx, request.Identity.WorkloadID)
 	if err != nil {
@@ -762,7 +753,7 @@ func (a *Adapter) observeAbsent(ctx context.Context, workload id.WorkloadID) (ke
 // Logs returns ordered, bounded and redacted chunks. It carries no lifecycle
 // authority and fails closed when the redaction source is unavailable.
 func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.LogBatch, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.LogBatch{}, err
 	}
 	if request.Limit <= 0 || request.Limit > MaxLogBytes {
@@ -807,7 +798,7 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 	}
 
 	positions := map[engine.LogStream]int64{}
-	stdoutOffset, stderrOffset := decodeLogCursor(request.AfterOffset)
+	stdoutOffset, stderrOffset := adapterutil.DecodeLogCursor(request.AfterOffset)
 	positions[engine.LogStdout] = stdoutOffset
 	positions[engine.LogStderr] = stderrOffset
 
@@ -825,8 +816,8 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 			return engine.LogBatch{}, fault.Wrap(fault.DependencyUnavailable, "container log read is unavailable", err)
 		}
 		mayGrow := page.Truncated && len(page.Data) == request.Limit
-		consumed, data := redactLogPage(page.Data, values, request.Limit, mayGrow)
-		nextPosition, err := nextStreamLogPosition(stream, offset, len(consumed))
+		consumed, data := adapterutil.RedactLogPage(page.Data, values, request.Limit, mayGrow)
+		nextPosition, err := adapterutil.NextStreamLogPosition(stream, offset, len(consumed))
 		if err != nil {
 			return engine.LogBatch{}, err
 		}
@@ -844,7 +835,7 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 			Truncated: page.Truncated || len(consumed) < len(page.Data),
 		})
 	}
-	batch.NextOffset = encodeLogCursor(positions[engine.LogStdout], positions[engine.LogStderr])
+	batch.NextOffset = adapterutil.EncodeLogCursor(positions[engine.LogStdout], positions[engine.LogStderr])
 	return batch, nil
 }
 
@@ -852,16 +843,15 @@ func (a *Adapter) Logs(ctx context.Context, request engine.LogsRequest) (engine.
 // affirmatively observed whole-container termination. A stop acknowledgment or a
 // lost response stays pending.
 func (a *Adapter) Stop(ctx context.Context, request engine.StopRequest) (kernel.StopEvidence, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return kernel.PendingStop("stop request identity is invalid"), err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return kernel.PendingStop("stop request workspace is invalid"), err
 	}
 
-	lock := a.lockFor(request.Identity.WorkloadID)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := a.lockFor(request.Identity.WorkloadID)
+	defer unlock()
 
 	fenced, err := a.isFenced(ctx, request.Identity.WorkloadID)
 	if err != nil {
@@ -919,19 +909,17 @@ func (a *Adapter) Stop(ctx context.Context, request engine.StopRequest) (kernel.
 // never removes or writes the retained workspace volume. A live or unconfirmed
 // container retains every owned resource and names the container.
 func (a *Adapter) Remove(ctx context.Context, request engine.RemoveRequest) (engine.Removal, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.Removal{Detail: "removal request identity is invalid"}, err
 	}
-	if err := validateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.Removal{Detail: "removal request workspace is invalid"}, err
 	}
 
-	lock := a.lockFor(request.Identity.WorkloadID)
-	lock.Lock()
-	defer lock.Unlock()
-	workspaceLock := a.lockForWorkspace(request.WorkspaceID)
-	workspaceLock.Lock()
-	defer workspaceLock.Unlock()
+	unlock := a.lockFor(request.Identity.WorkloadID)
+	defer unlock()
+	unlockWorkspace := a.lockForWorkspace(request.WorkspaceID)
+	defer unlockWorkspace()
 
 	name, err := ContainerName(request.Identity.WorkloadID)
 	if err != nil {
@@ -1024,16 +1012,15 @@ func retainedDetail(containerName, reason string) string {
 // never creates, starts, stops or removes the container, and a failed or lost
 // replacement leaves the previous token intact for a retry.
 func (a *Adapter) RefreshCredential(ctx context.Context, request engine.CredentialRequest) (engine.CredentialRefresh, error) {
-	if err := validateIdentity(request.Identity); err != nil {
+	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
 		return engine.CredentialRefresh{}, err
 	}
 	if strings.TrimSpace(request.Credential) == "" {
 		return engine.CredentialRefresh{}, fault.New(fault.InvalidInput, "credential refresh requires a non-empty credential")
 	}
 
-	lock := a.lockFor(request.Identity.WorkloadID)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := a.lockFor(request.Identity.WorkloadID)
+	defer unlock()
 
 	fenced, err := a.isFenced(ctx, request.Identity.WorkloadID)
 	if err != nil {
@@ -1055,6 +1042,6 @@ func (a *Adapter) RefreshCredential(ctx context.Context, request engine.Credenti
 	}
 	return engine.CredentialRefresh{
 		Delivered: true,
-		Detail:    fmt.Sprintf("replaced the execution credential for %s without restarting the container", describeIdentity(request.Identity)),
+		Detail:    fmt.Sprintf("replaced the execution credential for %s without restarting the container", adapterutil.DescribeIdentity(request.Identity)),
 	}, nil
 }

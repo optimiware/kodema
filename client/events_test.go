@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,6 +164,105 @@ func TestHTTPTransportStreamEventsRefusesPermanentErrors(t *testing.T) {
 	if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
 		t.Fatalf("err = %v (class=%v); want forbidden", err, class)
 	}
+}
+
+func TestHTTPTransportStreamEventsDecodesRealServerErrorBodies(t *testing.T) {
+	cases := []struct {
+		name         string
+		status       int
+		code         string
+		message      string
+		wantClass    fault.Class
+		wantAttempts int32
+	}{
+		{
+			name:         "403 forbidden is decoded and not retried",
+			status:       http.StatusForbidden,
+			code:         api.CodeForbidden,
+			message:      "project event stream denied",
+			wantClass:    fault.Forbidden,
+			wantAttempts: 1,
+		},
+		{
+			name:         "503 dependency unavailable is decoded and retried",
+			status:       http.StatusServiceUnavailable,
+			code:         api.CodeDependencyUnavailable,
+			message:      "event store temporarily unavailable",
+			wantClass:    fault.DependencyUnavailable,
+			wantAttempts: 3,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				w.Header().Set("Content-Type", api.MediaType)
+				w.WriteHeader(tc.status)
+				_ = json.NewEncoder(w).Encode(api.Error{
+					Code:    tc.code,
+					Message: tc.message,
+				})
+			}))
+			defer server.Close()
+
+			tr := &client.HTTPTransport{
+				BaseURL: server.URL,
+				// Wrap the real transport so reading the response body fails
+				// immediately if the request context was canceled before decode.
+				RoundTripper: contextCheckedBodyRoundTripper{base: server.Client().Transport},
+				Source: &fakeSource{credentials: []client.Credential{
+					{Kind: client.KindSession, Token: "tok-1", ExpiresAt: fixedNow().Add(time.Hour)},
+				}},
+				Retry: client.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond},
+				Now:   fixedNow,
+				Sleep: func(time.Duration) {},
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err := tr.StreamEvents(ctx, client.EventStreamRequest{ProjectID: "proj-1"})
+			if class, ok := fault.ClassOf(err); !ok || class != tc.wantClass {
+				t.Fatalf("err = %v (class=%v); want %v", err, class, tc.wantClass)
+			}
+			if msg, ok := fault.MessageOf(err); !ok || msg != tc.message {
+				t.Fatalf("message = %q (%v); want %q", msg, ok, tc.message)
+			}
+			if got := attempts.Load(); got != tc.wantAttempts {
+				t.Fatalf("attempts = %d; want %d", got, tc.wantAttempts)
+			}
+		})
+	}
+}
+
+type contextCheckedBodyRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (rt contextCheckedBodyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := rt.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &contextCheckedReadCloser{ctx: req.Context(), rc: resp.Body}
+	return resp, nil
+}
+
+type contextCheckedReadCloser struct {
+	ctx context.Context
+	rc  io.ReadCloser
+}
+
+func (c *contextCheckedReadCloser) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.rc.Read(p)
+}
+
+func (c *contextCheckedReadCloser) Close() error {
+	return c.rc.Close()
 }
 
 func TestHTTPTransportStreamEventsIdleCursorReconnectBackoffAndValidation(t *testing.T) {

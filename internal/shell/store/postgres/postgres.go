@@ -315,7 +315,10 @@ func checkActiveScope(tx store.Transaction, scope tenancy.Scope) error {
 	if !ok {
 		return nil
 	}
-	if owning.scope != scope {
+	owning.mu.Lock()
+	active := owning.scope
+	owning.mu.Unlock()
+	if active != scope {
 		return faultForbidden("scope does not match the active transaction")
 	}
 	return nil

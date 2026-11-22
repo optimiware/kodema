@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -505,5 +506,62 @@ func TestServicesEmailIntakePrintsTaskAndExecutionIDs(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), cliCredentialSentinel) {
 		t.Fatalf("stderr echoes the credential: %q", stderr.String())
+	}
+}
+
+// TestServicesEmailIntakeUsesCAFileForHTTPS proves the one-shot email intake
+// passes --ca-file into newPublicTransportWithCA so HTTPS endpoints signed by a
+// private installation CA succeed when --ca-file is supplied and fail otherwise.
+func TestServicesEmailIntakeUsesCAFileForHTTPS(t *testing.T) {
+	edge := newCLIEmailEdge()
+	server := httptest.NewTLSServer(edge)
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	messagePath := writeCLIEmailMessage(t)
+	credentialPath := filepath.Join(dir, "credential")
+	if err := os.WriteFile(credentialPath, []byte(cliCredentialSentinel), 0o600); err != nil {
+		t.Fatalf("WriteFile credential: %v", err)
+	}
+	caPath := filepath.Join(dir, "ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatalf("WriteFile ca.pem: %v", err)
+	}
+
+	baseArgs := []string{
+		"--kind", "email",
+		"--tenant", "tenant-1",
+		"--project", "project-1",
+		"--pipeline", "pipeline-1",
+		"--message", messagePath,
+		"--base-url", server.URL,
+		"--credential-file", credentialPath,
+	}
+
+	// Without --ca-file, the self-signed test server certificate is untrusted.
+	var noCAStdout, noCAStderr lockedBuffer
+	if code := runServicesEntry(context.Background(), baseArgs, &noCAStdout, &noCAStderr); code != 1 {
+		t.Fatalf("without --ca-file exit code = %d; want 1 (stdout=%q stderr=%q)", code, noCAStdout.String(), noCAStderr.String())
+	}
+
+	// With --ca-file, the TLS handshake trusts the test CA and commits the intake.
+	var stdout, stderr lockedBuffer
+	withCAArgs := append(append([]string(nil), baseArgs...), "--ca-file", caPath)
+	if code := runServicesEntry(context.Background(), withCAArgs, &stdout, &stderr); code != 0 {
+		t.Fatalf("with --ca-file exit code = %d; want 0 (stderr=%q)", code, stderr.String())
+	}
+	if got, want := stdout.String(), "task_id=task-cli-1 execution_id=execution-cli-1\n"; got != want {
+		t.Fatalf("stdout = %q; want %q", got, want)
+	}
+	if stderr.String() != "" {
+		t.Fatalf("stderr = %q; want empty", stderr.String())
+	}
+
+	// An unreadable --ca-file is a usage refusal (exit 2).
+	var badCAStderr lockedBuffer
+	badCAArgs := append(append([]string(nil), baseArgs...), "--ca-file", filepath.Join(dir, "missing.pem"))
+	if code := runServicesEntry(context.Background(), badCAArgs, &lockedBuffer{}, &badCAStderr); code != 2 {
+		t.Fatalf("missing --ca-file exit code = %d; want 2 (stderr=%q)", code, badCAStderr.String())
 	}
 }

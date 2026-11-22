@@ -12,7 +12,6 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/id"
@@ -216,7 +215,11 @@ func applyServerEnv(options serverOptions) (serverOptions, error) {
 	options.DevTenant = envOr("KODEMA_DEV_TENANT", options.DevTenant)
 	options.DevProject = envOr("KODEMA_DEV_PROJECT", options.DevProject)
 	options.DevRoles = envOr("KODEMA_DEV_ROLES", options.DevRoles)
-	options.DevExpiry = envDuration("KODEMA_DEV_EXPIRY", options.DevExpiry)
+	devExpiry, err := envDurationStrict("KODEMA_DEV_EXPIRY", options.DevExpiry)
+	if err != nil {
+		return serverOptions{}, err
+	}
+	options.DevExpiry = devExpiry
 	options.ModelsFile = envOr(shellapp.ModelsFileSetting, options.ModelsFile)
 	options.ToolProxyFile = envOr(shellapp.ToolProxyFileSetting, options.ToolProxyFile)
 	options.SecretRulesFile = envOr(shellapp.SecretRulesFileSetting, options.SecretRulesFile)
@@ -228,21 +231,10 @@ func applyServerEnv(options serverOptions) (serverOptions, error) {
 	options.Discovery.DeviceAuthorizationEndpoint = envOr("KODEMA_DISCOVERY_DEVICE_AUTHORIZATION_ENDPOINT", options.Discovery.DeviceAuthorizationEndpoint)
 	options.Discovery.RevocationEndpoint = envOr("KODEMA_DISCOVERY_REVOCATION_ENDPOINT", options.Discovery.RevocationEndpoint)
 	options.Discovery.APIURL = envOr("KODEMA_DISCOVERY_API_URL", options.Discovery.APIURL)
-	if scopes := envScopes("KODEMA_DISCOVERY_SCOPES"); len(scopes) > 0 {
+	if scopes := splitCommaOrSpace(os.Getenv("KODEMA_DISCOVERY_SCOPES")); len(scopes) > 0 {
 		options.Discovery.Scopes = scopes
 	}
 	return options, nil
-}
-
-// envScopes reads one comma- or whitespace-separated scope list.
-func envScopes(name string) []string {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return nil
-	}
-	return strings.FieldsFunc(value, func(character rune) bool {
-		return character == ',' || unicode.IsSpace(character)
-	})
 }
 
 func envOr(name, fallback string) string {
@@ -367,7 +359,7 @@ func parseServerOptions(args []string, stderr io.Writer) (serverOptions, int) {
 
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	tokens := stringList(options.DevTokens)
+	var tokens stringList
 	flags.StringVar(&configPath, "config", configPath, "JSON configuration file")
 	flags.StringVar(&options.Profile, "profile", options.Profile, "composition profile (development, test or production)")
 	flags.StringVar(&options.Address, "address", options.Address, "listen address")
@@ -386,8 +378,9 @@ func parseServerOptions(args []string, stderr io.Writer) (serverOptions, int) {
 	flags.DurationVar(&options.LoopInterval, "loop-interval", options.LoopInterval, "durable profiles' background scan interval (default 1s, 100ms to 1m)")
 	flags.StringVar(&options.GitStorageRoot, "git-storage-root", options.GitStorageRoot, "mounted tenant Git storage root for retained-commit keep refs")
 	flags.StringVar(&options.ModelsFile, "models-file", options.ModelsFile, "trusted JSON file configuring model gateway and LLM proxy providers")
-	llmProviders := stringList(options.LLMProviders)
+	var llmProviders stringList
 	flags.Var(&llmProviders, "llm-provider", "streaming LLM proxy provider: <name>=<base_url>[,secret=<NAME>][,auth=<Authorization|x-api-key>][,tenant=<TENANT>][,project=<PROJECT>] (repeatable)")
+	flags.StringVar(&options.ToolProxyFile, "tool-proxy-file", options.ToolProxyFile, "trusted JSON file configuring external MCP tool proxy servers")
 	flags.StringVar(&options.SecretRulesFile, "secret-rules-file", options.SecretRulesFile, "trusted JSON file configuring workload secret-name allow-list rules")
 	flags.Var(&tokens, "dev-token", "development bearer token (repeatable)")
 	flags.StringVar(&options.DevPrincipal, "dev-principal", options.DevPrincipal, "development principal identity")
@@ -395,7 +388,7 @@ func parseServerOptions(args []string, stderr io.Writer) (serverOptions, int) {
 	flags.StringVar(&options.DevProject, "dev-project", options.DevProject, "development project identity")
 	flags.StringVar(&options.DevRoles, "dev-roles", options.DevRoles, "development role list")
 	flags.DurationVar(&options.DevExpiry, "dev-expiry", options.DevExpiry, "development credential expiry")
-	discoveryScopes := stringList(options.Discovery.Scopes)
+	var discoveryScopes stringList
 	flags.StringVar(&options.Discovery.Issuer, "discovery-issuer", options.Discovery.Issuer, "public discovery issuer")
 	flags.StringVar(&options.Discovery.ClientID, "discovery-client-id", options.Discovery.ClientID, "public discovery client id")
 	flags.StringVar(&options.Discovery.Audience, "discovery-audience", options.Discovery.Audience, "public discovery audience")
@@ -412,9 +405,15 @@ func parseServerOptions(args []string, stderr io.Writer) (serverOptions, int) {
 		usage(stderr, fmt.Sprintf("unexpected argument %q", flags.Arg(0)))
 		return serverOptions{}, 2
 	}
-	options.DevTokens = tokens
-	options.LLMProviders = llmProviders
-	options.Discovery.Scopes = discoveryScopes
+	if len(tokens) > 0 {
+		options.DevTokens = tokens
+	}
+	if len(llmProviders) > 0 {
+		options.LLMProviders = llmProviders
+	}
+	if len(discoveryScopes) > 0 {
+		options.Discovery.Scopes = discoveryScopes
+	}
 	return options, 0
 }
 
@@ -521,9 +520,11 @@ func mergeServerFile(file serverFile, options serverOptions) (serverOptions, err
 		options.DevRoles = file.DevRoles
 	}
 	if file.DevExpiry != "" {
-		if parsed, err := time.ParseDuration(file.DevExpiry); err == nil {
-			options.DevExpiry = parsed
+		parsed, err := time.ParseDuration(file.DevExpiry)
+		if err != nil {
+			return serverOptions{}, fmt.Errorf("server configuration dev_expiry must be a Go duration such as 1h or 24h")
 		}
+		options.DevExpiry = parsed
 	}
 	if file.ModelsFile != "" {
 		options.ModelsFile = file.ModelsFile
@@ -622,16 +623,27 @@ func runProduction(ctx context.Context, options serverOptions, stderr io.Writer,
 			return buildProduction(options, os.Getenv, driverkube.InClusterConfig{})
 		}
 	}
-	production, err := build(options)
+	return runTLSProfile(ctx, options, stderr, deps, build, nil)
+}
+
+// runTLSProfile builds and serves a durable TLS composition (production or
+// test) with shared drain, exit-code and fixed-diagnostic behavior.
+func runTLSProfile(ctx context.Context, options serverOptions, stderr io.Writer, deps serverDeps, build func(serverOptions) (productionBuild, error), banner func(productionBuild) string) int {
+	built, err := build(options)
 	if err != nil {
 		fmt.Fprintf(stderr, "kodema: %v\n", err)
 		return 2
+	}
+	if banner != nil {
+		if text := banner(built); text != "" {
+			fmt.Fprintln(stderr, text)
+		}
 	}
 	// A dependency failure may quote a credential, a DSN or a request body in
 	// its private diagnostic, so these branches render a fixed message naming
 	// only the failed step. Configuration refusals from build above keep their
 	// own already-secret-free text.
-	app, err := deps.newApp(ctx, production.Config)
+	app, err := deps.newApp(ctx, built.Config)
 	if err != nil {
 		fmt.Fprintln(stderr, "kodema: composition failed to start")
 		return 1
@@ -642,7 +654,7 @@ func runProduction(ctx context.Context, options serverOptions, stderr io.Writer,
 		fmt.Fprintf(stderr, "kodema: listen %q failed\n", options.Address)
 		return 1
 	}
-	if err := app.Serve(ctx, tls.NewListener(listener, production.TLS)); err != nil {
+	if err := app.Serve(ctx, tls.NewListener(listener, built.TLS)); err != nil {
 		fmt.Fprintln(stderr, "kodema: server failed")
 		return 1
 	}

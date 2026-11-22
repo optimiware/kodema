@@ -85,20 +85,13 @@ func repositoryPolicyCommitMessage(repository string) string {
 	return "repo " + repository
 }
 
-// defaultRepositoryPolicy is the exact `conf/git.conf` block KODEMA.md defines
-// for a provisioned repository: read for every principal in scope, forced
-// writes below refs/heads/work/ for engineers and executions, fast-forward
-// writes to the default branch for executions, and reviewer approval for every
-// update of the default branch. The default branch is the same `main` the
-// provisioned admin repository and every bare repository use.
-func defaultRepositoryPolicy(repository string) string {
-	return defaultRepositoryPolicyWithResource(repository, "")
-}
-
-func defaultRepositoryPolicyWithResource(repository, resourceID string) string {
-	return defaultRepositoryPolicyWithResourceAndBranch(repository, resourceID, provisioningInitialBranch)
-}
-
+// defaultRepositoryPolicyWithResourceAndBranch is the exact `conf/git.conf`
+// block KODEMA.md defines for a provisioned repository: read for every
+// principal in scope, forced writes below refs/heads/work/ for engineers and
+// executions, fast-forward writes to the default branch for executions, and
+// reviewer approval for every update of the default branch. The default branch
+// is the same `main` the provisioned admin repository and every bare repository
+// use.
 func defaultRepositoryPolicyWithResourceAndBranch(repository, resourceID, branch string) string {
 	if strings.TrimSpace(branch) == "" {
 		branch = provisioningInitialBranch
@@ -115,13 +108,9 @@ func defaultRepositoryPolicyWithResourceAndBranch(repository, resourceID, branch
 		"    option approve.refs/heads/" + branch + " = reviewer\n"
 }
 
-// requireDefaultRepositoryPolicy proves the compile-time default block parses,
-// grants exactly the documented access and never widens it, before any of it
-// can become durable state.
-func requireDefaultRepositoryPolicy(repository, resourceID string) error {
-	return requireDefaultRepositoryPolicyForBranch(repository, resourceID, provisioningInitialBranch)
-}
-
+// requireDefaultRepositoryPolicyForBranch proves the compile-time default block
+// parses, grants exactly the documented access and never widens it, before any
+// of it can become durable state.
 func requireDefaultRepositoryPolicyForBranch(repository, resourceID, branch string) error {
 	if strings.TrimSpace(branch) == "" {
 		branch = provisioningInitialBranch
@@ -734,16 +723,9 @@ func validateProvisionedRepositoryWithBranch(ctx context.Context, repositoryPath
 	return nil
 }
 
-// appendRepositoryPolicy appends one default block to the accepted policy
-// bytes, keeping a blank separator and never altering the existing text.
-func appendRepositoryPolicy(accepted []byte, repository string) []byte {
-	return appendRepositoryPolicyWithResource(accepted, repository, "")
-}
-
-func appendRepositoryPolicyWithResource(accepted []byte, repository, resourceID string) []byte {
-	return appendRepositoryPolicyWithResourceAndBranch(accepted, repository, resourceID, provisioningInitialBranch)
-}
-
+// appendRepositoryPolicyWithResourceAndBranch appends one default block to the
+// accepted policy bytes, keeping a blank separator and never altering the
+// existing text.
 func appendRepositoryPolicyWithResourceAndBranch(accepted []byte, repository, resourceID, defaultBranch string) []byte {
 	var builder strings.Builder
 	builder.Write(accepted)

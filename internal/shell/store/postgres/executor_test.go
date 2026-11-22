@@ -302,8 +302,11 @@ func TestExecutorReadCommitsScopedReadOnlyTransaction(t *testing.T) {
 		t.Fatalf("read terminal calls: commits=%d rollbacks=%d; want one read-only commit", conn.commits, conn.rollbacks)
 	}
 	calls := conn.callsCopy()
-	if len(calls) < 3 {
-		t.Fatalf("read issued %d calls; want scope, query and commit", len(calls))
+	if len(calls) < 4 {
+		t.Fatalf("read issued %d calls; want read-only, scope, query and commit", len(calls))
+	}
+	if calls[0].kind != "exec" || !strings.EqualFold(strings.TrimSpace(calls[0].sql), beginReadOnlySQL) {
+		t.Errorf("first Read call = %+v; want %s", calls[0], beginReadOnlySQL)
 	}
 	if indexOfSQL(calls, "set_config") < 0 {
 		t.Error("Read did not establish transaction-local scope")
@@ -355,4 +358,27 @@ func TestExecutorReadRollsBackOnFailure(t *testing.T) {
 			t.Fatalf("cross-scope read terminal calls: commits=%d rollbacks=%d", conn.commits, conn.rollbacks)
 		}
 	})
+}
+
+func TestExecutorReadValidatesInputsBeforeBegin(t *testing.T) {
+	cases := []struct {
+		name  string
+		scope tenancy.Scope
+		table string
+		id    string
+	}{
+		{"unknown table", testProjectScope(), "not_a_table", "id-1"},
+		{"invalid id", testProjectScope(), "pipelines", "bad id"},
+		{"tenant scope on project table", testTenantScope(), "pipelines", "pipeline-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newFakeDB()
+			_, err := New(db).Read(context.Background(), tc.scope, tc.table, tc.id)
+			assertFaultClass(t, err, fault.InvalidInput)
+			if got := db.beginCount(); got != 0 {
+				t.Fatalf("invalid Read opened %d transactions; want 0", got)
+			}
+		})
+	}
 }

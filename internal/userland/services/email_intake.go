@@ -195,7 +195,7 @@ func IntakeEmail(ctx context.Context, config EmailIntakeConfig, source io.Reader
 			"email.content_sha256": parsed.contentDigest,
 		},
 	}
-	decoded, err := invokePublicOperation(ctx, config.Handler, emailCreateAndStartOperation, request,
+	decoded, err := invokePublicOperation(ctx, config.Handler, emailCreateAndStartOperation, request, nil,
 		emailIdempotencyKey(config, parsed.messageID))
 	if err != nil {
 		if isEmailChangedContent(err) {
@@ -258,39 +258,6 @@ func isEmailChangedContent(err error) bool {
 	}
 	var value api.Error
 	return errors.As(err, &value) && value.Code == api.CodeChangedIdempotencyContent
-}
-
-// invokePublicOperation crosses the served public boundary with the public
-// operation codec: the request is strictly encoded (and validated), the result
-// operation identity is checked and the result is strictly decoded. It is the
-// package-level counterpart of Adapter.invoke over the same codec table.
-func invokePublicOperation(ctx context.Context, handler api.Handler, operation string, request any, idempotencyKey string) (any, error) {
-	codec, ok := publicCodecs[operation]
-	if !ok {
-		return nil, fmt.Errorf("operation %q has no public codec", operation)
-	}
-	input, err := codec.EncodeRequest(request)
-	if err != nil {
-		return nil, fmt.Errorf("encode %s request: %w", operation, err)
-	}
-	result, err := handler.Invoke(ctx, api.Invocation{
-		Operation: operation,
-		Request: api.Request{
-			Input:          input,
-			IdempotencyKey: idempotencyKey,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	if result.Operation != operation {
-		return nil, fmt.Errorf("operation %q returned a result for %q", operation, result.Operation)
-	}
-	decoded, err := codec.DecodeResult(result.Body)
-	if err != nil {
-		return nil, fmt.Errorf("decode %s result: %w", operation, err)
-	}
-	return decoded, nil
 }
 
 // parseEmailMessage enforces every bound and reads only the fields the intake
@@ -423,18 +390,36 @@ func validEmailMessageID(value string) bool {
 // validateEmailBodyHeaders refuses multipart and attached messages and accepts
 // only a single text/plain part. Nothing here selects scope or authority.
 func validateEmailBodyHeaders(header textproto.MIMEHeader) error {
-	if contentType := strings.TrimSpace(header.Get("Content-Type")); contentType != "" {
+	var nonEmptyContentTypes int
+	var contentTypeErr error
+	for _, raw := range header.Values("Content-Type") {
+		contentType := strings.TrimSpace(raw)
+		if contentType == "" {
+			continue
+		}
+		nonEmptyContentTypes++
 		mediaType, _, err := mime.ParseMediaType(contentType)
 		if err != nil {
 			// The parser error can quote the attacker-supplied value.
-			return fmt.Errorf("%w: content type is not a media type", ErrEmailMalformed)
+			if contentTypeErr == nil {
+				contentTypeErr = fmt.Errorf("%w: content type is not a media type", ErrEmailMalformed)
+			}
+			continue
 		}
 		if strings.HasPrefix(strings.ToLower(mediaType), "multipart/") {
 			return fmt.Errorf("%w: multipart message", ErrEmailAttachment)
 		}
 		if !strings.EqualFold(mediaType, "text/plain") {
-			return fmt.Errorf("%w: content type is not text/plain", ErrEmailMalformed)
+			if contentTypeErr == nil {
+				contentTypeErr = fmt.Errorf("%w: content type is not text/plain", ErrEmailMalformed)
+			}
 		}
+	}
+	if contentTypeErr != nil {
+		return contentTypeErr
+	}
+	if nonEmptyContentTypes > 1 {
+		return fmt.Errorf("%w: multiple content type headers", ErrEmailMalformed)
 	}
 	for _, disposition := range header.Values("Content-Disposition") {
 		if strings.TrimSpace(disposition) == "" {

@@ -50,7 +50,7 @@ func (credentials *Credentials) LookupCredential(ctx context.Context, kind store
 	if !kind.Valid() {
 		return store.CandidateScope{}, faultInvalid("credential kind is not frozen")
 	}
-	if !validIdentity(credentialID) {
+	if !store.ValidIdentity(credentialID) {
 		return store.CandidateScope{}, uniformCredentialRefusal()
 	}
 	tx, err := beginUnscoped(ctx, credentials.db, true)

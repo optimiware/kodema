@@ -180,7 +180,8 @@ func TestBuildTestProfileConfiguration(t *testing.T) {
 		}
 		if test.OIDC.Issuer != "https://idp.example.com" || test.OIDC.Audience != "https://kodema.test" ||
 			test.OIDC.JWKSURL != "https://idp.example.com/jwks" || test.OIDC.TenantClaim != "org_id" ||
-			test.OIDC.ClockSkew != time.Minute || test.OIDC.CacheTTL != 10*time.Minute {
+			test.OIDC.ClockSkew != time.Minute || test.OIDC.CacheTTL != 10*time.Minute ||
+			test.OIDC.MinRefreshInterval != 10*time.Second {
 			t.Fatalf("OIDC = %+v", test.OIDC)
 		}
 		if test.NATSTLS != nil {

@@ -286,7 +286,7 @@ func TestLegacyPreparationKeepsImageWorkingDirectoryAfterUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fx.files.WriteFile(t.Context(), preparationPath(fx.root, workload), data, readOnlyMode); err != nil {
+	if err := fx.files.WriteFile(t.Context(), preparationRecordPath(fx.root, workload), data, readOnlyMode); err != nil {
 		t.Fatal(err)
 	}
 	source := filepath.Join(t.TempDir(), "kodema")

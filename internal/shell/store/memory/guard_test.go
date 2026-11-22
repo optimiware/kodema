@@ -8,6 +8,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -370,5 +371,26 @@ func TestGuardedDeleteRollsBackWhenTheUnitFails(t *testing.T) {
 	}
 	if _, found := s.Receipt(record.Key); found {
 		t.Error("a failed delete unit committed its receipt")
+	}
+}
+
+func TestValuesEqualHandlesNegativeIntegers(t *testing.T) {
+	if !valuesEqual(int64(-1), int64(-1)) {
+		t.Fatal("valuesEqual(int64(-1), int64(-1)) = false; want true")
+	}
+	if !valuesEqual(int64(-1), int(-1)) {
+		t.Fatal("valuesEqual(int64(-1), int(-1)) = false; want true")
+	}
+	if !valuesEqual(int64(math.MinInt64), int64(math.MinInt64)) {
+		t.Fatal("valuesEqual(MinInt64, MinInt64) = false; want true")
+	}
+	if valuesEqual(int64(-1), int64(1)) {
+		t.Fatal("valuesEqual(int64(-1), int64(1)) = true; want false")
+	}
+	if valuesEqual(int64(-1), uint64(math.MaxUint64)) {
+		t.Fatal("valuesEqual(int64(-1), uint64(MaxUint64)) = true; want false")
+	}
+	if !valuesEqual(uint64(math.MaxUint64), uint64(math.MaxUint64)) {
+		t.Fatal("valuesEqual(MaxUint64, MaxUint64) = false; want true")
 	}
 }

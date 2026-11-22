@@ -70,7 +70,7 @@ func runEvents(ctx context.Context, config Config, args []string, ports Ports, d
 		return usage(ports.Err, "events requires --project <id> or KODEMA_PROJECT")
 	}
 
-	types := parseEventTypeFlags(typeFlags)
+	types := parseCommaSeparatedList(typeFlags)
 	if err := api.ValidateEventTypes(types); err != nil {
 		return usage(ports.Err, publicMessage(err))
 	}
@@ -81,7 +81,7 @@ func runEvents(ctx context.Context, config Config, args []string, ports Ports, d
 		}
 	}
 	limit := 0
-	if seen["--limit"] || seen["-n"] {
+	if seen["--limit"] {
 		parsed, err := strconv.Atoi(strings.TrimSpace(limitRaw))
 		if err != nil || parsed <= 0 || parsed > api.MaxPageLimit {
 			return usage(ports.Err, fmt.Sprintf("--limit must be an integer between 1 and %d", api.MaxPageLimit))
@@ -359,75 +359,35 @@ func fetchProjectWatchSnapshot(ctx context.Context, ports Ports, projectID strin
 }
 
 func fetchProjectTasks(ctx context.Context, ports Ports, projectID string) ([]api.TaskSummaryView, error) {
-	var (
-		all    []api.TaskSummaryView
-		cursor string
-	)
-	for {
-		req := api.TaskListRequest{ProjectID: projectID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, err
-		}
-		result, err := ports.Client.Invoke(ctx, api.Invocation{
-			Operation: "task.list",
-			Request:   api.Request{Input: input},
-		})
-		if err != nil {
-			return nil, err
-		}
-		var page api.TaskListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, fmt.Errorf("invalid task.list response: %w", err)
+	tasks, _, _, err := fetchAllPages(ctx, ports, "task.list",
+		func(cursor string) any {
+			req := api.TaskListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		all = append(all, page.Tasks...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return all, nil
+			return req
+		},
+		func(page api.TaskListResult) ([]api.TaskSummaryView, string) {
+			return page.Tasks, page.NextCursor
+		},
+	)
+	return tasks, err
 }
 
 func fetchProjectExecutions(ctx context.Context, ports Ports, projectID string) ([]api.ExecutionSummary, error) {
-	var (
-		all    []api.ExecutionSummary
-		cursor string
-	)
-	for {
-		req := api.ExecutionListRequest{ProjectID: projectID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, err
-		}
-		result, err := ports.Client.Invoke(ctx, api.Invocation{
-			Operation: "execution.list",
-			Request:   api.Request{Input: input},
-		})
-		if err != nil {
-			return nil, err
-		}
-		var page api.ExecutionListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, fmt.Errorf("invalid execution.list response: %w", err)
+	executions, _, _, err := fetchAllPages(ctx, ports, "execution.list",
+		func(cursor string) any {
+			req := api.ExecutionListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		all = append(all, page.Executions...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return all, nil
+			return req
+		},
+		func(page api.ExecutionListResult) ([]api.ExecutionSummary, string) {
+			return page.Executions, page.NextCursor
+		},
+	)
+	return executions, err
 }
 
 func renderProjectWatchSnapshot(
@@ -554,27 +514,6 @@ func openProjectEventStream(ctx context.Context, transport client.Transport, req
 		return nil, fmt.Errorf("the configured client does not support live event streaming")
 	}
 	return streamer.StreamEvents(ctx, req)
-}
-
-func parseEventTypeFlags(rawFlags []string) []string {
-	var (
-		out  []string
-		seen = make(map[string]struct{})
-	)
-	for _, raw := range rawFlags {
-		for _, part := range strings.Split(raw, ",") {
-			trimmed := strings.TrimSpace(part)
-			if trimmed == "" {
-				continue
-			}
-			if _, dup := seen[trimmed]; dup {
-				continue
-			}
-			seen[trimmed] = struct{}{}
-			out = append(out, trimmed)
-		}
-	}
-	return out
 }
 
 func decodePublicEvent(evt api.Event) api.StreamEvent {

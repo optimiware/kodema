@@ -379,3 +379,89 @@ func TestGitOpenCodeWorktreeMultiRepoIsolationHealthyCheckAndConcurrentMirrorLoc
 		t.Fatal(err)
 	}
 }
+
+func TestGitOpenCodeWorktreeManagerCAFileValidationAndOriginScope(t *testing.T) {
+	t.Run("rejects control characters in CAFile", func(t *testing.T) {
+		for name, bad := range map[string]string{
+			"newline":         "/etc/ssl/ca.pem\nhttp.proxy=http://evil",
+			"carriage return": "/etc/ssl/ca.pem\r",
+			"nul":             "/etc/ssl/ca\x00.pem",
+			"del":             "/etc/ssl/ca\x7f.pem",
+		} {
+			_, err := NewGitOpenCodeWorktreeManager(GitOpenCodeWorktreeConfig{
+				RemoteBaseURL:  "https://git.example.test:8443",
+				StateDirectory: t.TempDir(),
+				CAFile:         bad,
+				Executor:       &realTestGitExecutor{},
+			})
+			if err == nil {
+				t.Fatalf("NewGitOpenCodeWorktreeManager accepted CAFile with %s", name)
+			}
+		}
+	})
+
+	t.Run("absolutizes relative CAFile and scopes sslCAInfo to HTTPS origin", func(t *testing.T) {
+		credFile := filepath.Join(t.TempDir(), "cred")
+		if err := os.WriteFile(credFile, []byte("kodsvc.tok\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile cred: %v", err)
+		}
+		relCA := filepath.Join("certs", "private-ca.pem")
+		wantAbsCA, err := filepath.Abs(relCA)
+		if err != nil {
+			t.Fatalf("filepath.Abs: %v", err)
+		}
+		mgr, err := NewGitOpenCodeWorktreeManager(GitOpenCodeWorktreeConfig{
+			RemoteBaseURL:  "https://git.example.test:8443",
+			StateDirectory: t.TempDir(),
+			CredentialFile: credFile,
+			CAFile:         "  " + relCA + "  ",
+			Executor:       &realTestGitExecutor{},
+		})
+		if err != nil {
+			t.Fatalf("NewGitOpenCodeWorktreeManager: %v", err)
+		}
+		env, _, err := mgr.remoteEnvironment("https://git.example.test:8443/team/app")
+		if err != nil {
+			t.Fatalf("remoteEnvironment(https): %v", err)
+		}
+		kv := make(map[string]string, len(env))
+		for _, entry := range env {
+			k, v, ok := strings.Cut(entry, "=")
+			if ok {
+				kv[k] = v
+			}
+		}
+		if kv["GIT_CONFIG_KEY_0"] != "http.https://git.example.test:8443.sslCAInfo" {
+			t.Fatalf("GIT_CONFIG_KEY_0 = %q; want origin-scoped sslCAInfo", kv["GIT_CONFIG_KEY_0"])
+		}
+		if kv["GIT_CONFIG_VALUE_0"] != wantAbsCA {
+			t.Fatalf("GIT_CONFIG_VALUE_0 = %q; want %q", kv["GIT_CONFIG_VALUE_0"], wantAbsCA)
+		}
+	})
+
+	t.Run("plain HTTP remote omits sslCAInfo", func(t *testing.T) {
+		credFile := filepath.Join(t.TempDir(), "cred")
+		if err := os.WriteFile(credFile, []byte("kodsvc.tok\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile cred: %v", err)
+		}
+		mgr, err := NewGitOpenCodeWorktreeManager(GitOpenCodeWorktreeConfig{
+			RemoteBaseURL:  "http://git.example.test:8080",
+			StateDirectory: t.TempDir(),
+			CredentialFile: credFile,
+			CAFile:         filepath.Join(t.TempDir(), "ca.pem"),
+			Executor:       &realTestGitExecutor{},
+		})
+		if err != nil {
+			t.Fatalf("NewGitOpenCodeWorktreeManager: %v", err)
+		}
+		env, _, err := mgr.remoteEnvironment("http://git.example.test:8080/team/app")
+		if err != nil {
+			t.Fatalf("remoteEnvironment(http): %v", err)
+		}
+		for _, entry := range env {
+			if strings.Contains(entry, "sslCAInfo") {
+				t.Fatalf("plain HTTP remote unexpectedly included sslCAInfo: %q", entry)
+			}
+		}
+	})
+}

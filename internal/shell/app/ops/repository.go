@@ -153,62 +153,20 @@ func repositoryHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 				return api.Result{}, err
 			}
 			page := pageOrDefault(request.Page)
-			wantLimit := page.EffectiveLimit()
-
-			repositories := make([]api.RepositoryView, 0, wantLimit)
-			after := page.Cursor
-			var nextCursor string
-			batchLimit := store.MaxQueryLimit
-			for {
-				committed, err := scanner.Query(ctx, call.Scope, store.ScanQuery{
-					Table:   "resource_bindings",
-					OrderBy: []store.Order{{Column: "id"}},
-					After:   after,
-					Limit:   batchLimit,
-				})
-				if err != nil {
-					return api.Result{}, err
-				}
-				kept := len(repositories)
-				reread := false
-				foundExtra := false
-				for index, row := range committed.Rows {
+			repositories, nextCursor, err := scanFilteredPage(ctx, scanner, call.Scope, "resource_bindings", page,
+				func(row store.Row) (api.RepositoryView, bool, error) {
 					binding, err := decodeBindingRow(row)
 					if err != nil {
-						return api.Result{}, err
+						return api.RepositoryView{}, false, err
 					}
 					if !bindingMatchesKind(binding, "git") {
-						continue
+						return api.RepositoryView{}, false, nil
 					}
-					if len(repositories) < wantLimit {
-						repositories = append(repositories, repositoryViewFromBinding(binding, deps.Repositories))
-						if len(repositories) < wantLimit {
-							continue
-						}
-						if index < len(committed.Rows)-1 {
-							repositories = repositories[:kept]
-							batchLimit = index + 1
-							reread = true
-							break
-						}
-						nextCursor = committed.Next
-					} else {
-						foundExtra = true
-						break
-					}
-				}
-				if foundExtra {
-					break
-				}
-				if reread {
-					continue
-				}
-				batchLimit = store.MaxQueryLimit
-				if !committed.HasMore {
-					nextCursor = ""
-					break
-				}
-				after = committed.Next
+					return repositoryViewFromBinding(binding, deps.Repositories), true, nil
+				},
+			)
+			if err != nil {
+				return api.Result{}, err
 			}
 			return respond(call, api.RepositoryListResult{
 				Repositories: repositories,

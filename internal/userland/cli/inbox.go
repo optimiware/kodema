@@ -137,49 +137,18 @@ func runInbox(ctx context.Context, config Config, args []string, ports Ports, de
 }
 
 func fetchInboxPages(ctx context.Context, ports Ports, projectID string, kinds []string) ([]api.InboxItem, json.RawMessage, int, error) {
-	var (
-		allItems  []api.InboxItem
-		firstBody json.RawMessage
-		pages     int
-		cursor    string
-	)
-	for {
-		req := api.TaskInboxRequest{ProjectID: projectID, Kinds: kinds}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		invocation := api.Invocation{
-			Operation: "task.inbox",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return nil, nil, 0, err
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.TaskInboxResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, nil, 0, fmt.Errorf("invalid task.inbox response: %w", err)
+	return fetchAllPages(ctx, ports, "task.inbox",
+		func(cursor string) any {
+			req := api.TaskInboxRequest{ProjectID: projectID, Kinds: kinds}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		allItems = append(allItems, page.Items...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return allItems, firstBody, pages, nil
+			return req
+		},
+		func(page api.TaskInboxResult) ([]api.InboxItem, string) {
+			return page.Items, page.NextCursor
+		},
+	)
 }
 
 func renderInboxResult(
@@ -192,23 +161,10 @@ func renderInboxResult(
 	pages int,
 ) int {
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "task.inbox", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
-		}
 		if allItems == nil {
 			allItems = []api.InboxItem{}
 		}
-		combined, err := json.Marshal(api.TaskInboxResult{Items: allItems})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "task.inbox", Body: combined}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "task.inbox", firstBody, pages, api.TaskInboxResult{Items: allItems})
 	}
 
 	// Best-effort enrichment for request items in table mode: inspect unique

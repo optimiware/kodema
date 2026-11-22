@@ -242,7 +242,7 @@ func (config Config) validateKeyReference() error {
 	// to the wrong family.
 	if strings.IndexFunc(name, func(character rune) bool {
 		return unicode.IsSpace(character) || unicode.IsControl(character)
-	}) >= 0 || strings.TrimSpace(name) != name {
+	}) >= 0 {
 		return fault.New(fault.InvalidInput, fmt.Sprintf("key reference has an invalid key name after the %q prefix", prefix))
 	}
 	// The AWS and GCP families are provider resources, not an opaque name.

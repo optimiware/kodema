@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 const differentialRandomIterations = 60_000
@@ -65,7 +66,7 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 				t.Fatalf("fixture %d issued no log read", fixtures)
 			}
 			forwarded := requests[len(requests)-1]
-			position, _ := decodeLogCursor(cursor)
+			position, _ := adapterutil.DecodeLogCursor(cursor)
 			if forwarded.Offset != position {
 				t.Fatalf("fixture %d forwarded offset %d; want %d", fixtures, forwarded.Offset, position)
 			}
@@ -106,7 +107,7 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 				}
 				break
 			}
-			next, _ := decodeLogCursor(batch.NextOffset)
+			next, _ := adapterutil.DecodeLogCursor(batch.NextOffset)
 			if next <= position || next > int64(len(log)) {
 				t.Fatalf("fixture %d cursor moved %d -> %d over %d bytes", fixtures, position, next, len(log))
 			}

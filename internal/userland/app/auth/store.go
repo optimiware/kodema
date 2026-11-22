@@ -24,11 +24,10 @@ const (
 )
 
 var (
-	errInvalidGrant   = errors.New("invalid_grant")
-	errExpiredToken   = errors.New("expired_token")
-	errAuthPending    = errors.New("authorization_pending")
-	errAccessDenied   = errors.New("access_denied")
-	errNotFoundOrUsed = errors.New("state not found or expired")
+	errInvalidGrant = errors.New("invalid_grant")
+	errExpiredToken = errors.New("expired_token")
+	errAuthPending  = errors.New("authorization_pending")
+	errAccessDenied = errors.New("access_denied")
 )
 
 type txKind int
@@ -49,13 +48,11 @@ type authTx struct {
 	CodeChallenge string
 	LoginHint     string
 	DeviceHash    [32]byte
-	UserCode      string
 	CreatedAt     time.Time
 	ExpiresAt     time.Time
 }
 
 type socialTx struct {
-	StateHash     [32]byte
 	Provider      string
 	AuthTxID      string
 	BrowserID     string
@@ -66,7 +63,6 @@ type socialTx struct {
 }
 
 type githubSetupTx struct {
-	StateHash [32]byte
 	AuthTxID  string
 	BrowserID string
 	CreatedAt time.Time
@@ -74,7 +70,6 @@ type githubSetupTx struct {
 }
 
 type authCodeEntry struct {
-	CodeHash      [32]byte
 	ClientID      string
 	RedirectURI   string
 	CodeChallenge string
@@ -115,12 +110,9 @@ type deviceEntry struct {
 }
 
 type registeredClient struct {
-	ClientID      string
-	ClientName    string
-	RedirectURIs  []string
-	GrantTypes    []string
-	ResponseTypes []string
-	IssuedAt      int64
+	ClientID     string
+	RedirectURIs []string
+	GrantTypes   []string
 }
 
 type authStore struct {
@@ -198,21 +190,51 @@ func normalizeUserCode(raw string) string {
 	return b.String()
 }
 
+func pruneAndEvict[K comparable, V any](
+	entries map[K]V,
+	maxEntries int,
+	now time.Time,
+	expiresAt func(V) time.Time,
+	evictAt func(V) time.Time,
+	onDelete func(V),
+) {
+	for k, v := range entries {
+		if !now.Before(expiresAt(v)) {
+			if onDelete != nil {
+				onDelete(v)
+			}
+			delete(entries, k)
+		}
+	}
+	if len(entries) < maxEntries {
+		return
+	}
+	var oldestKey K
+	var oldestSet bool
+	var oldestTime time.Time
+	for k, v := range entries {
+		t := evictAt(v)
+		if !oldestSet || t.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = t
+			oldestSet = true
+		}
+	}
+	if oldestSet {
+		if onDelete != nil {
+			onDelete(entries[oldestKey])
+		}
+		delete(entries, oldestKey)
+	}
+}
+
 func (store *authStore) putAuthTx(tx authTx, now time.Time) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.pruneAuthTxsLocked(now)
-	if len(store.authTxs) >= maxAuthTransactions {
-		var oldestKey string
-		var oldestTime time.Time
-		for k, v := range store.authTxs {
-			if oldestKey == "" || v.CreatedAt.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.CreatedAt
-			}
-		}
-		delete(store.authTxs, oldestKey)
-	}
+	pruneAndEvict(store.authTxs, maxAuthTransactions, now,
+		func(v *authTx) time.Time { return v.ExpiresAt },
+		func(v *authTx) time.Time { return v.CreatedAt },
+		nil)
 	copied := tx
 	store.authTxs[tx.ID] = &copied
 }
@@ -245,39 +267,14 @@ func (store *authStore) consumeAuthTx(id string, now time.Time) (authTx, bool) {
 	return *entry, true
 }
 
-func (store *authStore) pruneAuthTxsLocked(now time.Time) {
-	for k, v := range store.authTxs {
-		if !now.Before(v.ExpiresAt) {
-			delete(store.authTxs, k)
-		}
-	}
-}
-
 func (store *authStore) putSocialTx(rawState string, tx socialTx, now time.Time) {
 	hash := secretDigest(rawState)
-	tx.StateHash = hash
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	for k, v := range store.socialTxs {
-		if !now.Before(v.ExpiresAt) {
-			delete(store.socialTxs, k)
-		}
-	}
-	if len(store.socialTxs) >= maxSocialTransactions {
-		var oldestKey [32]byte
-		var oldestSet bool
-		var oldestTime time.Time
-		for k, v := range store.socialTxs {
-			if !oldestSet || v.CreatedAt.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.CreatedAt
-				oldestSet = true
-			}
-		}
-		if oldestSet {
-			delete(store.socialTxs, oldestKey)
-		}
-	}
+	pruneAndEvict(store.socialTxs, maxSocialTransactions, now,
+		func(v *socialTx) time.Time { return v.ExpiresAt },
+		func(v *socialTx) time.Time { return v.CreatedAt },
+		nil)
 	copied := tx
 	store.socialTxs[hash] = &copied
 }
@@ -301,28 +298,11 @@ func (store *authStore) putGitHubSetupTx(rawState, authTxID, browserID string, n
 	hash := secretDigest(rawState)
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	for k, v := range store.ghSetupTxs {
-		if !now.Before(v.ExpiresAt) {
-			delete(store.ghSetupTxs, k)
-		}
-	}
-	if len(store.ghSetupTxs) >= maxGitHubSetupStates {
-		var oldestKey [32]byte
-		var oldestSet bool
-		var oldestTime time.Time
-		for k, v := range store.ghSetupTxs {
-			if !oldestSet || v.CreatedAt.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.CreatedAt
-				oldestSet = true
-			}
-		}
-		if oldestSet {
-			delete(store.ghSetupTxs, oldestKey)
-		}
-	}
+	pruneAndEvict(store.ghSetupTxs, maxGitHubSetupStates, now,
+		func(v *githubSetupTx) time.Time { return v.ExpiresAt },
+		func(v *githubSetupTx) time.Time { return v.CreatedAt },
+		nil)
 	store.ghSetupTxs[hash] = &githubSetupTx{
-		StateHash: hash,
 		AuthTxID:  authTxID,
 		BrowserID: browserID,
 		CreatedAt: now,
@@ -347,29 +327,12 @@ func (store *authStore) consumeGitHubSetupTx(rawState string, now time.Time) (gi
 
 func (store *authStore) putAuthCode(rawCode string, entry authCodeEntry, now time.Time) {
 	hash := secretDigest(rawCode)
-	entry.CodeHash = hash
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	for k, v := range store.authCodes {
-		if !now.Before(v.ExpiresAt) {
-			delete(store.authCodes, k)
-		}
-	}
-	if len(store.authCodes) >= maxAuthCodes {
-		var oldestKey [32]byte
-		var oldestSet bool
-		var oldestTime time.Time
-		for k, v := range store.authCodes {
-			if !oldestSet || v.CreatedAt.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.CreatedAt
-				oldestSet = true
-			}
-		}
-		if oldestSet {
-			delete(store.authCodes, oldestKey)
-		}
-	}
+	pruneAndEvict(store.authCodes, maxAuthCodes, now,
+		func(v *authCodeEntry) time.Time { return v.ExpiresAt },
+		func(v *authCodeEntry) time.Time { return v.CreatedAt },
+		nil)
 	copied := entry
 	store.authCodes[hash] = &copied
 }
@@ -401,26 +364,10 @@ func refreshFamily(rawToken string) string {
 func (store *authStore) issueRefreshToken(rawToken, clientID, scope string, user UserIdentity, ttl time.Duration, now time.Time) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	for k, v := range store.refresh {
-		if !now.Before(v.ExpiresAt) {
-			delete(store.refresh, k)
-		}
-	}
-	if len(store.refresh) >= maxRefreshTokens {
-		var oldestKey string
-		var oldestSet bool
-		var oldestTime time.Time
-		for k, v := range store.refresh {
-			if !oldestSet || v.CreatedAt.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.CreatedAt
-				oldestSet = true
-			}
-		}
-		if oldestSet {
-			delete(store.refresh, oldestKey)
-		}
-	}
+	pruneAndEvict(store.refresh, maxRefreshTokens, now,
+		func(v *refreshEntry) time.Time { return v.ExpiresAt },
+		func(v *refreshEntry) time.Time { return v.CreatedAt },
+		nil)
 	store.refresh[refreshFamily(rawToken)] = &refreshEntry{
 		TokenHash: secretDigest(rawToken),
 		ClientID:  clientID,
@@ -481,22 +428,8 @@ func (store *authStore) revokeJTI(jti string, expiresAt time.Time, now time.Time
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	for k, exp := range store.revokedJTIs {
-		if !now.Before(exp) {
-			delete(store.revokedJTIs, k)
-		}
-	}
-	if len(store.revokedJTIs) >= maxRevokedJTIs {
-		var soonestKey string
-		var soonestTime time.Time
-		for k, exp := range store.revokedJTIs {
-			if soonestKey == "" || exp.Before(soonestTime) {
-				soonestKey = k
-				soonestTime = exp
-			}
-		}
-		delete(store.revokedJTIs, soonestKey)
-	}
+	identity := func(exp time.Time) time.Time { return exp }
+	pruneAndEvict(store.revokedJTIs, maxRevokedJTIs, now, identity, identity, nil)
 	store.revokedJTIs[jti] = expiresAt
 }
 
@@ -517,25 +450,14 @@ func (store *authStore) isJTIRevoked(jti string, now time.Time) bool {
 func (store *authStore) createDeviceSession(random io.Reader, clientID, scope string, ttl time.Duration, now time.Time) (string, string, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.pruneDevicesLocked(now)
-	if len(store.devices) >= maxDeviceSessions {
-		var oldestKey [32]byte
-		var oldestSet bool
-		var oldestTime time.Time
-		for k, v := range store.devices {
-			if !oldestSet || v.CreatedAt.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.CreatedAt
-				oldestSet = true
+	pruneAndEvict(store.devices, maxDeviceSessions, now,
+		func(v *deviceEntry) time.Time { return v.ExpiresAt },
+		func(v *deviceEntry) time.Time { return v.CreatedAt },
+		func(v *deviceEntry) {
+			if v != nil {
+				delete(store.userCodes, v.NormalizedUserCode)
 			}
-		}
-		if oldestSet {
-			if victim := store.devices[oldestKey]; victim != nil {
-				delete(store.userCodes, victim.NormalizedUserCode)
-			}
-			delete(store.devices, oldestKey)
-		}
-	}
+		})
 
 	rawDeviceCode, err := randomToken(random, 32)
 	if err != nil {
@@ -650,15 +572,6 @@ func (store *authStore) pollDeviceSession(rawDeviceCode, clientID string, now ti
 	}
 }
 
-func (store *authStore) pruneDevicesLocked(now time.Time) {
-	for k, v := range store.devices {
-		if !now.Before(v.ExpiresAt) {
-			delete(store.userCodes, v.NormalizedUserCode)
-			delete(store.devices, k)
-		}
-	}
-}
-
 func (store *authStore) registerClient(client registeredClient) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -670,7 +583,6 @@ func (store *authStore) registerClient(client registeredClient) {
 	copied := client
 	copied.RedirectURIs = append([]string(nil), client.RedirectURIs...)
 	copied.GrantTypes = append([]string(nil), client.GrantTypes...)
-	copied.ResponseTypes = append([]string(nil), client.ResponseTypes...)
 	store.clients[client.ClientID] = &copied
 	store.clientOrder = append(store.clientOrder, client.ClientID)
 }
@@ -685,6 +597,5 @@ func (store *authStore) lookupRegisteredClient(clientID string) (registeredClien
 	copied := *entry
 	copied.RedirectURIs = append([]string(nil), entry.RedirectURIs...)
 	copied.GrantTypes = append([]string(nil), entry.GrantTypes...)
-	copied.ResponseTypes = append([]string(nil), entry.ResponseTypes...)
 	return copied, true
 }

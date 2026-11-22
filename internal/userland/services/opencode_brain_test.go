@@ -1806,3 +1806,393 @@ func TestOpenCodeBrainModeNonCodingPlanSkipsSandbox(t *testing.T) {
 		t.Fatalf("plan resolution unexpected: %+v", resolved)
 	}
 }
+
+func TestOpenCodeBrainModeDetachMCPServerRetryAndOrphanRecovery(t *testing.T) {
+	cases := []struct {
+		name              string
+		failDeleteCount   int
+		wantMinDeletes    int
+		wantOrphanedAfter bool
+	}{
+		{
+			name:            "first DELETE returns HTTP 500 then retry succeeds",
+			failDeleteCount: 1,
+			wantMinDeletes:  3, // 1 failed + 1 succeeded for Task 1, 1 succeeded for Task 2
+		},
+		{
+			name:            "all cleanup DELETE retries return HTTP 500 then Task 2 detaches orphan before attach",
+			failDeleteCount: defaultOpenCodeMCPDetachRetries,
+			wantMinDeletes:  defaultOpenCodeMCPDetachRetries + 2, // 3 failed on Task 1 + 1 orphan detach before Task 2 + 1 Task 2 cleanup
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu          sync.Mutex
+				sessionSeq  int
+				deleteCalls int
+				putCalls    int
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+					sessionSeq++
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = fmt.Fprintf(w, `{"data":{"id":"sess-%d"}}`, sessionSeq)
+				case r.Method == http.MethodPut && r.URL.Path == "/api/experimental/mcp/sandbox":
+					putCalls++
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodDelete && r.URL.Path == "/api/experimental/mcp/sandbox":
+					deleteCalls++
+					if deleteCalls <= tc.failDeleteCount {
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = w.Write([]byte("transient mcp detach failure"))
+						return
+					}
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/api/session/"):
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"data":{"id":"u-1"}}`))
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/wait"):
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/message"):
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"data":[{"id":"i-1","type":"idle","outcome":"succeeded"},{"id":"m-1","type":"assistant","content":[{"type":"text","text":"summary ok"}]},{"id":"u-1","type":"user"}],"cursor":{}}`))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			cli, err := NewHTTPOpenCodeClient(HTTPOpenCodeClientConfig{BaseURL: srv.URL})
+			if err != nil {
+				t.Fatalf("NewHTTPOpenCodeClient: %v", err)
+			}
+
+			clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+			deadline := clock.Now().Add(5 * time.Minute)
+			item1, ex1 := makeBrainInboxFixture("exec-mcp-1", "act-mcp-1", "task-mcp-1", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
+			item2, ex2 := makeBrainInboxFixture("exec-mcp-2", "act-mcp-2", "task-mcp-2", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
+
+			handler := newBrainTestHandler()
+			handler.inboxItems = []api.InboxItem{item1}
+			handler.executions["exec-mcp-1"] = ex1
+			handler.executions["exec-mcp-2"] = ex2
+
+			sboxMgr := newRealLocalSandboxManager(t, nil)
+			store, err := NewFileOpenCodeStateStore(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewFileOpenCodeStateStore: %v", err)
+			}
+			adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
+				ServiceID:          "opencode-brain",
+				TenantID:           "tenant-1",
+				ProjectID:          "project-1",
+				ExecutionMode:      OpenCodeExecutionModeBrain,
+				Handler:            handler,
+				OpenCode:           cli,
+				Store:              store,
+				Sandboxes:          sboxMgr,
+				Clock:              clock,
+				MaxConcurrentTurns: 1,
+			})
+			if err != nil {
+				t.Fatalf("NewOpenCodeAdapter: %v", err)
+			}
+
+			// Run Task 1 (cleanup DELETE hits HTTP 500).
+			if err := adapter.RunOnce(context.Background()); err != nil {
+				t.Fatalf("Task 1 RunOnce: %v", err)
+			}
+
+			// Enqueue Task 2 and run it; it must attach and succeed cleanly.
+			handler.mu.Lock()
+			handler.inboxItems = []api.InboxItem{item2}
+			handler.mu.Unlock()
+			if err := adapter.RunOnce(context.Background()); err != nil {
+				t.Fatalf("Task 2 RunOnce: %v", err)
+			}
+
+			handler.mu.Lock()
+			res1 := handler.resolveCalls["exec-mcp-1"]
+			res2 := handler.resolveCalls["exec-mcp-2"]
+			handler.mu.Unlock()
+			if res1.Decision != DecisionPass {
+				t.Fatalf("Task 1 resolution = %+v; want pass", res1)
+			}
+			if res2.Decision != DecisionPass {
+				t.Fatalf("Task 2 resolution = %+v; want pass", res2)
+			}
+
+			mu.Lock()
+			gotDeletes := deleteCalls
+			gotPuts := putCalls
+			mu.Unlock()
+			if gotPuts != 2 {
+				t.Fatalf("PUT attach calls = %d; want 2", gotPuts)
+			}
+			if gotDeletes < tc.wantMinDeletes {
+				t.Fatalf("DELETE detach calls = %d; want >= %d", gotDeletes, tc.wantMinDeletes)
+			}
+		})
+	}
+}
+
+func TestKodemaSandboxManagerReleaseCancelsInFlightMonitorWithoutSpuriousDeath(t *testing.T) {
+	t.Run("Release cancels in-flight watchSandbox and waits for exit", func(t *testing.T) {
+		healthSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/healthz" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer healthSrv.Close()
+		_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(healthSrv.URL, "http://"))
+		boundPort, _ := strconv.Atoi(portStr)
+
+		var (
+			readyDone       atomic.Bool
+			inFlightEntered sync.Once
+			inspectEntered  = make(chan struct{})
+			inspectCanceled atomic.Bool
+			watchFinished   atomic.Bool
+			execCancelled   atomic.Bool
+		)
+		handler := testAPIHandlerFunc(func(ctx context.Context, inv api.Invocation) (api.Result, error) {
+			codec := publicCodecs[inv.Operation]
+			switch inv.Operation {
+			case OperationSecretWrite:
+				var req api.SecretWriteRequest
+				_ = json.Unmarshal(inv.Request.Input, &req)
+				body, _ := codec.EncodeResult(api.SecretWriteResult{SecretID: "sec-" + req.SecretID, Name: req.SecretID, Version: 1})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case OperationSecretDelete:
+				body, _ := codec.EncodeResult(api.SecretDeleteResult{Version: 2})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case OperationPipelineStart:
+				body, _ := codec.EncodeResult(api.PipelineStartResult{ExecutionID: "exec-mon-1", Version: 1})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case OperationExecutionLogsRead:
+				body, _ := codec.EncodeResult(api.ExecutionLogsReadResult{
+					Chunks: []api.LogChunk{{
+						ActionID: "act-mon-sbox",
+						Stream:   "stdout",
+						Data:     []byte(sandboxReadyLinePrefix + healthSrv.URL + "\n"),
+					}},
+				})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case OperationExecutionCancel:
+				execCancelled.Store(true)
+				body, _ := codec.EncodeResult(api.ExecutionCancelResult{ExecutionVersion: 2})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case OperationInspect:
+				if readyDone.Load() && !watchFinished.Load() {
+					// Block the watchSandbox goroutine's inspectExecution until mon.ctx cancels.
+					inFlightEntered.Do(func() { close(inspectEntered) })
+					<-ctx.Done()
+					inspectCanceled.Store(true)
+					watchFinished.Store(true)
+					return api.Result{}, ctx.Err()
+				}
+				state := "running"
+				if execCancelled.Load() {
+					state = "cancelled"
+				}
+				body, _ := codec.EncodeResult(api.ExecutionInspectResult{
+					ExecutionID:   "exec-mon-1",
+					State:         state,
+					Version:       1,
+					CurrentAction: 0,
+					Actions: []api.ExecutionAction{{
+						ActionID: "act-mon-sbox",
+						Index:    0,
+						Name:     "sandbox",
+						Kind:     "container",
+						State:    state,
+						Version:  1,
+					}},
+					Cleanup: api.ExecutionCleanup{State: "none"},
+				})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			default:
+				return api.Result{}, fmt.Errorf("unexpected op %s", inv.Operation)
+			}
+		})
+
+		mgr, err := NewKodemaExecutionSandboxManager(KodemaExecutionSandboxConfig{
+			TenantID:               "tenant-1",
+			ProjectID:              "project-1",
+			Handler:                handler,
+			AllowLoopbackEndpoints: true,
+			ReadyTimeout:           5 * time.Second,
+			HealthInterval:         10 * time.Millisecond,
+			StopTimeout:            5 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewKodemaExecutionSandboxManager: %v", err)
+		}
+
+		lease, err := mgr.Acquire(context.Background(), OpenCodeSandboxRequest{
+			ExecutionID: "exec-turn-1",
+			ActionID:    "act-turn-1",
+			TaskID:      "task-mon-1",
+			Image:       "golang:1.24",
+			Port:        boundPort,
+		})
+		if err != nil {
+			t.Fatalf("Acquire: %v", err)
+		}
+		readyDone.Store(true)
+
+		select {
+		case <-inspectEntered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for watchSandbox to enter inspectExecution")
+		}
+
+		if err := mgr.Release(context.Background(), lease); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+		if !inspectCanceled.Load() {
+			t.Fatal("Release did not cancel in-flight watchSandbox checkCtx")
+		}
+		select {
+		case <-lease.Done:
+			t.Fatalf("Release spuriously closed lease.Done (err=%v)", lease.Err())
+		default:
+		}
+		if lease.Err() != nil {
+			t.Fatalf("lease.Err() = %v; want nil after clean Release", lease.Err())
+		}
+	})
+
+	t.Run("OpenCodeAdapter joins lease.Done watcher goroutine before turn returns", func(t *testing.T) {
+		clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+		deadline := clock.Now().Add(5 * time.Minute)
+		item, ex := makeBrainInboxFixture("exec-wg-1", "act-wg-1", "task-wg-1", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
+
+		handler := newBrainTestHandler()
+		handler.inboxItems = []api.InboxItem{item}
+		handler.executions["exec-wg-1"] = ex
+
+		leaseDone := make(chan struct{})
+		sboxMgr := &blockingLeaseDoneSandboxManager{doneCh: leaseDone}
+
+		abortStarted := make(chan struct{})
+		releaseAbort := make(chan struct{})
+		var abortCompleted atomic.Bool
+
+		brainClient := newFakeBrainOpenCodeClient()
+		brainClient.onSend = func(ctx context.Context, _ string, _ OpenCodeMessageRequest, _ OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
+			close(leaseDone)
+			<-ctx.Done()
+			return OpenCodeMessageResponse{}, ctx.Err()
+		}
+		wrappedClient := &blockingAbortOpenCodeClient{
+			fakeBrainOpenCodeClient: brainClient,
+			onAbort: func() {
+				select {
+				case <-abortStarted:
+				default:
+					close(abortStarted)
+				}
+				<-releaseAbort
+				abortCompleted.Store(true)
+			},
+		}
+
+		store, err := NewFileOpenCodeStateStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("NewFileOpenCodeStateStore: %v", err)
+		}
+		adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
+			ServiceID:          "opencode-brain",
+			TenantID:           "tenant-1",
+			ProjectID:          "project-1",
+			ExecutionMode:      OpenCodeExecutionModeBrain,
+			Handler:            handler,
+			OpenCode:           wrappedClient,
+			Store:              store,
+			Sandboxes:          sboxMgr,
+			Clock:              clock,
+			MaxConcurrentTurns: 1,
+		})
+		if err != nil {
+			t.Fatalf("NewOpenCodeAdapter: %v", err)
+		}
+
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- adapter.RunOnce(context.Background())
+		}()
+
+		select {
+		case <-abortStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for lease.Done watcher to invoke AbortSession")
+		}
+
+		// RunOnce must not return while the lease.Done watcher goroutine is still
+		// inside AbortSession.
+		select {
+		case err := <-runDone:
+			t.Fatalf("RunOnce returned before lease.Done watcher goroutine exited (err=%v)", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		close(releaseAbort)
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("RunOnce did not return after watcher AbortSession finished")
+		}
+		if !abortCompleted.Load() {
+			t.Fatal("RunOnce returned before AbortSession completed")
+		}
+	})
+}
+
+type blockingLeaseDoneSandboxManager struct {
+	doneCh chan struct{}
+}
+
+func (m *blockingLeaseDoneSandboxManager) Acquire(_ context.Context, _ OpenCodeSandboxRequest) (OpenCodeSandboxLease, error) {
+	return OpenCodeSandboxLease{
+		SandboxID:    "sbox-wg-1",
+		ExecutionID:  "exec-sbox-wg-1",
+		EndpointURL:  "http://127.0.0.1:18099/mcp",
+		HealthURL:    "http://127.0.0.1:18099/healthz",
+		BearerToken:  "kodsbox.testtoken",
+		WorkspaceDir: "/workspace",
+		Done:         m.doneCh,
+		Err:          func() error { return ErrOpenCodeSandboxTerminated },
+	}, nil
+}
+
+func (m *blockingLeaseDoneSandboxManager) Release(_ context.Context, _ OpenCodeSandboxLease) error {
+	return nil
+}
+
+type blockingAbortOpenCodeClient struct {
+	*fakeBrainOpenCodeClient
+	onAbort func()
+}
+
+func (c *blockingAbortOpenCodeClient) AbortSession(ctx context.Context, sessionID string) error {
+	if c.onAbort != nil {
+		c.onAbort()
+	}
+	return c.fakeBrainOpenCodeClient.AbortSession(ctx, sessionID)
+}

@@ -90,10 +90,7 @@ func (adapter *Adapter) settleResolved(ctx context.Context, assignment PendingMe
 	if err := assignment.Request.Validate(); err != nil {
 		return err
 	}
-	inspected, err := adapter.inspect(ctx, api.InboxItem{
-		ExecutionID: string(assignment.Request.Assignment.ExecutionID),
-		ActionID:    string(assignment.Request.Assignment.ActionID),
-	})
+	inspected, err := inspectExecution(ctx, adapter.handler, string(assignment.Request.Assignment.ExecutionID))
 	if err != nil {
 		var publicErr *api.Error
 		if errors.As(err, &publicErr) && publicErr.Code == api.CodeNotFound {

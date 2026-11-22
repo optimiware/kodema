@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"text/tabwriter"
 
@@ -29,9 +28,9 @@ func runTask(ctx context.Context, config Config, args []string, ports Ports, dep
 	case "show", "read":
 		return runTaskShow(ctx, config, args[1:], ports)
 	case "start":
-		return runTaskStart(ctx, config, args[1:], ports, deps)
+		return runTaskStartOrRestart(ctx, config, args[1:], ports, deps, false)
 	case "restart":
-		return runTaskRestart(ctx, config, args[1:], ports, deps)
+		return runTaskStartOrRestart(ctx, config, args[1:], ports, deps, true)
 	case "ask":
 		return runTaskAsk(ctx, config, args[1:], ports, deps)
 	case "reply":
@@ -307,166 +306,15 @@ func runTaskShow(ctx context.Context, config Config, args []string, ports Ports)
 	return ExitSuccess
 }
 
-func runTaskStart(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
+func runTaskStartOrRestart(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps, restart bool) int {
+	subcmd := "start"
+	operation := "task.start"
+	if restart {
+		subcmd = "restart"
+		operation = "task.restart"
+	}
 	if hasHelpFlag(args) {
-		return runHelp(ports.Out, ports.Err, []string{"task", "start"})
-	}
-	var (
-		projectFlag        string
-		pipelineFlag       string
-		inputPairs         []string
-		outputInputPairs   []string
-		completesTaskFlag  bool
-		noCompleteFlag     bool
-		expectedVerRaw     string
-		outputFlag         string
-		idempotencyKeyFlag string
-	)
-	spec := newArgSpec()
-	spec.stringFlag(&projectFlag, "--project", "-p")
-	spec.stringFlag(&pipelineFlag, "--pipeline")
-	spec.listFlag(&inputPairs, "--input")
-	spec.listFlag(&outputInputPairs, "--input-from-output")
-	spec.boolFlag(&completesTaskFlag, "--completes-task")
-	spec.boolFlag(&noCompleteFlag, "--no-complete")
-	spec.stringFlag(&expectedVerRaw, "--expected-version")
-	spec.stringFlag(&outputFlag, "--output")
-	spec.stringFlag(&idempotencyKeyFlag, "--idempotency-key")
-	positionals, seen, err := spec.parse(args)
-	if err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	if len(positionals) != 1 || strings.TrimSpace(positionals[0]) == "" {
-		return usage(ports.Err, "task start requires <task-id>")
-	}
-	completesTask, err := resolveCompletesTaskFlag(seen, completesTaskFlag, noCompleteFlag)
-	if err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	taskID := strings.TrimSpace(positionals[0])
-	expectedVer, err := parsePositiveVersion(expectedVerRaw, "--expected-version")
-	if err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	inputs, err := parseKeyValues(inputPairs, "input")
-	if err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	outputRefs, err := parseOutputInputRefs(outputInputPairs)
-	if err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	if err := validateOutputInputRefCollisions(inputs, outputRefs); err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	format, err := resolveOutputFormat(outputFlag, config)
-	if err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	if err := config.Validate(); err != nil {
-		return usage(ports.Err, err.Error())
-	}
-	if err := (api.TaskReadRequest{TaskID: taskID}).Validate(); err != nil {
-		return usage(ports.Err, publicMessage(err))
-	}
-	if ports.Client == nil {
-		return failure(ports.Err, fmt.Errorf("no public client is configured"))
-	}
-
-	projectID := resolveProject(projectFlag, config, deps)
-	pipelineTarget, resolvedByName, resolveErr := resolveTaskPipelineTarget(ctx, ports, projectID, strings.TrimSpace(pipelineFlag))
-	if resolveErr != nil {
-		return failure(ports.Err, resolveErr)
-	}
-
-	var readView api.TaskReadResult
-	if expectedVer == nil || len(outputRefs) > 0 {
-		_, fetched, readErr := fetchTaskRead(ctx, ports, taskID)
-		if readErr != nil {
-			return failure(ports.Err, readErr)
-		}
-		readView = fetched
-		if expectedVer == nil && readView.LifecycleVersion > 0 {
-			v := readView.LifecycleVersion
-			expectedVer = &v
-		}
-	}
-	if len(outputRefs) > 0 {
-		resolvedInputs, refErr := resolveInputsFromLatestSucceeded(ctx, ports, taskID, readView, outputRefs, inputs)
-		if refErr != nil {
-			return failure(ports.Err, refErr)
-		}
-		inputs = resolvedInputs
-	}
-
-	buildInvocation := func(pipelineID string) (api.Invocation, int) {
-		req := api.TaskStartRequest{
-			TaskID:        taskID,
-			PipelineID:    pipelineID,
-			Inputs:        inputs,
-			CompletesTask: completesTask,
-		}
-		if err := req.Validate(); err != nil {
-			return api.Invocation{}, usage(ports.Err, publicMessage(err))
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return api.Invocation{}, failure(ports.Err, err)
-		}
-		key, err := makeIdempotencyKey(idempotencyKeyFlag, "task.start", deps.Login.Random)
-		if err != nil {
-			return api.Invocation{}, failure(ports.Err, err)
-		}
-		invocation := api.Invocation{
-			Operation: "task.start",
-			Request: api.Request{
-				Input:           input,
-				ExpectedVersion: expectedVer,
-				IdempotencyKey:  key,
-			},
-		}
-		if err := invocation.Validate(); err != nil {
-			return api.Invocation{}, usage(ports.Err, publicMessage(err))
-		}
-		return invocation, ExitSuccess
-	}
-
-	invocation, status := buildInvocation(pipelineTarget)
-	if status != ExitSuccess {
-		return status
-	}
-	result, err := ports.Client.Invoke(ctx, invocation)
-	if err != nil && pipelineTarget != "" && !resolvedByName && projectID != "" && isNotFoundError(err) {
-		if resolved, found, lookupErr := resolvePipelineIDByName(ctx, ports, projectID, pipelineTarget); lookupErr == nil && found && resolved != pipelineTarget {
-			retryInv, retryStatus := buildInvocation(resolved)
-			if retryStatus != ExitSuccess {
-				return retryStatus
-			}
-			result, err = ports.Client.Invoke(ctx, retryInv)
-		}
-	}
-	if err != nil {
-		return failure(ports.Err, err)
-	}
-	if format == OutputJSON {
-		if err := renderResult(ports.Out, OutputJSON, result); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
-	}
-	var started api.TaskStartResult
-	if err := json.Unmarshal(result.Body, &started); err != nil || started.ExecutionID == "" {
-		fmt.Fprintf(ports.Out, "started task %s\n", taskID)
-		return ExitSuccess
-	}
-	fmt.Fprintf(ports.Out, "task_id\t%s\nexecution_id\t%s\nlifecycle_version\t%d\n",
-		taskID, started.ExecutionID, started.LifecycleVersion)
-	return ExitSuccess
-}
-
-func runTaskRestart(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
-	if hasHelpFlag(args) {
-		return runHelp(ports.Out, ports.Err, []string{"task", "restart"})
+		return runHelp(ports.Out, ports.Err, []string{"task", subcmd})
 	}
 	var (
 		reasonFlag         string
@@ -481,7 +329,9 @@ func runTaskRestart(ctx context.Context, config Config, args []string, ports Por
 		idempotencyKeyFlag string
 	)
 	spec := newArgSpec()
-	spec.stringFlag(&reasonFlag, "--reason")
+	if restart {
+		spec.stringFlag(&reasonFlag, "--reason")
+	}
 	spec.stringFlag(&projectFlag, "--project", "-p")
 	spec.stringFlag(&pipelineFlag, "--pipeline")
 	spec.listFlag(&inputPairs, "--input")
@@ -496,7 +346,7 @@ func runTaskRestart(ctx context.Context, config Config, args []string, ports Por
 		return usage(ports.Err, err.Error())
 	}
 	if len(positionals) != 1 || strings.TrimSpace(positionals[0]) == "" {
-		return usage(ports.Err, "task restart requires <task-id>")
+		return usage(ports.Err, fmt.Sprintf("task %s requires <task-id>", subcmd))
 	}
 	completesTask, err := resolveCompletesTaskFlag(seen, completesTaskFlag, noCompleteFlag)
 	if err != nil {
@@ -559,26 +409,43 @@ func runTaskRestart(ctx context.Context, config Config, args []string, ports Por
 	}
 
 	buildInvocation := func(pipelineID string) (api.Invocation, int) {
-		req := api.TaskRestartRequest{
-			TaskID:        taskID,
-			Reason:        reasonFlag,
-			PipelineID:    pipelineID,
-			Inputs:        inputs,
-			CompletesTask: completesTask,
+		var (
+			input []byte
+			err   error
+		)
+		if restart {
+			req := api.TaskRestartRequest{
+				TaskID:        taskID,
+				Reason:        reasonFlag,
+				PipelineID:    pipelineID,
+				Inputs:        inputs,
+				CompletesTask: completesTask,
+			}
+			if err := req.Validate(); err != nil {
+				return api.Invocation{}, usage(ports.Err, publicMessage(err))
+			}
+			input, err = json.Marshal(req)
+		} else {
+			req := api.TaskStartRequest{
+				TaskID:        taskID,
+				PipelineID:    pipelineID,
+				Inputs:        inputs,
+				CompletesTask: completesTask,
+			}
+			if err := req.Validate(); err != nil {
+				return api.Invocation{}, usage(ports.Err, publicMessage(err))
+			}
+			input, err = json.Marshal(req)
 		}
-		if err := req.Validate(); err != nil {
-			return api.Invocation{}, usage(ports.Err, publicMessage(err))
-		}
-		input, err := json.Marshal(req)
 		if err != nil {
 			return api.Invocation{}, failure(ports.Err, err)
 		}
-		key, err := makeIdempotencyKey(idempotencyKeyFlag, "task.restart", deps.Login.Random)
+		key, err := makeIdempotencyKey(idempotencyKeyFlag, operation, deps.Login.Random)
 		if err != nil {
 			return api.Invocation{}, failure(ports.Err, err)
 		}
 		invocation := api.Invocation{
-			Operation: "task.restart",
+			Operation: operation,
 			Request: api.Request{
 				Input:           input,
 				ExpectedVersion: expectedVer,
@@ -614,16 +481,26 @@ func runTaskRestart(ctx context.Context, config Config, args []string, ports Por
 		}
 		return ExitSuccess
 	}
-	var restarted api.TaskRestartResult
-	if err := json.Unmarshal(result.Body, &restarted); err != nil || restarted.ExecutionID == "" {
-		fmt.Fprintf(ports.Out, "restarted task %s\n", taskID)
+	if restart {
+		var restarted api.TaskRestartResult
+		if err := json.Unmarshal(result.Body, &restarted); err != nil || restarted.ExecutionID == "" {
+			fmt.Fprintf(ports.Out, "restarted task %s\n", taskID)
+			return ExitSuccess
+		}
+		fmt.Fprintf(ports.Out, "task_id\t%s\nexecution_id\t%s\n", taskID, restarted.ExecutionID)
+		if restarted.SupersededExecution != "" {
+			fmt.Fprintf(ports.Out, "superseded_execution\t%s\n", restarted.SupersededExecution)
+		}
+		fmt.Fprintf(ports.Out, "lifecycle_version\t%d\n", restarted.LifecycleVersion)
 		return ExitSuccess
 	}
-	fmt.Fprintf(ports.Out, "task_id\t%s\nexecution_id\t%s\n", taskID, restarted.ExecutionID)
-	if restarted.SupersededExecution != "" {
-		fmt.Fprintf(ports.Out, "superseded_execution\t%s\n", restarted.SupersededExecution)
+	var started api.TaskStartResult
+	if err := json.Unmarshal(result.Body, &started); err != nil || started.ExecutionID == "" {
+		fmt.Fprintf(ports.Out, "started task %s\n", taskID)
+		return ExitSuccess
 	}
-	fmt.Fprintf(ports.Out, "lifecycle_version\t%d\n", restarted.LifecycleVersion)
+	fmt.Fprintf(ports.Out, "task_id\t%s\nexecution_id\t%s\nlifecycle_version\t%d\n",
+		taskID, started.ExecutionID, started.LifecycleVersion)
 	return ExitSuccess
 }
 
@@ -806,11 +683,7 @@ func runTaskAsk(ctx context.Context, config Config, args []string, ports Ports, 
 		taskID = strings.TrimSpace(positionals[0])
 	}
 	if taskID == "" {
-		getenv := deps.Login.Environment
-		if getenv == nil {
-			getenv = os.Getenv
-		}
-		taskID = strings.TrimSpace(getenv("KODEMA_TASK"))
+		taskID = strings.TrimSpace(resolveEnv(deps)("KODEMA_TASK"))
 	}
 	if taskID == "" {
 		return usage(ports.Err, "task ask requires <task-id> or KODEMA_TASK")
@@ -1260,47 +1133,42 @@ func runTaskList(ctx context.Context, config Config, args []string, ports Ports,
 	if err := req.Validate(); err != nil {
 		return usage(ports.Err, publicMessage(err))
 	}
-	tasks := []api.TaskSummaryView{}
-	for {
-		input, err := json.Marshal(req)
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		invocation := api.Invocation{
-			Operation: "task.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return usage(ports.Err, publicMessage(err))
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		var page api.TaskListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return failure(ports.Err, fmt.Errorf("invalid task.list response: %w", err))
+	tasks, firstBody, pages, err := fetchAllPages(ctx, ports, "task.list",
+		func(cursor string) any {
+			pageReq := req
+			if cursor != "" {
+				pageReq.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		tasks = append(tasks, page.Tasks...)
-		if page.NextCursor == "" {
-			break
-		}
-		req.Page = &api.Page{Cursor: page.NextCursor}
-	}
-	body, err := json.Marshal(api.TaskListResult{Tasks: tasks})
+			return pageReq
+		},
+		func(page api.TaskListResult) ([]api.TaskSummaryView, string) {
+			return page.Tasks, page.NextCursor
+		},
+	)
 	if err != nil {
 		return failure(ports.Err, err)
 	}
-	result := api.Result{Operation: "task.list", Body: body}
+	if tasks == nil {
+		tasks = []api.TaskSummaryView{}
+	}
 	if format == OutputJSON {
-		if err := renderResult(ports.Out, OutputJSON, result); err != nil {
+		body, err := json.Marshal(api.TaskListResult{Tasks: tasks})
+		if err != nil {
+			return failure(ports.Err, err)
+		}
+		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "task.list", Body: body}); err != nil {
 			return failure(ports.Err, err)
 		}
 		return ExitSuccess
 	}
-	return renderTaskListTable(ports, result)
+	body := firstBody
+	if pages != 1 {
+		body, err = json.Marshal(api.TaskListResult{Tasks: tasks})
+		if err != nil {
+			return failure(ports.Err, err)
+		}
+	}
+	return renderTaskListTable(ports, api.Result{Operation: "task.list", Body: body})
 }
 
 func renderTaskListTable(ports Ports, result api.Result) int {

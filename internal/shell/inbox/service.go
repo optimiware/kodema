@@ -88,7 +88,7 @@ func (service *Service) Query(ctx context.Context, command QueryCommand) (Page, 
 	if command.Limit < 0 || command.Limit > MaxPageSize {
 		return Page{}, fault.New(fault.InvalidInput, fmt.Sprintf("inbox limit %d is outside 0..%d", command.Limit, MaxPageSize))
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return Page{}, fault.New(fault.Forbidden, "actor scope does not match command scope")
 	}
 	const operation authorize.OperationName = "task.inbox"
@@ -145,11 +145,4 @@ func (service *Service) Query(ctx context.Context, command QueryCommand) (Page, 
 		Cursor:    command.Cursor,
 		Limit:     command.Limit,
 	})
-}
-
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
-	}
-	return owner.ProjectID == "" || owner.ProjectID == target.ProjectID
 }

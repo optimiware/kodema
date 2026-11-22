@@ -31,6 +31,7 @@ import (
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 const (
@@ -128,7 +129,7 @@ func (a *Adapter) removeWorkspaceRetention(ctx context.Context, workspace id.Wor
 // foreign volume is unavailable evidence and is never recreated.
 func (a *Adapter) Status(ctx context.Context, workspace id.WorkspaceID) (engine.WorkspaceObservation, error) {
 	observation := engine.WorkspaceObservation{WorkspaceID: workspace}
-	if err := validateWorkspaceID(workspace); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspace); err != nil {
 		observation.Detail = "workspace status request workspace is invalid"
 		return observation, err
 	}
@@ -137,9 +138,8 @@ func (a *Adapter) Status(ctx context.Context, workspace id.WorkspaceID) (engine.
 		return observation, fault.Wrap(fault.DependencyUnavailable, "workspace status cancelled before any effect", err)
 	}
 
-	lock := a.lockForWorkspace(workspace)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := a.lockForWorkspace(workspace)
+	defer unlock()
 
 	volumeName, err := WorkspaceVolumeName(workspace)
 	if err != nil {
@@ -171,16 +171,15 @@ func (a *Adapter) Status(ctx context.Context, workspace id.WorkspaceID) (engine.
 // Retain durably records workspace ownership. It is idempotent and never
 // creates a missing volume: a missing or foreign volume is a failure.
 func (a *Adapter) Retain(ctx context.Context, workspace id.WorkspaceID) error {
-	if err := validateWorkspaceID(workspace); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspace); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return fault.Wrap(fault.DependencyUnavailable, "workspace retention cancelled before any effect", err)
 	}
 
-	lock := a.lockForWorkspace(workspace)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := a.lockForWorkspace(workspace)
+	defer unlock()
 
 	volumeName, err := WorkspaceVolumeName(workspace)
 	if err != nil {
@@ -215,16 +214,15 @@ func (a *Adapter) Retain(ctx context.Context, workspace id.WorkspaceID) error {
 // the marker; an uncertain or partial removal is surfaced as an error and
 // leaves the marker and volume observable so a retry completes.
 func (a *Adapter) Release(ctx context.Context, workspace id.WorkspaceID) error {
-	if err := validateWorkspaceID(workspace); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspace); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return fault.Wrap(fault.DependencyUnavailable, "workspace release cancelled before any effect", err)
 	}
 
-	lock := a.lockForWorkspace(workspace)
-	lock.Lock()
-	defer lock.Unlock()
+	unlock := a.lockForWorkspace(workspace)
+	defer unlock()
 
 	volumeName, err := WorkspaceVolumeName(workspace)
 	if err != nil {

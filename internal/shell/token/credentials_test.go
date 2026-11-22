@@ -242,6 +242,7 @@ func TestCredentialAdminIssueCommitsCompleteUnit(t *testing.T) {
 		!credentialReadHeld(unit.Authority, "service.credential.issue", authorize.CheckServiceEnabled) {
 		t.Fatalf("authority reads = %+v; want membership and service_enabled", unit.Authority)
 	}
+	requireServiceEnabledTarget(t, unit.Authority, "service.credential.issue", string(fixture.env.serviceID))
 	if len(unit.PostCommit) != 0 {
 		t.Fatalf("service credential post-commit = %+v; want none (never mounted)", unit.PostCommit)
 	}
@@ -266,6 +267,19 @@ func credentialReadHeld(reads []authorize.AuthorityRead, operation authorize.Ope
 		}
 	}
 	return false
+}
+
+func requireServiceEnabledTarget(t *testing.T, reads []authorize.AuthorityRead, operation authorize.OperationName, wantTarget string) {
+	t.Helper()
+	for _, read := range reads {
+		if read.Operation == operation && read.Check == authorize.CheckServiceEnabled {
+			if read.TargetID != wantTarget {
+				t.Fatalf("%s service_enabled TargetID = %q; want %q", operation, read.TargetID, wantTarget)
+			}
+			return
+		}
+	}
+	t.Fatalf("authority reads %+v missing %s service_enabled check", reads, operation)
 }
 
 func TestCredentialAdminRefusesWithoutMutation(t *testing.T) {
@@ -462,6 +476,7 @@ func TestCredentialAdminRotateReplayHasNoToken(t *testing.T) {
 	if port.commits != 1 || port.replays != 1 {
 		t.Fatalf("commits/replays = %d/%d; want 1/1", port.commits, port.replays)
 	}
+	requireServiceEnabledTarget(t, port.units[0].Authority, "service.credential.rotate", string(fixture.env.serviceID))
 
 	changed := command
 	changed.Content = receipt.Content{MediaType: "application/json", Bytes: []byte(`{"ttl":"2h"}`)}
@@ -499,6 +514,7 @@ func TestCredentialAdminRevokeClearsWithoutSecret(t *testing.T) {
 	if len(unit.Events) != 1 || unit.Events[0].Type != event.TypeServiceChanged || unit.Events[0].SubjectVersion != 4 {
 		t.Fatalf("event = %+v; want service.changed v4", unit.Events)
 	}
+	requireServiceEnabledTarget(t, unit.Authority, "service.credential.revoke", string(fixture.env.serviceID))
 	if len(fixture.env.invalidator.invalidations) != 1 {
 		t.Fatalf("invalidations = %+v; want one revoked invalidation", fixture.env.invalidator.invalidations)
 	}

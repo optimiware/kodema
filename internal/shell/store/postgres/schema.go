@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/store"
 )
 
@@ -60,50 +59,8 @@ func buildSchemaIndex() schemaIndex {
 		meta.hasVersion = meta.hasColumn("version")
 		index.tables[table.Name] = meta
 	}
-	index.writeRanks = buildWriteRanks(design, index.lockOrder)
+	index.writeRanks = store.WriteRanks(design)
 	return index
-}
-
-// buildWriteRanks orders the tables a commit unit writes. Tables named by the
-// declared lock order keep that order. The declared order names every table an
-// atomic commit unit writes; the remaining schema tables (resources, secrets)
-// are written by neighbouring units and are placed immediately before the first
-// lock-ordered table that references them, so an ownership parent always
-// precedes its child inside one transaction. A table nothing references is
-// written last.
-func buildWriteRanks(design store.Schema, lockOrder map[string]int) map[string]float64 {
-	ranks := make(map[string]float64, len(design.Tables))
-	for _, table := range design.Tables {
-		if position, ok := lockOrder[table.Name]; ok {
-			ranks[table.Name] = float64(position)
-		}
-	}
-	for _, table := range design.Tables {
-		if _, ok := ranks[table.Name]; ok {
-			continue
-		}
-		first := -1
-		for _, candidate := range design.Tables {
-			for _, key := range candidate.ForeignKeys {
-				if key.References != table.Name {
-					continue
-				}
-				position, ok := lockOrder[candidate.Name]
-				if !ok {
-					continue
-				}
-				if first < 0 || position < first {
-					first = position
-				}
-			}
-		}
-		if first < 0 {
-			ranks[table.Name] = float64(len(lockOrder)) + 0.5
-			continue
-		}
-		ranks[table.Name] = float64(first) - 0.5
-	}
-	return ranks
 }
 
 // lookupTable returns the indexed metadata for one declared schema table.
@@ -116,29 +73,6 @@ func lookupTable(name string) (*tableMeta, bool) {
 // commit unit. Every declared table has a rank.
 func writeRank(name string) float64 {
 	return schema.writeRanks[name]
-}
-
-// validIdentity reports whether value is a bounded ASCII identity payload, the
-// same rule the neutral id package applies to every typed identity.
-func validIdentity(value string) bool {
-	if value == "" || len(value) > id.MaxIDLength {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for position := 0; position < len(value); position++ {
-		character := value[position]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // faultInvalid builds the invalid_input class.

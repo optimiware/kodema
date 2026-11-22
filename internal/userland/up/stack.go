@@ -634,8 +634,9 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 		}
 		_ = writeFileAtomic(filepath.Join(stateDir, "gateway.pid"), []byte(strconv.Itoa(pid)+"\n"), 0o600)
 		// bootstrap-admin reads /auth/jwks.json from the gateway just spawned.
-		for i := 0; i < 50 && !probeReadyz(ctx, publicURL+"/auth/healthz", tlsBundle.CACertPath); i++ {
-			time.Sleep(100 * time.Millisecond)
+		gatewayLogPath := filepath.Join(stateDir, "gateway.log")
+		if readyErr := waitGatewayReady(ctx, pid, publicURL+"/auth/healthz", tlsBundle.CACertPath, gatewayLogPath, 50, 100*time.Millisecond, probeReadyz); readyErr != nil {
+			return StackDescriptor{}, readyErr
 		}
 	}
 
@@ -1265,6 +1266,38 @@ func loadStackDescriptor(stateDir string) (StackDescriptor, error) {
 	return desc, nil
 }
 
+func waitGatewayReady(
+	ctx context.Context,
+	pid int,
+	readyURL, caPath, logPath string,
+	attempts int,
+	interval time.Duration,
+	probe func(context.Context, string, string) bool,
+) error {
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if probe(ctx, readyURL, caPath) {
+			return nil
+		}
+		if pid > 0 && !processAlive(pid) {
+			return fmt.Errorf("gateway process %d exited before becoming ready (see %s)", pid, logPath)
+		}
+		if i+1 == attempts {
+			break
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf("gateway did not become ready at %s (see %s)", readyURL, logPath)
+}
+
 func defaultSpawnGatewayDaemon(stateDir string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -1281,15 +1314,29 @@ func defaultSpawnGatewayDaemon(stateDir string) (int, error) {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
+	return spawnDetachedDaemon(cmd)
+}
+
+// spawnDetachedDaemon starts cmd in its own session and reaps it in a
+// background goroutine rather than calling Process.Release, so an early crash
+// does not linger as a zombie that processAlive (kill(pid, 0)) would mistake
+// for a running daemon. When the parent process exits normally after the
+// daemon becomes ready, the detached child continues under init/subreaper.
+func spawnDetachedDaemon(cmd *exec.Cmd) (int, error) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return 0, err
 	}
 	pid := cmd.Process.Pid
-	_ = cmd.Process.Release()
+	go func() { _ = cmd.Wait() }()
 	return pid, nil
 }
 
 func stopExistingGateway(stateDir string) {
+	stopExistingGatewayWithGrace(stateDir, 3*time.Second)
+}
+
+func stopExistingGatewayWithGrace(stateDir string, grace time.Duration) {
 	pidPath := filepath.Join(stateDir, "gateway.pid")
 	pid := readPIDFile(pidPath)
 	if pid <= 0 {
@@ -1299,9 +1346,12 @@ func stopExistingGateway(stateDir string) {
 	}
 	if pid > 0 && pid != os.Getpid() && processAlive(pid) && gatewayProcess(pid) {
 		_ = syscall.Kill(pid, syscall.SIGTERM)
-		deadline := time.Now().Add(3 * time.Second)
+		deadline := time.Now().Add(grace)
 		for processAlive(pid) && time.Now().Before(deadline) {
 			time.Sleep(50 * time.Millisecond)
+		}
+		if processAlive(pid) && gatewayProcessConfirmed(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
 	_ = os.Remove(pidPath)
@@ -1309,10 +1359,18 @@ func stopExistingGateway(stateDir string) {
 
 // gatewayProcess reports whether pid runs `kodema up --gateway-only`: after a
 // reboot the recorded PID may belong to another process. When ps cannot tell,
-// the PID is trusted.
+// the PID is trusted for SIGTERM.
 func gatewayProcess(pid int) bool {
 	out, err := exec.Command("ps", "-ww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	return err != nil || strings.Contains(string(out), "--gateway-only")
+}
+
+// gatewayProcessConfirmed requires positive identification from ps before
+// escalating to SIGKILL so a reused PID is never unconditionally killed when
+// ps is unavailable or fails.
+func gatewayProcessConfirmed(pid int) bool {
+	out, err := exec.Command("ps", "-ww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	return err == nil && strings.Contains(string(out), "--gateway-only")
 }
 
 func readPIDFile(path string) int {

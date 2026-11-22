@@ -20,6 +20,7 @@ import (
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/kernel/script"
 	"github.com/optimiware/kodema/internal/shell/pipeline"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -53,18 +54,18 @@ func validateToolbox(image, gitURL string) error {
 
 // activationConfigMapName returns the stable activation snapshot name.
 func activationConfigMapName(workload id.WorkloadID) string {
-	return "kodema-activation-" + stableDigest(string(workload))
+	return "kodema-activation-" + adapterutil.StableDigest(string(workload))
 }
 
 // credentialSecretName returns the stable credential Secret name.
 func credentialSecretName(workload id.WorkloadID) string {
-	return "kodema-credential-" + stableDigest(string(workload))
+	return "kodema-credential-" + adapterutil.StableDigest(string(workload))
 }
 
 // workloadJobName returns the stable Job name. A retry must find exactly this
 // Job, never a generated replacement.
 func workloadJobName(workload id.WorkloadID) string {
-	return "kodema-job-" + stableDigest(string(workload))
+	return "kodema-job-" + adapterutil.StableDigest(string(workload))
 }
 
 // labels returns the pinned tenant/execution/action/workload/workspace labels
@@ -138,89 +139,12 @@ func workloadRole(request engine.PrepareRequest) string {
 	return ""
 }
 
-// buildMaterialization validates and builds the complete all-or-nothing
-// activation snapshot. Validation happens before any cluster call so a partial
-// or unsafe snapshot never reaches the API.
-func buildMaterialization(request engine.PrepareRequest) (workspace.Materialization, error) {
-	if _, err := id.ParseWorkspaceID(string(request.WorkspaceID)); err != nil {
-		return workspace.Materialization{}, fault.Wrap(fault.InvalidInput, "preparation workspace id is invalid", err)
-	}
-	files := make([]workspace.File, 0, len(request.Inputs)+len(request.Outputs)+len(request.TaskFiles)+1)
-
-	inputKeys := make([]string, 0, len(request.Inputs))
-	for key := range request.Inputs {
-		inputKeys = append(inputKeys, string(key))
-	}
-	sort.Strings(inputKeys)
-	for _, raw := range inputKeys {
-		path, err := workspace.InputPath(id.InputKey(raw))
-		if err != nil {
-			return workspace.Materialization{}, err
-		}
-		files = append(files, workspace.File{Path: path, Data: []byte(request.Inputs[id.InputKey(raw)]), Mode: readOnlyMode})
-	}
-
-	actionNames := make([]string, 0, len(request.Outputs))
-	for action := range request.Outputs {
-		actionNames = append(actionNames, string(action))
-	}
-	sort.Strings(actionNames)
-	for _, rawAction := range actionNames {
-		action := id.ActionName(rawAction)
-		outputs := request.Outputs[action]
-		outputKeys := make([]string, 0, len(outputs))
-		for key := range outputs {
-			outputKeys = append(outputKeys, string(key))
-		}
-		sort.Strings(outputKeys)
-		for _, rawKey := range outputKeys {
-			path, err := workspace.OutputPath(action, id.OutputKey(rawKey))
-			if err != nil {
-				return workspace.Materialization{}, err
-			}
-			files = append(files, workspace.File{Path: path, Data: []byte(outputs[id.OutputKey(rawKey)]), Mode: readOnlyMode})
-		}
-	}
-
-	if request.Task != nil {
-		files = append(files, workspace.File{Path: workspace.TaskPath, Data: append([]byte(nil), request.Task...), Mode: readOnlyMode})
-	}
-	taskFiles, err := workspace.TaskMaterializationFiles(request.TaskFiles, readOnlyMode)
-	if err != nil {
-		return workspace.Materialization{}, err
-	}
-	files = append(files, taskFiles...)
-
-	secrets := make([]engine.SecretValue, len(request.Secrets))
-	for index, secret := range request.Secrets {
-		if _, err := workspace.SecretPath(secret.Name); err != nil {
-			return workspace.Materialization{}, err
-		}
-		secrets[index] = engine.SecretValue{Name: secret.Name, Value: secret.Value}
-	}
-
-	materialization := workspace.Materialization{
-		WorkspaceID: request.WorkspaceID,
-		Files:       files,
-		Secrets:     secrets,
-		Credential:  request.Credential,
-		Task:        request.Task,
-	}
-	if err := materialization.Validate(); err != nil {
-		return workspace.Materialization{}, err
-	}
-	return materialization, nil
-}
-
 // activationConfigMap builds the immutable activation snapshot.
 func (a *Adapter) activationConfigMap(identity engine.EffectIdentity, workspaceID id.WorkspaceID, materialization workspace.Materialization, digest string) ConfigMap {
 	data := make(map[string][]byte, len(materialization.Files))
-	paths := make([]string, 0, len(materialization.Files))
 	for _, file := range materialization.Files {
 		data[file.Path] = append([]byte(nil), file.Data...)
-		paths = append(paths, file.Path)
 	}
-	sort.Strings(paths)
 	labels := a.labels(identity, workspaceID)
 	labels[LabelPreparation] = digest
 	return ConfigMap{
@@ -565,9 +489,4 @@ func (a *Adapter) jobManifest(prepared preparedWorkload, identity engine.EffectI
 			ImagePullSecrets:             append([]string(nil), a.imagePullSecrets...),
 		},
 	}
-}
-
-// describeIdentity renders a stable, non-secret diagnostic identity.
-func describeIdentity(identity engine.EffectIdentity) string {
-	return fmt.Sprintf("workload %q (execution %q action %q)", identity.WorkloadID, identity.ExecutionID, identity.ActionID)
 }

@@ -125,7 +125,7 @@ func (kms *AWSKMS) assumeRole(ctx context.Context) (*awsRoleCredentials, error) 
 	}
 	// The access key id and the session token become header values and the
 	// secret key signs: anything but printable ASCII is refused here.
-	if !awsPrintableToken(credentials.accessKeyID) || !awsPrintableToken(credentials.secretAccessKey) || !awsPrintableToken(credentials.sessionToken) {
+	if !isPrintableASCIIToken(credentials.accessKeyID) || !isPrintableASCIIToken(credentials.secretAccessKey) || !isPrintableASCIIToken(credentials.sessionToken) {
 		return nil, fault.New(fault.DependencyUnavailable, "aws sts returned no credentials")
 	}
 	credentials.expiration, err = time.Parse(time.RFC3339, strings.TrimSpace(decoded.Credentials.Expiration))
@@ -176,7 +176,7 @@ func (kms *AWSKMS) readWebIdentityToken() (string, error) {
 		return "", fault.New(fault.Unauthenticated, "aws web identity token file (AWS_WEB_IDENTITY_TOKEN_FILE) is empty")
 	case len(token) > awsMaxWebIdentityTokenBytes:
 		return "", fault.New(fault.Unauthenticated, "aws web identity token file (AWS_WEB_IDENTITY_TOKEN_FILE) exceeds the token bound")
-	case !awsPrintableToken(token):
+	case !isPrintableASCIIToken(token):
 		return "", fault.New(fault.Unauthenticated, "aws web identity token file (AWS_WEB_IDENTITY_TOKEN_FILE) does not hold a single token")
 	}
 	return token, nil

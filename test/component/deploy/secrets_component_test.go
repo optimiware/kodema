@@ -281,6 +281,10 @@ if [[ "${SCW_FAIL:-0}" == "1" ]]; then
   echo 'scw: simulated key manager failure' >&2
   exit 1
 fi
+if [[ -n "${SCW_CIPHERTEXT+x}" ]]; then
+  printf '{"ciphertext":"%s"}\n' "$SCW_CIPHERTEXT"
+  exit 0
+fi
 printf '{"ciphertext":"%s"}\n' "$(printf 'wrapped-kek' | base64 | tr -d '\n')"
 exit 0
 `

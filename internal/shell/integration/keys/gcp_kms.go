@@ -6,12 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"hash/crc32"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -31,17 +28,6 @@ const gcpKMSMaxResponse int64 = 64 << 10
 // gcpKMSRequestTimeout bounds one decrypt request as a whole. The caller's
 // context can shorten it further and is always honoured.
 const gcpKMSRequestTimeout = 30 * time.Second
-
-// Explicit Cloud KMS transport defaults. The client owns its transport so
-// neither the process environment nor a caller proxy policy can route a
-// request that carries the bearer token.
-const (
-	gcpKMSDialTimeout           = 10 * time.Second
-	gcpKMSDialKeepAlive         = 30 * time.Second
-	gcpKMSIdleConnTimeout       = 90 * time.Second
-	gcpKMSTLSHandshakeTimeout   = 10 * time.Second
-	gcpKMSExpectContinueTimeout = time.Second
-)
 
 // GCPKMSConfig configures the Cloud KMS client. The client holds no configured
 // credential: it authenticates as the workload identity the GKE metadata
@@ -97,7 +83,7 @@ var _ KMSClient = (*GCPKMS)(nil)
 // NewGCPKMS validates the configuration and returns the client. It makes no
 // request: it contacts neither Cloud KMS nor the metadata server.
 func NewGCPKMS(config GCPKMSConfig) (*GCPKMS, error) {
-	endpoint, err := gcpKMSOrigin(config.KMSEndpoint)
+	endpoint, err := parseHTTPSOrigin(config.KMSEndpoint, gcpKMSEndpoint, "gcp kms endpoint")
 	if err != nil {
 		return nil, err
 	}
@@ -106,18 +92,10 @@ func NewGCPKMS(config GCPKMSConfig) (*GCPKMS, error) {
 		return nil, err
 	}
 
-	client := &http.Client{}
-	if config.HTTPClient != nil {
-		copied := *config.HTTPClient
-		client = &copied
-	}
-	owned, err := gcpKMSOwnedTransport(client.Transport)
+	client, err := newKMSHTTPClient(config.HTTPClient, "gcp kms client", gcpKMSRequestTimeout)
 	if err != nil {
 		return nil, err
 	}
-	client.Transport = owned
-	client.CheckRedirect = gcpRefuseRedirect
-	client.Timeout = gcpKMSRequestTimeout
 
 	return &GCPKMS{endpoint: endpoint, client: client, tokens: tokens}, nil
 }
@@ -223,7 +201,7 @@ func (kms *GCPKMS) decryptOnce(ctx context.Context, endpoint string, body []byte
 		// returned for anything but 200, even when the body is valid.
 		return nil, false, fault.New(fault.DependencyUnavailable, "gcp kms returned an unexpected status")
 	}
-	payload, err := gcpReadResponse(response.Body, gcpKMSMaxResponse, "gcp kms")
+	payload, err := readBoundedResponse(response.Body, gcpKMSMaxResponse, "gcp kms")
 	if err != nil {
 		// See the entry comment of Decrypt: a body read interrupted by
 		// cancellation is cancellation, not an unavailable dependency.
@@ -260,105 +238,4 @@ func (kms *GCPKMS) decryptOnce(ctx context.Context, endpoint string, body []byte
 // integrity fields.
 func gcpCRC32C(data []byte) uint32 {
 	return crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
-}
-
-// gcpKMSOrigin validates the Cloud KMS origin. The client never downgrades to
-// cleartext, never carries an embedded credential, query or fragment, and
-// trims only a trailing path separator.
-func gcpKMSOrigin(value string) (string, error) {
-	origin := strings.TrimRight(value, "/")
-	if origin == "" {
-		origin = gcpKMSEndpoint
-	}
-	parsed, err := gcpParseOrigin(origin, "gcp kms endpoint")
-	if err != nil {
-		return "", err
-	}
-	if parsed.Scheme != "https" || parsed.Host == "" {
-		return "", fault.New(fault.InvalidInput, "gcp kms endpoint must be an explicit https URL")
-	}
-	return origin, nil
-}
-
-// gcpParseOrigin applies the refusals the Cloud KMS and metadata origins
-// share: whitespace, an unparsable URL, userinfo, a query and a fragment.
-// subject names the origin in the refusal; the value itself is never rendered.
-func gcpParseOrigin(origin, subject string) (*url.URL, error) {
-	if strings.ContainsAny(origin, " \t\r\n") {
-		return nil, fault.New(fault.InvalidInput, subject+" contains whitespace")
-	}
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return nil, fault.New(fault.InvalidInput, subject+" is not a valid URL")
-	}
-	if parsed.User != nil {
-		return nil, fault.New(fault.InvalidInput, subject+" must not carry userinfo")
-	}
-	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
-		return nil, fault.New(fault.InvalidInput, subject+" must not carry a query or fragment")
-	}
-	return parsed, nil
-}
-
-// gcpKMSOwnedTransport returns the private transport New installs for the
-// Cloud KMS calls. A nil transport gets explicit defaults with no proxy
-// function; a caller-supplied *http.Transport is cloned so its explicit TLS,
-// dial and HTTP/2 settings are preserved and its proxy is cleared. An opaque
-// RoundTripper, a typed nil and the shared http.DefaultTransport are refused
-// rather than silently trusted.
-func gcpKMSOwnedTransport(transport http.RoundTripper) (*http.Transport, error) {
-	if transport == nil {
-		return newGCPKMSTransport(), nil
-	}
-	caller, ok := transport.(*http.Transport)
-	if !ok {
-		return nil, fault.New(fault.InvalidInput, "gcp kms client must use an explicit HTTP transport")
-	}
-	if caller == nil {
-		return nil, fault.New(fault.InvalidInput, "gcp kms client supplies a nil HTTP transport")
-	}
-	if http.DefaultTransport != nil && caller == http.DefaultTransport {
-		return nil, fault.New(fault.InvalidInput, "gcp kms client must not use the shared default HTTP transport")
-	}
-	owned := caller.Clone()
-	owned.Proxy = nil
-	return owned, nil
-}
-
-// newGCPKMSTransport builds the client-owned transport with explicit defaults
-// and no proxy function. TLS verification stays at the system default; it
-// deliberately does not clone a process-wide transport.
-func newGCPKMSTransport() *http.Transport {
-	return &http.Transport{
-		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout:   gcpKMSDialTimeout,
-			KeepAlive: gcpKMSDialKeepAlive,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		IdleConnTimeout:       gcpKMSIdleConnTimeout,
-		TLSHandshakeTimeout:   gcpKMSTLSHandshakeTimeout,
-		ExpectContinueTimeout: gcpKMSExpectContinueTimeout,
-	}
-}
-
-// gcpRefuseRedirect is the redirect policy of both clients: a redirect is
-// returned as the response it is, so neither the bearer token nor the token
-// request is ever replayed to another location.
-func gcpRefuseRedirect(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
-}
-
-// gcpReadResponse reads at most one byte over bound so an oversized body is
-// refused instead of truncated into a parse failure. subject names the
-// responder in the fault.
-func gcpReadResponse(body io.Reader, bound int64, subject string) ([]byte, error) {
-	payload, err := io.ReadAll(io.LimitReader(body, bound+1))
-	if err != nil {
-		return nil, fault.Wrap(fault.DependencyUnavailable, subject+" response could not be read", err)
-	}
-	if int64(len(payload)) > bound {
-		return nil, fault.New(fault.DependencyUnavailable, subject+" response exceeds the configured bound")
-	}
-	return payload, nil
 }

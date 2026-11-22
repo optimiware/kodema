@@ -589,18 +589,35 @@ func (proxy *Proxy) mapTransportError(err error) (string, error) {
 }
 
 // redact removes every resolved credential value from the returned content. A
-// value is replaced both raw and in its JSON-escaped form.
+// value is replaced both raw and in its JSON-escaped form, longest first so a
+// shorter secret cannot partially mask a longer one.
 func redact(content json.RawMessage, resolved []secret.Resolved) json.RawMessage {
 	redacted := append(json.RawMessage(nil), content...)
+	if len(redacted) == 0 || len(resolved) == 0 {
+		return redacted
+	}
+	patterns := make([][]byte, 0, len(resolved)*2)
 	for _, value := range resolved {
 		if value.Value == "" {
 			continue
 		}
-		redacted = bytes.ReplaceAll(redacted, []byte(value.Value), []byte(redactionMarker))
+		raw := []byte(value.Value)
+		patterns = append(patterns, raw)
 		if escaped, err := json.Marshal(value.Value); err == nil {
 			form := escaped[1 : len(escaped)-1]
-			redacted = bytes.ReplaceAll(redacted, form, []byte(redactionMarker))
+			if len(form) > 0 && !bytes.Equal(form, raw) {
+				patterns = append(patterns, form)
+			}
 		}
+	}
+	slices.SortFunc(patterns, func(a, b []byte) int {
+		if len(a) != len(b) {
+			return len(b) - len(a)
+		}
+		return bytes.Compare(a, b)
+	})
+	for _, pattern := range patterns {
+		redacted = bytes.ReplaceAll(redacted, pattern, []byte(redactionMarker))
 	}
 	return redacted
 }

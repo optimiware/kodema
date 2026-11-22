@@ -1074,3 +1074,42 @@ func TestResolverTenantScopedHumanProjectMembershipFallback(t *testing.T) {
 		}
 	})
 }
+
+// TestResolverHumanBearerStoreOutageIsUnavailable proves resolveBearer maps
+// principal-store outages (DependencyUnavailable / InternalFailure) to
+// DependencyUnavailable instead of masking them as Unauthenticated when
+// resolving a project-scoped human bearer token.
+func TestResolverHumanBearerStoreOutageIsUnavailable(t *testing.T) {
+	jwt := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJodW1hbi0xIn0.sig"
+	cases := []struct {
+		name string
+		err  error
+		want fault.Class
+	}{
+		{"dependency unavailable", fault.New(fault.DependencyUnavailable, "postgres connection refused"), fault.DependencyUnavailable},
+		{"deadline expired", fault.New(fault.DeadlineExpired, "postgres statement timeout"), fault.DependencyUnavailable},
+		{"version conflict", fault.New(fault.VersionConflict, "serialization failure"), fault.DependencyUnavailable},
+		{"raw context deadline exceeded", context.DeadlineExceeded, fault.DependencyUnavailable},
+		{"internal failure", fault.New(fault.InternalFailure, "corrupt membership row"), fault.DependencyUnavailable},
+		{"not found stays unauthenticated", fault.New(fault.NotFound, "principal missing"), fault.Unauthenticated},
+		{"forbidden stays unauthenticated", fault.New(fault.Forbidden, "ambiguous principal"), fault.Unauthenticated},
+		{"invalid input stays unauthenticated", fault.New(fault.InvalidInput, "bad scope"), fault.Unauthenticated},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newResolverEnv(t)
+			env.oidc.principal = identity.Principal{
+				ID:      id.PrincipalID("human-1"),
+				Kind:    identity.KindHuman,
+				Scope:   env.scope, // project-scoped so resolveBearer takes the direct ReadPrincipal path
+				Enabled: true,
+			}
+			env.principals.err = tc.err
+			_, err := env.resolver.Resolve(context.Background(), jwt)
+			requireClass(t, err, tc.want)
+			if strings.Contains(err.Error(), "postgres") || strings.Contains(err.Error(), "corrupt") {
+				t.Fatalf("error %q leaked private store cause", err)
+			}
+		})
+	}
+}

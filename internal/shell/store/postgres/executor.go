@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
@@ -17,15 +18,29 @@ func (s *Store) Execute(ctx context.Context, scope tenancy.Scope, unit store.Uni
 	return ExecuteUnit(ctx, s, scope, unit)
 }
 
-// Read reads one row by identity inside a scoped transaction. The transaction
-// is read-only in effect and is completed with a commit so the transaction-local
+// Read reads one row by identity inside a scoped read-only transaction. Inputs
+// are validated before opening a transaction so malformed reads never touch the
+// pool. The transaction is completed with a commit so the transaction-local
 // scope resets with the transaction; a failed read rolls the transaction back
 // and returns the original cause.
 func (s *Store) Read(ctx context.Context, scope tenancy.Scope, table, id string) (store.Row, error) {
 	if err := ctx.Err(); err != nil {
 		return store.Row{}, err
 	}
-	tx, err := s.Begin(ctx, scope)
+	meta, ok := lookupTable(table)
+	if !ok {
+		return store.Row{}, faultInvalid(fmt.Sprintf("unknown table %q", table))
+	}
+	if err := scope.Validate(); err != nil {
+		return store.Row{}, err
+	}
+	if !store.ValidIdentity(id) {
+		return store.Row{}, faultInvalid(fmt.Sprintf("row id %q is not a valid identity", id))
+	}
+	if _, err := scopedReadQuery(meta, scope, id); err != nil {
+		return store.Row{}, err
+	}
+	tx, err := s.beginRead(ctx, scope)
 	if err != nil {
 		return store.Row{}, err
 	}

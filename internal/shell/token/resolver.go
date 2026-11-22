@@ -203,13 +203,7 @@ func (resolver *Resolver) resolveDerived(
 	}
 	authenticated, err := resolver.credentials.Authenticate(ctx, request)
 	if err != nil {
-		if class, ok := fault.ClassOf(err); ok {
-			switch class {
-			case fault.DependencyUnavailable, fault.UncertainExternalEffect, fault.InternalFailure:
-				return authorize.Principal{}, resolverUnavailable()
-			}
-		}
-		return authorize.Principal{}, resolverRefusal()
+		return authorize.Principal{}, resolverFailure(err)
 	}
 	return authenticatedPrincipal(authenticated, kind, credentialID, candidate, scope)
 }
@@ -335,19 +329,19 @@ func (resolver *Resolver) resolveBearer(ctx context.Context, presented string) (
 		principal.Roles = append([]tenancy.Role(nil), current.Roles...)
 		return principal, nil
 	}
-	current, err := identity.Current(ctx, resolver.principals, identity.PrincipalRequest{
+	current, err := resolver.principals.ReadPrincipal(ctx, identity.PrincipalRequest{
 		Scope:       readScope,
 		PrincipalID: verified.ID,
 	})
 	if err != nil {
 		return authorize.Principal{}, resolverFailure(err)
 	}
-	expected := verified
-	expected.Scope = readScope
-	if err := identity.CheckCurrent(expected, current); err != nil {
+	if err := current.Validate(); err != nil || current.Scope != readScope || current.ID != verified.ID || !current.Enabled {
 		return authorize.Principal{}, resolverRefusal()
 	}
-	if current.Kind != identity.KindHuman {
+	expected := verified
+	expected.Scope = readScope
+	if err := identity.CheckCurrent(expected, current); err != nil || current.Kind != identity.KindHuman {
 		return authorize.Principal{}, resolverRefusal()
 	}
 	principal := current.WithVerifiedExpiry(verified.VerifiedExpiry())
@@ -392,17 +386,18 @@ func (resolver *Resolver) ResolveInScope(ctx context.Context, principal authoriz
 	return narrowed, nil
 }
 
-// resolverFailure maps a dependency error to the fail-closed unavailable class
-// and every authentication-shaped error to the one uniform refusal. The private
-// cause is never rendered.
+// resolverFailure maps authentication-shaped refusals to the one uniform
+// unauthenticated refusal and every other error (including timeouts, conflicts,
+// dependency outages and unclassified errors) to the fail-closed unavailable
+// class. The private cause is never rendered.
 func resolverFailure(err error) error {
 	if class, ok := fault.ClassOf(err); ok {
 		switch class {
-		case fault.DependencyUnavailable, fault.UncertainExternalEffect, fault.InternalFailure:
-			return resolverUnavailable()
+		case fault.NotFound, fault.Forbidden, fault.InvalidInput, fault.Unauthenticated:
+			return resolverRefusal()
 		}
 	}
-	return resolverRefusal()
+	return resolverUnavailable()
 }
 
 // dummyWork spends one HMAC and one constant-time comparison on a lookup miss or

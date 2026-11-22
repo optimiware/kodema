@@ -2856,3 +2856,71 @@ func TestLogCollectionDrainsOnConfirmedExit(t *testing.T) {
 		}
 	})
 }
+
+func TestLogCollectionClearsStopWithholdOnRemoveAndConfirmedExit(t *testing.T) {
+	t.Run("remove clears stopWithheld after withheld stop", func(t *testing.T) {
+		fixture := newLogCollectionFixture(t, nil)
+		fixture.runtime.logsErr = fault.New(fault.DependencyUnavailable, "transient log failure")
+		if _, err := fixture.collector.Stop(context.Background(), fixture.stopRequest()); err == nil {
+			t.Fatal("first Stop succeeded despite checkpoint fault")
+		}
+		fixture.collector.stopMu.Lock()
+		before := len(fixture.collector.stopWithheld)
+		fixture.collector.stopMu.Unlock()
+		if before != 1 {
+			t.Fatalf("stopWithheld entries after withheld Stop = %d; want 1", before)
+		}
+
+		fixture.runtime.logsErr = nil
+		if _, err := fixture.collector.Remove(context.Background(), fixture.removeRequest()); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		fixture.collector.stopMu.Lock()
+		after := len(fixture.collector.stopWithheld)
+		fixture.collector.stopMu.Unlock()
+		if after != 0 {
+			t.Fatalf("stopWithheld entries after Remove = %d; want 0", after)
+		}
+	})
+
+	t.Run("remove clears stopWithheld after withhold budget is spent", func(t *testing.T) {
+		fixture := newLogCollectionFixture(t, nil)
+		fixture.runtime.logsErr = fault.New(fault.DependencyUnavailable, "persistent log failure")
+		if _, err := fixture.collector.Stop(context.Background(), fixture.stopRequest()); err == nil {
+			t.Fatal("first Stop succeeded despite checkpoint fault")
+		}
+		if _, err := fixture.collector.Stop(context.Background(), fixture.stopRequest()); err != nil {
+			t.Fatalf("second Stop did not delegate: %v", err)
+		}
+
+		fixture.runtime.logsErr = nil
+		if _, err := fixture.collector.Remove(context.Background(), fixture.removeRequest()); err != nil {
+			t.Fatalf("Remove: %v", err)
+		}
+		fixture.collector.stopMu.Lock()
+		after := len(fixture.collector.stopWithheld)
+		fixture.collector.stopMu.Unlock()
+		if after != 0 {
+			t.Fatalf("stopWithheld entries after Remove = %d; want 0", after)
+		}
+	})
+
+	t.Run("confirmed exit observe clears stopWithheld", func(t *testing.T) {
+		fixture := newLogCollectionFixture(t, nil)
+		fixture.runtime.logsErr = fault.New(fault.DependencyUnavailable, "transient log failure")
+		if _, err := fixture.collector.Stop(context.Background(), fixture.stopRequest()); err == nil {
+			t.Fatal("first Stop succeeded despite checkpoint fault")
+		}
+		exited := kernel.ExitedObservation(0, kernel.ConfirmedStop("container exited 0"))
+		fixture.runtime.observeResult = &exited
+		if _, err := fixture.collector.Observe(context.Background(), fixture.observeRequest()); err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+		fixture.collector.stopMu.Lock()
+		after := len(fixture.collector.stopWithheld)
+		fixture.collector.stopMu.Unlock()
+		if after != 0 {
+			t.Fatalf("stopWithheld entries after confirmed-exit Observe = %d; want 0", after)
+		}
+	})
+}

@@ -282,28 +282,11 @@ func operationCodecFor(operation string) (OperationCodec, bool) {
 // supplied params. The body may omit a route-derived field; the route value is
 // filled in. A body value that conflicts with the route refuses.
 func DecodeRESTRequest(operation string, raw json.RawMessage, params map[string]string) (any, error) {
-	codec, ok := operationCodecFor(operation)
+	route, ok := LookupRoute(operation)
 	if !ok {
 		return nil, invalid("unknown operation %q", operation)
 	}
-	spec, ok := operationCodecSpecs[operation]
-	if !ok {
-		return nil, invalid("unknown operation %q", operation)
-	}
-	value, err := spec.decodeRequestStrict(raw)
-	if err != nil {
-		return nil, err
-	}
-	bound, err := bindRouteParams(value, codec.RouteParams, params)
-	if err != nil {
-		return nil, err
-	}
-	if validator, ok := bound.(interface{ Validate() error }); ok {
-		if err := validator.Validate(); err != nil {
-			return nil, err
-		}
-	}
-	return bound, nil
+	return DecodeRouteRequest(route, raw, params)
 }
 
 // DecodeRouteRequest decodes one operation input for a concrete REST binding

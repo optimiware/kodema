@@ -18,6 +18,7 @@ import (
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 const retainedValue = "true"
@@ -82,7 +83,7 @@ func (a *Adapter) unownedClaimReason(claim Claim, workspaceID id.WorkspaceID) st
 // recreated or adopted.
 func (a *Adapter) Status(ctx context.Context, workspaceID id.WorkspaceID) (engine.WorkspaceObservation, error) {
 	observation := engine.WorkspaceObservation{WorkspaceID: workspaceID}
-	if err := validateWorkspaceID(workspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
 		return observation, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -123,7 +124,7 @@ func (a *Adapter) Status(ctx context.Context, workspaceID id.WorkspaceID) (engin
 // Retain persists a durable retention marker. It is idempotent and never
 // recreates a missing claim or adopts a foreign one.
 func (a *Adapter) Retain(ctx context.Context, workspaceID id.WorkspaceID) error {
-	if err := validateWorkspaceID(workspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -207,7 +208,7 @@ func (a *Adapter) Retain(ctx context.Context, workspaceID id.WorkspaceID) error 
 // settle instead of exhausting cleanup retries on a workspace Kubernetes is
 // already removing.
 func (a *Adapter) Release(ctx context.Context, workspaceID id.WorkspaceID) error {
-	if err := validateWorkspaceID(workspaceID); err != nil {
+	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -367,8 +368,10 @@ func (a *Adapter) ensureNoWorkspaceReference(ctx context.Context, workspaceID id
 	if err != nil {
 		return fault.Wrap(fault.DependencyUnavailable, "workspace Pod references are unreachable", err)
 	}
-	if !workspaceReleasable(pods) {
-		return fault.New(fault.Forbidden, fmt.Sprintf("workspace is still referenced by %d Pod(s)", len(pods)))
+	for _, pod := range pods {
+		if !podTerminated(pod) {
+			return fault.New(fault.Forbidden, fmt.Sprintf("workspace is still referenced by %d Pod(s)", len(pods)))
+		}
 	}
 	return nil
 }

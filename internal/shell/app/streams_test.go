@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -359,8 +360,17 @@ func TestProductionStartupRefusesStreamConflictAndCleansUp(t *testing.T) {
 	if len(gotStops) != 1 || gotStops[0] != "runtime-driver" {
 		t.Fatalf("runtime-driver stops = %v; want exactly one", gotStops)
 	}
-	if got := config.hooks.stopped; len(got) != 3 || got[0] != "runtime-driver" || got[1] != "live-log-publisher" || got[2] != "broker" {
-		t.Fatalf("cleanup order = %v; want [runtime-driver live-log-publisher broker]", got)
+	wantStops := []string{
+		"runtime-driver",
+		"live-log-publisher",
+		"broker",
+		"postgres-auth",
+		"postgres-publisher",
+		"postgres-controller",
+		"postgres-runtime",
+	}
+	if got := config.hooks.stopped; !slices.Equal(got, wantStops) {
+		t.Fatalf("cleanup order = %v; want %v", got, wantStops)
 	}
 	eventually(t, time.Second, func() bool {
 		return runtime.NumGoroutine() <= baseline+1

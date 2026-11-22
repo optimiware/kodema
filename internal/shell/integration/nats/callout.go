@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -122,6 +123,9 @@ type Callout struct {
 	clock         Clock
 	grantLifetime time.Duration
 
+	mu           sync.Mutex
+	closed       bool
+	starting     bool
 	subscription Subscription
 }
 
@@ -174,27 +178,55 @@ func (callout *Callout) Start(ctx context.Context) error {
 	if callout == nil {
 		return fault.New(fault.InvalidInput, "nats callout is nil")
 	}
-	if callout.subscription != nil {
+	callout.mu.Lock()
+	if callout.closed {
+		callout.mu.Unlock()
+		return fault.New(fault.DependencyUnavailable, "nats callout is closed")
+	}
+	if callout.subscription != nil || callout.starting {
+		callout.mu.Unlock()
 		return fault.New(fault.InternalFailure, "nats callout is already started")
 	}
 	if err := ctx.Err(); err != nil {
+		callout.mu.Unlock()
 		return fault.Wrap(fault.DeadlineExpired, "nats callout start was canceled", err)
 	}
+	callout.starting = true
+	callout.mu.Unlock()
+
 	subscription, err := callout.connection.SubscribeCallout(ctx, CalloutSubject, callout.handle)
 	if err != nil {
+		callout.mu.Lock()
+		callout.starting = false
+		callout.mu.Unlock()
 		return fault.Wrap(fault.DependencyUnavailable, "nats callout subscription failed", err)
 	}
+
+	callout.mu.Lock()
+	callout.starting = false
+	if callout.closed {
+		callout.mu.Unlock()
+		_ = subscription.Close(context.Background())
+		return fault.New(fault.DependencyUnavailable, "nats callout is closed")
+	}
 	callout.subscription = subscription
+	callout.mu.Unlock()
 	return nil
 }
 
 // Close releases the authorization subscription. It is idempotent.
 func (callout *Callout) Close(ctx context.Context) error {
-	if callout == nil || callout.subscription == nil {
+	if callout == nil {
 		return nil
 	}
+	callout.mu.Lock()
+	callout.closed = true
 	subscription := callout.subscription
 	callout.subscription = nil
+	callout.mu.Unlock()
+	if subscription == nil {
+		return nil
+	}
 	return subscription.Close(ctx)
 }
 
@@ -219,11 +251,7 @@ func (callout *Callout) handle(ctx context.Context, request CalloutRequest) erro
 		// revealing why a forged request was malformed.
 		return nil
 	}
-	credential := decoded.credential
-	if credential == "" {
-		return callout.replyError(ctx, request.Reply, decoded, "credential is missing")
-	}
-	principal, err := callout.principal.Resolve(ctx, credential)
+	principal, err := callout.principal.Resolve(ctx, decoded.credential)
 	if err != nil {
 		return callout.replyError(ctx, request.Reply, decoded, "credential is not current")
 	}

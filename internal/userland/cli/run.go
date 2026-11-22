@@ -478,7 +478,7 @@ func runWatch(ctx context.Context, config Config, args []string, ports Ports, de
 		return usage(ports.Err, "watch requires exactly one execution or --project <id>")
 	}
 
-	explicitProject := seen["--project"] || seen["-p"] || deps.ExplicitProject
+	explicitProject := seen["--project"] || deps.ExplicitProject
 	if len(positionals) == 0 {
 		if !explicitProject && !seen["--until"] {
 			return usage(ports.Err, "watch requires exactly one execution or --project <id>")

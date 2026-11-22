@@ -1050,3 +1050,35 @@ func TestControllerEventCommitRefusesRawPublicationInsert(t *testing.T) {
 		})
 	}
 }
+
+// When an event unit locks another execution row whose id sorts before the
+// target executionID, executeEventUnit acquires that lower-id FOR UPDATE lock
+// before locking executionID so concurrent units cannot AB/BA deadlock.
+func TestControllerEventCommitLocksLowerExecutionIDFirst(t *testing.T) {
+	withControllerEventCommit(t)
+	db := newFakeDB()
+	db.script.setQuery(controllerEventScript())
+	controller := NewController(db)
+
+	unit := controllerEventUnit(testProjectScope())
+	unit.Locks = append(unit.Locks, store.Lock{Table: "executions", IDs: []string{"execution-0"}})
+	if _, err := controller.Execute(context.Background(), "execution-1", unit); err != nil {
+		t.Fatalf("controller event commit with lower execution lock: %v", err)
+	}
+	calls := db.conn(t).callsCopy()
+	var lockedIDs []string
+	for _, call := range calls {
+		lower := strings.ToLower(call.sql)
+		if strings.Contains(lower, "from executions") && strings.Contains(lower, "for update") && len(call.args) > 0 {
+			if id, ok := call.args[0].(string); ok {
+				lockedIDs = append(lockedIDs, id)
+			}
+		}
+	}
+	if len(lockedIDs) < 2 {
+		t.Fatalf("execution FOR UPDATE calls = %v; want execution-0 before execution-1", lockedIDs)
+	}
+	if lockedIDs[0] != "execution-0" || lockedIDs[1] != "execution-1" {
+		t.Fatalf("first two execution FOR UPDATE locks = %v; want [execution-0 execution-1]", lockedIDs[:2])
+	}
+}

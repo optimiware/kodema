@@ -7,7 +7,9 @@ package recovery
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -145,4 +147,132 @@ func TestOSFilesReadFileRefusesFinalSymlink(t *testing.T) {
 	if data, err := files.ReadFile(ctx, link); err == nil {
 		t.Fatalf("ReadFile followed a final-component symlink and read %q", data)
 	}
+}
+
+func TestCopyFileRefusesSymlinksFIFOsAndExistingTargets(t *testing.T) {
+	root := t.TempDir()
+	realSource := filepath.Join(root, "real.txt")
+	if err := os.WriteFile(realSource, []byte("payload"), 0o640); err != nil {
+		t.Fatalf("write real source: %v", err)
+	}
+
+	t.Run("copies regular file and preserves mode", func(t *testing.T) {
+		target := filepath.Join(root, "copied.txt")
+		if err := copyFile(realSource, target); err != nil {
+			t.Fatalf("copyFile regular: %v", err)
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read copied: %v", err)
+		}
+		if string(got) != "payload" {
+			t.Fatalf("copied = %q; want payload", got)
+		}
+		info, err := os.Stat(target)
+		if err != nil {
+			t.Fatalf("stat copied: %v", err)
+		}
+		srcInfo, err := os.Stat(realSource)
+		if err != nil {
+			t.Fatalf("stat source: %v", err)
+		}
+		if info.Mode().Perm() != srcInfo.Mode().Perm() {
+			t.Fatalf("copied mode = %o; want %o", info.Mode().Perm(), srcInfo.Mode().Perm())
+		}
+	})
+
+	t.Run("refuses source symlink", func(t *testing.T) {
+		srcLink := filepath.Join(root, "src-link.txt")
+		if err := os.Symlink(realSource, srcLink); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		target := filepath.Join(root, "from-link.txt")
+		err := copyFile(srcLink, target)
+		if err == nil {
+			t.Fatal("copyFile accepted a source symlink")
+		}
+		if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+			t.Fatalf("source symlink err = %v (class=%v); want Forbidden", err, class)
+		}
+		if _, statErr := os.Lstat(target); !os.IsNotExist(statErr) {
+			t.Fatalf("target %q was created for symlink source", target)
+		}
+	})
+
+	t.Run("refuses source FIFO without hanging", func(t *testing.T) {
+		fifo := filepath.Join(root, "source.fifo")
+		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+			t.Fatalf("mkfifo: %v", err)
+		}
+		target := filepath.Join(root, "from-fifo.txt")
+		done := make(chan error, 1)
+		go func() {
+			done <- copyFile(fifo, target)
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("copyFile accepted a FIFO source")
+			}
+			if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+				t.Fatalf("FIFO source err = %v (class=%v); want Forbidden", err, class)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("copyFile hung opening a FIFO source")
+		}
+	})
+
+	t.Run("refuses target symlink without modifying symlink target", func(t *testing.T) {
+		victim := filepath.Join(root, "victim.txt")
+		if err := os.WriteFile(victim, []byte("untouched"), 0o600); err != nil {
+			t.Fatalf("write victim: %v", err)
+		}
+		targetLink := filepath.Join(root, "target-link.txt")
+		if err := os.Symlink(victim, targetLink); err != nil {
+			t.Fatalf("symlink target: %v", err)
+		}
+		err := copyFile(realSource, targetLink)
+		if err == nil {
+			t.Fatal("copyFile followed a target symlink")
+		}
+		if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+			t.Fatalf("live target symlink err = %v (class=%v); want Forbidden", err, class)
+		}
+		data, err := os.ReadFile(victim)
+		if err != nil {
+			t.Fatalf("read victim: %v", err)
+		}
+		if string(data) != "untouched" {
+			t.Fatalf("victim was modified through target symlink: %q", data)
+		}
+
+		danglingLink := filepath.Join(root, "dangling-target-link.txt")
+		if err := os.Symlink(filepath.Join(root, "does-not-exist.txt"), danglingLink); err != nil {
+			t.Fatalf("dangling symlink target: %v", err)
+		}
+		err = copyFile(realSource, danglingLink)
+		if err == nil {
+			t.Fatal("copyFile followed a dangling target symlink")
+		}
+		if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+			t.Fatalf("dangling target symlink err = %v (class=%v); want Forbidden", err, class)
+		}
+	})
+
+	t.Run("refuses pre-existing target file", func(t *testing.T) {
+		existing := filepath.Join(root, "existing.txt")
+		if err := os.WriteFile(existing, []byte("keep"), 0o600); err != nil {
+			t.Fatalf("write existing: %v", err)
+		}
+		if err := copyFile(realSource, existing); err == nil {
+			t.Fatal("copyFile overwrote an existing target file")
+		}
+		data, err := os.ReadFile(existing)
+		if err != nil {
+			t.Fatalf("read existing: %v", err)
+		}
+		if string(data) != "keep" {
+			t.Fatalf("existing file was overwritten: %q", data)
+		}
+	})
 }

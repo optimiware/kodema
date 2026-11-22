@@ -7,7 +7,6 @@ import (
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/secret"
 	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/transport/ops"
@@ -30,26 +29,8 @@ func secretHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 					return api.Result{}, idErr
 				}
 			}
-			if deps.Authority != nil {
-				reads := make([]authorize.AuthorityRead, 0, len(call.Operation.Authority))
-				for _, check := range call.Operation.Authority {
-					reads = append(reads, authorize.AuthorityRead{
-						Operation:   call.Operation.Name,
-						Required:    call.Operation.Requires,
-						Check:       check,
-						Scope:       call.Scope,
-						PrincipalID: call.Principal.ID,
-					})
-				}
-				if len(reads) > 0 {
-					facts, err := deps.Authority.Read(ctx, reads)
-					if err != nil {
-						return api.Result{}, err
-					}
-					if err := authorize.Confirm(reads, facts); err != nil {
-						return api.Result{}, err
-					}
-				}
+			if err := confirmReadAuthority(ctx, deps, call, call.Scope); err != nil {
+				return api.Result{}, err
 			}
 			var metadata secret.Metadata
 			if nameErr == nil {

@@ -168,3 +168,57 @@ func TestEventPublishUsesResolvedProjectScope(t *testing.T) {
 		t.Fatalf("event leaked into tenant-wide scope: %+v", events)
 	}
 }
+
+// TestMembershipListAndResourceBindingReadConfirmCurrentAuthority pins that
+// membership.list and resource.binding.read re-check current store-backed
+// authority so a caller whose membership has been revoked cannot keep reading
+// with a stale principal snapshot.
+func TestMembershipListAndResourceBindingReadConfirmCurrentAuthority(t *testing.T) {
+	h := newHarness(t)
+	projectScope := tenancy.Scope{TenantID: testTenant, ProjectID: testProject}
+	h.seedResource(t, projectScope, "resource-auth-1", 1)
+
+	if _, err := h.invoke(t, testToken, "resource.binding.register", jsonBody(t, map[string]any{
+		"binding_id":        "binding-auth-1",
+		"resource_id":       "resource-auth-1",
+		"enforcing_service": "service-1",
+		"trusted_origins":   []string{"https://example.test"},
+		"operations":        []string{"git.ref.update"},
+		"reportable_events": []string{"git.ref.updated"},
+	}), map[string]string{"project": testProject}); err != nil {
+		t.Fatalf("resource.binding.register: %v", err)
+	}
+
+	// Revoke testEngineer's project membership in the store while testToken
+	// still resolves to the stale principal snapshot.
+	if _, err := h.invokeVersion(t, "token-admin", "membership.revoke", `{}`, 1, map[string]string{
+		"project":   testProject,
+		"principal": testEngineer,
+	}); err != nil {
+		t.Fatalf("revoke engineer membership: %v", err)
+	}
+	if _, err := h.invoke(t, testToken, "resource.binding.read", `{}`, map[string]string{"binding": "binding-auth-1"}); err == nil {
+		t.Fatal("resource.binding.read succeeded after membership revocation")
+	} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+		t.Fatalf("resource.binding.read after revocation = %v; want forbidden", err)
+	}
+
+	// Delete the tenant-admin's membership row while token-admin still resolves
+	// to the stale principal snapshot.
+	tenantScope := tenancy.Scope{TenantID: testTenant}
+	adminRows := membershipRows(t, h, tenantScope, testAdmin)
+	if len(adminRows) != 1 {
+		t.Fatalf("admin tenant membership rows = %d; want 1", len(adminRows))
+	}
+	adminRowID, _ := adminRows[0].Values["id"].(string)
+	if _, err := h.store.Execute(context.Background(), tenantScope, store.Unit{
+		Writes: []store.Write{{Table: "memberships", ID: adminRowID, Delete: true, ExpectVersion: 1}},
+	}); err != nil {
+		t.Fatalf("delete admin membership: %v", err)
+	}
+	if _, err := h.invoke(t, "token-admin", "membership.list", `{}`, map[string]string{"project": testProject}); err == nil {
+		t.Fatal("membership.list succeeded after tenant-admin membership deletion")
+	} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+		t.Fatalf("membership.list after revocation = %v; want forbidden", err)
+	}
+}

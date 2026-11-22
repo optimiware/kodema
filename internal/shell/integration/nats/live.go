@@ -85,10 +85,28 @@ func (broker *Broker) SubscribeLive(ctx context.Context, scope tenancy.Scope, ex
 		_ = invalidationClient.Close(context.Background())
 		return nil, fault.New(fault.DependencyUnavailable, "broker adapter is closed")
 	}
+	live.mu.Lock()
+	if live.closed {
+		live.mu.Unlock()
+		broker.mu.Unlock()
+		_ = logClient.Close(context.Background())
+		_ = invalidationClient.Close(context.Background())
+		return live, nil
+	}
 	live.logClient = logClient
 	live.invalidationClient = invalidationClient
+	live.mu.Unlock()
 	broker.liveSubscriptions[live] = struct{}{}
+	clientChanged := broker.client != client
+	if clientChanged {
+		broker.resubscribePending = true
+	}
+	resumeNow := clientChanged && broker.client != nil
 	broker.mu.Unlock()
+
+	if resumeNow {
+		broker.resumeSubscriptions(ctx)
+	}
 	return live, nil
 }
 

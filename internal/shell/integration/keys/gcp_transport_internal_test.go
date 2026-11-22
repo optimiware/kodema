@@ -58,8 +58,8 @@ func TestNewGCPKMSOwnsPrivateTransport(t *testing.T) {
 	if transport.DialContext == nil {
 		t.Fatal("transport has no explicit dial function")
 	}
-	if gcpKMSDialTimeout != 10*time.Second {
-		t.Fatalf("dial timeout = %v; want the literal 10s", gcpKMSDialTimeout)
+	if kmsDialTimeout != 10*time.Second {
+		t.Fatalf("dial timeout = %v; want the literal 10s", kmsDialTimeout)
 	}
 	if client.client.CheckRedirect == nil {
 		t.Fatal("client has no redirect policy")

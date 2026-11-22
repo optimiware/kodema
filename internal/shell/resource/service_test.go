@@ -306,3 +306,70 @@ func TestBindingReadAdmitsRolelessServiceAndAllHumanRoles(t *testing.T) {
 	})
 	requireFaultClass(t, err, fault.Forbidden)
 }
+
+func TestBindingReadAndQueryEnforceActorGrant(t *testing.T) {
+	scope := projectScope("tenant-a", "project-a")
+	stored := resource.Binding{
+		ID:               "binding-a",
+		ResourceID:       "resource-a",
+		Scope:            scope,
+		EnforcingService: service.ServiceID("git-service"),
+		TrustedOrigins:   []string{"https://git.example.com/shop"},
+		Operations:       []resource.Operation{resource.OperationGitRefUpdate},
+		ReportableEvents: []string{"git.ref.updated"},
+		Version:          1,
+	}
+	deniedActors := []struct {
+		name  string
+		actor authorize.Principal
+	}{
+		{
+			name:  "roleless human",
+			actor: authorize.Principal{ID: "human-none", Kind: identity.KindHuman, Scope: scope, Enabled: true, Version: 1},
+		},
+		{
+			name:  "disabled human viewer",
+			actor: authorize.Principal{ID: "human-disabled", Kind: identity.KindHuman, Scope: scope, Roles: []tenancy.Role{tenancy.RoleViewer}, Enabled: false, Version: 1},
+		},
+		{
+			name:  "disabled service",
+			actor: authorize.Principal{ID: "svc-disabled", Kind: identity.KindService, Scope: scope, Enabled: false, Version: 1},
+		},
+	}
+	for _, tc := range deniedActors {
+		t.Run(tc.name, func(t *testing.T) {
+			readCalls, queryCalls := 0, 0
+			ports := &fakeBindingPorts{
+				read: func(context.Context, resource.BindingReadRequest) (resource.Binding, error) {
+					readCalls++
+					return stored, nil
+				},
+				query: func(context.Context, resource.BindingQuery) (resource.BindingPage, error) {
+					queryCalls++
+					return resource.BindingPage{Bindings: []resource.Binding{stored}}, nil
+				},
+			}
+			svc := newBindingService(t, ports)
+
+			_, err := svc.ReadBinding(context.Background(), resource.ReadBindingCommand{
+				Actor:     tc.actor,
+				Scope:     scope,
+				BindingID: stored.ID,
+			})
+			requireFaultClass(t, err, fault.Forbidden)
+			if readCalls != 0 {
+				t.Fatalf("ReadBinding port calls = %d; want 0", readCalls)
+			}
+
+			_, err = svc.QueryBindings(context.Background(), resource.QueryBindingsCommand{
+				Actor: tc.actor,
+				Scope: scope,
+				Limit: 10,
+			})
+			requireFaultClass(t, err, fault.Forbidden)
+			if queryCalls != 0 {
+				t.Fatalf("QueryBindings port calls = %d; want 0", queryCalls)
+			}
+		})
+	}
+}

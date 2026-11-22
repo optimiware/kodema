@@ -29,9 +29,9 @@ type Server struct {
 
 	mu         sync.Mutex
 	httpServer *http.Server
-	listener   net.Listener
 	runCtx     context.Context
 	cancelRun  context.CancelFunc
+	started    bool
 	closed     bool
 
 	pgidMu      sync.Mutex
@@ -82,22 +82,17 @@ func (s *Server) Start(ctx context.Context) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
+	ln, err := s.bindListener()
 	if err != nil {
-		return "", fmt.Errorf("listen sandbox MCP server on %q: %w", s.cfg.ListenAddr, err)
+		return "", err
 	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		_ = ln.Close()
-		return "", errors.New("sandbox server already closed")
-	}
-	s.listener = ln
-	s.mu.Unlock()
 
 	go func() {
-		<-ctx.Done()
-		_ = s.Shutdown(context.Background())
+		select {
+		case <-ctx.Done():
+			_ = s.Shutdown(context.Background())
+		case <-s.runCtx.Done():
+		}
 	}()
 	go func() {
 		_ = s.httpServer.Serve(ln)
@@ -111,18 +106,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
+	ln, err := s.bindListener()
 	if err != nil {
-		return fmt.Errorf("listen sandbox MCP server on %q: %w", s.cfg.ListenAddr, err)
+		return err
 	}
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		_ = ln.Close()
-		return errors.New("sandbox server already closed")
-	}
-	s.listener = ln
-	s.mu.Unlock()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -141,6 +128,36 @@ func (s *Server) Serve(ctx context.Context) error {
 		_ = s.Shutdown(context.Background())
 		return serveErr
 	}
+}
+
+func (s *Server) bindListener() (net.Listener, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox server already closed")
+	}
+	if s.started {
+		s.mu.Unlock()
+		return nil, errors.New("sandbox server already started")
+	}
+	s.started = true
+	s.mu.Unlock()
+
+	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
+	if err != nil {
+		s.mu.Lock()
+		s.started = false
+		s.mu.Unlock()
+		return nil, fmt.Errorf("listen sandbox MCP server on %q: %w", s.cfg.ListenAddr, err)
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return nil, errors.New("sandbox server already closed")
+	}
+	s.mu.Unlock()
+	return ln, nil
 }
 
 // Shutdown stops accepting new calls, cancels all in-flight request contexts,

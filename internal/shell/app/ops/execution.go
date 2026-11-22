@@ -61,10 +61,7 @@ func executionHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			if err != nil {
 				return api.Result{}, err
 			}
-			page := request.Page
-			if page == nil {
-				page = &api.Page{}
-			}
+			page := pageOrDefault(request.Page)
 			committed, err := deps.Executions.List(ctx, execution.ListCommand{
 				Actor: call.Principal,
 				Scope: call.Scope,
@@ -182,10 +179,7 @@ func executionHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			if err != nil {
 				return api.Result{}, err
 			}
-			page := request.Page
-			if page == nil {
-				page = &api.Page{}
-			}
+			page := pageOrDefault(request.Page)
 			// A human or service principal must address an execution and action
 			// visible in its resolved project scope. FileSink returns an empty
 			// page when no stream file exists on disk, which is valid for an

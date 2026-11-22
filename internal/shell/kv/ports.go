@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -207,6 +208,9 @@ func rowInt64(value any) (int64, error) {
 		}
 		return int64(typed), nil
 	case uint64:
+		if typed > math.MaxInt64 {
+			return 0, fault.New(fault.InternalFailure, "stored kv size_bytes overflows int64")
+		}
 		return int64(typed), nil
 	default:
 		return 0, fault.New(fault.InternalFailure, "stored kv object has no usable size_bytes")

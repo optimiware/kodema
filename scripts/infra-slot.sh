@@ -64,7 +64,11 @@ mkdir -p "$dir"
 cpus=$(nproc 2>/dev/null || echo 8)
 stack_slots=${KODEMA_STACK_SLOTS:-6}
 kind_slots=${KODEMA_KIND_SLOTS:-4}
-load_max=${KODEMA_LOAD_MAX:-$((cpus * 8 / 10))}
+default_load_max=$((cpus * 8 / 10))
+if [ "$default_load_max" -lt 1 ]; then
+  default_load_max=1
+fi
+load_max=${KODEMA_LOAD_MAX:-$default_load_max}
 wait_max=${KODEMA_SLOT_WAIT:-3600}
 started=$SECONDS
 

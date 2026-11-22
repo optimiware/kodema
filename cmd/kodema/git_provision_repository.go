@@ -73,9 +73,9 @@ func runGitProvisionRepositoryEntry(ctx context.Context, args []string, stdout, 
 }
 
 // validResourceID mirrors the public contract's resource-id syntax: 1 to 128
-// ASCII letters, digits, '-' or '_', and never the dot segments.
+// ASCII letters, digits, '-' or '_'.
 func validResourceID(value string) bool {
-	if value == "" || len(value) > 128 || value == "." || value == ".." {
+	if value == "" || len(value) > 128 {
 		return false
 	}
 	for index := 0; index < len(value); index++ {

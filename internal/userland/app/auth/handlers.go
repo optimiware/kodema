@@ -556,21 +556,10 @@ func (server *Server) handleDeviceVerify(w http.ResponseWriter, r *http.Request)
 			server.renderDevicePage(w, r, http.StatusBadRequest, userCode, "", "GitHub login is not configured.")
 			return
 		}
-		txID, err := randomToken(server.config.Random, 24)
-		if err != nil {
-			server.renderErrorPage(w, http.StatusInternalServerError, "Internal Error", "Could not allocate device transaction.")
+		txID, ok := server.createDeviceAuthTx(w, devEntry, now)
+		if !ok {
 			return
 		}
-		server.store.putAuthTx(authTx{
-			ID:         txID,
-			Kind:       txDevice,
-			ClientID:   devEntry.ClientID,
-			Scope:      devEntry.Scope,
-			DeviceHash: devEntry.DeviceHash,
-			UserCode:   devEntry.DisplayUserCode,
-			CreatedAt:  now,
-			ExpiresAt:  now.Add(browserFlowLifetime),
-		}, now)
 		server.startGitHubRedirect(w, r, txID, browserID, now)
 
 	case "oidc":
@@ -578,21 +567,10 @@ func (server *Server) handleDeviceVerify(w http.ResponseWriter, r *http.Request)
 			server.renderDevicePage(w, r, http.StatusBadRequest, userCode, "", "SSO login is not configured.")
 			return
 		}
-		txID, err := randomToken(server.config.Random, 24)
-		if err != nil {
-			server.renderErrorPage(w, http.StatusInternalServerError, "Internal Error", "Could not allocate device transaction.")
+		txID, ok := server.createDeviceAuthTx(w, devEntry, now)
+		if !ok {
 			return
 		}
-		server.store.putAuthTx(authTx{
-			ID:         txID,
-			Kind:       txDevice,
-			ClientID:   devEntry.ClientID,
-			Scope:      devEntry.Scope,
-			DeviceHash: devEntry.DeviceHash,
-			UserCode:   devEntry.DisplayUserCode,
-			CreatedAt:  now,
-			ExpiresAt:  now.Add(browserFlowLifetime),
-		}, now)
 		server.startUpstreamOIDCRedirect(w, r, txID, browserID, now)
 
 	case "local":
@@ -633,6 +611,24 @@ func (server *Server) handleDeviceVerify(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (server *Server) createDeviceAuthTx(w http.ResponseWriter, devEntry deviceEntry, now time.Time) (string, bool) {
+	txID, err := randomToken(server.config.Random, 24)
+	if err != nil {
+		server.renderErrorPage(w, http.StatusInternalServerError, "Internal Error", "Could not allocate device transaction.")
+		return "", false
+	}
+	server.store.putAuthTx(authTx{
+		ID:         txID,
+		Kind:       txDevice,
+		ClientID:   devEntry.ClientID,
+		Scope:      devEntry.Scope,
+		DeviceHash: devEntry.DeviceHash,
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(browserFlowLifetime),
+	}, now)
+	return txID, true
+}
+
 func (server *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeMethodNotAllowed(w, http.MethodPost)
@@ -652,10 +648,8 @@ func (server *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "token is required")
 		return
 	}
-	hint := strings.TrimSpace(r.PostFormValue("token_type_hint"))
-	if hint != "" && hint != "refresh_token" && hint != "access_token" {
-		// RFC 7009 §2.1: unsupported hints are ignored if the server can still check revocation.
-	}
+	// RFC 7009 §2.1: unsupported token_type_hint values are ignored because the
+	// server checks both refresh and access tokens below.
 	now := server.config.Clock()
 	server.store.revokeRefreshToken(rawToken, clientID)
 	if claims, err := server.verifyOwnAccessToken(rawToken, now); err == nil && claims.JTI != "" && claims.Client == clientID {
@@ -768,12 +762,9 @@ func (server *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	server.store.registerClient(registeredClient{
-		ClientID:      clientID,
-		ClientName:    clientName,
-		RedirectURIs:  redirects,
-		GrantTypes:    grantTypes,
-		ResponseTypes: responseTypes,
-		IssuedAt:      now.Unix(),
+		ClientID:     clientID,
+		RedirectURIs: redirects,
+		GrantTypes:   grantTypes,
 	})
 
 	resp := map[string]any{
@@ -1026,7 +1017,6 @@ func (server *Server) renderErrorPage(w http.ResponseWriter, status int, heading
 		Title:   heading,
 		Heading: heading,
 		Message: message,
-		IsError: true,
 	})
 }
 

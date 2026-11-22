@@ -663,3 +663,73 @@ func TestSubscribeRefusesCrossScopeInvalidation(t *testing.T) {
 		t.Fatal("a cross-scope message closed the subscription instead of being refused")
 	}
 }
+
+// TestSubscribeCloseJoinsInFlightDelivery proves Close waits for an in-flight
+// delivery callback to return before returning.
+func TestSubscribeCloseJoinsInFlightDelivery(t *testing.T) {
+	scope := testScope()
+	human := humanPrincipal(scope)
+	client := newFakeClient()
+	resolver := &fakePrincipalResolver{byToken: map[string]identity.Principal{testCredential: human}}
+	env := newBrokerEnv(t, brokerOptions{
+		connector: &fakeConnector{clients: []nats.Client{client}},
+		resolver:  resolver,
+	})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(context.Context, token.Invalidation) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	sub, err := env.broker.Subscribe(context.Background(), subscribeRequest(testCredential, scope, handler))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	fakeSub := client.lastSubscription(t)
+
+	payload := mustJSON(t, validInvalidation(scope, id.PrincipalID("other-human"), service.ServiceID("other-service")))
+	delivered := make(chan error, 1)
+	go func() {
+		delivered <- fakeSub.deliver(context.Background(), payload)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- sub.Close(context.Background())
+	}()
+
+	// Close must wait for the in-flight handler before returning.
+	fakeSub.waitClosed(t)
+	select {
+	case err := <-closed:
+		close(release)
+		t.Fatalf("Close returned (%v) while delivery handler was still in flight", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-delivered:
+		if err != nil {
+			t.Fatalf("in-flight delivery returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("in-flight delivery did not finish")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after in-flight delivery finished")
+	}
+}

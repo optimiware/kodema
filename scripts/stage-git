@@ -105,7 +105,7 @@ smoke_binding="m2-repo-${run_id}"
 git_host_origin="https://127.0.0.1:${git_port}"
 git_workload_origin="https://kodema-git-${tenant}.${release_ns}.svc.cluster.local:8443"
 
-for tool in kubectl jq python3 mktemp stat sed head; do
+for tool in kubectl jq mktemp stat sed head; do
 	command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
 done
 

@@ -333,3 +333,37 @@ func TestAppendGitConfigEnvPreservesExistingAndAddsPushOptions(t *testing.T) {
 		}
 	})
 }
+
+func TestSplitCGIResponseUsesEarliestTerminator(t *testing.T) {
+	t.Run("LF headers with CRLFCRLF inside binary packfile body", func(t *testing.T) {
+		body := []byte("PACK\x00\x00\x00\x02\r\n\r\nbinary-tail")
+		raw := append([]byte("Content-Type: application/x-git-upload-pack-result\nStatus: 200 OK\n\n"), body...)
+		headers, gotBody := splitCGIResponse(raw)
+		wantHeaders := "Content-Type: application/x-git-upload-pack-result\nStatus: 200 OK"
+		if string(headers) != wantHeaders {
+			t.Fatalf("headers = %q; want %q", headers, wantHeaders)
+		}
+		if !bytes.Equal(gotBody, body) {
+			t.Fatalf("body = %q; want %q", gotBody, body)
+		}
+	})
+
+	t.Run("CRLF headers with LFLF inside body", func(t *testing.T) {
+		body := []byte("line1\n\nline2")
+		raw := append([]byte("Content-Type: text/plain\r\n\r\n"), body...)
+		headers, gotBody := splitCGIResponse(raw)
+		if string(headers) != "Content-Type: text/plain" {
+			t.Fatalf("headers = %q; want Content-Type: text/plain", headers)
+		}
+		if !bytes.Equal(gotBody, body) {
+			t.Fatalf("body = %q; want %q", gotBody, body)
+		}
+	})
+
+	t.Run("missing terminator returns nil", func(t *testing.T) {
+		headers, body := splitCGIResponse([]byte("Content-Type: text/plain\n"))
+		if headers != nil || body != nil {
+			t.Fatalf("got (%q, %q); want (nil, nil)", headers, body)
+		}
+	})
+}

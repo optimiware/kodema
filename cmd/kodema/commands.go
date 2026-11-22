@@ -336,7 +336,8 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	opencodeMode := flags.String("mode", envOr("KODEMA_OPENCODE_MODE", string(services.OpenCodeExecutionModeWorktree)), "OpenCode execution mode (worktree|brain)")
 	llmProxyListen := flags.String("llm-proxy-listen", envOr("KODEMA_OPENCODE_LLM_PROXY_LISTEN", ""), "optional loopback listen address for the attributed LLM reverse proxy")
 	llmProxyAPIKey := flags.String("llm-proxy-api-key", "", "optional shared secret for inbound loopback LLM proxy requests (or KODEMA_OPENCODE_LLM_PROXY_API_KEY; auto-generated if empty)")
-	perTurnProxyRouting := flags.Bool("per-turn-proxy-routing", envOr("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "") == "true", "route LLM proxy calls via explicit /turn/{exec}/{action}/llm/* paths for concurrent turns")
+	defaultPerTurnProxyRouting, perTurnProxyEnvErr := envBoolStrict("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", false)
+	perTurnProxyRouting := flags.Bool("per-turn-proxy-routing", defaultPerTurnProxyRouting, "route LLM proxy calls via explicit /turn/{exec}/{action}/llm/* paths for concurrent turns")
 	sandboxDefaultImage := flags.String("sandbox-default-image", envOr("KODEMA_OPENCODE_SANDBOX_DEFAULT_IMAGE", ""), "default stock toolchain image for Option 2 brain mode sandboxes")
 	sandboxCachesRaw := flags.String("sandbox-caches", envOr("KODEMA_OPENCODE_SANDBOX_CACHES", ""), "comma-separated default Kodema cache names mounted into ephemeral sandboxes")
 	sandboxPort := flags.Int("sandbox-port", services.DefaultOpenCodeSandboxPort, "container TCP port served by kodema sandbox serve in brain mode")
@@ -356,7 +357,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	}
 	if strings.TrimSpace(*message) != "" {
 		return runServicesEmailIntake(ctx, *kind, *tenant, *project, *pipeline, *message,
-			*baseURL, *credentialFile, stdout, stderr)
+			*baseURL, *credentialFile, *caFile, stdout, stderr)
 	}
 	if strings.TrimSpace(*kind) == "" || strings.TrimSpace(*service) == "" ||
 		strings.TrimSpace(*tenant) == "" || strings.TrimSpace(*project) == "" {
@@ -397,6 +398,10 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	if services.ServiceKind(*kind) == services.KindOpenCode {
 		setFlags := make(map[string]bool)
 		flags.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+		if !setFlags["per-turn-proxy-routing"] && perTurnProxyEnvErr != nil {
+			usage(stderr, perTurnProxyEnvErr.Error())
+			return 2
+		}
 		explicitPassword := setFlags["opencode-password"]
 		explicitPasswordFile := setFlags["opencode-password-file"]
 		if explicitPassword && explicitPasswordFile {
@@ -470,12 +475,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 				effectiveMaxConcurrency = 1
 			}
 		}
-		var defaultCaches []string
-		for _, part := range strings.Split(*sandboxCachesRaw, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				defaultCaches = append(defaultCaches, trimmed)
-			}
-		}
+		defaultCaches := splitComma(*sandboxCachesRaw)
 		brainCfg := services.OpenCodeBrainConfig{
 			DefaultSandboxImage:  strings.TrimSpace(*sandboxDefaultImage),
 			DefaultSandboxCaches: defaultCaches,
@@ -539,7 +539,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 // runServicesEmailIntake runs the one-shot `kodema services --kind email`
 // intake. The message source is read before the public transport is used, so an
 // unreadable source is a local refusal, never an ambiguous mutation.
-func runServicesEmailIntake(ctx context.Context, kind, tenant, project, pipeline, message, baseURL, credentialFile string, stdout, stderr io.Writer) int {
+func runServicesEmailIntake(ctx context.Context, kind, tenant, project, pipeline, message, baseURL, credentialFile, caFile string, stdout, stderr io.Writer) int {
 	if kind != string(services.KindEmail) {
 		usage(stderr, "email intake requires --kind email")
 		return 2
@@ -562,7 +562,7 @@ func runServicesEmailIntake(ctx context.Context, kind, tenant, project, pipeline
 		defer file.Close()
 		source = file
 	}
-	transport, err := newPublicTransport(baseURL, credentialFile)
+	transport, err := newPublicTransportWithCA(baseURL, credentialFile, caFile)
 	if err != nil {
 		usage(stderr, err.Error())
 		return 2

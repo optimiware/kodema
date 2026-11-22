@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"time"
 	"unicode/utf8"
@@ -90,28 +89,11 @@ func (action *ExecutionAction) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	action.Subject = nil
-	raw := bytes.TrimSpace(wire.Subject)
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
-		return nil
-	}
-	var subjectWire struct {
-		Fields []struct {
-			Name  *string `json:"name"`
-			Kind  *string `json:"kind"`
-			Value *string `json:"value"`
-		} `json:"fields"`
-	}
-	if err := decodeStrict(raw, &subjectWire); err != nil {
+	subject, err := decodeStrictSubject(wire.Subject)
+	if err != nil {
 		return err
 	}
-	subject := Subject{Fields: make([]SubjectField, 0, len(subjectWire.Fields))}
-	for _, field := range subjectWire.Fields {
-		if field.Name == nil || field.Kind == nil || field.Value == nil {
-			return invalid("subject field is missing a required member")
-		}
-		subject.Fields = append(subject.Fields, SubjectField{Name: *field.Name, Kind: *field.Kind, Value: *field.Value})
-	}
-	action.Subject = &subject
+	action.Subject = subject
 	return nil
 }
 

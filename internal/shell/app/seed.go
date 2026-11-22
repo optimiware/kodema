@@ -48,12 +48,7 @@ func seedFirstAdmin(
 		key, err := (tenantKeySource{
 			cipher:     cipher,
 			keyVersion: keyVersion,
-			associated: secret.AssociatedData{
-				InstallationID: installationID,
-				SecretID:       secret.SecretID("tenant-derivation-key"),
-				Name:           id.SecretName("TENANT_DERIVATION_KEY"),
-				KeyVersion:     keyVersion,
-			},
+			associated: tenantDerivationAssociated(installationID, keyVersion),
 		}).NewTenantKey(ctx, bootstrap.TenantID, 1)
 		if err != nil {
 			return err

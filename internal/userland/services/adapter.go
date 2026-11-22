@@ -120,7 +120,7 @@ func (adapter *Adapter) Run(ctx context.Context) error {
 // processes every candidate even when an earlier one fails and returns the
 // first scan error after the pass, otherwise the drain error.
 func (adapter *Adapter) RunOnce(ctx context.Context) error {
-	notificationErr := adapter.drainNotifications(ctx)
+	notificationErr := drainEventSource(ctx, adapter.events)
 	var firstErr error
 	// A merge assignment whose request resolution committed but whose response
 	// was lost is no longer offered by the inbox. Converge it from the durable
@@ -171,13 +171,13 @@ func (failure *eventSourceError) Error() string {
 
 func (failure *eventSourceError) Unwrap() error { return failure.err }
 
-// drainNotifications polls every retained page. Notifications are hints only:
+// drainEventSource polls every retained page. Notifications are hints only:
 // they never cause a resolve and never grant assignment authority.
-func (adapter *Adapter) drainNotifications(ctx context.Context) error {
+func drainEventSource(ctx context.Context, source EventSource) error {
 	cursor := ""
 	seen := make(map[string]bool)
 	for {
-		page, err := adapter.events.Poll(ctx, cursor)
+		page, err := source.Poll(ctx, cursor)
 		if err != nil {
 			return err
 		}
@@ -198,7 +198,7 @@ func (adapter *Adapter) scanInbox(ctx context.Context, cursor string) (api.TaskI
 		Kinds:     []string{requestInboxKind},
 		Page:      &api.Page{Limit: api.DefaultPageLimit, Cursor: cursor},
 	}
-	decoded, err := adapter.invoke(ctx, OperationInbox, request, nil, "")
+	decoded, err := invokePublicOperation(ctx, adapter.handler, OperationInbox, request, nil, "")
 	if err != nil {
 		return api.TaskInboxResult{}, err
 	}
@@ -209,10 +209,10 @@ func (adapter *Adapter) scanInbox(ctx context.Context, cursor string) (api.TaskI
 	return page, nil
 }
 
-// invoke crosses the served public boundary with the public operation codec: the
-// request is strictly encoded, the result operation identity is validated and
-// the result is strictly decoded.
-func (adapter *Adapter) invoke(ctx context.Context, operation string, request any, expectedVersion *uint64, idempotencyKey string) (any, error) {
+// invokePublicOperation crosses the served public boundary with the public
+// operation codec: the request is strictly encoded, the result operation
+// identity is validated and the result is strictly decoded.
+func invokePublicOperation(ctx context.Context, handler api.Handler, operation string, request any, expectedVersion *uint64, idempotencyKey string) (any, error) {
 	codec, ok := publicCodecs[operation]
 	if !ok {
 		return nil, fmt.Errorf("operation %q has no public codec", operation)
@@ -221,7 +221,7 @@ func (adapter *Adapter) invoke(ctx context.Context, operation string, request an
 	if err != nil {
 		return nil, fmt.Errorf("encode %s request: %w", operation, err)
 	}
-	result, err := adapter.handler.Invoke(ctx, api.Invocation{
+	result, err := handler.Invoke(ctx, api.Invocation{
 		Operation: operation,
 		Request: api.Request{
 			Input:           input,
@@ -262,7 +262,7 @@ func (adapter *Adapter) consider(ctx context.Context, scanned api.InboxItem) err
 			return nil
 		}
 	}
-	current, err := adapter.inspect(ctx, scanned)
+	current, err := inspectExecution(ctx, adapter.handler, scanned.ExecutionID)
 	if err != nil {
 		var publicErr *api.Error
 		if errors.As(err, &publicErr) && publicErr.Code == api.CodeNotFound {
@@ -301,11 +301,11 @@ func currentAction(inspected api.ExecutionInspectResult, actionID string) (api.E
 	return api.ExecutionAction{}, false
 }
 
-// inspect revalidates one scanned request through the served execution.inspect
-// operation.
-func (adapter *Adapter) inspect(ctx context.Context, scanned api.InboxItem) (api.ExecutionInspectResult, error) {
-	decoded, err := adapter.invoke(ctx, OperationInspect, api.ExecutionInspectRequest{
-		ExecutionID: scanned.ExecutionID,
+// inspectExecution reads current execution state through the served
+// execution.inspect operation.
+func inspectExecution(ctx context.Context, handler api.Handler, executionID string) (api.ExecutionInspectResult, error) {
+	decoded, err := invokePublicOperation(ctx, handler, OperationInspect, api.ExecutionInspectRequest{
+		ExecutionID: executionID,
 	}, nil, "")
 	if err != nil {
 		return api.ExecutionInspectResult{}, err
@@ -332,7 +332,7 @@ func (adapter *Adapter) resolve(ctx context.Context, scanned api.InboxItem, curr
 		Outputs:               outputs,
 	}
 	expected := current.Version
-	_, err := adapter.invoke(ctx, OperationResolve, request, &expected, adapter.idempotencyKey(scanned, current, action))
+	_, err := invokePublicOperation(ctx, adapter.handler, OperationResolve, request, &expected, adapter.idempotencyKey(scanned, current, action))
 	if err == nil {
 		return nil
 	}

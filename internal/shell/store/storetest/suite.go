@@ -111,6 +111,8 @@ func Run(t *testing.T, newBackend func(*testing.T) Backend) {
 				t.Fatalf("%s: insert the incomplete receipt: %v", testCase.name, err)
 			}
 			completion := record
+			completion.ID = id.ReceiptID(fmt.Sprintf("receipt-complete-%d", index))
+			completion.At = record.At.Add(time.Minute)
 			completion.Result = []byte("started")
 			completion.SnapshotHash = testCase.completing
 			unit := store.Unit{
@@ -118,25 +120,39 @@ func Run(t *testing.T, newBackend func(*testing.T) Backend) {
 				ReceiptMode:   store.ReceiptComplete,
 				ReceiptExpect: &store.ReceiptExpect{ContentHash: record.ContentHash},
 			}
-			if _, err := backend.Executor.Execute(t.Context(), Scope(), unit); err != nil {
+			completed, err := backend.Executor.Execute(t.Context(), Scope(), unit)
+			if err != nil {
 				t.Fatalf("%s: complete the receipt: %v", testCase.name, err)
 			}
+			if completed.Replayed {
+				t.Fatalf("%s: first completion reported Replayed=true; want false", testCase.name)
+			}
+			assertCompletedReceipt := func(label string, got receipt.Record) {
+				t.Helper()
+				if got.ID != record.ID {
+					t.Errorf("%s (%s): receipt ID = %q; want original %q", testCase.name, label, got.ID, record.ID)
+				}
+				if !got.At.Equal(record.At) {
+					t.Errorf("%s (%s): receipt At = %v; want original %v", testCase.name, label, got.At, record.At)
+				}
+				if string(got.Result) != "started" {
+					t.Errorf("%s (%s): durable result = %q; want started", testCase.name, label, got.Result)
+				}
+				switch {
+				case testCase.want == nil && got.SnapshotHash != nil:
+					t.Errorf("%s (%s): durable snapshot digest = %x; want none", testCase.name, label, *got.SnapshotHash)
+				case testCase.want != nil && (got.SnapshotHash == nil || *got.SnapshotHash != *testCase.want):
+					t.Errorf("%s (%s): durable snapshot digest = %v; want %x", testCase.name, label, got.SnapshotHash, *testCase.want)
+				}
+			}
+			assertCompletedReceipt("first completion", completed.Receipt)
 			// A second completion replays the durable row, which is what a
 			// retrying caller observes.
 			replay, err := backend.Executor.Execute(t.Context(), Scope(), unit)
 			if err != nil || !replay.Replayed {
 				t.Fatalf("%s: replay = %+v, %v; want a replay of the completed receipt", testCase.name, replay, err)
 			}
-			if string(replay.Receipt.Result) != "started" {
-				t.Errorf("%s: durable result = %q; want started", testCase.name, replay.Receipt.Result)
-			}
-			got := replay.Receipt.SnapshotHash
-			switch {
-			case testCase.want == nil && got != nil:
-				t.Errorf("%s: durable snapshot digest = %x; want none", testCase.name, *got)
-			case testCase.want != nil && (got == nil || *got != *testCase.want):
-				t.Errorf("%s: durable snapshot digest = %v; want %x", testCase.name, got, *testCase.want)
-			}
+			assertCompletedReceipt("replay", replay.Receipt)
 		}
 	})
 
@@ -198,6 +214,163 @@ func Run(t *testing.T, newBackend func(*testing.T) Backend) {
 			}},
 		})
 		requireClass(t, err, fault.VersionConflict, "stale expected version")
+	})
+
+	t.Run("absence guard enforces unit scope", func(t *testing.T) {
+		backend := newBackend(t)
+		tenantOnly := tenancy.Scope{TenantID: Scope().TenantID}
+
+		// Project-scoped unit may guard its own project key and its own
+		// tenant-wide (project_id: nil) key.
+		for _, project := range []any{string(Scope().ProjectID), nil} {
+			if _, err := backend.Executor.Execute(t.Context(), Scope(), store.Unit{
+				Locks: []store.Lock{{
+					Table:        "memberships",
+					ExpectAbsent: true,
+					Key: map[string]any{
+						"tenant_id":    string(Scope().TenantID),
+						"project_id":   project,
+						"principal_id": "principal-parity",
+					},
+				}},
+			}); err != nil {
+				t.Fatalf("in-scope absence guard (project=%v): %v", project, err)
+			}
+		}
+
+		// Cross-tenant, cross-project, and project key in a tenant-scoped unit
+		// are all forbidden.
+		forbiddenCases := []struct {
+			name    string
+			scope   tenancy.Scope
+			tenant  string
+			project any
+		}{
+			{"foreign tenant in project scope", Scope(), "tenant-other", string(Scope().ProjectID)},
+			{"foreign tenant nil project in project scope", Scope(), "tenant-other", nil},
+			{"foreign project in project scope", Scope(), string(Scope().TenantID), "project-other"},
+			{"project key in tenant scope", tenantOnly, string(Scope().TenantID), string(Scope().ProjectID)},
+			{"foreign tenant in tenant scope", tenantOnly, "tenant-other", nil},
+		}
+		for _, tc := range forbiddenCases {
+			_, err := backend.Executor.Execute(t.Context(), tc.scope, store.Unit{
+				Locks: []store.Lock{{
+					Table:        "memberships",
+					ExpectAbsent: true,
+					Key: map[string]any{
+						"tenant_id":    tc.tenant,
+						"project_id":   tc.project,
+						"principal_id": "principal-parity",
+					},
+				}},
+			})
+			requireClass(t, err, fault.Forbidden, tc.name)
+		}
+	})
+
+	t.Run("root row reads do not leak foreign project or tenant existence", func(t *testing.T) {
+		backend := newBackend(t)
+		tenantScope := tenancy.Scope{TenantID: Scope().TenantID}
+		otherTenantScope := tenancy.Scope{TenantID: "tenant-other"}
+
+		// Seed our tenant, another tenant, our project, and a sibling project
+		// in the same tenant.
+		if _, err := backend.Executor.Execute(t.Context(), tenantScope, store.Unit{
+			Writes: []store.Write{
+				{Table: "tenants", ID: string(Scope().TenantID), Insert: true, Values: map[string]any{
+					"name": "acme", "version": int64(1), "derivation_key": []byte(`{"version":1}`), "created_at": parityTime(),
+				}},
+				{Table: "projects", ID: string(Scope().ProjectID), Insert: true, Values: map[string]any{
+					"name": "p1", "version": int64(1), "created_at": parityTime(),
+				}},
+				{Table: "projects", ID: "project-sibling", Insert: true, Values: map[string]any{
+					"name": "p2", "version": int64(1), "created_at": parityTime(),
+				}},
+			},
+		}); err != nil {
+			t.Fatalf("seed tenant and projects: %v", err)
+		}
+		if _, err := backend.Executor.Execute(t.Context(), otherTenantScope, store.Unit{
+			Writes: []store.Write{{
+				Table: "tenants", ID: "tenant-other", Insert: true, Values: map[string]any{
+					"name": "other", "version": int64(1), "derivation_key": []byte(`{"version":1}`), "created_at": parityTime(),
+				},
+			}},
+		}); err != nil {
+			t.Fatalf("seed other tenant: %v", err)
+		}
+
+		// Reading an existing sibling project from project scope must return
+		// NotFound, identical to a non-existent project id.
+		_, err := backend.Executor.Read(t.Context(), Scope(), "projects", "project-sibling")
+		requireClass(t, err, fault.NotFound, "existing sibling project from project scope")
+		_, err = backend.Executor.Read(t.Context(), Scope(), "projects", "project-missing")
+		requireClass(t, err, fault.NotFound, "missing project from project scope")
+
+		// Reading an existing foreign tenant must return NotFound, identical to
+		// a non-existent tenant id.
+		_, err = backend.Executor.Read(t.Context(), Scope(), "tenants", "tenant-other")
+		requireClass(t, err, fault.NotFound, "existing foreign tenant from project scope")
+		_, err = backend.Executor.Read(t.Context(), tenantScope, "tenants", "tenant-other")
+		requireClass(t, err, fault.NotFound, "existing foreign tenant from tenant scope")
+	})
+
+	t.Run("deadline lock requires exactly one row identity", func(t *testing.T) {
+		backend := newBackend(t)
+		for _, ids := range [][]string{nil, {}, {"action-1", "action-2"}} {
+			_, err := backend.Executor.Execute(t.Context(), Scope(), store.Unit{
+				Locks: []store.Lock{{
+					Table:    "actions",
+					IDs:      ids,
+					Deadline: &store.DeadlineGuard{Column: "deadline"},
+				}},
+			})
+			requireClass(t, err, fault.InvalidInput, fmt.Sprintf("deadline lock with %d ids", len(ids)))
+		}
+	})
+
+	t.Run("same-table multi-row locks evaluate guards in row id order", func(t *testing.T) {
+		backend := newBackend(t)
+		for _, svc := range []struct{ id, name string }{
+			{"service-a", "parity-a"},
+			{"service-b", "parity-b"},
+		} {
+			if _, err := backend.Executor.Execute(t.Context(), Scope(), store.Unit{
+				Writes: []store.Write{{
+					Table:  "services",
+					ID:     svc.id,
+					Insert: true,
+					Values: map[string]any{
+						"name":       svc.name,
+						"roles":      []byte(`["engineer"]`),
+						"state":      "enabled",
+						"version":    int64(1),
+						"created_at": parityTime(),
+					},
+				}},
+			}); err != nil {
+				t.Fatalf("seed %s: %v", svc.id, err)
+			}
+		}
+		// Caller lists service-b (failing version guard) before service-a
+		// (failing deadline guard). Both adapters sort same-table row locks by
+		// row id, so service-a's deadline guard must be reported first.
+		_, err := backend.Executor.Execute(t.Context(), Scope(), store.Unit{
+			Locks: []store.Lock{
+				{
+					Table:         "services",
+					IDs:           []string{"service-b"},
+					ExpectVersion: 99,
+				},
+				{
+					Table:         "services",
+					IDs:           []string{"service-a"},
+					ExpectVersion: 1,
+					Deadline:      &store.DeadlineGuard{Column: "token_expires_at"},
+				},
+			},
+		})
+		requireClass(t, err, fault.DeadlineExpired, "same-table lock ordering parity")
 	})
 }
 

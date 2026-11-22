@@ -890,6 +890,7 @@ Commands:
   inbox       List pending approvals, waiting tasks, and failed tasks
   approve     Approve a waiting execution request action
   reject      Reject a waiting execution request action
+  revise      Request revision on a waiting execution request action
   cancel      Cancel a running or queued execution
   logs        Read or stream decoded execution action logs
   events      Read or live-stream decoded project events

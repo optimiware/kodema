@@ -190,14 +190,19 @@ func (store *FileCoordinationStore) load(path string, tenant id.TenantID, key Me
 // write replaces one record atomically: a complete temporary file is renamed
 // over the target so a reader never sees a partial record.
 func (store *FileCoordinationStore) write(path string, record CoordinationRecord) error {
-	record = normalizeRecord(record)
-	data, err := json.Marshal(record)
+	return writeAtomicJSON(store.directory, ".record-*", path, normalizeRecord(record), store.syncDirectory)
+}
+
+// writeAtomicJSON marshals value as JSON and writes it atomically to path using
+// temp-file + chmod(0600) + fsync + close + rename + directory fsync.
+func writeAtomicJSON(dir, tempPattern, path string, value any, syncDir func(string) error) error {
+	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(store.directory, ".record-*")
+	temp, err := os.CreateTemp(dir, tempPattern)
 	if err != nil {
-		return fmt.Errorf("create coordination record: %w", err)
+		return fmt.Errorf("create temporary record: %w", err)
 	}
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
@@ -217,21 +222,18 @@ func (store *FileCoordinationStore) write(path string, record CoordinationRecord
 		return err
 	}
 	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("replace coordination record: %w", err)
+		return fmt.Errorf("replace record: %w", err)
 	}
 	// The rename is visible to readers but not yet durable: flush the directory
 	// entry so a crash cannot revert it. A failure here means the caller must
 	// treat the write as not durable rather than as a committed record.
-	if err := store.syncStoreDirectory(); err != nil {
-		return fmt.Errorf("make coordination record durable: %w", err)
+	if syncDir == nil {
+		syncDir = syncDirectory
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("make record durable: %w", err)
 	}
 	return nil
-}
-
-// syncStoreDirectory flushes the store directory so a published record survives
-// a crash.
-func (store *FileCoordinationStore) syncStoreDirectory() error {
-	return store.syncDirectory(store.directory)
 }
 
 // syncDirectory flushes one directory. A nil injection uses the real flush.

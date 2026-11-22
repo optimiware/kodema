@@ -750,3 +750,86 @@ func TestFileSinkReadRollsBackEvictionOnPersistFailure(t *testing.T) {
 		t.Fatalf("reopened page = %+v; want persisted eviction", reopenedPage)
 	}
 }
+
+// TestFileSinkReportsTruncationWhenOffsetZeroChunkDropped proves that dropping
+// an offset-0 chunk (via retention expiry or storage bound eviction) reports
+// Truncated=true on Read(AfterOffset=0), including across reopen.
+func TestFileSinkReportsTruncationWhenOffsetZeroChunkDropped(t *testing.T) {
+	t.Run("retention expiry of offset-0 chunk", func(t *testing.T) {
+		clock := &fakeClock{now: testNow}
+		root := t.TempDir()
+		config := defaultSinkConfig(t, clock)
+		config.Root = root
+		sink := newFileSink(t, config)
+		scope := testScope("tenant-a", "project-a")
+
+		if _, err := sink.Append(context.Background(), scope, testChunk("exec-1", "action-1", log.StreamStdout, 0, 1, "first")); err != nil {
+			t.Fatalf("Append offset 0: %v", err)
+		}
+		clock.Advance(log.DefaultRetention().RetainFor)
+
+		page, err := sink.Read(context.Background(), testReadRequest(scope, "exec-1", "action-1", log.StreamStdout, 0, 10))
+		if err != nil {
+			t.Fatalf("Read after expiry: %v", err)
+		}
+		if len(page.Chunks) != 0 || !page.Truncated {
+			t.Fatalf("page after offset-0 expiry = %+v; want empty with Truncated=true", page)
+		}
+
+		reopened := newFileSink(t, config)
+		page, err = reopened.Read(context.Background(), testReadRequest(scope, "exec-1", "action-1", log.StreamStdout, 0, 10))
+		if err != nil {
+			t.Fatalf("Read reopened: %v", err)
+		}
+		if len(page.Chunks) != 0 || !page.Truncated {
+			t.Fatalf("reopened page after offset-0 expiry = %+v; want empty with Truncated=true", page)
+		}
+	})
+
+	t.Run("storage bound eviction of offset-0 chunk", func(t *testing.T) {
+		clock := &fakeClock{now: testNow}
+		root := t.TempDir()
+		config := defaultSinkConfig(t, clock)
+		config.Root = root
+		config.Limits = log.Limits{
+			MaxChunkBytes:   1024,
+			MaxReadChunks:   10,
+			MaxStoredChunks: 2,
+			MaxQueuedChunks: 2,
+		}
+		sink := newFileSink(t, config)
+		scope := testScope("tenant-a", "project-a")
+
+		for index, offset := range []uint64{0, 10, 20} {
+			if _, err := sink.Append(context.Background(), scope, testChunk("exec-1", "action-1", log.StreamStdout, offset, uint64(index+1), "chunk")); err != nil {
+				t.Fatalf("Append %d: %v", index, err)
+			}
+		}
+
+		page, err := sink.Read(context.Background(), testReadRequest(scope, "exec-1", "action-1", log.StreamStdout, 0, 10))
+		if err != nil {
+			t.Fatalf("Read from 0: %v", err)
+		}
+		if len(page.Chunks) != 2 || !page.Truncated {
+			t.Fatalf("page from 0 after offset-0 eviction = %+v; want 2 chunks with Truncated=true", page)
+		}
+
+		// Reading strictly past offset 0 is not truncated.
+		later, err := sink.Read(context.Background(), testReadRequest(scope, "exec-1", "action-1", log.StreamStdout, 10, 10))
+		if err != nil {
+			t.Fatalf("Read from 10: %v", err)
+		}
+		if later.Truncated {
+			t.Fatalf("page from 10 = %+v; want Truncated=false", later)
+		}
+
+		reopened := newFileSink(t, config)
+		page, err = reopened.Read(context.Background(), testReadRequest(scope, "exec-1", "action-1", log.StreamStdout, 0, 10))
+		if err != nil {
+			t.Fatalf("Read reopened from 0: %v", err)
+		}
+		if !page.Truncated {
+			t.Fatalf("reopened page from 0 = %+v; want Truncated=true persisted", page)
+		}
+	})
+}

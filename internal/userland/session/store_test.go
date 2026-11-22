@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/userland/session"
@@ -1466,5 +1467,50 @@ func TestStoreFallsBackWhenRedactedArgumentsLeaveTheBound(t *testing.T) {
 	}
 	if nearRestored.Messages[1].ToolCalls[0].Arguments != near {
 		t.Fatal("restored near-bound call arguments differ from the persisted form")
+	}
+}
+
+func TestStoreTruncatesRedactedOutcomeSummaryOnUTF8Boundary(t *testing.T) {
+	storage := newFakeStorage()
+	store := newTestStore(t, storage, &fakeClock{now: testNow})
+
+	// Build a valid <=4096-byte Outcome.Summary whose redaction grows past 4096
+	// bytes and places a multi-byte UTF-8 rune ("é", 2 bytes) straddling byte 4096.
+	prefix := "TOKEN=x "
+	// After redaction: "TOKEN=[redacted] " (17 bytes, +9 bytes over len("TOKEN=x ")==8).
+	// Place ASCII padding so that the multi-byte rune starts at byte 4095 post-redaction:
+	// 17 + 4078 = 4095, then "é" occupies bytes 4095..4096 (crossing 4096).
+	summary := prefix + strings.Repeat("a", 4078) + "é" + "tail"
+	if len(summary) > 4096 {
+		t.Fatalf("fixture summary is %d bytes; want <= 4096", len(summary))
+	}
+
+	record := baseRecord()
+	record.Retention = session.RetentionPolicy{RawContent: true}
+	record.Outcome = session.Outcome{Status: "succeeded", Summary: summary}
+
+	ref, err := store.Save(context.Background(), record)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	persisted := storage.lastRecord().Outcome.Summary
+	if len(persisted) > 4096 {
+		t.Fatalf("persisted summary is %d bytes; want <= 4096", len(persisted))
+	}
+	if !utf8.ValidString(persisted) {
+		t.Fatalf("persisted summary is not valid UTF-8")
+	}
+	if len(persisted) != 4095 {
+		t.Fatalf("persisted summary length = %d; want 4095 (cleanly before straddling 2-byte rune)", len(persisted))
+	}
+	if !strings.HasPrefix(persisted, "TOKEN=[redacted] ") {
+		t.Fatalf("persisted summary did not redact credential: %q", persisted[:32])
+	}
+	restored, err := store.Restore(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("Restore after redaction truncation failed: %v", err)
+	}
+	if restored.Outcome.Summary != persisted {
+		t.Fatal("restored summary differs from persisted summary")
 	}
 }

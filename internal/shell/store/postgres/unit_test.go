@@ -1073,3 +1073,81 @@ func TestUnitTableNamesAreSchemaTables(t *testing.T) {
 		}
 	}
 }
+
+func TestLockRowsMultiLockSameTableSortsByIDAndCanonicalKey(t *testing.T) {
+	t.Run("present-row locks across multiple store.Lock entries sort by id", func(t *testing.T) {
+		db := newFakeDB()
+		connector := New(db)
+		tx, err := connector.Begin(context.Background(), testProjectScope())
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		locks := []store.Lock{
+			{Table: "tasks", IDs: []string{"task-c"}},
+			{Table: "tasks", IDs: []string{"task-a"}},
+			{Table: "tasks", IDs: []string{"task-b"}},
+		}
+		if err := LockRows(context.Background(), tx, testProjectScope(), locks); err != nil {
+			t.Fatalf("LockRows: %v", err)
+		}
+		calls := dataExecCalls(db.conn(t).callsCopy())
+		if len(calls) != 3 {
+			t.Fatalf("LockRows issued %d statements; want 3", len(calls))
+		}
+		got := []string{calls[0].args[0].(string), calls[1].args[0].(string), calls[2].args[0].(string)}
+		want := []string{"task-a", "task-b", "task-c"}
+		if !equalStrings(got, want) {
+			t.Fatalf("same-table multi-lock order = %v; want %v", got, want)
+		}
+	})
+
+	t.Run("absence and insert advisory locks sort by canonical key with absence first on tie", func(t *testing.T) {
+		scope := testProjectScope()
+		plans, err := planLocks(scope, []store.Lock{
+			{
+				Table:        "memberships",
+				ExpectAbsent: true,
+				Key: map[string]any{
+					"tenant_id":    testTenantID,
+					"project_id":   testProjectID,
+					"principal_id": "principal-b",
+				},
+			},
+			{Table: "memberships", IDs: []string{"membership-z"}},
+			{Table: "memberships", IDs: []string{"membership-a"}},
+		})
+		if err != nil {
+			t.Fatalf("planLocks: %v", err)
+		}
+		writes, err := planUnitWrites(scope, []store.Write{
+			{Table: "memberships", ID: "membership-new-b", Insert: true, Values: map[string]any{
+				"principal_id": "principal-b", "roles": []byte(`["engineer"]`), "version": uint64(1),
+			}},
+			{Table: "memberships", ID: "membership-new-a", Insert: true, Values: map[string]any{
+				"principal_id": "principal-a", "roles": []byte(`["engineer"]`), "version": uint64(1),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("planUnitWrites: %v", err)
+		}
+		merged := addInsertAdvisories(plans, writes)
+		if len(merged.entries) != 5 {
+			t.Fatalf("merged lock entries = %d; want 5", len(merged.entries))
+		}
+		// Order: insertAdvisory(principal-a), absence(principal-b),
+		// insertAdvisory(principal-b), present(membership-a), present(membership-z).
+		if !merged.entries[0].insertAdvisory || !strings.Contains(merged.entries[0].absenceKey, "principal-a") {
+			t.Errorf("entry 0 = %+v; want insertAdvisory for principal-a", merged.entries[0])
+		}
+		if !merged.entries[1].absence || !strings.Contains(merged.entries[1].absenceKey, "principal-b") {
+			t.Errorf("entry 1 = %+v; want absence guard for principal-b before insertAdvisory tie", merged.entries[1])
+		}
+		if !merged.entries[2].insertAdvisory || !strings.Contains(merged.entries[2].absenceKey, "principal-b") {
+			t.Errorf("entry 2 = %+v; want insertAdvisory for principal-b", merged.entries[2])
+		}
+		if merged.entries[3].id != "membership-a" || merged.entries[4].id != "membership-z" {
+			t.Errorf("present-row entries = [%s, %s]; want [membership-a, membership-z]", merged.entries[3].id, merged.entries[4].id)
+		}
+	})
+}

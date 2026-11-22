@@ -95,6 +95,9 @@ func resourceHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			if err != nil {
 				return api.Result{}, err
 			}
+			if err := confirmReadAuthority(ctx, deps, call, call.Scope); err != nil {
+				return api.Result{}, err
+			}
 			binding, err := deps.Bindings.ReadBinding(ctx, resource.ReadBindingCommand{
 				Actor:     call.Principal,
 				Scope:     call.Scope,
@@ -127,13 +130,12 @@ func resourceHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 				return api.Result{}, err
 			}
 			page := pageOrDefault(request.Page)
-			wantLimit := page.EffectiveLimit()
 			if request.Kind == "" {
 				committed, err := scanner.Query(ctx, call.Scope, store.ScanQuery{
 					Table:   "resource_bindings",
 					OrderBy: []store.Order{{Column: "id"}},
 					After:   page.Cursor,
-					Limit:   wantLimit,
+					Limit:   page.EffectiveLimit(),
 				})
 				if err != nil {
 					return api.Result{}, err
@@ -152,65 +154,20 @@ func resourceHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 				})
 			}
 
-			bindings := make([]api.ResourceBindingView, 0, wantLimit)
-			after := page.Cursor
-			var nextCursor string
-			// Scan in full batches. Once the page is full, keep scanning until
-			// one more matching binding shows that a next page exists.
-			batchLimit := store.MaxQueryLimit
-			for {
-				committed, err := scanner.Query(ctx, call.Scope, store.ScanQuery{
-					Table:   "resource_bindings",
-					OrderBy: []store.Order{{Column: "id"}},
-					After:   after,
-					Limit:   batchLimit,
-				})
-				if err != nil {
-					return api.Result{}, err
-				}
-				kept := len(bindings)
-				reread := false
-				foundExtra := false
-				for index, row := range committed.Rows {
+			bindings, nextCursor, err := scanFilteredPage(ctx, scanner, call.Scope, "resource_bindings", page,
+				func(row store.Row) (api.ResourceBindingView, bool, error) {
 					view, err := decodeBindingRow(row)
 					if err != nil {
-						return api.Result{}, err
+						return api.ResourceBindingView{}, false, err
 					}
 					if !bindingMatchesKind(view, request.Kind) {
-						continue
+						return api.ResourceBindingView{}, false, nil
 					}
-					if len(bindings) < wantLimit {
-						bindings = append(bindings, view)
-						if len(bindings) < wantLimit {
-							continue
-						}
-						if index < len(committed.Rows)-1 {
-							// The scanner has a cursor only for the end of a
-							// batch, so re-read this one ending on the
-							// binding that fills the page.
-							bindings = bindings[:kept]
-							batchLimit = index + 1
-							reread = true
-							break
-						}
-						nextCursor = committed.Next
-					} else {
-						foundExtra = true
-						break
-					}
-				}
-				if foundExtra {
-					break
-				}
-				if reread {
-					continue
-				}
-				batchLimit = store.MaxQueryLimit
-				if !committed.HasMore {
-					nextCursor = ""
-					break
-				}
-				after = committed.Next
+					return view, true, nil
+				},
+			)
+			if err != nil {
+				return api.Result{}, err
 			}
 			return respond(call, api.ResourceBindingListResult{
 				Bindings:   bindings,

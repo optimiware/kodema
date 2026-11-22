@@ -1,8 +1,9 @@
 package definition
 
 import (
-	"fmt"
 	"strings"
+
+	"github.com/optimiware/kodema/internal/id"
 )
 
 const (
@@ -61,12 +62,9 @@ func ValidateCaches(caches []string) error {
 	return nil
 }
 
-func validateContainerCaches(action string, caches []string) error {
+func validateContainerCaches(action id.ActionName, caches []string) error {
 	if len(caches) == 0 {
 		return nil
 	}
-	if err := ValidateCaches(caches); err != nil {
-		return invalidInput("action %q: %s", action, fmt.Sprint(err))
-	}
-	return nil
+	return wrapActionInvalid(action, ValidateCaches(caches))
 }

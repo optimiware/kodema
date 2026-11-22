@@ -218,7 +218,7 @@ func runLogout(ctx context.Context, config Config, args []string, ports Ports, r
 		issuer, clientID, audience, bindErr := trustedBinding(ctx, runtime.OIDC, apiURL,
 			runtime.Issuer, runtime.ClientID, runtime.Audience)
 		if bindErr != nil {
-			return refuseUnverifiedLogout(ctx, ports, runtime.Store, bindErr)
+			return refuseUnverifiedLogout(ctx, ports, runtime.Lock, runtime.Store, bindErr)
 		}
 		err = Logout(ctx, LogoutDeps{
 			APIURL:   apiURL,
@@ -249,8 +249,22 @@ func runLogout(ctx context.Context, config Config, args []string, ports Ports, r
 // refuseUnverifiedLogout deletes the local session without revoking it and
 // reports the binding refusal. This mirrors Logout's own binding-error path:
 // the token is never sent and the local file does not survive.
-func refuseUnverifiedLogout(ctx context.Context, ports Ports, store SessionRecordStore, cause error) int {
+func refuseUnverifiedLogout(ctx context.Context, ports Ports, lock SessionLock, store SessionRecordStore, cause error) int {
 	refusal := loginRequired("the session binding could not be verified", cause)
+	if lock == nil {
+		return failure(ports.Err, fault.New(fault.InternalFailure, "no session lock is configured"))
+	}
+	release, lockErr := lock.Acquire(context.WithoutCancel(ctx))
+	if lockErr != nil {
+		return failure(ports.Err, fault.Wrap(fault.Unauthenticated,
+			fmt.Sprintf("login required: the session binding could not be verified and the session lock could not be acquired: %v", lockErr),
+			errors.Join(ErrReauthenticationRequired, cause, lockErr)))
+	}
+	if release != nil {
+		defer func() {
+			_ = release()
+		}()
+	}
 	if deleteErr := deleteSessionRecord(ctx, store); deleteErr != nil {
 		return failure(ports.Err, fault.Wrap(fault.Unauthenticated,
 			"login required: the session binding could not be verified and its file could not be deleted",

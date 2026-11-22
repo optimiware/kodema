@@ -91,19 +91,28 @@ actions:
 	})
 
 	t.Run("invalid non-boolean completes_task is refused", func(t *testing.T) {
-		yamlBad := []byte(`completes_task: "nope"
+		for name, rawValue := range map[string]string{
+			"string":       `"nope"`,
+			"null":         "null",
+			"tilde null":   "~",
+			"empty scalar": "",
+		} {
+			t.Run(name, func(t *testing.T) {
+				yamlBad := []byte("completes_task: " + rawValue + `
 actions:
   - name: build
     image: registry.example.com/build:latest
     commands: [echo ok]
 `)
-		_, err := admission.Admit(t.Context(), pipeline.AdmitRequest{
-			Scope:          scope,
-			Definition:     pipeline.Definition{Name: "bad", YAML: yamlBad},
-			DefaultTimeout: 5 * time.Minute,
-		})
-		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
-			t.Fatalf("bad completes_task err = %v; want invalid_input", err)
+				_, err := admission.Admit(t.Context(), pipeline.AdmitRequest{
+					Scope:          scope,
+					Definition:     pipeline.Definition{Name: "bad", YAML: yamlBad},
+					DefaultTimeout: 5 * time.Minute,
+				})
+				if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+					t.Fatalf("bad completes_task (%s) err = %v; want invalid_input", name, err)
+				}
+			})
 		}
 	})
 }

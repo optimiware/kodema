@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -414,5 +415,51 @@ func TestProductionTenantNamespaceIDGrammar(t *testing.T) {
 		if err := validateTenantNamespaceID(invalid); err == nil {
 			t.Errorf("accepted invalid tenant id %q", invalid)
 		}
+	}
+}
+
+func TestAdaptersHasDevelopmentAdapterCoversEveryExportedField(t *testing.T) {
+	if (*Adapters)(nil).hasDevelopmentAdapter() {
+		t.Fatal("nil Adapters reported hasDevelopmentAdapter() = true")
+	}
+	if (&Adapters{}).hasDevelopmentAdapter() {
+		t.Fatal("zero Adapters reported hasDevelopmentAdapter() = true")
+	}
+
+	populated := *fullTestProfileConfig(t).Adapters
+	populated.LivePublisher = &recordingLivePublisher{}
+	populated.RuntimeCloser = func(context.Context) error { return nil }
+	populated.PublisherCloser = func(context.Context) error { return nil }
+	populated.VolumeProvisioner = &recordingProvisioner{}
+	populated.WorkspaceActivation = &fakeActivation{}
+	populated.ClaimProvisioner = &recordingClaimProvisioner{}
+
+	populatedVal := reflect.ValueOf(populated)
+	adaptersType := reflect.TypeFor[Adapters]()
+	for index := range adaptersType.NumField() {
+		field := adaptersType.Field(index)
+		if !field.IsExported() {
+			continue
+		}
+		t.Run(field.Name, func(t *testing.T) {
+			source := populatedVal.Field(index)
+			if source.IsZero() {
+				t.Fatalf("test fixture left exported Adapters.%s unset; populate it so every field is verified", field.Name)
+			}
+			var single Adapters
+			reflect.ValueOf(&single).Elem().Field(index).Set(source)
+			if !single.hasDevelopmentAdapter() {
+				t.Fatalf("hasDevelopmentAdapter() = false when Adapters.%s is set", field.Name)
+			}
+			cfg := validProductionConfig(t)
+			cfg.Adapters = &single
+			err := cfg.resolved().validate()
+			if err == nil {
+				t.Fatalf("production validate() accepted Adapters.%s", field.Name)
+			}
+			if !strings.Contains(err.Error(), "refuses a development or test adapter") {
+				t.Fatalf("production validate() refusal for Adapters.%s = %q; want development/test adapter refusal", field.Name, err)
+			}
+		})
 	}
 }

@@ -276,6 +276,14 @@ func TestManagementReadAndList(t *testing.T) {
 		t.Fatalf("list = %v; want one definition", list)
 	}
 	requireDefinition(t, list[0], current)
+	calls = authorizer.captured()
+	if len(calls) != 2 || calls[1].Operation != "pipeline.list" {
+		t.Fatalf("authorizer calls after List = %+v; want pipeline.list", calls)
+	}
+	if authority.callCount() != 2 {
+		t.Fatalf("authority reader calls after List = %d; want 2", authority.callCount())
+	}
+	requireAuthority(t, authority.captured()[1], "pipeline.list", authorize.CheckMembership)
 
 	admin := humanActor("tenant-a", "project-a", "principal-admin", tenancy.RoleAdmin)
 	got, err = management.Read(t.Context(), pipeline.ReadCommand{Actor: admin, Scope: admin.Scope, PipelineID: "pipeline-1"})

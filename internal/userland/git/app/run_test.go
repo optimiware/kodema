@@ -906,3 +906,99 @@ func requireIsolatedEnvironment(t *testing.T, name string, env map[string]string
 		t.Errorf("%s environment dropped PATH", name)
 	}
 }
+
+// TestServeKeepsHooksAliveDuringShutdownDrain verifies that canceling the Serve
+// context does not tear down the hook Unix socket before in-flight HTTP
+// requests finish draining.
+func TestServeKeepsHooksAliveDuringShutdownDrain(t *testing.T) {
+	config := wiredConfig(t)
+	server, err := New(config)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = server.Close() }()
+
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	socketAlive := make(chan error, 1)
+	server.handler = http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(inFlight)
+		<-release
+		conn, dialErr := net.DialTimeout("unix", server.HookSocketPath(), time.Second)
+		if dialErr == nil {
+			_ = conn.Close()
+		}
+		socketAlive <- dialErr
+		writer.WriteHeader(http.StatusOK)
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() {
+		served <- server.Serve(ctx, listener)
+	}()
+
+	reqDone := make(chan error, 1)
+	go func() {
+		resp, reqErr := http.Get("http://" + listener.Addr().String() + "/drain")
+		if reqErr == nil {
+			_ = resp.Body.Close()
+		}
+		reqDone <- reqErr
+	}()
+
+	<-inFlight
+	cancel()
+	// Give shutdown a moment to begin draining while the request is still in-flight.
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+
+	if err := <-socketAlive; err != nil {
+		t.Fatalf("hook Unix socket was unavailable during Shutdown drain: %v", err)
+	}
+	if err := <-reqDone; err != nil {
+		t.Fatalf("in-flight HTTP request failed: %v", err)
+	}
+	if err := <-served; err != nil {
+		t.Fatalf("Serve returned error: %v", err)
+	}
+	if conn, dialErr := net.DialTimeout("unix", server.HookSocketPath(), 100*time.Millisecond); dialErr == nil {
+		_ = conn.Close()
+		t.Fatal("hook Unix socket remained open after Serve returned")
+	}
+}
+
+// TestRunClosesCreatedListenerOnStartHooksError verifies that when Run creates
+// its own TCP listener and StartHooks fails before httpServer.Serve takes
+// ownership, Run closes the listener rather than leaking it.
+func TestRunClosesCreatedListenerOnStartHooksError(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe Listen: %v", err)
+	}
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	config := wiredConfig(t)
+	config.ListenAddress = addr
+	// A regular file as the parent of HookSocketPath forces StartHooks to fail
+	// after Run has already created the TCP listener.
+	blockingFile := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blockingFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	config.HookSocketPath = filepath.Join(blockingFile, "hooks.sock")
+
+	if err := Run(context.Background(), config); err == nil {
+		t.Fatal("Run unexpectedly succeeded with invalid HookSocketPath")
+	}
+	rebound, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("Run leaked its TCP listener on StartHooks failure: %v", err)
+	}
+	_ = rebound.Close()
+}

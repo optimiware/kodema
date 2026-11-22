@@ -9,7 +9,6 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/identity"
 	"github.com/optimiware/kodema/internal/shell/receipt"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/internal/shell/token"
@@ -110,69 +109,23 @@ const (
 	operationMembershipList   authorize.OperationName = "membership.list"
 )
 
-// admit validates the presented principal and pins that its kind can satisfy
-// the registry grant. It never treats the principal's role snapshot as current
-// authority: the returned unit carries the registry grant and the authority
-// reads the transaction must re-evaluate.
-func admit(actor authorize.Principal, name authorize.OperationName) (authorize.Operation, error) {
-	if err := actor.Validate(); err != nil {
-		return authorize.Operation{}, err
-	}
-	op, ok := authorize.LookupOperation(name)
-	if !ok {
-		return authorize.Operation{}, fault.New(fault.InternalFailure, "tenancy administration operation is not registered")
-	}
-	switch actor.Kind {
-	case identity.KindHuman:
-		if !op.Requires.AdmitsKind(identity.KindHuman) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no human role")
-		}
-	case identity.KindService:
-		if !op.Requires.AdmitsKind(identity.KindService) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no service role")
-		}
-	case identity.KindExecution:
-		if !op.Requires.AdmitsKind(identity.KindExecution) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no execution permission")
-		}
-	default:
-		return authorize.Operation{}, fault.New(fault.Forbidden, "unknown principal kind")
-	}
-	return op, nil
-}
-
 // authorityReads builds the current-authority reads for one registry operation.
 // Every read names the operation and its required grant so the adapter can
 // re-evaluate the exact grant instead of guessing from a bare check name.
-// Versioned checks carry the target and expected version; other checks leave
-// them empty.
 func authorityReads(
 	op authorize.Operation,
 	scope tenancy.Scope,
 	principal id.PrincipalID,
-	target string,
-	expected uint64,
 ) []authorize.AuthorityRead {
 	reads := make([]authorize.AuthorityRead, 0, len(op.Authority))
 	for _, check := range op.Authority {
-		read := authorize.AuthorityRead{
+		reads = append(reads, authorize.AuthorityRead{
 			Operation:   op.Name,
 			Required:    op.Requires,
 			Check:       check,
 			Scope:       scope,
 			PrincipalID: principal,
-		}
-		switch check {
-		case authorize.CheckBindingVersion,
-			authorize.CheckTaskVersion,
-			authorize.CheckExecutionVersion,
-			authorize.CheckPipelineVersion:
-			read.TargetID = target
-			read.ExpectedVersion = expected
-		case authorize.CheckResourceOwnership:
-			read.TargetID = target
-		}
-		reads = append(reads, read)
+		})
 	}
 	return reads
 }
@@ -265,7 +218,7 @@ func publishEffect() event.PostCommitEffect {
 // CreateTenant commits one new tenant together with its initial encrypted
 // derivation key, receipt, audit and event intent.
 func (s *Service) CreateTenant(ctx context.Context, command TenantCreateCommand) (TenantCreateResult, error) {
-	op, err := admit(command.Actor, operationTenantCreate)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationTenantCreate)
 	if err != nil {
 		return TenantCreateResult{}, err
 	}
@@ -308,7 +261,7 @@ func (s *Service) CreateTenant(ctx context.Context, command TenantCreateCommand)
 		Receipt:    record,
 		Audit:      []event.Audit{audit},
 		Events:     []event.Envelope{envelope},
-		Authority:  authorityReads(op, scope, command.Actor.ID, "", 0),
+		Authority:  authorityReads(op, scope, command.Actor.ID),
 		PostCommit: []event.PostCommitEffect{publishEffect()},
 	}
 	if err := unit.Validate(); err != nil {
@@ -325,7 +278,7 @@ func (s *Service) CreateTenant(ctx context.Context, command TenantCreateCommand)
 // the next tenant version, current-authority reads, receipt, audit, event and
 // credential-refresh intent.
 func (s *Service) RotateTenantKey(ctx context.Context, command TenantKeyRotationCommand) (TenantKeyRotationResult, error) {
-	op, err := admit(command.Actor, operationTenantRotateKey)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationTenantRotateKey)
 	if err != nil {
 		return TenantKeyRotationResult{}, err
 	}
@@ -373,7 +326,7 @@ func (s *Service) RotateTenantKey(ctx context.Context, command TenantKeyRotation
 		Receipt:         record,
 		Audit:           []event.Audit{audit},
 		Events:          []event.Envelope{envelope},
-		Authority:       authorityReads(op, scope, command.Actor.ID, "", 0),
+		Authority:       authorityReads(op, scope, command.Actor.ID),
 		PostCommit: []event.PostCommitEffect{
 			publishEffect(),
 			{Kind: event.PostRefreshCredential, Target: string(tenant.ID)},
@@ -391,7 +344,7 @@ func (s *Service) RotateTenantKey(ctx context.Context, command TenantKeyRotation
 
 // CreateProject commits one new project in the actor's tenant.
 func (s *Service) CreateProject(ctx context.Context, command ProjectCreateCommand) (ProjectCreateResult, error) {
-	op, err := admit(command.Actor, operationProjectCreate)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationProjectCreate)
 	if err != nil {
 		return ProjectCreateResult{}, err
 	}
@@ -428,7 +381,7 @@ func (s *Service) CreateProject(ctx context.Context, command ProjectCreateComman
 		Receipt:    record,
 		Audit:      []event.Audit{audit},
 		Events:     []event.Envelope{envelope},
-		Authority:  authorityReads(op, scope, command.Actor.ID, "", 0),
+		Authority:  authorityReads(op, scope, command.Actor.ID),
 		PostCommit: []event.PostCommitEffect{publishEffect()},
 	}
 	committed, err := s.projectCreate.CreateProject(ctx, unit)
@@ -440,7 +393,7 @@ func (s *Service) CreateProject(ctx context.Context, command ProjectCreateComman
 
 // UpdateProject commits one versioned project change in the actor's tenant.
 func (s *Service) UpdateProject(ctx context.Context, command ProjectUpdateCommand) (ProjectUpdateResult, error) {
-	op, err := admit(command.Actor, operationProjectUpdate)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationProjectUpdate)
 	if err != nil {
 		return ProjectUpdateResult{}, err
 	}
@@ -483,7 +436,7 @@ func (s *Service) UpdateProject(ctx context.Context, command ProjectUpdateComman
 		Receipt:         record,
 		Audit:           []event.Audit{audit},
 		Events:          []event.Envelope{envelope},
-		Authority:       authorityReads(op, scope, command.Actor.ID, "", 0),
+		Authority:       authorityReads(op, scope, command.Actor.ID),
 		PostCommit:      []event.PostCommitEffect{publishEffect()},
 	}
 	committed, err := s.projectUpdate.UpdateProject(ctx, unit)
@@ -496,7 +449,7 @@ func (s *Service) UpdateProject(ctx context.Context, command ProjectUpdateComman
 // GrantMembership creates or replaces one membership grant and advances the
 // membership version.
 func (s *Service) GrantMembership(ctx context.Context, command MembershipGrantCommand) (MembershipGrantResult, error) {
-	op, err := admit(command.Actor, operationMembershipGrant)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationMembershipGrant)
 	if err != nil {
 		return MembershipGrantResult{}, err
 	}
@@ -509,7 +462,7 @@ func (s *Service) GrantMembership(ctx context.Context, command MembershipGrantCo
 	if err := membership.Validate(); err != nil {
 		return MembershipGrantResult{}, err
 	}
-	if !withinScope(command.Actor.Scope, membership.Scope) {
+	if !command.Actor.Scope.Contains(membership.Scope) {
 		return MembershipGrantResult{}, fault.New(fault.Forbidden, "membership grant scope is outside the actor scope")
 	}
 	scope := membership.Scope
@@ -535,7 +488,7 @@ func (s *Service) GrantMembership(ctx context.Context, command MembershipGrantCo
 		Receipt:         record,
 		Audit:           []event.Audit{audit},
 		Events:          []event.Envelope{envelope},
-		Authority:       authorityReads(op, scope, command.Actor.ID, "", 0),
+		Authority:       authorityReads(op, scope, command.Actor.ID),
 		PostCommit:      []event.PostCommitEffect{publishEffect()},
 	}
 	committed, err := s.membershipGrant.GrantMembership(ctx, unit)
@@ -548,7 +501,7 @@ func (s *Service) GrantMembership(ctx context.Context, command MembershipGrantCo
 // RevokeMembership removes one current membership grant and advances its
 // version.
 func (s *Service) RevokeMembership(ctx context.Context, command MembershipRevokeCommand) (MembershipRevokeResult, error) {
-	op, err := admit(command.Actor, operationMembershipRevoke)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationMembershipRevoke)
 	if err != nil {
 		return MembershipRevokeResult{}, err
 	}
@@ -562,7 +515,7 @@ func (s *Service) RevokeMembership(ctx context.Context, command MembershipRevoke
 	if command.ExpectedVersion == 0 {
 		return MembershipRevokeResult{}, fault.New(fault.InvalidInput, "membership revocation expected version is zero")
 	}
-	if !withinScope(command.Actor.Scope, scope) {
+	if !command.Actor.Scope.Contains(scope) {
 		return MembershipRevokeResult{}, fault.New(fault.Forbidden, "membership revocation scope is outside the actor scope")
 	}
 	version := command.ExpectedVersion + 1
@@ -588,7 +541,7 @@ func (s *Service) RevokeMembership(ctx context.Context, command MembershipRevoke
 		Receipt:         record,
 		Audit:           []event.Audit{audit},
 		Events:          []event.Envelope{envelope},
-		Authority:       authorityReads(op, scope, command.Actor.ID, "", 0),
+		Authority:       authorityReads(op, scope, command.Actor.ID),
 		PostCommit:      []event.PostCommitEffect{publishEffect()},
 	}
 	committed, err := s.membershipRevoke.RevokeMembership(ctx, unit)
@@ -601,8 +554,12 @@ func (s *Service) RevokeMembership(ctx context.Context, command MembershipRevoke
 // ListMemberships returns one authoritative, stably paginated membership page
 // for the caller's current scope.
 func (s *Service) ListMemberships(ctx context.Context, command MembershipListCommand) (MembershipPage, error) {
-	if _, err := admit(command.Actor, operationMembershipList); err != nil {
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationMembershipList)
+	if err != nil {
 		return MembershipPage{}, err
+	}
+	if !op.Requires.Allows(command.Actor) {
+		return MembershipPage{}, fault.New(fault.Forbidden, "actor is not authorized for membership.list")
 	}
 	query := MembershipQuery{
 		Scope:       command.Scope,
@@ -613,7 +570,7 @@ func (s *Service) ListMemberships(ctx context.Context, command MembershipListCom
 	if err := query.Validate(); err != nil {
 		return MembershipPage{}, err
 	}
-	if !withinScope(command.Actor.Scope, query.Scope) {
+	if !command.Actor.Scope.Contains(query.Scope) {
 		return MembershipPage{}, fault.New(fault.Forbidden, "membership query scope is outside the actor scope")
 	}
 	page, err := s.membershipQuery.ListMemberships(ctx, query)

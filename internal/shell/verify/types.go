@@ -32,31 +32,10 @@ type VerificationID string
 
 // ParseVerificationID validates and converts a verification identity.
 func ParseVerificationID(value string) (VerificationID, error) {
-	if !validVerificationID(value) {
+	if !id.Valid(value) {
 		return "", fault.New(fault.InvalidInput, fmt.Sprintf("invalid verification id %q", value))
 	}
 	return VerificationID(value), nil
-}
-
-func validVerificationID(value string) bool {
-	if value == "" || len(value) > id.MaxIDLength {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // ValueKind is the JSON value kind of one subject field.

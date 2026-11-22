@@ -413,7 +413,7 @@ func validateReportCommand(command ReportCommand) error {
 	if !command.Service.Enabled {
 		return fault.New(fault.Forbidden, "reporting service is disabled")
 	}
-	if !scopeContains(command.Service.Scope, command.Scope) {
+	if !command.Service.Scope.Contains(command.Scope) {
 		return fault.New(fault.Forbidden, "reporting service is outside the report scope")
 	}
 	if command.SourceEventID == "" || len(command.SourceEventID) > id.MaxIDLength {

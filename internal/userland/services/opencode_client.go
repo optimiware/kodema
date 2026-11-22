@@ -1011,10 +1011,7 @@ func (c *HTTPOpenCodeClient) endpointSegments(query url.Values, segments ...stri
 }
 
 func classifyOpenCodeHTTPError(op string, status int, body []byte) error {
-	snippet := strings.TrimSpace(string(body))
-	if len(snippet) > 512 {
-		snippet = snippet[:512]
-	}
+	snippet := truncateString(strings.TrimSpace(string(body)), 512)
 	lower := strings.ToLower(snippet)
 	if status == http.StatusTooManyRequests || strings.Contains(lower, "budget_exceeded") {
 		return fmt.Errorf("%w: opencode %s returned %d: %s", ErrOpenCodeBudgetExceeded, op, status, snippet)

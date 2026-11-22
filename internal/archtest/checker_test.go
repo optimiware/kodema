@@ -481,3 +481,23 @@ func TestDocsRejectsInvalidJSON(t *testing.T) {
 func TestDocsAcceptsRealRepository(t *testing.T) {
 	assertClean(t, runCheck(t, repoRoot(), "docs"))
 }
+
+func TestIsMarkdownPathUsesFilepathExt(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"README.md", true},
+		{"docs/GUIDE.MD", true},
+		{"docs/guide.Md", true},
+		{"docs.md/plain", false},
+		{"docs.md/guide.txt", false},
+		{"README.txt", false},
+		{"README", false},
+	}
+	for _, tc := range cases {
+		if got := isMarkdownPath(tc.path); got != tc.want {
+			t.Errorf("isMarkdownPath(%q) = %v; want %v", tc.path, got, tc.want)
+		}
+	}
+}

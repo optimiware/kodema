@@ -431,6 +431,44 @@ func TestWorkspaceReleaseRequiresNoWorkloadReference(t *testing.T) {
 		}
 	})
 
+	t.Run("allows release when multiple pods all affirmatively terminated", func(t *testing.T) {
+		fake, _, adapter := testSetup(t)
+		workspaceID := testWorkspaceID()
+		first := testIdentity()
+		second := testIdentity()
+		second.WorkloadID = id.WorkloadID("workload-2")
+		second.ActionID = id.ActionID("action-2")
+		fake.addPod(workspacePod(workspaceID, testTerminatedPod(first, "Succeeded", 0)))
+		fake.addPod(workspacePod(workspaceID, testTerminatedPod(second, "Succeeded", 0)))
+
+		if err := adapter.Release(context.Background(), workspaceID); err != nil {
+			t.Fatalf("Release returned error when all workspace pods terminated: %v", err)
+		}
+		if fake.claimExists(testNamespace, testClaimName(t, workspaceID)) {
+			t.Fatal("Release left the claim behind after all pods terminated")
+		}
+	})
+
+	t.Run("refuses release when one pod terminated and another is still running", func(t *testing.T) {
+		fake, _, adapter := testSetup(t)
+		workspaceID := testWorkspaceID()
+		first := testIdentity()
+		second := testIdentity()
+		second.WorkloadID = id.WorkloadID("workload-2")
+		second.ActionID = id.ActionID("action-2")
+		fake.addPod(workspacePod(workspaceID, testTerminatedPod(first, "Succeeded", 0)))
+		fake.addPod(workspacePod(workspaceID, testRunningPod(second)))
+
+		err := adapter.Release(context.Background(), workspaceID)
+		requireFaultClass(t, err, fault.Forbidden)
+		if !fake.claimExists(testNamespace, testClaimName(t, workspaceID)) {
+			t.Fatal("Release deleted a claim while a second pod was still running")
+		}
+		if fake.callCount("DeleteClaim") != 0 {
+			t.Fatal("Release attempted to delete a claim referenced by a running pod")
+		}
+	})
+
 	t.Run("accepts an owned terminating claim as released in progress", func(t *testing.T) {
 		fake, _, adapter := testSetup(t)
 		workspaceID := testWorkspaceID()

@@ -17,9 +17,11 @@ package memory
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -747,6 +749,103 @@ func TestScannerTenantScopeRefusesProjectTable(t *testing.T) {
 	s := New()
 	_, err := s.Query(context.Background(), tenantScope(), store.ScanQuery{Table: "executions", Limit: 1})
 	assertScanFault(t, err, fault.InvalidInput)
+}
+
+// TestScannerCursorPrecisionAndValidationParity pins 64-bit integer precision
+// and strict JSON validation on keyset cursors matching the PostgreSQL scanner.
+func TestScannerCursorPrecisionAndValidationParity(t *testing.T) {
+	s := New()
+	scope := projectScope()
+
+	const (
+		aboveFloat53 = int64(1<<53) + 1
+		nextFloat53  = int64(1<<53) + 2
+		nearMaxInt64 = math.MaxInt64 - 1
+		maxInt64     = math.MaxInt64
+	)
+	seeded := []struct {
+		id      string
+		version int64
+	}{
+		{id: "exec-1", version: aboveFloat53},
+		{id: "exec-2", version: nextFloat53},
+		{id: "exec-3", version: nearMaxInt64},
+		{id: "exec-4", version: maxInt64},
+	}
+	for _, entry := range seeded {
+		values := executionValues(1, "queued")
+		values["version"] = entry.version
+		seedRow(t, s, scope, "executions", entry.id, values)
+	}
+
+	var gotIDs []string
+	var after string
+	for range len(seeded) + 1 {
+		page := queryScanner(t, s, scope, store.ScanQuery{
+			Table:   "executions",
+			OrderBy: []store.Order{{Column: "version"}},
+			After:   after,
+			Limit:   1,
+		})
+		for _, row := range page.Rows {
+			gotIDs = append(gotIDs, rowString(t, row, "id"))
+		}
+		if !page.HasMore {
+			break
+		}
+		after = page.Next
+	}
+	wantIDs := []string{"exec-1", "exec-2", "exec-3", "exec-4"}
+	if !equalStrings(gotIDs, wantIDs) {
+		t.Fatalf("int64 keyset pagination ids = %v; want %v", gotIDs, wantIDs)
+	}
+
+	// Empty JSON object must fail completeness as InvalidInput (not Forbidden).
+	emptyObj := base64.RawURLEncoding.EncodeToString([]byte(`{}`))
+	_, err := s.Query(context.Background(), scope, store.ScanQuery{Table: "executions", After: emptyObj, Limit: 1})
+	assertScanFault(t, err, fault.InvalidInput)
+
+	// Trailing JSON after a valid cursor object must be rejected as InvalidInput.
+	firstPage := queryScanner(t, s, scope, store.ScanQuery{
+		Table:   "executions",
+		OrderBy: []store.Order{{Column: "version"}},
+		Limit:   1,
+	})
+	rawCursor, err := base64.RawURLEncoding.DecodeString(firstPage.Next)
+	if err != nil {
+		t.Fatalf("decode generated cursor: %v", err)
+	}
+	trailing := base64.RawURLEncoding.EncodeToString(append(rawCursor, []byte(` {"extra":1}`)...))
+	_, err = s.Query(context.Background(), scope, store.ScanQuery{
+		Table:   "executions",
+		OrderBy: []store.Order{{Column: "version"}},
+		After:   trailing,
+		Limit:   1,
+	})
+	assertScanFault(t, err, fault.InvalidInput)
+
+	// Null cursor key element must be rejected as InvalidInput.
+	nullKeyJSON := fmt.Sprintf(
+		`{"tenant_id":%q,"project_id":%q,"table":"executions","order":[{"column":"version","desc":false},{"column":"id","desc":false}],"key":[null,"exec-1"]}`,
+		scope.TenantID, scope.ProjectID,
+	)
+	nullKeyToken := base64.RawURLEncoding.EncodeToString([]byte(nullKeyJSON))
+	_, err = s.Query(context.Background(), scope, store.ScanQuery{
+		Table:   "executions",
+		OrderBy: []store.Order{{Column: "version"}},
+		After:   nullKeyToken,
+		Limit:   1,
+	})
+	assertScanFault(t, err, fault.InvalidInput)
+
+	// Cursor encoding errors must propagate instead of returning an empty Next token.
+	meta, _ := lookupTable("executions")
+	terms := canonicalScanTerms(meta, []store.Order{{Column: "version"}})
+	_, err = encodeScanCursor(scope, "executions", terms, scanRow{
+		identity: "exec-bad",
+		values:   map[string]any{"version": func() {}, "id": "exec-bad"},
+	})
+	assertScanFault(t, err, fault.InternalFailure)
 }
 
 func queryScanner(t *testing.T, s *Store, scope tenancy.Scope, query store.ScanQuery) store.QueryPage {

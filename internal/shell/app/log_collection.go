@@ -308,6 +308,7 @@ func (runtime *logCollectingRuntime) Remove(ctx context.Context, request kernele
 	// boundary, so stop it before the final retained drain reads the same
 	// source again.
 	runtime.stopLiveLogs(ctx, request.Identity)
+	runtime.clearStopWithhold(request.Identity)
 	if err := runtime.drainBeforeRemove(ctx, request.Identity); err != nil {
 		return kernelengine.Removal{}, err
 	}
@@ -629,20 +630,23 @@ func (runtime *logCollectingRuntime) withholdStop(identity kernelengine.EffectId
 	if runtime.stopWithheld == nil {
 		runtime.stopWithheld = map[string]int{}
 	}
-	key := string(identity.ExecutionID) + "\x00" + string(identity.ActionID) + "\x00" + string(identity.WorkloadID)
+	key := liveLogKey(identity)
+	if runtime.stopWithheld[key] > logCollectionStopWithholdLimit {
+		return false
+	}
 	runtime.stopWithheld[key]++
 	return runtime.stopWithheld[key] <= logCollectionStopWithholdLimit
 }
 
 // clearStopWithhold forgets a workload's consecutive checkpoint faults after a
-// checkpoint succeeded.
+// checkpoint succeeded or the workload is being removed.
 func (runtime *logCollectingRuntime) clearStopWithhold(identity kernelengine.EffectIdentity) {
 	runtime.stopMu.Lock()
 	defer runtime.stopMu.Unlock()
 	if runtime.stopWithheld == nil {
 		return
 	}
-	delete(runtime.stopWithheld, string(identity.ExecutionID)+"\x00"+string(identity.ActionID)+"\x00"+string(identity.WorkloadID))
+	delete(runtime.stopWithheld, liveLogKey(identity))
 }
 
 // markCollectionComplete records the durable per-workload-identity completion
@@ -1022,6 +1026,7 @@ func (runtime *logCollectingRuntime) Observe(ctx context.Context, request kernel
 	}
 	if observation.StopConfirmed() {
 		runtime.stopLiveLogs(ctx, request.Identity)
+		runtime.clearStopWithhold(request.Identity)
 		runtime.drainCompleted(ctx, request.Identity)
 	}
 	return observation, nil

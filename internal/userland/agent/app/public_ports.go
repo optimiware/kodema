@@ -236,7 +236,6 @@ func (tools *PublicTools) Invoke(ctx context.Context, request agent.ToolRequest)
 // opened through it, so a symlink or a replaced path cannot escape the root.
 type FileKnowledge struct {
 	root *os.Root
-	path string
 }
 
 var _ agent.KnowledgePort = (*FileKnowledge)(nil)
@@ -255,7 +254,7 @@ func NewFileKnowledge(root string) (*FileKnowledge, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open knowledge root %q: %w", absolute, err)
 	}
-	return &FileKnowledge{root: opened, path: absolute}, nil
+	return &FileKnowledge{root: opened}, nil
 }
 
 // Close releases the pinned root handle.

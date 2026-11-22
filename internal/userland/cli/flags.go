@@ -1,13 +1,18 @@
 package cli
 
 import (
+	"context"
 	cryptorand "crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/optimiware/kodema/api"
 )
 
 // hasHelpFlag reports whether args asks for help (-h or --help) before a "--"
@@ -141,6 +146,18 @@ func (spec *argSpec) parse(args []string) ([]string, map[string]bool, error) {
 	return positionals, seen, nil
 }
 
+// resolveEnv returns the active environment lookup function: deps.Env, then
+// deps.Login.Environment, and finally os.Getenv.
+func resolveEnv(deps CommandDeps) func(string) string {
+	if deps.Env != nil {
+		return deps.Env
+	}
+	if deps.Login.Environment != nil {
+		return deps.Login.Environment
+	}
+	return os.Getenv
+}
+
 // resolveProject resolves the active project from an explicit subcommand flag,
 // the loaded configuration, or the KODEMA_PROJECT environment variable.
 func resolveProject(flagValue string, config Config, deps CommandDeps) string {
@@ -150,11 +167,7 @@ func resolveProject(flagValue string, config Config, deps CommandDeps) string {
 	if trimmed := strings.TrimSpace(config.Project); trimmed != "" {
 		return trimmed
 	}
-	getenv := deps.Login.Environment
-	if getenv == nil {
-		getenv = os.Getenv
-	}
-	return strings.TrimSpace(getenv("KODEMA_PROJECT"))
+	return strings.TrimSpace(resolveEnv(deps)("KODEMA_PROJECT"))
 }
 
 // resolveOutputFormat resolves an optional per-command --output flag or falls
@@ -222,4 +235,110 @@ func makeIdempotencyKey(explicit, operation string, random Random) (string, erro
 		return "", fmt.Errorf("cannot generate idempotency key: %w", err)
 	}
 	return "cli:" + operation + ":" + hex.EncodeToString(buf[:]), nil
+}
+
+// parseCommaSeparatedList splits repeatable comma-delimited flag values into a
+// trimmed, deduplicated slice preserving first-seen order.
+func parseCommaSeparatedList(rawFlags []string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, raw := range rawFlags {
+		for _, item := range strings.Split(raw, ",") {
+			trimmed := strings.TrimSpace(item)
+			if trimmed == "" {
+				continue
+			}
+			if _, dup := seen[trimmed]; dup {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// decodeJWTPayload decodes the unverified payload segment of a compact JWS/JWT.
+func decodeJWTPayload(token string) ([]byte, bool) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return nil, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return nil, false
+		}
+	}
+	return payload, true
+}
+
+// fetchAllPages drains a cursor-paginated public list operation, returning all
+// items, the raw first page body (for single-page JSON pass-through), and the
+// number of pages fetched.
+func fetchAllPages[T any, Page any](
+	ctx context.Context,
+	ports Ports,
+	operation string,
+	buildReq func(cursor string) any,
+	extract func(Page) ([]T, string),
+) ([]T, json.RawMessage, int, error) {
+	var (
+		all       []T
+		firstBody json.RawMessage
+		pages     int
+		cursor    string
+	)
+	for {
+		input, err := json.Marshal(buildReq(cursor))
+		if err != nil {
+			return nil, nil, pages, err
+		}
+		invocation := api.Invocation{
+			Operation: operation,
+			Request:   api.Request{Input: input},
+		}
+		if err := invocation.Validate(); err != nil {
+			return nil, nil, pages, err
+		}
+		result, err := ports.Client.Invoke(ctx, invocation)
+		if err != nil {
+			return nil, nil, pages, err
+		}
+		pages++
+		if pages == 1 {
+			firstBody = result.Body
+		}
+		var page Page
+		if len(result.Body) > 0 {
+			if err := json.Unmarshal(result.Body, &page); err != nil {
+				return nil, nil, pages, fmt.Errorf("invalid %s response: %w", operation, err)
+			}
+		}
+		items, nextCursor := extract(page)
+		all = append(all, items...)
+		if nextCursor == "" {
+			break
+		}
+		cursor = nextCursor
+	}
+	return all, firstBody, pages, nil
+}
+
+// renderPaginatedJSON renders a single-page raw body unchanged or marshals
+// combinedPayload when multiple pages were drained.
+func renderPaginatedJSON(ports Ports, operation string, firstBody json.RawMessage, pages int, combinedPayload any) int {
+	body := firstBody
+	if pages != 1 {
+		var err error
+		body, err = json.Marshal(combinedPayload)
+		if err != nil {
+			return failure(ports.Err, err)
+		}
+	}
+	if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: operation, Body: body}); err != nil {
+		return failure(ports.Err, err)
+	}
+	return ExitSuccess
 }

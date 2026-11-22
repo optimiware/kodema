@@ -441,3 +441,91 @@ func TestResolveReplayRefusesRevokedMembership(t *testing.T) {
 		t.Fatalf("replay = %+v; want %+v replayed", replayed, settled)
 	}
 }
+
+func TestAppendAuthorityLockNeverDropsDifferingGuards(t *testing.T) {
+	t.Run("merges compatible Expect maps and ExpectVersion without mutating inputs", func(t *testing.T) {
+		firstExpect := map[string]any{"state": "running"}
+		secondExpect := map[string]any{"lifecycle_version": uint64(3)}
+		index := make(map[string][]int)
+		var locks []store.Lock
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:         tableExecutions,
+			IDs:           []string{"exec-1"},
+			ExpectVersion: 2,
+			Expect:        firstExpect,
+		})
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:  tableExecutions,
+			IDs:    []string{"exec-1"},
+			Expect: secondExpect,
+		})
+		if len(locks) != 1 {
+			t.Fatalf("compatible locks = %d; want 1 merged lock", len(locks))
+		}
+		if locks[0].ExpectVersion != 2 || locks[0].Expect["state"] != "running" || locks[0].Expect["lifecycle_version"] != uint64(3) {
+			t.Fatalf("merged lock = %+v; want version 2 and both Expect keys", locks[0])
+		}
+		if len(firstExpect) != 1 {
+			t.Fatalf("first input Expect map was mutated: %v", firstExpect)
+		}
+	})
+
+	t.Run("keeps conflicting Expect predicates separate", func(t *testing.T) {
+		index := make(map[string][]int)
+		var locks []store.Lock
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:  tableExecutions,
+			IDs:    []string{"exec-1"},
+			Expect: map[string]any{"state": "running"},
+		})
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:  tableExecutions,
+			IDs:    []string{"exec-1"},
+			Expect: map[string]any{"state": "failed"},
+		})
+		if len(locks) != 2 {
+			t.Fatalf("conflicting Expect locks = %d; want 2 separate locks", len(locks))
+		}
+	})
+
+	t.Run("keeps differing ExpectVersion separate", func(t *testing.T) {
+		index := make(map[string][]int)
+		var locks []store.Lock
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:         tableExecutions,
+			IDs:           []string{"exec-1"},
+			ExpectVersion: 1,
+		})
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:         tableExecutions,
+			IDs:           []string{"exec-1"},
+			ExpectVersion: 2,
+		})
+		if len(locks) != 2 {
+			t.Fatalf("conflicting ExpectVersion locks = %d; want 2 separate locks", len(locks))
+		}
+	})
+
+	t.Run("keeps differing TenantWide flags separate", func(t *testing.T) {
+		index := make(map[string][]int)
+		var locks []store.Lock
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:         tableServices,
+			IDs:           []string{"svc-1"},
+			ExpectVersion: 1,
+			TenantWide:    false,
+		})
+		locks = appendAuthorityLock(locks, index, store.Lock{
+			Table:         tableServices,
+			IDs:           []string{"svc-1"},
+			ExpectVersion: 1,
+			TenantWide:    true,
+		})
+		if len(locks) != 2 {
+			t.Fatalf("differing TenantWide locks = %d; want 2 separate locks", len(locks))
+		}
+		if locks[0].TenantWide || !locks[1].TenantWide {
+			t.Fatalf("TenantWide flags were overwritten: %+v", locks)
+		}
+	})
+}

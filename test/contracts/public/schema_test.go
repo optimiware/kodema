@@ -5,6 +5,7 @@ package publiccontract
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -530,4 +531,31 @@ func TestOperationInputSchemaAdvertisesStringMapValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestModelTemperatureSchemaAndNaNValidation pins that float fields such as
+// model.invoke temperature project as JSON Schema "number" (not "object") and
+// that NaN temperatures are rejected by Validate.
+func TestModelTemperatureSchemaAndNaNValidation(t *testing.T) {
+	_, inputProperties := inputSchemaFor(t, "model.invoke")
+	temperature := schemaObject(t, schemaMember(t, inputProperties, "temperature", "model.invoke input properties"), "model.invoke temperature")
+	if got := schemaString(t, temperature, "type", "model.invoke temperature"); got != "number" {
+		t.Errorf("model.invoke temperature type = %q; want number", got)
+	}
+
+	nan := math.NaN()
+	chatReq := api.ChatCompletionRequest{
+		Model:       "gpt-4o-mini",
+		Messages:    api.Messages{{Role: "user", Content: "hi"}},
+		Temperature: &nan,
+	}
+	requirePublicError(t, chatReq.Validate(), api.CodeInvalidInput)
+
+	invokeReq := api.ModelInvokeRequest{
+		ProjectID:   "proj-1",
+		Model:       "gpt-4o-mini",
+		Messages:    api.Messages{{Role: "user", Content: "hi"}},
+		Temperature: &nan,
+	}
+	requirePublicError(t, invokeReq.Validate(), api.CodeInvalidInput)
 }
