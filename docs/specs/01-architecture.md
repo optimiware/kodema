@@ -2,71 +2,72 @@
 
 Source: [architecture](../../KODEMA.md#1-product-and-architecture), [implementation discipline](../../KODEMA.md#implementation-discipline).
 
-## 1. Ownership
+## 1. Architectural shape and ownership
 
-Kernel executes admitted ordered work. Shell coordinates, persists, and authorizes. Userland performs work and owns external resources. One Go module contains these three layers; packaging is not an additional runtime layer.
+Kodema uses a **two-sided (hourglass) architecture** joined at a narrow public contract (`api/` and `client/`), with a **hexagonal Control Plane** on the inside and isolated **Apps & Workloads** on the outside:
 
-Only Shell adapters access the factory database. Userland uses `api`/`client` contracts even when built into the same executable. Kernel has no knowledge of tasks, roles, Git, HTTP, SQL, NATS, identity, or agents. Task snapshot bytes may reach preparation as opaque data; Kernel never interprets their fields.
+```mermaid
+flowchart TB
+    subgraph AW["Apps & Workloads — zero server imports, sibling-isolated"]
+        direction LR
+        Apps["First-Party Apps (apps/)<br/>cli · git · agent · opencode · merge · email · sandbox · up"]
+        Workloads["External Workloads & Services<br/>containers · harnesses · recipes · UIs"]
+    end
 
-## 2. Functional package catalog
+    Waist(["Public Contract — api/ · client/<br/>REST · SSE · MCP · NATS · materialized workload files"])
 
-Paths below are exact ownership targets. A listed directory may contain a few cohesive subpackages under the same owner. Contract declaration files are owned by F02/C01–C03 and excluded from builder writes.
+    subgraph CP["Control Plane — Hexagonal (composed by server/)"]
+        direction TB
+        Transport["Transports (transport/)<br/>REST · SSE · MCP"]
+        Control["Control (control/)<br/>pure domain capabilities"]
+        Engine["Engine (engine/)<br/>pure ordered state machine"]
+        Adapter["Adapters (adapter/)<br/>PostgreSQL · NATS · Podman · Kubernetes · KMS · OCI"]
+        Transport --> Control
+        Control --> Engine
+        Control -. ports .-> Adapter
+        Engine -. ports .-> Adapter
+    end
 
-| Owner | Paths | Responsibility |
-|---|---|---|
-| F01/F02 | `internal/id`, `internal/fault`, Kernel `types.go`/`ports.go` files | Minimal vocabulary, typed failures, contracts |
-| K01 | `internal/kernel/definition` | Typed definition validation and direct references |
-| K02 | `internal/kernel/flow` | Pure state transitions for both action kinds |
-| K03 | `internal/kernel/script` | Fail-fast command scripts (output staging/settlement lives in `flow` and `engine`, with value bounds on `kernel.Outputs`) |
-| K04 | `internal/kernel/testkit` | Deterministic state/runtime/clock fakes and fault schedules |
-| K05 | `internal/kernel/engine` | Reconcile durable intents, observations, deadlines, cleanup |
-| P01 | `internal/shell/tenancy`, `internal/shell/resource` | Tenants/projects/memberships and versioned resource bindings |
-| P02 | `internal/shell/identity`, `internal/shell/token`, `internal/shell/service` | Principal verification, credential lifecycle, service management |
-| P03 | `internal/shell/authorize`, `internal/shell/verify` | Shared operation grants and service-plus-actor facts |
-| P04 | `internal/shell/pipeline` | YAML authoring, admission and image pinning orchestration |
-| P05 | `internal/shell/execution`, `internal/shell/request` | Execution API and authorized request settlement |
-| P06 | `internal/shell/task`, `internal/shell/inbox` | Conversations, atomic handoffs, derived progress |
-| P07 | `internal/shell/event`, `internal/shell/receipt` | Durable publication intent, verified ingress, deduplication |
-| P08 | `internal/shell/trigger` | Event-table-driven exact push starts |
-| P09 | `internal/shell/secret`, `internal/shell/workspace`, `internal/shell/log` | Secret custody, activation data, retained/live log boundaries |
-| P10 | `internal/shell/gateway` | Optional model gateway |
-| P11 | `internal/shell/mcpproxy` | Optional external MCP proxy |
-| P12 | `internal/shell/store/memory` | Development transaction implementation |
-| P13 | `internal/shell/store/postgres` | Plain SQL, migrations, RLS, atomic commit units |
-| P14 | `internal/shell/runtime/process` | Explicit host-process development adapter |
-| P15 | `internal/shell/runtime/podman` | Test-environment container adapter |
-| P16 | `internal/shell/runtime/kube` | Production Jobs, volumes, stop evidence |
-| P17 | `internal/shell/integration/keys` | Ephemeral/keyfile/AWS/GCP/Scaleway key adapters |
-| P18 | `internal/shell/integration/nats` | Scoped events/logs and live credential invalidation |
-| P19 | `internal/shell/integration/oidc`, `internal/shell/integration/platform` | OIDC access-token checks and hosted authority |
-| P20 | `internal/shell/integration/registry` | Immutable image resolution |
-| P21 | `internal/shell/transport/ops`, `internal/shell/transport/httpapi`, `internal/shell/transport/mcp` | Single router and two thin public edges |
-| P22 | `client`, `internal/userland/cli` | REST client, the client and toolbox commands of `kodema`, login/credential helper |
-| P23 | `internal/userland/git` | Independent Git service, rules, journal, retention |
-| P24 | `internal/userland/session`, `internal/userland/skill` | Durable agent context; Markdown skill declarations and loader (`skill` is frozen by C-PUBLIC and consumed by `kodema context`) |
-| P25 | `internal/userland/agent` | Native agent runtime using public contracts |
-| P26 | `internal/userland/services` | Email/webhook/timer/responders and merge serialization |
-| P27 | `examples` | Pipelines, images, context and delivery recipes |
-| P28 | `internal/installation`, `deploy` | Config/preflight, Helm, backup/restore entrypoints |
-| P29 | `internal/shell/store/units/execution` | Execution, request, and Kernel `engine.State` store adapters over neutral `store` seams |
-| P30 | `internal/shell/store/units/work` | Task, inbox, pipeline, and trigger store adapters over neutral `store` seams |
-| P31 | `internal/shell/store/units/identity` | Tenancy, resource-binding, identity, authority, credential, and service store adapters |
-| P32 | `internal/shell/store/units/platform` | Event outbox/ingress/read, verification, secret-lookup, gateway, and MCP store adapters |
-| P33 | `internal/shell/store/units/readers` | Store-backed readers for task execution views, log ownership, event cursors/validity, token receipts, and verification |
+    Apps --> Waist
+    Workloads --> Waist
+    Waist --> Transport
+```
 
-`api` contains public DTOs/schemas only and is frozen by C03. `internal/installation` is configuration/tooling, not a fourth product layer or alternate composition root. `internal/shell/app`, Userland app wiring, `cmd/kodema`, and `test/{component,integration,e2e,qualification}` are reserved for integration tasks after G2.
+- **Execution Engine (`internal/engine`):** executes admitted ordered work. Pure, deterministic, stdlib-only state machine with zero knowledge of tasks, roles, Git, HTTP, SQL, NATS, identity, or agents. Task snapshot bytes reach preparation as opaque data; the Engine never interprets their fields.
+- **Control Capabilities (`internal/control`):** pure domain rules, authorization, verification, task/request lifecycles, immutable KV, secret custody, tokens, event publication intent, and push triggers. Zero infrastructure I/O (`net`, `database/sql`, `os/exec`, `crypto/tls`).
+- **Adapters & Transports (`internal/adapter`, `internal/transport`):** concrete PostgreSQL/memory persistence, Process/Podman/Kubernetes runtimes, NATS/KMS/OIDC/OCI integrations, and one shared operation router behind thin REST and MCP edges. Only Control Plane adapters access the factory database.
+- **Composition (`internal/server`, `cmd/kodema`):** one explicit Control Plane composition root and CLI dispatch entrypoint.
+- **Public Contract (`api`, `client`):** stdlib-only wire DTOs/schemas (`api`) and the public REST/SSE/NATS Go client (`client`).
+- **Apps & Workloads (`internal/apps`, plus external containers/services):** independent first-party programs (`cli`, `git`, `agent`, `opencode`, `merge`, `email`, `sandbox`, `up`) and third-party workloads/services. Even when linked into the single `kodema` binary, apps use `api`/`client` contracts only, never import Control Plane or Engine internals, and remain isolated from sibling apps (sharing only `api`, `client`, neutral primitives, and a minimal `internal/apps/kit` helper layer).
+
+## 2. Target package layout and migration map
+
+The repository is transitioning from the earlier three-folder layout (`internal/kernel`, `internal/shell`, `internal/userland`) to the hexagonal + `apps/` tree below so `ls internal/` mirrors the enforced import boundaries directly instead of hiding ring classification inside `internal/archtest`.
+
+| Target ring | Target paths | Current paths (pre-move) | Responsibility |
+|---|---|---|---|
+| Neutral & contract | `api`, `client`, `internal/id`, `internal/fault`, `internal/docs` | *(unchanged)* | Public DTOs/schemas, Go client, typed IDs, error taxonomy, embedded docs |
+| Engine | `internal/engine/{definition,flow,script,reconcile,testkit}` | `internal/kernel/{definition,flow,script,engine,testkit}` | Pure definition validation, ordered reducer, fail-fast script rendering, deterministic reconciler, fakes |
+| Control | `internal/control/{tenancy,resource,identity,token,service,authorize,verify,pipeline,execution,request,task,inbox,kv,event,receipt,trigger,secret,workspace,log,gateway,mcpproxy}` | `internal/shell/<capability>` | Pure domain capabilities, authorization/verification, secret/workspace contracts, optional in-process gateways |
+| Adapter | `internal/adapter/store/{memory,postgres,units/*}`, `internal/adapter/runtime/{container,process,podman,kube}`, `internal/adapter/integration/{keys,nats,oidc,platform,registry}` | `internal/shell/store/*`, `internal/shell/runtime/*`, `internal/shell/integration/*` | Concrete persistence, container/process runtimes (with shared container-runtime core), infrastructure integrations |
+| Transport | `internal/transport/{ops,httpapi,mcp}` | `internal/shell/transport/{ops,httpapi,mcp}` | Single operation router and thin REST, SSE, and MCP edges |
+| Server | `internal/server` | `internal/shell/app` | Control Plane composition root and driver wiring |
+| Apps | `internal/apps/{cli,git,agent,opencode,merge,email,sandbox,up,auth}`, `internal/apps/kit/{principal,session,skill}` | `internal/userland/{cli,git,agent,services,sandbox,up,app/auth,principal,session,skill}` | Independent first-party programs speaking public contracts only; `services` split into sibling daemon apps |
+| Installation & examples | `internal/installation`, `deploy`, `examples` | *(unchanged)* | Config/preflight, Helm/OpenTofu, reference delivery recipes |
+
+`api` contains public DTOs/schemas only. `internal/installation` is configuration and preflight logic, not a product layer or alternate composition root.
 
 ## 3. Import rules
 
 | Importer | Allowed | Forbidden |
 |---|---|---|
 | `api`, `id`, `fault`, `docs` | Standard library | Product implementations, transport clients |
-| Kernel | Standard library, `id`, `fault`, acyclic Kernel dependencies | Shell/Userland and infrastructure clients |
-| Shell capability | Kernel types/logic, neutral types, consumer-owned contracts | Concrete stores/runtimes/transports, Userland |
-| Shell adapter | Consumed contracts, approved technology dependency | Another capability's implementation to bypass its port |
-| Shell transport | Public schema, verified-principal boundary, router contract | SQL, duplicate authorization/lifecycle rules |
-| Userland/client | Public schema/client, neutral values, own adapters | Kernel/Shell internals, factory DB/key access |
-| Composition | Completed packages needed for its process | Shared mutable global registries, `init` side effects |
+| `engine` | Standard library, `id`, `fault`, acyclic `engine` packages | `api`, `control`, `adapter`, `transport`, `server`, `apps`, infrastructure stdlib/clients |
+| `control` | `engine`, `api`, neutral packages, consumer-owned ports, approved YAML parser | Concrete `adapter` packages, `transport`, `server`, `apps`, infrastructure I/O (`database/sql`, `net`, `os/exec`, `crypto/tls`) |
+| `adapter` | Consumed `engine`/`control`/`api` contracts, neutral packages, approved technology dependencies | Bypassing another capability's port; `server`, `apps` |
+| `transport` | `api`, `engine`, `control`, neutral packages, router contract | `database/sql`, concrete `adapter` packages, duplicate authorization/lifecycle rules, `apps` |
+| `server` / `cmd` | Completed packages needed for its process | Shared mutable global registries, `init` side effects |
+| `apps/<app>` | `api`, `client`, neutral packages, `apps/kit`, own subpackages | `engine`, `control`, `adapter`, `transport`, `server`, `installation`, sibling `apps/<other>` packages |
 
 Consumer-owned interfaces live with the consumer; no universal `Repository`, service locator, generic event engine, or global `contracts` god-package. A provider can implement several small interfaces without depending on a consumer implementation. Shared declarations must form an acyclic graph.
 
@@ -74,9 +75,9 @@ Consumer-owned interfaces live with the consumer; no universal `Repository`, ser
 
 Every effectful port specifies input identity/version, success evidence, ambiguous failure, idempotency, cancellation, and ownership of retries. `context.Context` is first on blocking calls. Return a structured observation, not a boolean that collapses uncertainty.
 
-Kernel state ports must support load, compare-and-commit transitions/intents, and scanning due/unfinished work. The commit contains expected execution/action versions, output changes, cancellation/deadline effects, and credential-invalidation intent. Shell applies its audit/events/token changes atomically without injecting identity policy into Kernel.
+Engine state ports must support load, compare-and-commit transitions/intents, and scanning due/unfinished work. The commit contains expected execution/action versions, output changes, cancellation/deadline effects, and credential-invalidation intent. Control Plane adapters apply audit, events, and token changes atomically without injecting identity policy into the Engine.
 
-Shell transaction ports express **complete commit units**, such as `AskTask`, `ReplyAndAdmit`, or `ResolveRequest`; not independently committing `SaveTask` and `CancelExecution` calls. Capability transitions run with authoritative locked/versioned state and an explicit current time. The adapter is persistence, not another state machine.
+Control Plane transaction ports express **complete commit units**, such as `AskTask`, `ReplyAndAdmit`, or `ResolveRequest`—never independently committing `SaveTask` and `CancelExecution` calls. Capability transitions run with authoritative locked/versioned state and an explicit current time. The persistence adapter stores facts; it is not a second state machine.
 
 External calls occur outside database transactions. Read/resolve external input first, then validate relevant versions and authority when committing. Persist external-effect intent before starting it; retry through observation, not guessed success.
 
@@ -86,8 +87,6 @@ Required error classes: invalid input, unauthenticated, forbidden, not found, ve
 
 Inject clock, ID generation, randomness, external clients, and command execution at real boundaries. Production randomness is cryptographic. Runtime errors distinguish a proven pre-effect refusal from a lost post-effect response. Business terminal state and pending cleanup are separate fields.
 
-## 6. Unit-stage boundary
+## 6. Verification boundary
 
-Functional packages are implemented against frozen interfaces and deterministic fakes. Calling a pure Kernel helper or using public value types is allowed. Wiring real Shell capabilities together, launching services/processes, and testing infrastructure semantics wait for G2. Unit tests exercise one capability and its faked collaborators, including full transactional command payloads and rollback behavior of the in-memory adapter.
-
-Every package documents its owned invariant, its ports, and the real proof still required. `unit-complete` never means PostgreSQL atomicity, container isolation, or end-to-end authority has been proven.
+Pure Engine and Control packages are verified with deterministic fakes and zero external processes. Adapters are verified first against contract fixtures over faked drivers, then against real PostgreSQL, NATS, Podman, Kubernetes, Git, and KMS infrastructure. Every package documents its owned invariant, its ports, and the real-infrastructure proof required; unit tests alone never claim PostgreSQL atomicity, container isolation, or end-to-end authority.

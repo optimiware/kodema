@@ -1,6 +1,6 @@
 # S03 — Pipeline definitions and immutable admission
 
-Source: [core model](../../KODEMA.md#core-model), [ordered flow](../../KODEMA.md#ordered-flow), [push triggers](../../KODEMA.md#pipeline-push-triggers-and-userland-services). Owners: K01, P04, P08, P20. AC: 2, 11, 13, 14.
+Source: [core model](../../KODEMA.md#core-model), [ordered flow](../../KODEMA.md#ordered-flow), [push triggers](../../KODEMA.md#pipeline-push-triggers-and-independent-services). Owners: K01, P04, P08, P20. AC: 2, 11, 13, 14.
 
 ## 1. Authoring boundary
 

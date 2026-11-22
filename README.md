@@ -265,7 +265,7 @@ Then follow the [Podman bundle runbook](docs/runbooks/podman-quickstart.md) to
 |---|---|
 | `cmd/kodema` | The one binary: the installation (`up`, `serve`, `git serve`, `auth`, `agent`, `services`, `migrate`, `bootstrap-admin`), the client (`run`, `login`, `inbox`, `approve`, `logs`, ...) and the toolbox of a container action (`output push`, `git credential`). |
 | `api`, `client` | The public API declarations and the Go client. |
-| `internal` | The Kernel, the Shell and Userland. |
+| `internal` | The Control Plane (execution engine, domain capabilities, adapters, transports, server composition) and first-party apps (`cli`, `git`, `agent`, services, `sandbox`, `up`). |
 | `deploy` | The image, the Helm charts, the Podman bundle and the OpenTofu roots per cloud. |
 | `examples` | Example pipelines and knowledge files. |
 | `test` | Contract, component, integration, e2e and qualification suites. |
