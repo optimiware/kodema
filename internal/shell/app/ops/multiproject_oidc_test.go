@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"sort"
@@ -244,8 +245,8 @@ func TestMultiProjectTenantScopedHumanOIDC(t *testing.T) {
 		`{"project_id":"unauthorized-proj","name":"Nope"}`,
 		"eng-create-proj", map[string]string{"tenant": testTenant}); err == nil {
 		t.Fatal("engineer project.create unexpectedly succeeded")
-	} else if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated && class != fault.Forbidden {
-		t.Fatalf("engineer project.create = %v; want unauthenticated or forbidden", err)
+	} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+		t.Fatalf("engineer project.create = %v; want forbidden", err)
 	}
 
 	// 3. Project-scoped admin-token stays pinned to project-local and cannot
@@ -820,6 +821,292 @@ func TestMultiProjectTenantScopedIDAddressedOperations(t *testing.T) {
 		if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
 			t.Fatalf("unassigned %s(%s) = %v; want unauthenticated", probe.op, probe.id, err)
 		}
+	}
+}
+
+// TestIssue94ProjectOnlyHumanOIDCReceivesForbiddenOnTenantAdminOps pins Issue #94
+// end-to-end through the real token.Resolver, identitystore.Adapter, ops.Router,
+// REST edge (httpapi) and MCP edge (mcp):
+//   - project-only human OIDC sessions (engineer, reviewer, operator, and even
+//     project-only viewer/admin with no tenant-wide role) receive 403 forbidden
+//     with the standard authorization refusal message on tenant-admin operations
+//     (membership.list, membership.grant, membership.revoke, project.create,
+//     project.update, tenant.create, tenant.rotate_key) via REST and MCP;
+//   - human OIDC tenant-admin succeeds on membership.list and membership.grant;
+//   - zero-membership human OIDC sessions remain refused as 401 unauthenticated;
+//   - revoking a project-only human's last project membership immediately flips
+//     tenant-admin calls back to 401 unauthenticated (no cached authority).
+func TestIssue94ProjectOnlyHumanOIDCReceivesForbiddenOnTenantAdminOps(t *testing.T) {
+	h := newHarness(t)
+
+	if _, err := h.invokeKey(t, "token-admin", "tenant.create",
+		`{"tenant_id":"`+testTenant+`","name":"Local Tenant"}`, "id94-seed-tenant", nil); err != nil {
+		t.Fatalf("tenant.create: %v", err)
+	}
+	for _, proj := range []string{"project-local", "secret-project"} {
+		if _, err := h.invokeKey(t, "token-admin", "project.create",
+			`{"project_id":"`+proj+`","name":"Project `+proj+`"}`, "id94-seed-"+proj,
+			map[string]string{"tenant": testTenant}); err != nil {
+			t.Fatalf("project.create %s: %v", proj, err)
+		}
+	}
+
+	adminID := id.PrincipalID("oidc-id94-admin")
+	engineerID := id.PrincipalID("oidc-id94-engineer")
+	reviewerID := id.PrincipalID("oidc-id94-reviewer")
+	operatorID := id.PrincipalID("oidc-id94-operator")
+	projViewerID := id.PrincipalID("oidc-id94-project-viewer")
+	projAdminID := id.PrincipalID("oidc-id94-project-admin")
+	unassignedID := id.PrincipalID("oidc-id94-unassigned")
+
+	h.seedMembership(t, tenancy.Scope{TenantID: testTenant}, "membership-id94-admin-tenant", adminID, 1, tenancy.RoleAdmin)
+	for _, seed := range []struct {
+		key       string
+		principal id.PrincipalID
+		roles     string
+	}{
+		{"id94-grant-eng", engineerID, `["engineer"]`},
+		{"id94-grant-rev", reviewerID, `["reviewer"]`},
+		{"id94-grant-op", operatorID, `["operator"]`},
+		{"id94-grant-pv", projViewerID, `["viewer"]`},
+		{"id94-grant-pa", projAdminID, `["admin"]`},
+	} {
+		if _, err := h.invokeKey(t, "token-admin", "membership.grant",
+			`{"roles":`+seed.roles+`}`, seed.key,
+			map[string]string{"project": "project-local", "principal": string(seed.principal)}); err != nil {
+			t.Fatalf("membership.grant %s: %v", seed.principal, err)
+		}
+	}
+
+	exp := fixedClock{}.Now().Add(time.Hour)
+	verifier := mapOIDCVerifier{
+		tokens: map[string]identity.Principal{
+			"jwt-admin": identity.Principal{
+				ID: adminID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-engineer": identity.Principal{
+				ID: engineerID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-reviewer": identity.Principal{
+				ID: reviewerID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-operator": identity.Principal{
+				ID: operatorID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-project-viewer": identity.Principal{
+				ID: projViewerID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-project-admin": identity.Principal{
+				ID: projAdminID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-unassigned": identity.Principal{
+				ID: unassignedID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+		},
+	}
+
+	realResolver, err := token.NewResolver(token.ResolverConfig{
+		Lookup:      noopLookup{},
+		Credentials: noopCredAuth{},
+		OIDC:        verifier,
+		Principals:  h.adapter,
+		Clock:       fixedClock{},
+	})
+	if err != nil {
+		t.Fatalf("token.NewResolver: %v", err)
+	}
+	oidcRouter, err := ops.NewRouter(ops.Config{
+		Principals: realResolver,
+		Scopes:     h.ownership,
+		Executions: h.ownership,
+		Bindings:   h.bindingsTable,
+	})
+	if err != nil {
+		t.Fatalf("ops.NewRouter: %v", err)
+	}
+	restEdge, err := httpapi.NewEdge(oidcRouter)
+	if err != nil {
+		t.Fatalf("httpapi.NewEdge: %v", err)
+	}
+	mcpEdge, err := mcp.NewEdge(mcp.Config{
+		Router:     oidcRouter,
+		ServerInfo: api.MCPImplementation{Name: "kodema", Version: "test"},
+	})
+	if err != nil {
+		t.Fatalf("mcp.NewEdge: %v", err)
+	}
+
+	callREST := func(cred, method, path, body string) *responseRecorder {
+		req, err := http.NewRequest(method, path, bytes.NewReader([]byte(body)))
+		if err != nil {
+			t.Fatalf("http.NewRequest %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		rec := &responseRecorder{header: make(http.Header)}
+		restEdge.ServeHTTP(rec, req)
+		return rec
+	}
+	callMCPError := func(cred, tool string, input map[string]any, key string) api.Error {
+		t.Helper()
+		args := map[string]any{"input": input}
+		if key != "" {
+			args["idempotency_key"] = key
+		}
+		rawArgs, _ := json.Marshal(args)
+		payload, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "tools/call",
+			"params":  map[string]any{"name": tool, "arguments": json.RawMessage(rawArgs)},
+		})
+		raw := mcpEdge.Handle(context.Background(), cred, payload)
+		var rpc struct {
+			Error *struct {
+				Data api.Error `json:"data"`
+			} `json:"error"`
+			Result struct {
+				IsError           bool      `json:"isError"`
+				StructuredContent api.Error `json:"structuredContent"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &rpc); err != nil {
+			t.Fatalf("unmarshal MCP error response %s: %v", string(raw), err)
+		}
+		if rpc.Error != nil {
+			return rpc.Error.Data
+		}
+		if !rpc.Result.IsError {
+			t.Fatalf("MCP %s(%s) unexpectedly succeeded: %s", cred, tool, string(raw))
+		}
+		return rpc.Result.StructuredContent
+	}
+
+	// 1. Tenant-admin human OIDC succeeds on membership.list and membership.grant.
+	adminList := callREST("jwt-admin", http.MethodGet, "/api/v1/projects/project-local/memberships", "")
+	if adminList.status != http.StatusOK {
+		t.Fatalf("admin REST membership.list = %d %s; want 200", adminList.status, adminList.body.String())
+	}
+	adminGrant := callREST("jwt-admin", http.MethodPut,
+		"/api/v1/projects/secret-project/memberships/"+string(operatorID),
+		`{"idempotency_key":"id94-admin-grant","input":{"roles":["operator"]}}`)
+	if adminGrant.status != http.StatusOK {
+		t.Fatalf("admin REST membership.grant = %d %s; want 200", adminGrant.status, adminGrant.body.String())
+	}
+
+	// 2. Project-only human OIDC personas receive 403 forbidden with the exact
+	// operation authorization message on all tenant-admin operations (REST + MCP),
+	// including project-only viewer and project-only admin (who hold no tenant role).
+	projectOnlyPersonas := []struct {
+		cred        string
+		principalID id.PrincipalID
+	}{
+		{"jwt-engineer", engineerID},
+		{"jwt-reviewer", reviewerID},
+		{"jwt-operator", operatorID},
+		{"jwt-project-viewer", projViewerID},
+		{"jwt-project-admin", projAdminID},
+	}
+	restProbes := []struct {
+		op     string
+		method string
+		path   string
+		body   string
+	}{
+		{"membership.list", http.MethodGet, "/api/v1/projects/project-local/memberships", ""},
+		{"membership.list", http.MethodGet, "/api/v1/projects/secret-project/memberships", ""},
+		{"membership.list", http.MethodGet, "/api/v1/projects/no-such-project/memberships", ""},
+		{"membership.grant", http.MethodPut, "/api/v1/projects/project-local/memberships/" + string(engineerID),
+			`{"idempotency_key":"id94-try-grant","input":{"roles":["reviewer"]}}`},
+		{"membership.revoke", http.MethodDelete, "/api/v1/projects/project-local/memberships/" + string(engineerID),
+			`{"idempotency_key":"id94-try-revoke","expected_version":1,"input":{}}`},
+		{"project.create", http.MethodPost, "/api/v1/tenants/" + testTenant + "/projects",
+			`{"idempotency_key":"id94-try-create-proj","input":{"project_id":"nope","name":"Nope"}}`},
+		{"project.update", http.MethodPatch, "/api/v1/projects/project-local",
+			`{"idempotency_key":"id94-try-update-proj","expected_version":1,"input":{"name":"Renamed"}}`},
+		{"tenant.create", http.MethodPost, "/api/v1/tenants",
+			`{"idempotency_key":"id94-try-create-tenant","input":{"tenant_id":"other","name":"Other"}}`},
+		{"tenant.rotate_key", http.MethodPost, "/api/v1/tenants/" + testTenant + "/rotate-key",
+			`{"idempotency_key":"id94-try-rotate","expected_version":1,"input":{"name":"Local Tenant"}}`},
+	}
+	for _, persona := range projectOnlyPersonas {
+		for _, probe := range restProbes {
+			rec := callREST(persona.cred, probe.method, probe.path, probe.body)
+			if rec.status != http.StatusForbidden {
+				t.Fatalf("%s REST %s %s = %d %s; want 403", persona.cred, probe.op, probe.path, rec.status, rec.body.String())
+			}
+			var apiErr api.Error
+			if err := json.Unmarshal(rec.body.Bytes(), &apiErr); err != nil {
+				t.Fatalf("decode error body %s: %v", rec.body.String(), err)
+			}
+			wantMsg := fmt.Sprintf("principal %q is not authorized for operation %q", persona.principalID, probe.op)
+			if apiErr.Code != string(fault.Forbidden) || apiErr.Message != wantMsg {
+				t.Fatalf("%s REST %s error = %+v; want code=forbidden message=%q", persona.cred, probe.op, apiErr, wantMsg)
+			}
+		}
+
+		// MCP parity for membership_list and membership_grant.
+		mcpListErr := callMCPError(persona.cred, "membership_list", map[string]any{"project_id": "project-local"}, "")
+		wantListMsg := fmt.Sprintf("principal %q is not authorized for operation %q", persona.principalID, "membership.list")
+		if mcpListErr.Code != string(fault.Forbidden) || mcpListErr.Message != wantListMsg {
+			t.Fatalf("%s MCP membership_list = %+v; want code=forbidden message=%q", persona.cred, mcpListErr, wantListMsg)
+		}
+		mcpGrantErr := callMCPError(persona.cred, "membership_grant", map[string]any{
+			"project_id":   "project-local",
+			"principal_id": string(engineerID),
+			"roles":        []string{"reviewer"},
+		}, "id94-mcp-grant")
+		wantGrantMsg := fmt.Sprintf("principal %q is not authorized for operation %q", persona.principalID, "membership.grant")
+		if mcpGrantErr.Code != string(fault.Forbidden) || mcpGrantErr.Message != wantGrantMsg {
+			t.Fatalf("%s MCP membership_grant = %+v; want code=forbidden message=%q", persona.cred, mcpGrantErr, wantGrantMsg)
+		}
+	}
+
+	// Foreign tenant stays uniformly 404 not_found before authorization.
+	foreignTenant := callREST("jwt-engineer", http.MethodPost, "/api/v1/tenants/tenant-foreign/projects",
+		`{"idempotency_key":"id94-foreign","input":{"project_id":"nope","name":"Nope"}}`)
+	if foreignTenant.status != http.StatusNotFound {
+		t.Fatalf("engineer foreign tenant project.create = %d %s; want 404", foreignTenant.status, foreignTenant.body.String())
+	}
+
+	// 3. Zero-membership OIDC user remains refused as 401 unauthenticated across
+	// all tenant-admin operations (REST and MCP) and foreign-tenant probes.
+	for _, probe := range restProbes {
+		rec := callREST("jwt-unassigned", probe.method, probe.path, probe.body)
+		if rec.status != http.StatusUnauthorized {
+			t.Fatalf("unassigned REST %s %s = %d %s; want 401", probe.op, probe.path, rec.status, rec.body.String())
+		}
+		var apiErr api.Error
+		if err := json.Unmarshal(rec.body.Bytes(), &apiErr); err != nil {
+			t.Fatalf("decode unassigned error body %s: %v", rec.body.String(), err)
+		}
+		if apiErr.Code != string(fault.Unauthenticated) || apiErr.Message != "presented credential is invalid" {
+			t.Fatalf("unassigned REST %s error = %+v; want unauthenticated", probe.op, apiErr)
+		}
+	}
+	unassignedMCPErr := callMCPError("jwt-unassigned", "membership_list", map[string]any{"project_id": "project-local"}, "")
+	if unassignedMCPErr.Code != string(fault.Unauthenticated) || unassignedMCPErr.Message != "presented credential is invalid" {
+		t.Fatalf("unassigned MCP membership_list = %+v; want unauthenticated", unassignedMCPErr)
+	}
+
+	// 4. Revoking engineer's only project membership immediately flips
+	// membership.list from 403 forbidden back to 401 unauthenticated.
+	v1 := uint64(1)
+	if _, err := oidcRouter.Invoke(context.Background(), ops.Invocation{
+		Operation:  "membership.revoke",
+		Credential: "jwt-admin",
+		Params:     map[string]string{"project": "project-local", "principal": string(engineerID)},
+		Request: api.Request{
+			Input:           json.RawMessage(`{}`),
+			IdempotencyKey:  "id94-revoke-eng",
+			ExpectedVersion: &v1,
+		},
+	}); err != nil {
+		t.Fatalf("admin revoke engineer membership: %v", err)
+	}
+	afterRevoke := callREST("jwt-engineer", http.MethodGet, "/api/v1/projects/project-local/memberships", "")
+	if afterRevoke.status != http.StatusUnauthorized {
+		t.Fatalf("engineer membership.list after last membership revoked = %d %s; want 401",
+			afterRevoke.status, afterRevoke.body.String())
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/id"
 	shellidentity "github.com/optimiware/kodema/internal/shell/identity"
+	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
@@ -117,6 +119,73 @@ func TestReadPrincipalAmbiguousIdentityRefused(t *testing.T) {
 	h.seedMembership(scope, "membership-shared", "principal-shared", 1, tenancy.RoleViewer)
 	_, err := h.adapter.ReadPrincipal(context.Background(), shellidentity.PrincipalRequest{Scope: scope, PrincipalID: "principal-shared"})
 	requireFaultClass(t, err, fault.Forbidden)
+}
+
+func TestHasProjectMembership(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	// Seed two tenants with projects.
+	h.seedTenantRow("tenant-a")
+	h.seedTenantRow("tenant-b")
+	h.seed(tenantScope("tenant-a"), "projects", "project-1", map[string]any{"name": "Project 1", "version": int64(1), "created_at": testNow})
+	h.seed(tenantScope("tenant-a"), "projects", "project-2", map[string]any{"name": "Project 2", "version": int64(1), "created_at": testNow})
+	h.seed(tenantScope("tenant-b"), "projects", "project-b", map[string]any{"name": "Project B", "version": int64(1), "created_at": testNow})
+
+	// No memberships yet -> false.
+	has, err := h.adapter.HasProjectMembership(ctx, id.TenantID("tenant-a"), id.PrincipalID("principal-eng"))
+	if err != nil {
+		t.Fatalf("HasProjectMembership empty: %v", err)
+	}
+	if has {
+		t.Fatal("HasProjectMembership = true for zero-membership user; want false")
+	}
+
+	// Membership in another tenant is invisible in tenant-a.
+	h.seedMembership(projectScope("tenant-b", "project-b"), "membership-b", "principal-other", 1, tenancy.RoleEngineer)
+	has, err = h.adapter.HasProjectMembership(ctx, id.TenantID("tenant-a"), id.PrincipalID("principal-other"))
+	if err != nil {
+		t.Fatalf("HasProjectMembership cross-tenant: %v", err)
+	}
+	if has {
+		t.Fatal("HasProjectMembership = true for foreign-tenant member; want false")
+	}
+
+	// Active project membership in tenant-a/project-2 -> true.
+	h.seedMembership(projectScope("tenant-a", "project-2"), "membership-eng-2", "principal-eng", 1, tenancy.RoleEngineer)
+	has, err = h.adapter.HasProjectMembership(ctx, id.TenantID("tenant-a"), id.PrincipalID("principal-eng"))
+	if err != nil {
+		t.Fatalf("HasProjectMembership member: %v", err)
+	}
+	if !has {
+		t.Fatal("HasProjectMembership = false for active project member; want true")
+	}
+
+	// Revoking the last project membership immediately flips HasProjectMembership back to false.
+	if _, err := h.store.Execute(ctx, projectScope("tenant-a", "project-2"), store.Unit{
+		Writes: []store.Write{{Table: "memberships", ID: "membership-eng-2", Delete: true, ExpectVersion: 1}},
+	}); err != nil {
+		t.Fatalf("delete membership: %v", err)
+	}
+	has, err = h.adapter.HasProjectMembership(ctx, id.TenantID("tenant-a"), id.PrincipalID("principal-eng"))
+	if err != nil {
+		t.Fatalf("HasProjectMembership after revoke: %v", err)
+	}
+	if has {
+		t.Fatal("HasProjectMembership = true after revocation; want false")
+	}
+
+	// An ambiguous identity colliding with a service row in the project fails closed.
+	h.seedService(projectScope("tenant-a", "project-1"), "principal-shared", 1, string(serviceStateEnabledForTest), nil, nil)
+	h.seedMembership(projectScope("tenant-a", "project-1"), "membership-shared", "principal-shared", 1, tenancy.RoleEngineer)
+	_, err = h.adapter.HasProjectMembership(ctx, id.TenantID("tenant-a"), id.PrincipalID("principal-shared"))
+	requireFaultClass(t, err, fault.Forbidden)
+
+	// Invalid tenant or principal ID is refused with invalid_input.
+	_, err = h.adapter.HasProjectMembership(ctx, "", id.PrincipalID("principal-eng"))
+	requireFaultClass(t, err, fault.InvalidInput)
+	_, err = h.adapter.HasProjectMembership(ctx, id.TenantID("tenant-a"), "")
+	requireFaultClass(t, err, fault.InvalidInput)
 }
 
 // serviceStateEnabledForTest mirrors the declared enabled state without

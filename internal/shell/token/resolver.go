@@ -48,6 +48,15 @@ type CredentialAuthenticator interface {
 	Authenticate(context.Context, AuthenticateRequest) (Authenticated, error)
 }
 
+// tenantProjectMembershipReader is optionally implemented by a PrincipalReader
+// (such as identitystore.Adapter) so a verified tenant-scoped human with no
+// tenant-wide membership row can still be authenticated as a zero-tenant-role
+// principal when they hold at least one active project-scoped membership in
+// the tenant. Zero-membership humans remain refused as unauthenticated.
+type tenantProjectMembershipReader interface {
+	HasProjectMembership(context.Context, id.TenantID, id.PrincipalID) (bool, error)
+}
+
 // ResolverConfig binds every pre-authentication dependency.
 type ResolverConfig struct {
 	Lookup      store.CredentialLookup
@@ -284,13 +293,27 @@ func (resolver *Resolver) resolveBearer(ctx context.Context, presented string) (
 	}
 	allowUnassigned := authorize.AllowsUnassignedPrincipal(ctx) ||
 		(!verified.Scope.ProjectScoped() && readScope == verified.Scope && authorize.AllowsProjectScopeResolution(ctx))
-	if allowUnassigned && resolver.principals != nil {
+	checkProjectMembership := !allowUnassigned && !verified.Scope.ProjectScoped() && readScope == verified.Scope
+	if (allowUnassigned || checkProjectMembership) && resolver.principals != nil {
 		current, readErr := resolver.principals.ReadPrincipal(ctx, identity.PrincipalRequest{
 			Scope:       readScope,
 			PrincipalID: verified.ID,
 		})
 		if readErr != nil {
 			if class, ok := fault.ClassOf(readErr); ok && class == fault.NotFound {
+				if !allowUnassigned {
+					checker, ok := resolver.principals.(tenantProjectMembershipReader)
+					if !ok {
+						return authorize.Principal{}, resolverRefusal()
+					}
+					hasMembership, checkErr := checker.HasProjectMembership(ctx, verified.Scope.TenantID, verified.ID)
+					if checkErr != nil {
+						return authorize.Principal{}, resolverFailure(checkErr)
+					}
+					if !hasMembership {
+						return authorize.Principal{}, resolverRefusal()
+					}
+				}
 				return authorize.Principal{
 					ID:      verified.ID,
 					Kind:    identity.KindHuman,

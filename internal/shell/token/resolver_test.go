@@ -895,3 +895,182 @@ func TestResolverPropagatesHumanVerifiedExpiry(t *testing.T) {
 		t.Fatalf("execution VerifiedExpiry = %v; want zero", execPrincipal.VerifiedExpiry())
 	}
 }
+
+type fakeTenantMemberPrincipals struct {
+	fakePrincipals
+	hasProjectMembership bool
+	checkErr             error
+	checkCalls           int
+	checkedTenants       []id.TenantID
+	checkedPrincipals    []id.PrincipalID
+}
+
+func (fake *fakeTenantMemberPrincipals) HasProjectMembership(_ context.Context, tenantID id.TenantID, principalID id.PrincipalID) (bool, error) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.checkCalls++
+	fake.checkedTenants = append(fake.checkedTenants, tenantID)
+	fake.checkedPrincipals = append(fake.checkedPrincipals, principalID)
+	return fake.hasProjectMembership, fake.checkErr
+}
+
+// TestResolverTenantScopedHumanProjectMembershipFallback pins Issue #94 at the
+// token.Resolver boundary: a tenant-scoped human OIDC session with no
+// tenant-wide membership row authenticates as a zero-tenant-role human when
+// HasProjectMembership confirms at least one active project membership in the
+// tenant, while zero-membership users remain refused as unauthenticated and
+// dependency/collision failures fail closed.
+func TestResolverTenantScopedHumanProjectMembershipFallback(t *testing.T) {
+	tenantScope := tenancy.Scope{TenantID: "tenant-1"}
+	projectScope := tenancy.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	humanID := id.PrincipalID("oidc-engineer-1")
+	jwt := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJlbmcifQ.sig"
+
+	newEnv := func(principals *fakeTenantMemberPrincipals, verifiedScope tenancy.Scope) (*token.Resolver, time.Time) {
+		t.Helper()
+		base := newResolverEnv(t)
+		exp := base.clock.Now().Add(30 * time.Minute)
+		base.oidc.principal = identity.Principal{
+			ID:      humanID,
+			Kind:    identity.KindHuman,
+			Scope:   verifiedScope,
+			Enabled: true,
+		}.WithVerifiedExpiry(exp)
+		resolver, err := token.NewResolver(token.ResolverConfig{
+			Lookup:      base.lookup,
+			Credentials: base.manager,
+			OIDC:        base.oidc,
+			Principals:  principals,
+			Clock:       base.clock,
+		})
+		if err != nil {
+			t.Fatalf("NewResolver: %v", err)
+		}
+		return resolver, exp
+	}
+
+	t.Run("active_project_member_authenticates_with_empty_tenant_roles", func(t *testing.T) {
+		principals := &fakeTenantMemberPrincipals{
+			fakePrincipals:       fakePrincipals{err: fault.New(fault.NotFound, "no tenant-wide membership")},
+			hasProjectMembership: true,
+		}
+		resolver, exp := newEnv(principals, tenantScope)
+		got, err := resolver.Resolve(context.Background(), jwt)
+		if err != nil {
+			t.Fatalf("Resolve: %v", err)
+		}
+		if got.ID != humanID || got.Kind != identity.KindHuman || got.Scope != tenantScope || !got.Enabled || len(got.Roles) != 0 {
+			t.Fatalf("principal = %+v; want enabled tenant-scoped human with empty roles", got)
+		}
+		if !got.VerifiedExpiry().Equal(exp) {
+			t.Fatalf("VerifiedExpiry = %v; want %v", got.VerifiedExpiry(), exp)
+		}
+		if principals.checkCalls != 1 || principals.checkedTenants[0] != tenantScope.TenantID || principals.checkedPrincipals[0] != humanID {
+			t.Fatalf("HasProjectMembership calls = %d (%v, %v); want 1 (%s, %s)",
+				principals.checkCalls, principals.checkedTenants, principals.checkedPrincipals, tenantScope.TenantID, humanID)
+		}
+	})
+
+	t.Run("zero_membership_user_stays_unauthenticated", func(t *testing.T) {
+		principals := &fakeTenantMemberPrincipals{
+			fakePrincipals:       fakePrincipals{err: fault.New(fault.NotFound, "no tenant-wide membership")},
+			hasProjectMembership: false,
+		}
+		resolver, _ := newEnv(principals, tenantScope)
+		_, err := resolver.Resolve(context.Background(), jwt)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
+			t.Fatalf("Resolve(zero-membership) = %v; want unauthenticated", err)
+		}
+		if principals.checkCalls != 1 {
+			t.Fatalf("HasProjectMembership calls = %d; want 1", principals.checkCalls)
+		}
+	})
+
+	t.Run("dependency_unavailable_fails_closed", func(t *testing.T) {
+		principals := &fakeTenantMemberPrincipals{
+			fakePrincipals: fakePrincipals{err: fault.New(fault.NotFound, "no tenant-wide membership")},
+			checkErr:       fault.New(fault.DependencyUnavailable, "db down"),
+		}
+		resolver, _ := newEnv(principals, tenantScope)
+		_, err := resolver.Resolve(context.Background(), jwt)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.DependencyUnavailable {
+			t.Fatalf("Resolve(db down) = %v; want dependency_unavailable", err)
+		}
+	})
+
+	t.Run("ambiguous_identity_error_fails_closed_as_unauthenticated", func(t *testing.T) {
+		principals := &fakeTenantMemberPrincipals{
+			fakePrincipals: fakePrincipals{err: fault.New(fault.NotFound, "no tenant-wide membership")},
+			checkErr:       fault.New(fault.Forbidden, "ambiguous identity"),
+		}
+		resolver, _ := newEnv(principals, tenantScope)
+		_, err := resolver.Resolve(context.Background(), jwt)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
+			t.Fatalf("Resolve(ambiguous) = %v; want unauthenticated", err)
+		}
+	})
+
+	t.Run("tenant_wide_member_does_not_scan_projects", func(t *testing.T) {
+		principals := &fakeTenantMemberPrincipals{
+			fakePrincipals: fakePrincipals{
+				principal: identity.Principal{
+					ID:      humanID,
+					Kind:    identity.KindHuman,
+					Scope:   tenantScope,
+					Roles:   []tenancy.Role{tenancy.RoleAdmin},
+					Enabled: true,
+					Version: 1,
+				},
+			},
+			hasProjectMembership: true,
+		}
+		resolver, _ := newEnv(principals, tenantScope)
+		got, err := resolver.Resolve(context.Background(), jwt)
+		if err != nil {
+			t.Fatalf("Resolve(tenant admin): %v", err)
+		}
+		if !got.HasRole(tenancy.RoleAdmin) {
+			t.Fatalf("tenant admin roles = %v; want admin", got.Roles)
+		}
+		if principals.checkCalls != 0 {
+			t.Fatalf("HasProjectMembership calls = %d; want 0 for tenant-wide member", principals.checkCalls)
+		}
+	})
+
+	t.Run("non_not_found_tenant_read_error_does_not_check_projects", func(t *testing.T) {
+		principals := &fakeTenantMemberPrincipals{
+			fakePrincipals:       fakePrincipals{err: fault.New(fault.Forbidden, "ambiguous tenant principal")},
+			hasProjectMembership: true,
+		}
+		resolver, _ := newEnv(principals, tenantScope)
+		_, err := resolver.Resolve(context.Background(), jwt)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
+			t.Fatalf("Resolve(tenant forbidden) = %v; want unauthenticated", err)
+		}
+		if principals.checkCalls != 0 {
+			t.Fatalf("HasProjectMembership calls = %d; want 0", principals.checkCalls)
+		}
+	})
+
+	t.Run("project_scoped_token_and_target_project_never_fallback", func(t *testing.T) {
+		principals := &fakeTenantMemberPrincipals{
+			fakePrincipals:       fakePrincipals{err: fault.New(fault.NotFound, "missing")},
+			hasProjectMembership: true,
+		}
+		projectResolver, _ := newEnv(principals, projectScope)
+		if _, err := projectResolver.Resolve(context.Background(), jwt); err == nil {
+			t.Fatal("project-scoped token unexpectedly succeeded")
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
+			t.Fatalf("project-scoped token err = %v; want unauthenticated", err)
+		}
+		tenantResolver, _ := newEnv(principals, tenantScope)
+		if _, err := tenantResolver.Resolve(authorize.WithTargetProject(context.Background(), "project-1"), jwt); err == nil {
+			t.Fatal("WithTargetProject unexpectedly succeeded")
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
+			t.Fatalf("WithTargetProject err = %v; want unauthenticated", err)
+		}
+		if principals.checkCalls != 0 {
+			t.Fatalf("HasProjectMembership calls = %d; want 0", principals.checkCalls)
+		}
+	})
+}
