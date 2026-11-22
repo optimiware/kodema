@@ -1,0 +1,128 @@
+# Reference kodema-stack Helm values for a single-node k3s / local Kubernetes
+# cluster without any cloud provider credentials.
+#
+# Use deploy/k3s/install.sh to generate the local PKI, Secrets, optional
+# in-cluster TLS PostgreSQL, and `kodema migrate` Job before installing this
+# chart:
+#
+#   deploy/k3s/install.sh
+#
+# Or render offline with Helm:
+#
+#   helm template kodema deploy/charts/kodema-stack -n kodema-system -f deploy/k3s/values.yaml
+
+nats:
+  enabled: true
+  replicaCount: 1
+  jetstream:
+    # Empty selects the cluster default StorageClass (local-path on k3s).
+    storageClass: ""
+    size: "2Gi"
+
+kodema:
+  # Runs `kodema serve --profile test` with KODEMA_RUNTIME=kubernetes and a
+  # local 32-byte keyfile staged from the kodema-keys Secret (key kek-v1.key).
+  # For production on self-hosted Kubernetes, set environment: "production" and
+  # config.keyAdapter: "vault-transit" (OpenBao / HashiCorp Vault Transit).
+  environment: "test"
+  replicaCount: 1
+  image:
+    repository: ghcr.io/optimiware/kodema/kodema
+    tag: "0.8.2"
+    # Set digest (sha256:<64 hex>) to enable the /kodema/bin/kodema workload
+    # toolbox initContainer (required for `kodema output push` in pipelines).
+    digest: ""
+    pullPolicy: IfNotPresent
+  config:
+    installationID: "kodema-k3s"
+    publicURL: "https://kodema.kodema-system.svc.cluster.local:8443"
+    natsURL: "tls://nats.kodema-system.svc.cluster.local:4222"
+    keyAdapter: "keyfile"
+    keyReference: "keyfile:kek-v1"
+    keyCurrentVersion: 1
+    mcpPath: "/mcp"
+    workspacePVC:
+      # Empty selects the cluster default StorageClass (local-path on k3s).
+      storageClass: ""
+      size: "2Gi"
+      accessMode: "ReadWriteOnce"
+    workloadCA:
+      secretName: "kodema-workload-ca"
+    extraEnv:
+      KODEMA_OIDC_ISSUER: "https://oauthsonas.kodema-system.svc.cluster.local:8443"
+      KODEMA_OIDC_AUDIENCE: "https://kodema.kodema-system.svc.cluster.local:8443"
+      KODEMA_OIDC_JWKS_URL: "https://oauthsonas.kodema-system.svc.cluster.local:8443/.well-known/jwks.json"
+      KODEMA_OIDC_TENANT_CLAIM: "org_id"
+      KODEMA_OIDC_CA_FILE: "/etc/kodema/tls/ca.crt"
+  secrets:
+    database:
+      existingSecret: kodema-database
+    broker:
+      existingSecret: kodema-broker
+    keys:
+      existingSecret: kodema-keys
+    tls:
+      existingSecret: kodema-tls
+    natsAuth:
+      existingSecret: "kodema-nats-auth"
+      account: "KODEMA"
+  tenants:
+    - tenant-a
+  networkPolicy:
+    defaultDeny: true
+    permitKodema: true
+    permitGit: true
+    # Leave empty on default k3s (flannel + kube-router). Setting egressFQDNs
+    # requires Cilium with the cilium.io/v2/CiliumNetworkPolicy CRD and
+    # enable-l7-proxy; see deploy/k3s/README.md.
+    egressFQDNs: []
+  persistence:
+    logs:
+      enabled: true
+      storageClass: ""
+      size: "2Gi"
+      accessMode: ReadWriteOnce
+      mountPath: /var/lib/kodema
+
+# In-cluster OAuthSonas development identity provider (never use in production).
+oauthsonas:
+  enabled: true
+  host: "oauthsonas.kodema-system.svc.cluster.local"
+  port: 8443
+  tlsSecret: oauthsonas-tls
+  accessCodeSecret: oauthsonas-access
+  accessCodeKey: access_code
+  config: |
+    issuer: https://oauthsonas.kodema-system.svc.cluster.local:8443
+    api_audience: https://kodema.kodema-system.svc.cluster.local:8443
+    clients:
+      - id: kodema-cli
+        name: Kodema CLI
+        public: true
+        redirect_uris:
+          - http://127.0.0.1/callback
+    personas:
+      - id: admin
+        subject: admin
+        email: admin@localhost.test
+        name: Local Administrator
+        organization_id: tenant-a
+        roles: [admin]
+      - id: engineer
+        subject: engineer
+        email: engineer@localhost.test
+        name: Local Engineer
+        organization_id: tenant-a
+        roles: [engineer]
+      - id: reviewer
+        subject: reviewer
+        email: reviewer@localhost.test
+        name: Local Reviewer
+        organization_id: tenant-a
+        roles: [reviewer]
+      - id: operator
+        subject: operator
+        email: operator@localhost.test
+        name: Local Operator
+        organization_id: tenant-a
+        roles: [operator]

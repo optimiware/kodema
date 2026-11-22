@@ -149,6 +149,8 @@ func TestProductionOIDCAndKMSRequiredBySchema(t *testing.T) {
 		{name: "gcp-kms with an empty annotation", values: withAdapter("gcp-kms", annotated(gcpAnnotation, "")), refused: gcpAnnotation},
 		{name: "gcp-kms with only the EKS annotation", values: withAdapter("gcp-kms", annotated(awsAnnotation, awsRole)), refused: gcpAnnotation},
 		{name: "gcp-kms with an external ServiceAccount", values: withAdapter("gcp-kms", map[string]any{"create": false})},
+		{name: "vault-transit without the Secret", values: withAdapter("vault-transit", nil), refused: "kmsCredentials"},
+		{name: "production refuses keyfile", values: withAdapter("keyfile", nil), refused: "keyAdapter"},
 	} {
 		err := validateAgainstSchema(schema, testCase.values, "values")
 		switch {
@@ -161,18 +163,38 @@ func TestProductionOIDCAndKMSRequiredBySchema(t *testing.T) {
 		}
 	}
 
-	for _, profile := range []string{"development", "test"} {
-		values := fqdnValues([]any{})
-		values["environment"] = profile
-		delete(extraEnvOf(values), "KODEMA_OIDC_ISSUER")
-		delete(values["secrets"].(map[string]any), "kmsCredentials")
-		if err := validateAgainstSchema(schema, values, "values"); err != nil {
-			t.Errorf("schema refused a %s profile without production-only inputs: %v", profile, err)
-		}
-		values["config"].(map[string]any)["keyAdapter"] = "aws-kms"
-		if err := validateAgainstSchema(schema, values, "values"); err != nil {
-			t.Errorf("schema refused a %s aws-kms profile without a ServiceAccount annotation: %v", profile, err)
-		}
+	// development cannot boot in-cluster and is refused by the schema.
+	dev := fqdnValues([]any{})
+	dev["environment"] = "development"
+	if err := validateAgainstSchema(schema, dev, "values"); err == nil {
+		t.Error("schema accepted environment=development, which cannot boot in-cluster")
+	}
+
+	// test boots in-cluster with keyfile + OIDC and requires neither
+	// secrets.kmsCredentials nor a cloud ServiceAccount annotation.
+	testVals := fqdnValues([]any{})
+	testVals["environment"] = "test"
+	testVals["config"].(map[string]any)["keyAdapter"] = "keyfile"
+	delete(testVals["secrets"].(map[string]any), "kmsCredentials")
+	if err := validateAgainstSchema(schema, testVals, "values"); err != nil {
+		t.Errorf("schema refused a valid test profile with keyfile and OIDC: %v", err)
+	}
+
+	// test without OIDC is refused.
+	testNoOIDC := fqdnValues([]any{})
+	testNoOIDC["environment"] = "test"
+	testNoOIDC["config"].(map[string]any)["keyAdapter"] = "keyfile"
+	delete(extraEnvOf(testNoOIDC), "KODEMA_OIDC_ISSUER")
+	if err := validateAgainstSchema(schema, testNoOIDC, "values"); err == nil {
+		t.Error("schema accepted environment=test without KODEMA_OIDC_ISSUER")
+	}
+
+	// test with a cloud KMS adapter is refused (must use keyfile).
+	testCloudKMS := fqdnValues([]any{})
+	testCloudKMS["environment"] = "test"
+	testCloudKMS["config"].(map[string]any)["keyAdapter"] = "scw-kms"
+	if err := validateAgainstSchema(schema, testCloudKMS, "values"); err == nil {
+		t.Error("schema accepted environment=test with keyAdapter=scw-kms")
 	}
 }
 
@@ -271,13 +293,15 @@ func TestKMSEnvFromIsRequiredOnlyInProduction(t *testing.T) {
 		t.Fatal("deployment.yaml has no envFrom block")
 	}
 	requirePattern(t, block, `(?m)^[ \t]*name:[ \t]*\{\{[ \t]*\.Values\.secrets\.kmsCredentials\.existingSecret[ \t]*\}\}[ \t]*$`, "envFrom KMS credentials Secret")
-	requirePattern(t, deployment, `(?ms)if ne \.Values\.environment "production".*?optional:[ \t]*true`, "envFrom optional only outside production")
-	if !regexp.MustCompile(`(?ms)\{\{-[ \t]*if ne \.Values\.environment "production"[ \t]*\}\}\s*optional:[ \t]*true\s*\{\{-[ \t]*end`).MatchString(deployment) {
-		t.Errorf("deployment.yaml does not gate optional: true on a non-production profile:\n%s", block)
+	if !strings.Contains(deployment, `if and $production (not $workloadIdentity)`) {
+		t.Errorf("deployment.yaml does not gate envFrom exclusively to production non-workload-identity adapters:\n%s", block)
+	}
+	if strings.Contains(block, "optional: true") {
+		t.Errorf("production envFrom must not mark the KMS credentials Secret optional:\n%s", block)
 	}
 
 	guard := readText(t, chartPath(t, "templates", "_extraenv.tpl"))
-	if !strings.Contains(guard, `if eq .Values.environment "production"`) {
+	if !strings.Contains(guard, `else if eq .Values.environment "production"`) {
 		t.Error("_extraenv.tpl has no production requirement guard")
 	}
 	for _, name := range productionOIDCNames {

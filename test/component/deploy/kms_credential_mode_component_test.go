@@ -500,12 +500,40 @@ func TestKodemaChartKMSCredentialRuleSchemaAndTemplateAgree(t *testing.T) {
 			args: joinArgs(adapterArgs("", "gcp-kms"), withoutKMSCredentialsArgs(""), externalServiceAccount),
 		},
 		{
-			name: "a development profile needs neither the Secret nor an annotation",
-			args: joinArgs([]string{"--set", "environment=development"}, adapterArgs("", "aws-kms"), withoutKMSCredentialsArgs("")),
+			name: "vault-transit with the KMS credentials Secret",
+			args: []string{"--set", "config.keyAdapter=vault-transit", "--set", "config.keyReference=vault-transit:transit/kodema-kek"},
 		},
 		{
-			name: "a test profile needs neither the Secret nor an annotation",
-			args: joinArgs([]string{"--set", "environment=test"}, adapterArgs("", "gcp-kms"), withoutKMSCredentialsArgs("")),
+			name:       "vault-transit without the KMS credentials Secret",
+			args:       joinArgs([]string{"--set", "config.keyAdapter=vault-transit", "--set", "config.keyReference=vault-transit:transit/kodema-kek"}, withoutKMSCredentialsArgs("")),
+			refused:    true,
+			wantSchema: "kmsCredentials",
+			wantGuard:  secretGuard,
+		},
+		{
+			name:       "production refuses keyfile",
+			args:       []string{"--set", "config.keyAdapter=keyfile", "--set", "config.keyReference=keyfile:kek-v1"},
+			refused:    true,
+			wantSchema: "keyAdapter",
+			wantGuard:  `production refuses config.keyAdapter="keyfile"`,
+		},
+		{
+			name:       "development profile is refused in-cluster",
+			args:       []string{"--set", "environment=development"},
+			refused:    true,
+			wantSchema: "environment",
+			wantGuard:  "environment",
+		},
+		{
+			name: "test profile with keyfile needs neither the Secret nor an annotation",
+			args: joinArgs([]string{"--set", "environment=test", "--set", "config.keyAdapter=keyfile", "--set", "config.keyReference=keyfile:kek-v1"}, withoutKMSCredentialsArgs("")),
+		},
+		{
+			name:       "test profile refuses cloud KMS adapters",
+			args:       joinArgs([]string{"--set", "environment=test"}, adapterArgs("", "gcp-kms"), withoutKMSCredentialsArgs("")),
+			refused:    true,
+			wantSchema: "keyAdapter",
+			wantGuard:  `environment "test" requires config.keyAdapter="keyfile"`,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -571,42 +599,40 @@ func TestKodemaChartExternalServiceAccountSkipsAnnotationGuard(t *testing.T) {
 	}
 }
 
-// TestKodemaChartNonProductionKMSReferenceStaysOptional pins the unchanged
-// development and test behaviour: a named Secret is referenced with
-// optional: true for every adapter, and a profile that names none renders no
-// reference instead of failing.
+// TestKodemaChartNonProductionKMSReferenceStaysOptional pins the in-cluster
+// test profile behaviour: environment=test runs with keyfile, renders
+// KODEMA_RUNTIME=kubernetes, KODEMA_KEYFILE and the prepare-keyfile
+// initContainer, and never references secrets.kmsCredentials even when left at
+// its chart default.
 func TestKodemaChartNonProductionKMSReferenceStaysOptional(t *testing.T) {
 	helm, charts := stagedCharts(t)
 	chart := filepath.Join(charts, "kodema")
-	for _, profile := range []string{"development", "test"} {
-		for _, mode := range kmsCredentialModes {
-			t.Run(profile+"/"+mode.adapter, func(t *testing.T) {
-				base := joinArgs([]string{"--set", "environment=" + profile}, adapterArgs("", mode.adapter))
-				rendered, err := renderChartArgs(t, helm, "kodema", chart, base...)
-				if err != nil {
-					t.Fatalf("helm template refused a %s render: %v\n%s", profile, err, rendered)
-				}
-				server := workloadContainer(t, renderedObjectNamed(t, rendered, "Deployment", "kodema"), "kodema")
-				envFrom, ok := server["envFrom"].([]any)
-				if !ok || len(envFrom) != 1 {
-					t.Fatalf("%s envFrom = %v, want the optional KMS credentials Secret", profile, server["envFrom"])
-				}
-				secretRef := objectAtKey(t, envFrom[0].(map[string]any), "secretRef")
-				if got := stringAtKey(t, secretRef, "name"); got != kmsCredentialsSecretName {
-					t.Errorf("%s envFrom reads %q, want %s", profile, got, kmsCredentialsSecretName)
-				}
-				if optional, ok := secretRef["optional"].(bool); !ok || !optional {
-					t.Errorf("%s envFrom does not mark the KMS credentials optional: %v", profile, secretRef)
-				}
-
-				rendered, err = renderChartArgs(t, helm, "kodema", chart, joinArgs(base, withoutKMSCredentialsArgs(""))...)
-				if err != nil {
-					t.Fatalf("helm template refused a %s render without secrets.kmsCredentials: %v\n%s", profile, err, rendered)
-				}
-				assertNoCredentialSecretReference(t, rendered)
-			})
+	base := kodemaProductionArgs(
+		"--set", "environment=test",
+		"--set", "config.keyAdapter=keyfile",
+		"--set", "config.keyReference=keyfile:kek-v1",
+	)
+	rendered, err := renderChartArgs(t, helm, "kodema", chart, base...)
+	if err != nil {
+		t.Fatalf("helm template refused a test render with keyfile: %v\n%s", err, rendered)
+	}
+	assertNoCredentialSecretReference(t, rendered)
+	deployment := renderedDocument(t, rendered, "Deployment", "kodema")
+	env := renderedEnvNames(t, deployment)
+	for _, want := range []string{"KODEMA_RUNTIME", "KODEMA_KEYFILE"} {
+		if !env[want] {
+			t.Errorf("test profile Deployment does not set %s", want)
 		}
 	}
+	if !strings.Contains(deployment, "name: prepare-keyfile") {
+		t.Error("test profile Deployment does not render prepare-keyfile initContainer")
+	}
+
+	rendered, err = renderChartArgs(t, helm, "kodema", chart, joinArgs(base, withoutKMSCredentialsArgs(""))...)
+	if err != nil {
+		t.Fatalf("helm template refused a test render without secrets.kmsCredentials: %v\n%s", err, rendered)
+	}
+	assertNoCredentialSecretReference(t, rendered)
 }
 
 // TestDescriptorCredentialModePerCloud runs the real

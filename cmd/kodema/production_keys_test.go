@@ -83,6 +83,17 @@ func TestBuildProductionSelectsTheKeyAdapter(t *testing.T) {
 			adapter:  "scw-kms",
 			isClient: func(client keys.KMSClient) bool { _, ok := client.(*keys.ScalewayKMS); return ok },
 		},
+		{
+			name: "vault-transit reads VAULT_ADDR and VAULT_TOKEN",
+			settings: map[string]string{
+				"KODEMA_KEY_ADAPTER": "vault-transit",
+				"KODEMA_KEY_REF":     "vault-transit:transit/kodema-kek",
+				"VAULT_ADDR":         "https://openbao.kodema-system.svc.cluster.local:8200",
+				"VAULT_TOKEN":        "hvs.example-token",
+			},
+			adapter:  "vault-transit",
+			isClient: func(client keys.KMSClient) bool { _, ok := client.(*keys.VaultTransitKMS); return ok },
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			getenv, build := productionKeyEnv(t, tc.settings)
@@ -144,6 +155,10 @@ func TestBuildProductionRefusesIncompleteKeyAdapterSettings(t *testing.T) {
 		{"aws adapter with a gcp reference", aws(map[string]string{"KODEMA_KEY_REF": testGCPKey}), "key reference"},
 		{"gcp adapter with an aws reference", map[string]string{"KODEMA_KEY_ADAPTER": "gcp-kms", "KODEMA_KEY_REF": testAWSKeyARN}, "key reference"},
 		{"gcp adapter with a malformed reference", map[string]string{"KODEMA_KEY_ADAPTER": "gcp-kms", "KODEMA_KEY_REF": "gcp-kms:projects/kodema"}, "key reference"},
+		{"vault-transit without VAULT_ADDR", map[string]string{"KODEMA_KEY_ADAPTER": "vault-transit", "KODEMA_KEY_REF": "vault-transit:transit/kodema-kek", "VAULT_TOKEN": "hvs.tok"}, "VAULT_ADDR"},
+		{"vault-transit without VAULT_TOKEN", map[string]string{"KODEMA_KEY_ADAPTER": "vault-transit", "KODEMA_KEY_REF": "vault-transit:transit/kodema-kek", "VAULT_ADDR": "https://vault.local:8200"}, "VAULT_TOKEN"},
+		{"vault-transit with http VAULT_ADDR", map[string]string{"KODEMA_KEY_ADAPTER": "vault-transit", "KODEMA_KEY_REF": "vault-transit:transit/kodema-kek", "VAULT_ADDR": "http://vault.local:8200", "VAULT_TOKEN": "hvs.tok"}, "https"},
+		{"vault-transit with malformed key reference", map[string]string{"KODEMA_KEY_ADAPTER": "vault-transit", "KODEMA_KEY_REF": "vault-transit:no-mount", "VAULT_ADDR": "https://vault.local:8200", "VAULT_TOKEN": "hvs.tok"}, "key reference"},
 		{"keyfile adapter", map[string]string{"KODEMA_KEY_ADAPTER": "keyfile"}, "aws-kms"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

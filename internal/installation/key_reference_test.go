@@ -137,3 +137,45 @@ func TestGCPKeyReferencePreflight(t *testing.T) {
 		})
 	}
 }
+
+func TestVaultTransitKeyReferencePreflight(t *testing.T) {
+	accepted := []string{
+		"vault-transit:transit/kodema-kek",
+		"vault-transit:platform/transit/kodema.kek_1",
+	}
+	for _, reference := range accepted {
+		t.Run("accepted "+reference, func(t *testing.T) {
+			if err := productionKeyConfig(KeyVaultTransit, reference).Preflight(); err != nil {
+				t.Fatalf("Preflight refused %q: %v", reference, err)
+			}
+		})
+	}
+
+	refused := []string{
+		"vault-transit:",
+		"vault-transit:kodema-kek",
+		"vault-transit:transit/",
+		"vault-transit:/transit/kodema-kek",
+		"vault-transit:transit//kodema-kek",
+		"vault-transit:../kodema-kek",
+		"vault-transit:transit/a..b",
+		"vault-transit:transit/kodema-kek?x=1",
+		"vault-transit:transit/kodema-kek#frag",
+		"vault-transit:transit/%2e%2e",
+	}
+	for _, reference := range refused {
+		t.Run("refused "+reference, func(t *testing.T) {
+			err := productionKeyConfig(KeyVaultTransit, reference).Preflight()
+			if err == nil {
+				t.Fatalf("Preflight accepted the Vault Transit reference %q", reference)
+			}
+			class, ok := fault.ClassOf(err)
+			if !ok || class != fault.InvalidInput {
+				t.Fatalf("refusal class = %v (%v); want InvalidInput", class, err)
+			}
+			if reference != "vault-transit:" && strings.Contains(err.Error(), reference) {
+				t.Fatalf("refusal echoes the configured reference: %v", err)
+			}
+		})
+	}
+}

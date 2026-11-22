@@ -39,6 +39,12 @@ type GCPReference struct {
 	CryptoKey string
 }
 
+// VaultTransitReference is a validated vault-transit: reference.
+type VaultTransitReference struct {
+	Mount   string
+	KeyName string
+}
+
 // ParseAWSReference validates an "aws-kms:" reference and returns its parts.
 func ParseAWSReference(reference secret.KeyRef) (AWSReference, error) {
 	body, ok := strings.CutPrefix(string(reference), AWSKeyRefPrefix)
@@ -147,6 +153,72 @@ func ParseGCPReference(reference secret.KeyRef) (GCPReference, error) {
 	}, nil
 }
 
+// ParseVaultTransitReference validates a "vault-transit:" reference and returns
+// its mount path and key name.
+func ParseVaultTransitReference(reference secret.KeyRef) (VaultTransitReference, error) {
+	body, ok := strings.CutPrefix(string(reference), VaultTransitKeyRefPrefix)
+	if !ok {
+		return VaultTransitReference{}, fault.New(fault.InvalidInput, "key reference is not a vault transit reference")
+	}
+	parts := strings.Split(body, "/")
+	if len(parts) < 2 || len(parts) > 8 {
+		return VaultTransitReference{}, fault.New(fault.InvalidInput, "vault transit key reference must be vault-transit:<mount>/<key-name>")
+	}
+	for _, segment := range parts[:len(parts)-1] {
+		if !validVaultTransitMount(segment) {
+			return VaultTransitReference{}, fault.New(fault.InvalidInput, "vault transit key reference has an invalid mount path")
+		}
+	}
+	keyName := parts[len(parts)-1]
+	if !validVaultTransitKey(keyName) {
+		return VaultTransitReference{}, fault.New(fault.InvalidInput, "vault transit key reference has an invalid key name")
+	}
+	return VaultTransitReference{
+		Mount:   strings.Join(parts[:len(parts)-1], "/"),
+		KeyName: keyName,
+	}, nil
+}
+
+func validVaultTransitMount(segment string) bool {
+	if len(segment) == 0 || len(segment) > 63 {
+		return false
+	}
+	for index, character := range segment {
+		switch {
+		case character >= 'A' && character <= 'Z':
+		case character >= 'a' && character <= 'z':
+		case character >= '0' && character <= '9':
+		case character == '-' || character == '_':
+			if index == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validVaultTransitKey(name string) bool {
+	if len(name) == 0 || len(name) > 128 || strings.Contains(name, "..") {
+		return false
+	}
+	for index, character := range name {
+		switch {
+		case character >= 'A' && character <= 'Z':
+		case character >= 'a' && character <= 'z':
+		case character >= '0' && character <= '9':
+		case character == '-' || character == '_' || character == '.':
+			if index == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // validateCloudKeyReference applies the family's grammar to a reference the
 // caller has already assigned to prefix. Scaleway has no structural grammar
 // here: the concrete client owns the scw-kms reference shape, so only a
@@ -158,6 +230,9 @@ func validateCloudKeyReference(prefix string, reference secret.KeyRef) error {
 		return err
 	case GCPKeyRefPrefix:
 		_, err := ParseGCPReference(reference)
+		return err
+	case VaultTransitKeyRefPrefix:
+		_, err := ParseVaultTransitReference(reference)
 		return err
 	default:
 		body, ok := strings.CutPrefix(string(reference), prefix)

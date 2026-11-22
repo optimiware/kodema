@@ -290,15 +290,16 @@ func TestKodemaChartFQDNEgressRendersOnlyWhenEnabled(t *testing.T) {
 	}
 	assertFQDNEgressPolicy(t, policy, []string{"registry.npmjs.org", "api.github.com"})
 
-	// Without the CRD the policy is skipped, never approximated.
+	// Without the CRD the render fails loudly rather than silently leaving
+	// tenant workloads blocked behind default-deny.
 	rendered, err = renderChartArgs(t, helm, "kodema", chart, kodemaProductionArgs(
 		"--set", "networkPolicy.egressFQDNs[0]=registry.npmjs.org",
 	)...)
-	if err != nil {
-		t.Fatalf("helm template kodema without the Cilium CRD: %v\n%s", err, rendered)
+	if err == nil {
+		t.Fatalf("helm template kodema without the Cilium CRD succeeded; want render failure:\n%s", rendered)
 	}
-	if count := renderedKindCount(rendered, "CiliumNetworkPolicy"); count != 0 {
-		t.Errorf("rendered %d CiliumNetworkPolicy objects on a cluster without the CRD", count)
+	if !strings.Contains(rendered, ciliumCRD) {
+		t.Errorf("failure without Cilium CRD does not name %q:\n%s", ciliumCRD, rendered)
 	}
 
 	// An explicitly empty list is a no-op even with the CRD.

@@ -18,23 +18,35 @@ import (
 	"github.com/optimiware/kodema/internal/shell/transport/httpapi"
 )
 
-// TestConfig is the durable form of ProfileTest: KODEMA.md's single-host test
-// environment with PostgreSQL, NATS, the Podman runtime and a local keyfile.
+// TestConfig is the durable form of ProfileTest: KODEMA.md's test
+// environment with PostgreSQL, NATS, a local keyfile, OIDC humans, and either
+// the single-host Podman runtime or the in-cluster Kubernetes Job runtime.
 // It shares the durable builder with production (role pools, broker, token and
 // OIDC resolver, registry, file log sink, stream provisioning) and differs only
-// in its runtime and key adapters. Humans authenticate through OIDC and the
-// current database memberships; no development authenticator or seed exists.
+// in its key adapter (keyfile) and optional Podman runtime. Humans authenticate
+// through OIDC and the current database memberships; no development
+// authenticator or seed exists.
 //
 // A ProfileTest configuration with Test == nil keeps the fully injected
 // harness form; the two forms are never mixed.
 type TestConfig struct {
-	// Runtime and Workspace are the Podman adapter. VolumeProvisioner is the
-	// Podman API client the fresh-only workspace decorator creates volumes
-	// with. All three are required.
-	Runtime           kernelengine.Runtime
-	Workspace         kernelengine.Workspace
+	// Runtime and Workspace are the single-tenant runtime and workspace
+	// adapters (Podman or single-tenant Kubernetes). For multi-tenant
+	// Kubernetes installations, set Tenants instead.
+	Runtime   kernelengine.Runtime
+	Workspace kernelengine.Workspace
+	// Tenants is the explicit multi-tenant adapter set for the Kubernetes
+	// runtime. Mutually exclusive with Runtime/Workspace and Podman.
+	Tenants []ProductionTenant
+	// VolumeProvisioner is the Podman API client the fresh-only workspace
+	// decorator creates volumes with. Required for RuntimePodman, refused for
+	// RuntimeKubernetes.
 	VolumeProvisioner VolumeProvisioner
-	// RuntimeReady probes the Podman API service for readiness. Required.
+	// ClaimProvisioner, with Config.WorkspacePVC (or per-tenant WorkspacePVC),
+	// provisions each execution's workspace PVC before first activation when
+	// Installation.Runtime is RuntimeKubernetes. Refused for RuntimePodman.
+	ClaimProvisioner ClaimProvisioner
+	// RuntimeReady probes the runtime API service for readiness. Required.
 	RuntimeReady func(context.Context) error
 	// RuntimeCloser releases the runtime client's transport at shutdown. It
 	// never stops the daemon or a durable workload.
@@ -72,8 +84,8 @@ func (config Config) validateDurableTest() error {
 	if config.Installation.Environment != installation.EnvironmentTest {
 		return fault.New(fault.InvalidInput, "durable test composition requires the test installation environment")
 	}
-	if config.Installation.Runtime != installation.RuntimePodman {
-		return fault.New(fault.InvalidInput, "durable test composition requires the podman runtime adapter")
+	if config.Installation.Runtime != installation.RuntimePodman && config.Installation.Runtime != installation.RuntimeKubernetes {
+		return fault.New(fault.InvalidInput, "durable test composition requires the podman or kubernetes runtime adapter")
 	}
 	if config.Dev != nil {
 		return fault.New(fault.InvalidInput, "durable test composition refuses a development authenticator and first-admin seed")
@@ -84,24 +96,49 @@ func (config Config) validateDurableTest() error {
 	if config.Adapters != nil && !reflect.ValueOf(*config.Adapters).IsZero() {
 		return fault.New(fault.InvalidInput, "durable test composition refuses injected adapter overrides")
 	}
-	if config.WorkspacePVC != nil {
+	if config.Installation.Runtime == installation.RuntimePodman && config.WorkspacePVC != nil {
 		return fault.New(fault.InvalidInput, "durable test composition refuses a kubernetes workspace claim template")
 	}
 	if strings.TrimSpace(config.DataDir) == "" || !filepath.IsAbs(config.DataDir) {
 		return fault.New(fault.InvalidInput, "durable test composition requires an absolute data directory")
 	}
-	return config.Test.validate(config.Installation)
+	return config.Test.validate(config.Installation, config.WorkspacePVC)
 }
 
-func (test *TestConfig) validate(installationConfig installation.Config) error {
-	if test.Runtime == nil {
-		return fault.New(fault.InvalidInput, "durable test composition requires the podman runtime adapter")
-	}
-	if test.Workspace == nil {
-		return fault.New(fault.InvalidInput, "durable test composition requires the podman workspace adapter")
-	}
-	if test.VolumeProvisioner == nil {
-		return fault.New(fault.InvalidInput, "durable test composition requires the podman volume provisioner")
+func (test *TestConfig) validate(installationConfig installation.Config, workspacePVC *WorkspacePVC) error {
+	switch installationConfig.Runtime {
+	case installation.RuntimePodman:
+		if len(test.Tenants) > 0 {
+			return fault.New(fault.InvalidInput, "durable test podman composition refuses a kubernetes tenant list")
+		}
+		if test.ClaimProvisioner != nil {
+			return fault.New(fault.InvalidInput, "durable test podman composition refuses a kubernetes claim provisioner")
+		}
+		if test.Runtime == nil {
+			return fault.New(fault.InvalidInput, "durable test composition requires the podman runtime adapter")
+		}
+		if test.Workspace == nil {
+			return fault.New(fault.InvalidInput, "durable test composition requires the podman workspace adapter")
+		}
+		if test.VolumeProvisioner == nil {
+			return fault.New(fault.InvalidInput, "durable test composition requires the podman volume provisioner")
+		}
+	case installation.RuntimeKubernetes:
+		if test.VolumeProvisioner != nil {
+			return fault.New(fault.InvalidInput, "durable test kubernetes composition refuses a podman volume provisioner")
+		}
+		if err := validateKubernetesAdapters(
+			"durable test",
+			test.Runtime,
+			test.Workspace,
+			test.Tenants,
+			test.ClaimProvisioner,
+			workspacePVC,
+		); err != nil {
+			return err
+		}
+	default:
+		return fault.New(fault.InvalidInput, "durable test composition requires the podman or kubernetes runtime adapter")
 	}
 	if test.RuntimeReady == nil {
 		return fault.New(fault.InvalidInput, "durable test composition requires a runtime readiness probe")
@@ -160,15 +197,35 @@ func buildDurableTestEnvironment(ctx context.Context, builder *builder) (*enviro
 	if err != nil {
 		return nil, err
 	}
-	// The Podman adapter's Retain never recreates a lost volume; the
-	// decorator provisions it only for a never-activated workspace.
-	activation, err := newWorkspaceActivation(stores.controller)
-	if err != nil {
-		return nil, err
-	}
-	workspace, err := newProvisioningWorkspace(test.Workspace, test.VolumeProvisioner, activation)
-	if err != nil {
-		return nil, err
+	var (
+		runtimeAdapter   kernelengine.Runtime
+		workspaceAdapter kernelengine.Workspace
+	)
+	switch cfg.Installation.Runtime {
+	case installation.RuntimeKubernetes:
+		runtimeAdapter, workspaceAdapter, err = wireKubernetesRuntime(
+			stores.controller,
+			test.Runtime,
+			test.Workspace,
+			test.Tenants,
+			test.ClaimProvisioner,
+			cfg.WorkspacePVC,
+		)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		// The Podman adapter's Retain never recreates a lost volume; the
+		// decorator provisions it only for a never-activated workspace.
+		activation, err := newWorkspaceActivation(stores.controller)
+		if err != nil {
+			return nil, err
+		}
+		workspaceAdapter, err = newProvisioningWorkspace(test.Workspace, test.VolumeProvisioner, activation)
+		if err != nil {
+			return nil, err
+		}
+		runtimeAdapter = test.Runtime
 	}
 	dial := test.dialNATS
 	if dial == nil {
@@ -176,8 +233,8 @@ func buildDurableTestEnvironment(ctx context.Context, builder *builder) (*enviro
 	}
 	environment, err := buildPersistentEnvironment(ctx, builder, stores, persistentServices{
 		label:         "test",
-		runtime:       test.Runtime,
-		workspace:     workspace,
+		runtime:       runtimeAdapter,
+		workspace:     workspaceAdapter,
 		provider:      provider,
 		keyVersion:    secret.MinKeyVersion,
 		natsTLS:       test.NATSTLS,

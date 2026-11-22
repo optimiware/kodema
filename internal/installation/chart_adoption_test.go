@@ -51,6 +51,7 @@ var chartDirectEnvNames = []string{
 	"KODEMA_KEY_BLOBS_DIR",
 	"KODEMA_KEY_CURRENT_VERSION",
 	"KODEMA_KEY_REF",
+	"KODEMA_KEYFILE",
 	"KODEMA_MCP_PATH",
 	"KODEMA_NATS_CA_FILE",
 	"KODEMA_NATS_CALLOUT_ACCOUNT",
@@ -65,6 +66,7 @@ var chartDirectEnvNames = []string{
 	"KODEMA_PROFILE",
 	"KODEMA_PUBLIC_URL",
 	"KODEMA_PUBLISHER_DATABASE_URL",
+	"KODEMA_RUNTIME",
 	"KODEMA_TENANT",
 	"KODEMA_TENANTS",
 	"KODEMA_TLS_DIR",
@@ -385,14 +387,18 @@ func TestTenantNamespacePodSecurityMutationSensitivity(t *testing.T) {
 
 // checkCiliumFQDNPolicyTemplate verifies the opt-in FQDN policy: the
 // egressFQDNs gate keeps an empty list from rendering an allow-all, the CRD
-// capability gate keeps it off clusters that cannot enforce FQDN rules, and the
-// DNS rule required by Cilium lives in the same policy as the toFQDNs rule.
+// capability check fails rendering when egressFQDNs is set on a cluster without
+// Cilium, and the DNS rule required by Cilium lives in the same policy as the
+// toFQDNs rule.
 func checkCiliumFQDNPolicyTemplate(body string) error {
-	if !regexp.MustCompile(`(?m)\{\{-?\s*if\s+and\s+\.Values\.networkPolicy\.egressFQDNs\b`).MatchString(body) {
+	if !regexp.MustCompile(`(?m)\{\{-?\s*if\s+\.Values\.networkPolicy\.egressFQDNs\b`).MatchString(body) {
 		return fmt.Errorf("policy is not gated by a non-empty .Values.networkPolicy.egressFQDNs")
 	}
 	if !strings.Contains(body, `.Capabilities.APIVersions.Has "cilium.io/v2/CiliumNetworkPolicy"`) {
 		return fmt.Errorf("policy is not gated by the Cilium CRD capability")
+	}
+	if !strings.Contains(body, "fail ") {
+		return fmt.Errorf("policy does not fail rendering when egressFQDNs is set without the Cilium CRD")
 	}
 	if got := strings.Count(body, "kind: CiliumNetworkPolicy"); got != 1 {
 		return fmt.Errorf("template renders %d CiliumNetworkPolicy objects per tenant, want 1", got)
@@ -463,12 +469,20 @@ func TestCiliumFQDNPolicyMutationSensitivity(t *testing.T) {
 		t.Fatal("checker accepted an FQDN policy without the DNS rule")
 	}
 
-	noGate := strings.Replace(body, "{{- if and .Values.networkPolicy.egressFQDNs (.Capabilities.APIVersions.Has \"cilium.io/v2/CiliumNetworkPolicy\") }}", "{{- if .Capabilities.APIVersions.Has \"cilium.io/v2/CiliumNetworkPolicy\" }}", 1)
+	noGate := strings.Replace(body, "{{- if .Values.networkPolicy.egressFQDNs }}", "{{- if true }}", 1)
 	if noGate == body {
 		t.Fatal("test mutation did not remove the egressFQDNs gate")
 	}
 	if err := checkCiliumFQDNPolicyTemplate(noGate); err == nil {
 		t.Fatal("checker accepted a policy that renders with an empty FQDN list")
+	}
+
+	noFail := regexp.MustCompile(`(?m)^.*fail .*\r?\n`).ReplaceAllString(body, "")
+	if noFail == body {
+		t.Fatal("test mutation did not remove the missing-CRD fail guard")
+	}
+	if err := checkCiliumFQDNPolicyTemplate(noFail); err == nil {
+		t.Fatal("checker accepted a policy that silently skips when the Cilium CRD is absent")
 	}
 
 	wildcard := strings.Replace(body, "matchName: {{ . | quote }}", `matchPattern: "*"`, 1)
@@ -638,8 +652,11 @@ func checkKMSCredentialsCustody(values, deployment string) error {
 	if strings.Contains(envFrom, ".Values.secrets.keys.existingSecret") {
 		return fmt.Errorf("envFrom loads the binary KEK Secret as environment variables")
 	}
-	if !regexp.MustCompile(`(?ms)if ne \.Values\.environment "production".*?optional:[ \t]*true`).MatchString(deployment) {
-		return fmt.Errorf("KMS credentials secretRef is not optional outside production, or the production requirement is missing")
+	if !strings.Contains(deployment, `if and $production (not $workloadIdentity)`) {
+		return fmt.Errorf("KMS credentials secretRef is not gated exclusively to production non-workload-identity adapters")
+	}
+	if strings.Contains(envFrom, "optional: true") {
+		return fmt.Errorf("production KMS credentials secretRef must not be marked optional")
 	}
 	inline := regexp.MustCompile(`(?ms)^[ \t]*-[ \t]*name:[ \t]*(?:SCW_[A-Z0-9_]+|AWS_[A-Z0-9_]+|GOOGLE_[A-Z0-9_]+)[ \t]*\r?\n[ \t]*value:`)
 	if inline.MatchString(deployment) {

@@ -676,6 +676,83 @@ func (adapters *Adapters) hasDevelopmentAdapter() bool {
 		adapters.ClaimProvisioner != nil
 }
 
+func validateKubernetesAdapters(
+	label string,
+	runtimeAdapter kernelengine.Runtime,
+	workspaceAdapter kernelengine.Workspace,
+	tenants []ProductionTenant,
+	claimProvisioner ClaimProvisioner,
+	workspacePVC *WorkspacePVC,
+) error {
+	if len(tenants) == 0 {
+		if runtimeAdapter == nil {
+			return fault.New(fault.InvalidInput, label+" composition requires the kubernetes runtime adapter")
+		}
+		if workspaceAdapter == nil {
+			return fault.New(fault.InvalidInput, label+" composition requires the kubernetes workspace adapter")
+		}
+		if (workspacePVC == nil) != (claimProvisioner == nil) {
+			return fault.New(fault.InvalidInput,
+				label+" workspace claim provisioning needs both a workspace claim template and a claim provisioner")
+		}
+		return nil
+	}
+	if runtimeAdapter != nil || workspaceAdapter != nil {
+		return fault.New(fault.InvalidInput,
+			label+" refuses both a single-tenant runtime and a tenant list")
+	}
+	if workspacePVC != nil {
+		return fault.New(fault.InvalidInput,
+			label+" refuses a single-tenant workspace claim template with a tenant list")
+	}
+	seenTenants := make(map[id.TenantID]bool, len(tenants))
+	seenNamespaces := make(map[string]int, len(tenants))
+	for index, tenant := range tenants {
+		if _, err := id.ParseTenantID(string(tenant.TenantID)); err != nil {
+			return fault.New(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entry %d tenant id is invalid", label, index+1))
+		}
+		if err := validateTenantNamespaceID(tenant.TenantID); err != nil {
+			return fault.Wrap(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entry %d tenant id is not a lowercase DNS label of at most %d characters", label, index+1, maxTenantNamespaceIDLength), err)
+		}
+		if seenTenants[tenant.TenantID] {
+			return fault.New(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entry %d repeats an earlier tenant id", label, index+1))
+		}
+		seenTenants[tenant.TenantID] = true
+		if tenant.Runtime == nil {
+			return fault.New(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entry %d requires a runtime adapter", label, index+1))
+		}
+		if tenant.Workspace == nil {
+			return fault.New(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entry %d requires a workspace adapter", label, index+1))
+		}
+		if (tenant.WorkspacePVC == nil) != (claimProvisioner == nil) {
+			return fault.New(fault.InvalidInput,
+				fmt.Sprintf("%s tenant workspace claim provisioning needs both a template per tenant and a claim provisioner (entry %d)", label, index+1))
+		}
+		if tenant.WorkspacePVC == nil {
+			continue
+		}
+		if err := validateWorkspacePVC(*tenant.WorkspacePVC); err != nil {
+			return fault.Wrap(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entry %d workspace claim template is invalid", label, index+1), err)
+		}
+		if tenant.WorkspacePVC.TenantID != tenant.TenantID {
+			return fault.New(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entry %d workspace claim template tenant does not match its tenant", label, index+1))
+		}
+		if other, ok := seenNamespaces[tenant.WorkspacePVC.Namespace]; ok {
+			return fault.New(fault.InvalidInput,
+				fmt.Sprintf("%s tenant list entries %d and %d share a workspace claim namespace", label, other+1, index+1))
+		}
+		seenNamespaces[tenant.WorkspacePVC.Namespace] = index
+	}
+	return nil
+}
+
 func (config *ProductionConfig) validate(installationConfig installation.Config) error {
 	if len(config.Tenants) == 0 {
 		if config.Runtime == nil {
@@ -797,6 +874,8 @@ func productionKeyPrefix(adapter installation.KeyAdapter) string {
 		return installation.KeyRefGCPKMSPrefix
 	case installation.KeyScalewayKMS:
 		return installation.KeyRefScalewayKMSPrefix
+	case installation.KeyVaultTransit:
+		return installation.KeyRefVaultTransitPrefix
 	default:
 		return "\x00"
 	}

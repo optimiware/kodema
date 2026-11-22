@@ -858,7 +858,6 @@ func TestBuildProductionRefusesWhatItCannotRunSafely(t *testing.T) {
 		{"missing oidc audience", "KODEMA_OIDC_AUDIENCE", "", "KODEMA_OIDC_AUDIENCE"},
 		{"missing oidc jwks", "KODEMA_OIDC_JWKS_URL", "", "KODEMA_OIDC_JWKS_URL"},
 		{"missing oidc tenant claim", "KODEMA_OIDC_TENANT_CLAIM", "", "KODEMA_OIDC_TENANT_CLAIM"},
-		{"missing workspace storage class", "KODEMA_WORKSPACE_PVC_STORAGE_CLASS", "", "KODEMA_WORKSPACE_PVC_STORAGE_CLASS"},
 		{"missing workspace size", "KODEMA_WORKSPACE_PVC_SIZE", "", "KODEMA_WORKSPACE_PVC_SIZE"},
 		{"missing workspace access mode", "KODEMA_WORKSPACE_PVC_ACCESS_MODE", "", "KODEMA_WORKSPACE_PVC_ACCESS_MODE"},
 		{"other key adapter", "KODEMA_KEY_ADAPTER", "keyfile", "scw-kms"},
@@ -887,6 +886,26 @@ func TestBuildProductionRefusesWhatItCannotRunSafely(t *testing.T) {
 				t.Fatalf("err = %v, want it to mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestBuildProductionAllowsEmptyWorkspaceStorageClass(t *testing.T) {
+	getenv, kube, options := productionFixture(t)
+	override := func(name string) string {
+		if name == "KODEMA_WORKSPACE_PVC_STORAGE_CLASS" {
+			return ""
+		}
+		return getenv(name)
+	}
+	built, err := buildProduction(options, override, kube)
+	if err != nil {
+		t.Fatalf("buildProduction with empty KODEMA_WORKSPACE_PVC_STORAGE_CLASS: %v", err)
+	}
+	if built.Config.WorkspacePVC == nil {
+		t.Fatal("WorkspacePVC is nil")
+	}
+	if built.Config.WorkspacePVC.StorageClass != "" {
+		t.Fatalf("WorkspacePVC.StorageClass = %q; want empty (cluster default)", built.Config.WorkspacePVC.StorageClass)
 	}
 }
 

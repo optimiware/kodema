@@ -904,9 +904,10 @@ func TestWorkspacePVCConfigValidation(t *testing.T) {
 	}{
 		{name: "unset template", template: nil},
 		{name: "valid template", template: func() *WorkspacePVC { template := kubeTestTemplate(); return &template }()},
+		{name: "cluster default storage class", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.StorageClass = "" })},
 		{name: "empty namespace", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.Namespace = "" }), want: "namespace"},
 		{name: "blank namespace", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.Namespace = "   " }), want: "namespace"},
-		{name: "empty storage class", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.StorageClass = "" }), want: "storage class"},
+		{name: "blank storage class", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.StorageClass = "   " }), want: "storage class"},
 		{name: "empty size", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.Size = "" }), want: "storage size"},
 		{name: "empty access mode", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.AccessMode = "" }), want: "access mode"},
 		{name: "invalid tenant", template: kubeTemplatePointer(func(template *WorkspacePVC) { template.TenantID = "tenant bad" }), want: "tenant"},

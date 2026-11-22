@@ -98,18 +98,22 @@ const (
 	KeyGCPKMS KeyAdapter = "gcp-kms"
 	// KeyScalewayKMS is the production Scaleway KMS adapter.
 	KeyScalewayKMS KeyAdapter = "scw-kms"
+	// KeyVaultTransit is the production OpenBao / HashiCorp Vault Transit adapter.
+	KeyVaultTransit KeyAdapter = "vault-transit"
 )
 
 // Valid reports whether the adapter is one of the declared adapters.
 func (adapter KeyAdapter) Valid() bool {
 	return adapter == KeyEphemeral || adapter == KeyKeyfile ||
-		adapter == KeyAWSKMS || adapter == KeyGCPKMS || adapter == KeyScalewayKMS
+		adapter == KeyAWSKMS || adapter == KeyGCPKMS || adapter == KeyScalewayKMS ||
+		adapter == KeyVaultTransit
 }
 
 // CloudKMS reports whether the adapter is an explicitly selected production
-// cloud KMS. Exactly one is required in production.
+// KMS (cloud KMS or self-hosted OpenBao / Vault Transit). Exactly one is
+// required in production.
 func (adapter KeyAdapter) CloudKMS() bool {
-	return adapter == KeyAWSKMS || adapter == KeyGCPKMS || adapter == KeyScalewayKMS
+	return adapter == KeyAWSKMS || adapter == KeyGCPKMS || adapter == KeyScalewayKMS || adapter == KeyVaultTransit
 }
 
 // Config is one installation configuration. URLs and the key reference are

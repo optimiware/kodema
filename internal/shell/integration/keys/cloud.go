@@ -15,9 +15,10 @@ import (
 // a configuration naming another family's reference is refused rather than
 // silently treated as a different key.
 const (
-	AWSKeyRefPrefix      = "aws-kms:"
-	GCPKeyRefPrefix      = "gcp-kms:"
-	ScalewayKeyRefPrefix = "scw-kms:"
+	AWSKeyRefPrefix          = "aws-kms:"
+	GCPKeyRefPrefix          = "gcp-kms:"
+	ScalewayKeyRefPrefix     = "scw-kms:"
+	VaultTransitKeyRefPrefix = "vault-transit:"
 )
 
 // KMSClient unwraps one installation-configured encrypted key blob. It is the
@@ -53,6 +54,12 @@ func NewGCP(client KMSClient, config CloudConfig, random io.Reader) (Provider, e
 // the configuration shape only; it never contacts the KMS.
 func NewScaleway(client KMSClient, config CloudConfig, random io.Reader) (Provider, error) {
 	return newCloudProvider(ScalewayKeyRefPrefix, client, config, random)
+}
+
+// NewVaultTransit returns an OpenBao / HashiCorp Vault Transit-backed provider.
+// Construction validates the configuration shape only; it never contacts Vault.
+func NewVaultTransit(client KMSClient, config CloudConfig, random io.Reader) (Provider, error) {
+	return newCloudProvider(VaultTransitKeyRefPrefix, client, config, random)
 }
 
 // newCloudProvider builds the shared KMS-backed provider. The key-encryption

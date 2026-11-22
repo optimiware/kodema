@@ -490,7 +490,7 @@ func TestProductionRefusesTestEntrySettings(t *testing.T) {
 		}, "development"},
 		{"production adapters", func(c *Config) { c.Production = &ProductionConfig{} }, "production"},
 		{"injected adapter", func(c *Config) { c.Adapters = &Adapters{Runtime: &fakeRuntime{}} }, "injected"},
-		{"kubernetes runtime", func(c *Config) { c.Installation.Runtime = installation.RuntimeKubernetes }, "podman"},
+		{"kubernetes runtime with podman volume provisioner", func(c *Config) { c.Installation.Runtime = installation.RuntimeKubernetes }, "podman"},
 		{"production environment", func(c *Config) { c.Installation.Environment = installation.EnvironmentProduction }, ""},
 		{"http public URL", func(c *Config) { c.Installation.PublicURL = "http://kodema.test" }, "public URL"},
 		{"relative data dir", func(c *Config) { c.DataDir = "data" }, "data directory"},
@@ -535,4 +535,81 @@ func TestProductionRefusesTestEntrySettings(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDurableTestCompositionSupportsKubernetesRuntime(t *testing.T) {
+	t.Run("single-tenant kubernetes with keyfile", func(t *testing.T) {
+		installClosingPools(t)
+		server := &fakeNATSServer{}
+		config := durableTestConfig(t, server)
+		config.Installation.Runtime = installation.RuntimeKubernetes
+		config.Test.VolumeProvisioner = nil
+		provisioner := &recordingClaimProvisioner{}
+		config.Test.ClaimProvisioner = provisioner
+		template := kubeTestTemplate()
+		template.StorageClass = ""
+		config.WorkspacePVC = &template
+
+		resolved := config.resolved()
+		if err := resolved.validate(); err != nil {
+			t.Fatalf("validate single-tenant kubernetes durable test: %v", err)
+		}
+		builder := &builder{cfg: resolved, logger: resolved.logger()}
+		environment, err := buildEnvironment(context.Background(), builder)
+		if err != nil {
+			t.Fatalf("buildEnvironment kubernetes: %v", err)
+		}
+		t.Cleanup(func() { builder.cleanup(context.Background()) })
+
+		if _, ok := environment.workspace.(*kubeProvisioningWorkspace); !ok {
+			t.Fatalf("workspace = %T; want *kubeProvisioningWorkspace", environment.workspace)
+		}
+		if environment.readiness == nil || len(environment.readiness.pools) != 4 || len(environment.readiness.local) != 2 || environment.readiness.kms != nil {
+			t.Fatalf("readiness dependencies = %+v; want four pools, NATS and the two local probes", environment.readiness)
+		}
+	})
+
+	t.Run("multi-tenant kubernetes with keyfile", func(t *testing.T) {
+		installClosingPools(t)
+		server := &fakeNATSServer{}
+		config := durableTestConfig(t, server)
+		config.Installation.Runtime = installation.RuntimeKubernetes
+		config.Test.Runtime = nil
+		config.Test.Workspace = nil
+		config.Test.VolumeProvisioner = nil
+		provisioner := &recordingClaimProvisioner{}
+		config.Test.ClaimProvisioner = provisioner
+		rtA, rtB := &fakeRuntime{}, &fakeRuntime{}
+		config.Test.Tenants = []ProductionTenant{
+			{
+				TenantID:     "tenant-a",
+				Runtime:      rtA,
+				Workspace:    rtA,
+				WorkspacePVC: &WorkspacePVC{Namespace: "kodema-tenant-tenant-a", TenantID: "tenant-a", StorageClass: "", Size: "10Gi", AccessMode: "ReadWriteOnce"},
+			},
+			{
+				TenantID:     "tenant-b",
+				Runtime:      rtB,
+				Workspace:    rtB,
+				WorkspacePVC: &WorkspacePVC{Namespace: "kodema-tenant-tenant-b", TenantID: "tenant-b", StorageClass: "", Size: "10Gi", AccessMode: "ReadWriteOnce"},
+			},
+		}
+
+		resolved := config.resolved()
+		if err := resolved.validate(); err != nil {
+			t.Fatalf("validate multi-tenant kubernetes durable test: %v", err)
+		}
+		builder := &builder{cfg: resolved, logger: resolved.logger()}
+		environment, err := buildEnvironment(context.Background(), builder)
+		if err != nil {
+			t.Fatalf("buildEnvironment multi-tenant kubernetes: %v", err)
+		}
+		t.Cleanup(func() { builder.cleanup(context.Background()) })
+		if _, ok := environment.runtime.(*tenantRuntime); !ok {
+			t.Fatalf("runtime = %T; want *tenantRuntime", environment.runtime)
+		}
+		if _, ok := environment.workspace.(*tenantWorkspace); !ok {
+			t.Fatalf("workspace = %T; want *tenantWorkspace", environment.workspace)
+		}
+	})
 }

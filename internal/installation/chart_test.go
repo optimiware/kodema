@@ -122,7 +122,7 @@ func TestValuesSchemaShape(t *testing.T) {
 	properties := objectAt(t, schema["properties"], "schema.properties")
 
 	environment := objectAt(t, properties["environment"], "schema.properties.environment")
-	if got, want := sortedCopy(stringsAt(t, environment["enum"], "environment.enum")), sortedCopy([]string{"development", "test", "production"}); strings.Join(got, ",") != strings.Join(want, ",") {
+	if got, want := sortedCopy(stringsAt(t, environment["enum"], "environment.enum")), sortedCopy([]string{"test", "production"}); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("environment enum = %v, want %v", got, want)
 	}
 

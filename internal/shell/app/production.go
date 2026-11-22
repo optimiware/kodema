@@ -8,12 +8,14 @@ import (
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
+	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/shell/app/bridges"
 	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	shellidentity "github.com/optimiware/kodema/internal/shell/identity"
 	"github.com/optimiware/kodema/internal/shell/integration/keys"
 	"github.com/optimiware/kodema/internal/shell/secret"
+	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/store/postgres"
 	identitystore "github.com/optimiware/kodema/internal/shell/store/units/identity"
 	"github.com/optimiware/kodema/internal/shell/store/units/readers"
@@ -127,55 +129,16 @@ func buildProductionEnvironment(ctx context.Context, builder *builder) (*environ
 	}
 	controller := stores.controller
 
-	// A multi-tenant installation routes every Kernel operation through the
-	// durable owning tenant. The dispatcher is built from the same controller
-	// seam the single-tenant composition already uses, so no router state is
-	// lost on restart. The credential deliverer and environment.runtime both
-	// use this one runtime, and the workspace dispatcher wraps each tenant's
-	// own adapter with the existing claim-provisioning decorator.
-	runtimeAdapter := production.Runtime
-	workspaceAdapter := production.Workspace
-	if len(production.Tenants) > 0 {
-		scopes, err := newControllerExecutionScopes(controller)
-		if err != nil {
-			return nil, err
-		}
-		runtimeAdapter, err = newTenantRuntime(scopes, production.Tenants)
-		if err != nil {
-			return nil, err
-		}
-		activation, err := newWorkspaceActivation(controller)
-		if err != nil {
-			return nil, err
-		}
-		routedTenants := append([]ProductionTenant(nil), production.Tenants...)
-		if production.ClaimProvisioner != nil {
-			for index := range routedTenants {
-				tenant := routedTenants[index]
-				if tenant.WorkspacePVC == nil {
-					return nil, fault.New(fault.InvalidInput,
-						"production tenant workspace claim template is missing")
-				}
-				wrapped, err := newKubeProvisioningWorkspace(tenant.Workspace, production.ClaimProvisioner, activation, *tenant.WorkspacePVC)
-				if err != nil {
-					return nil, err
-				}
-				routedTenants[index].Workspace = wrapped
-			}
-		}
-		workspaceAdapter, err = newTenantWorkspace(activation, routedTenants)
-		if err != nil {
-			return nil, err
-		}
-	} else if production.ClaimProvisioner != nil {
-		activation, err := newWorkspaceActivation(controller)
-		if err != nil {
-			return nil, err
-		}
-		workspaceAdapter, err = newKubeProvisioningWorkspace(workspaceAdapter, production.ClaimProvisioner, activation, *cfg.WorkspacePVC)
-		if err != nil {
-			return nil, err
-		}
+	runtimeAdapter, workspaceAdapter, err := wireKubernetesRuntime(
+		controller,
+		production.Runtime,
+		production.Workspace,
+		production.Tenants,
+		production.ClaimProvisioner,
+		cfg.WorkspacePVC,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	provider, err := productionKeyProvider(cfg.Installation.Keys, production)
@@ -216,7 +179,68 @@ func productionKeyProvider(adapter installation.KeyAdapter, production *Producti
 		return keys.NewGCP(production.KMS, production.Cloud, rand.Reader)
 	case installation.KeyScalewayKMS:
 		return keys.NewScaleway(production.KMS, production.Cloud, rand.Reader)
+	case installation.KeyVaultTransit:
+		return keys.NewVaultTransit(production.KMS, production.Cloud, rand.Reader)
 	default:
 		return nil, fault.New(fault.InvalidInput, "production requires an explicitly selected cloud KMS key adapter")
 	}
+}
+
+// wireKubernetesRuntime builds the single-tenant or multi-tenant Kubernetes
+// runtime and workspace adapters, wrapping workspace retention with fresh-only
+// PVC claim provisioning when claimProvisioner is configured. Both production
+// and the Kubernetes form of the durable test profile share this wiring.
+func wireKubernetesRuntime(
+	controller store.Controller,
+	runtimeAdapter kernelengine.Runtime,
+	workspaceAdapter kernelengine.Workspace,
+	tenants []ProductionTenant,
+	claimProvisioner ClaimProvisioner,
+	workspacePVC *WorkspacePVC,
+) (kernelengine.Runtime, kernelengine.Workspace, error) {
+	if len(tenants) > 0 {
+		scopes, err := newControllerExecutionScopes(controller)
+		if err != nil {
+			return nil, nil, err
+		}
+		runtimeAdapter, err = newTenantRuntime(scopes, tenants)
+		if err != nil {
+			return nil, nil, err
+		}
+		activation, err := newWorkspaceActivation(controller)
+		if err != nil {
+			return nil, nil, err
+		}
+		routedTenants := append([]ProductionTenant(nil), tenants...)
+		if claimProvisioner != nil {
+			for index := range routedTenants {
+				tenant := routedTenants[index]
+				if tenant.WorkspacePVC == nil {
+					return nil, nil, fault.New(fault.InvalidInput,
+						"tenant workspace claim template is missing")
+				}
+				wrapped, err := newKubeProvisioningWorkspace(tenant.Workspace, claimProvisioner, activation, *tenant.WorkspacePVC)
+				if err != nil {
+					return nil, nil, err
+				}
+				routedTenants[index].Workspace = wrapped
+			}
+		}
+		workspaceAdapter, err = newTenantWorkspace(activation, routedTenants)
+		if err != nil {
+			return nil, nil, err
+		}
+		return runtimeAdapter, workspaceAdapter, nil
+	}
+	if claimProvisioner != nil {
+		activation, err := newWorkspaceActivation(controller)
+		if err != nil {
+			return nil, nil, err
+		}
+		workspaceAdapter, err = newKubeProvisioningWorkspace(workspaceAdapter, claimProvisioner, activation, *workspacePVC)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return runtimeAdapter, workspaceAdapter, nil
 }
