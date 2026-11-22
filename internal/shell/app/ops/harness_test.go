@@ -741,7 +741,7 @@ func (h *harness) seedMembership(t *testing.T, scope tenancy.Scope, rowID string
 // buildRouter constructs the real binding table and router.
 func (h *harness) buildRouter(t *testing.T) {
 	t.Helper()
-	ownership, err := opsapp.NewOwnership(h.facts, opsapp.RegistryPermissions{})
+	ownership, err := opsapp.NewOwnership(h.facts, opsapp.RegistryPermissions{}, h.store)
 	if err != nil {
 		t.Fatalf("NewOwnership: %v", err)
 	}

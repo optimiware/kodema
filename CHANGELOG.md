@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.2
+
+Fixed:
+
+- **Resolve owning project for ID-addressed operations under tenant-scoped OIDC sessions (#92):**
+  `opsapp.Ownership.Resolve` now resolves the owning project of ID-addressed
+  project-scoped operations (`execution.*`, `task.*`, `service.*`, and
+  `resource.binding.*`) within the authenticated tenant across both REST and
+  MCP when invoked by a tenant-wide principal (human OIDC login session or
+  tenant-admin token), scoping lookups for project-only human members strictly
+  to their current member projects so foreign-project and foreign-tenant IDs
+  remain uniformly `not_found` and zero-membership principals remain refused as
+  `unauthenticated`.
+
 ## 0.8.1
 
 Fixed:

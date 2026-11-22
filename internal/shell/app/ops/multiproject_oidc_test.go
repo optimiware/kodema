@@ -1,9 +1,11 @@
 package opsapp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"sort"
 	"testing"
@@ -12,10 +14,19 @@ import (
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
+	"github.com/optimiware/kodema/internal/kernel"
+	"github.com/optimiware/kodema/internal/kernel/definition"
+	opsapp "github.com/optimiware/kodema/internal/shell/app/ops"
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/identity"
+	"github.com/optimiware/kodema/internal/shell/log"
+	"github.com/optimiware/kodema/internal/shell/receipt"
+	shellrequest "github.com/optimiware/kodema/internal/shell/request"
+	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 	"github.com/optimiware/kodema/internal/shell/token"
+	"github.com/optimiware/kodema/internal/shell/transport/httpapi"
+	"github.com/optimiware/kodema/internal/shell/transport/mcp"
 	"github.com/optimiware/kodema/internal/shell/transport/ops"
 )
 
@@ -309,4 +320,521 @@ func TestMultiProjectTenantScopedHumanOIDC(t *testing.T) {
 	if pinned.Scope != (tenancy.Scope{TenantID: testTenant, ProjectID: "project-local"}) {
 		t.Fatalf("project-scoped token was widened to %+v; want project-local", pinned.Scope)
 	}
+}
+
+// TestMultiProjectTenantScopedIDAddressedOperations pins Issue #92 end-to-end
+// through the real token.Resolver, real identitystore.Adapter, real log.Reader,
+// real ops.Router, REST edge (httpapi) and MCP edge (mcp):
+//   - tenant-scoped human OIDC sessions (engineer, reviewer) and tenant-admin
+//     tokens succeed on ID-addressed execution, task, service and resource
+//     binding operations across multiple projects via both REST and MCP;
+//   - ID-addressed operations on resources in projects where a tenant-scoped
+//     human holds no membership (or in a foreign tenant) fail uniformly with
+//     not_found (no existence oracle);
+//   - role checks still enforce forbidden on resources in member projects
+//     (e.g. reviewer cannot cancel an execution or start a task in demo2);
+//   - zero-membership OIDC users are refused uniformly as unauthenticated.
+func TestMultiProjectTenantScopedIDAddressedOperations(t *testing.T) {
+	h := newHarness(t)
+
+	if _, err := h.invokeKey(t, "token-admin", "tenant.create",
+		`{"tenant_id":"`+testTenant+`","name":"Local Tenant"}`, "id92-seed-tenant", nil); err != nil {
+		t.Fatalf("tenant.create: %v", err)
+	}
+	for _, proj := range []string{"project-local", "secret-project"} {
+		if _, err := h.invokeKey(t, "token-admin", "project.create",
+			`{"project_id":"`+proj+`","name":"Project `+proj+`"}`, "id92-seed-"+proj,
+			map[string]string{"tenant": testTenant}); err != nil {
+			t.Fatalf("project.create %s: %v", proj, err)
+		}
+	}
+
+	adminID := id.PrincipalID("oidc-id92-admin")
+	engineerID := id.PrincipalID("oidc-id92-engineer")
+	reviewerID := id.PrincipalID("oidc-id92-reviewer")
+	unassignedID := id.PrincipalID("oidc-id92-unassigned")
+
+	h.seedMembership(t, tenancy.Scope{TenantID: testTenant}, "membership-id92-admin-tenant", adminID, 1, tenancy.RoleAdmin)
+	if _, err := h.invokeKey(t, "token-admin", "membership.grant",
+		`{"roles":["engineer","reviewer","operator"]}`, "id92-grant-admin-local",
+		map[string]string{"project": "project-local", "principal": string(adminID)}); err != nil {
+		t.Fatalf("membership.grant admin: %v", err)
+	}
+	if _, err := h.invokeKey(t, "token-admin", "membership.grant",
+		`{"roles":["engineer"]}`, "id92-grant-eng-local",
+		map[string]string{"project": "project-local", "principal": string(engineerID)}); err != nil {
+		t.Fatalf("membership.grant engineer: %v", err)
+	}
+	if _, err := h.invokeKey(t, "token-admin", "membership.grant",
+		`{"roles":["reviewer"]}`, "id92-grant-rev-local",
+		map[string]string{"project": "project-local", "principal": string(reviewerID)}); err != nil {
+		t.Fatalf("membership.grant reviewer: %v", err)
+	}
+
+	exp := fixedClock{}.Now().Add(time.Hour)
+	verifier := mapOIDCVerifier{
+		tokens: map[string]identity.Principal{
+			"jwt-tenant-admin": identity.Principal{
+				ID: adminID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-engineer": identity.Principal{
+				ID: engineerID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-reviewer": identity.Principal{
+				ID: reviewerID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-unassigned": identity.Principal{
+				ID: unassignedID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+		},
+	}
+
+	realResolver, err := token.NewResolver(token.ResolverConfig{
+		Lookup:      noopLookup{},
+		Credentials: noopCredAuth{},
+		OIDC:        verifier,
+		Principals:  h.adapter,
+		Clock:       fixedClock{},
+	})
+	if err != nil {
+		t.Fatalf("token.NewResolver: %v", err)
+	}
+
+	// Wire a real log.Reader (backed by h.adapter for PrincipalReader +
+	// AuthorityReader) so execution.logs.read exercises the full production path.
+	logSink := &memoryLogSink{}
+	realLogReader, err := log.NewReader(log.ReaderConfig{
+		Authorizer: authorize.NewMatrix(),
+		Principals: h.adapter,
+		Authority:  h.adapter,
+		Ownership:  noLogOwnership{},
+		Sink:       logSink,
+		Clock:      fixedClock{},
+	})
+	if err != nil {
+		t.Fatalf("log.NewReader: %v", err)
+	}
+	deps := h.deps
+	deps.Logs = realLogReader
+	bindings, err := opsapp.Bindings(deps)
+	if err != nil {
+		t.Fatalf("opsapp.Bindings: %v", err)
+	}
+	oidcRouter, err := ops.NewRouter(ops.Config{
+		Principals: realResolver,
+		Scopes:     h.ownership,
+		Executions: h.ownership,
+		Bindings:   bindings,
+	})
+	if err != nil {
+		t.Fatalf("ops.NewRouter: %v", err)
+	}
+	restEdge, err := httpapi.NewEdge(oidcRouter)
+	if err != nil {
+		t.Fatalf("httpapi.NewEdge: %v", err)
+	}
+	mcpEdge, err := mcp.NewEdge(mcp.Config{
+		Router:     oidcRouter,
+		ServerInfo: api.MCPImplementation{Name: "kodema", Version: "test"},
+	})
+	if err != nil {
+		t.Fatalf("mcp.NewEdge: %v", err)
+	}
+
+	invoke := func(cred, op, input, key string, version *uint64, params map[string]string) (api.Result, error) {
+		return oidcRouter.Invoke(context.Background(), ops.Invocation{
+			Operation:  authorize.OperationName(op),
+			Credential: cred,
+			Params:     params,
+			Request: api.Request{
+				Input:           json.RawMessage(input),
+				IdempotencyKey:  key,
+				ExpectedVersion: version,
+			},
+		})
+	}
+	callREST := func(cred, method, path, body string) *responseRecorder {
+		req, err := http.NewRequest(method, path, bytes.NewReader([]byte(body)))
+		if err != nil {
+			t.Fatalf("http.NewRequest %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		rec := &responseRecorder{header: make(http.Header)}
+		restEdge.ServeHTTP(rec, req)
+		return rec
+	}
+	callMCP := func(cred, tool string, input map[string]any, key string) (api.Result, string) {
+		args := map[string]any{"input": input}
+		if key != "" {
+			args["idempotency_key"] = key
+		}
+		rawArgs, _ := json.Marshal(args)
+		payload, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "tools/call",
+			"params":  map[string]any{"name": tool, "arguments": json.RawMessage(rawArgs)},
+		})
+		respBytes := mcpEdge.Handle(context.Background(), cred, payload)
+		var rpc struct {
+			Result json.RawMessage `json:"result"`
+			Error  json.RawMessage `json:"error"`
+		}
+		if err := json.Unmarshal(respBytes, &rpc); err != nil {
+			t.Fatalf("unmarshal MCP response: %v (%s)", err, string(respBytes))
+		}
+		if len(rpc.Error) != 0 {
+			return api.Result{}, string(rpc.Error)
+		}
+		res, err := api.DecodeMCPResult(rpc.Result)
+		if err != nil {
+			return api.Result{}, err.Error()
+		}
+		return res, ""
+	}
+
+	// Create demo2 copying memberships from project-local.
+	if _, err := invoke("jwt-tenant-admin", "project.create",
+		`{"project_id":"demo2","name":"Demo 2","copy_members_from":"project-local"}`,
+		"id92-create-demo2", nil, map[string]string{"tenant": testTenant}); err != nil {
+		t.Fatalf("project.create demo2: %v", err)
+	}
+
+	yamlDoc := base64.StdEncoding.EncodeToString([]byte("actions:\n  - name: hello\n    image: " + pinnedImage + "\n    timeout: 1m\n    commands:\n      - echo hi\n"))
+	approvalYAML := base64.StdEncoding.EncodeToString([]byte("actions:\n  - name: review\n    request: role/reviewer\n    subject:\n      change: demo2\n    timeout: 1h\n"))
+
+	// 1. Engineer starts an execution and creates a task in BOTH project-local
+	// and demo2, then exercises ID-addressed execution & task operations via
+	// REST and MCP.
+	var demo2ExecID, demo2ActionID, demo2TaskID string
+	for _, proj := range []string{"project-local", "demo2"} {
+		appliedRes, err := invoke("jwt-engineer", "pipeline.apply",
+			`{"name":"hello","yaml":"`+yamlDoc+`"}`,
+			"id92-apply-"+proj, nil, map[string]string{"project": proj, "pipeline": "hello"})
+		if err != nil {
+			t.Fatalf("pipeline.apply in %s: %v", proj, err)
+		}
+		var pipe api.PipelineApplyResult
+		decodeResult(t, appliedRes, &pipe)
+
+		startRes, err := invoke("jwt-engineer", "pipeline.start",
+			`{"yaml":"`+yamlDoc+`"}`,
+			"id92-start-"+proj, nil, map[string]string{"project": proj})
+		if err != nil {
+			t.Fatalf("pipeline.start in %s: %v", proj, err)
+		}
+		var started api.PipelineStartResult
+		decodeResult(t, startRes, &started)
+
+		// REST GET /api/v1/executions/{id}
+		rec := callREST("jwt-engineer", http.MethodGet, "/api/v1/executions/"+started.ExecutionID, "")
+		if rec.status != http.StatusOK {
+			t.Fatalf("REST execution.inspect in %s = %d %s; want 200", proj, rec.status, rec.body.String())
+		}
+		var restRes api.Result
+		if err := json.Unmarshal(rec.body.Bytes(), &restRes); err != nil {
+			t.Fatalf("decode REST execution.inspect: %v", err)
+		}
+		var inspected api.ExecutionInspectResult
+		decodeResult(t, restRes, &inspected)
+		if inspected.ExecutionID != started.ExecutionID || len(inspected.Actions) != 1 {
+			t.Fatalf("inspected in %s = %+v", proj, inspected)
+		}
+		actionID := inspected.Actions[0].ActionID
+
+		// MCP execution_inspect
+		mcpRes, mcpErr := callMCP("jwt-engineer", "execution_inspect", map[string]any{"execution_id": started.ExecutionID}, "")
+		if mcpErr != "" {
+			t.Fatalf("MCP execution_inspect in %s failed: %s", proj, mcpErr)
+		}
+		var mcpInspected api.ExecutionInspectResult
+		decodeResult(t, mcpRes, &mcpInspected)
+		if mcpInspected.ExecutionID != started.ExecutionID {
+			t.Fatalf("MCP execution_inspect in %s = %+v", proj, mcpInspected)
+		}
+
+		// execution.logs.read through real log.Reader
+		if _, err := invoke("jwt-engineer", "execution.logs.read",
+			jsonBody(t, map[string]any{"action_id": actionID, "stream": "stdout"}),
+			"", nil, map[string]string{"execution": started.ExecutionID}); err != nil {
+			t.Fatalf("execution.logs.read in %s: %v", proj, err)
+		}
+
+		// Task create -> read (REST + MCP) -> edit -> comment -> select_pipeline -> start -> history
+		taskRes, err := invoke("jwt-engineer", "task.create",
+			`{"title":"task in `+proj+`"}`,
+			"id92-task-"+proj, nil, map[string]string{"project": proj})
+		if err != nil {
+			t.Fatalf("task.create in %s: %v", proj, err)
+		}
+		var createdTask api.TaskCreateResult
+		decodeResult(t, taskRes, &createdTask)
+
+		taskRec := callREST("jwt-engineer", http.MethodGet, "/api/v1/tasks/"+createdTask.TaskID, "")
+		if taskRec.status != http.StatusOK {
+			t.Fatalf("REST task.read in %s = %d %s; want 200", proj, taskRec.status, taskRec.body.String())
+		}
+		if _, mcpErr := callMCP("jwt-engineer", "task_read", map[string]any{"task_id": createdTask.TaskID}, ""); mcpErr != "" {
+			t.Fatalf("MCP task_read in %s failed: %s", proj, mcpErr)
+		}
+
+		v1 := createdTask.ContentVersion
+		if _, err := invoke("jwt-engineer", "task.edit",
+			`{"title":"edited `+proj+`"}`, "id92-edit-"+proj, &v1, map[string]string{"task": createdTask.TaskID}); err != nil {
+			t.Fatalf("task.edit in %s: %v", proj, err)
+		}
+		v2 := uint64(2)
+		if _, err := invoke("jwt-engineer", "task.comment",
+			`{"body":"hello `+proj+`"}`, "id92-comment-"+proj, &v2, map[string]string{"task": createdTask.TaskID}); err != nil {
+			t.Fatalf("task.comment in %s: %v", proj, err)
+		}
+		lv1 := createdTask.LifecycleVersion
+		if _, err := invoke("jwt-engineer", "task.start",
+			jsonBody(t, map[string]any{"pipeline_id": pipe.PipelineID}),
+			"id92-task-start-"+proj, &lv1, map[string]string{"task": createdTask.TaskID}); err != nil {
+			t.Fatalf("task.start in %s: %v", proj, err)
+		}
+		if _, err := invoke("jwt-engineer", "task.history", `{}`, "", nil,
+			map[string]string{"task": createdTask.TaskID}); err != nil {
+			t.Fatalf("task.history in %s: %v", proj, err)
+		}
+
+		// execution.cancel on the standalone execution
+		ev := inspected.Version
+		if _, err := invoke("jwt-engineer", "execution.cancel", `{}`,
+			"id92-cancel-exec-"+proj, &ev, map[string]string{"execution": started.ExecutionID}); err != nil {
+			t.Fatalf("execution.cancel in %s: %v", proj, err)
+		}
+
+		if proj == "demo2" {
+			demo2ExecID = started.ExecutionID
+			demo2ActionID = actionID
+			demo2TaskID = createdTask.TaskID
+		}
+	}
+
+	// 2. Reviewer (tenant-scoped OIDC login, reviewer role only in demo2) can
+	// inspect executions, read tasks, and resolve an approval request in demo2,
+	// while being refused forbidden on engineer-only operations in demo2.
+	approvalStart, err := invoke("jwt-engineer", "pipeline.start",
+		`{"yaml":"`+approvalYAML+`"}`, "id92-start-approval", nil, map[string]string{"project": "demo2"})
+	if err != nil {
+		t.Fatalf("start approval pipeline: %v", err)
+	}
+	var approvalExec api.PipelineStartResult
+	decodeResult(t, approvalStart, &approvalExec)
+	approvalInspect, err := invoke("jwt-reviewer", "execution.inspect", `{}`, "", nil,
+		map[string]string{"execution": approvalExec.ExecutionID})
+	if err != nil {
+		t.Fatalf("reviewer execution.inspect in demo2: %v", err)
+	}
+	var approvalView api.ExecutionInspectResult
+	decodeResult(t, approvalInspect, &approvalView)
+	reqActionID := id.ActionID(approvalView.Actions[0].ActionID)
+	demo2Scope := tenancy.Scope{TenantID: testTenant, ProjectID: "demo2"}
+	engineCaller, err := shellrequest.NewEngineCaller("engine-id92")
+	if err != nil {
+		t.Fatalf("NewEngineCaller: %v", err)
+	}
+	reviewerAssignment, err := shellrequest.ParseAssignment("role/reviewer")
+	if err != nil {
+		t.Fatalf("ParseAssignment: %v", err)
+	}
+	if _, err := h.store.Execute(context.Background(), demo2Scope, store.Unit{
+		Writes: []store.Write{{
+			Table:         "executions",
+			ID:            approvalExec.ExecutionID,
+			ExpectVersion: approvalView.Version,
+			Values: map[string]any{
+				"state": string(kernel.ExecutionRunning),
+			},
+		}},
+	}); err != nil {
+		t.Fatalf("mark approval execution running: %v", err)
+	}
+	approvalSubject := definition.NewSubject(map[string]definition.SubjectValue{
+		"change": {Kind: definition.SubjectLiteral, Literal: "demo2"},
+	})
+	if _, err := h.requests.Activate(context.Background(), shellrequest.ActivateCommand{
+		Caller:                   engineCaller,
+		Scope:                    demo2Scope,
+		ExecutionID:              id.ExecutionID(approvalExec.ExecutionID),
+		ActionID:                 reqActionID,
+		ExpectedExecutionVersion: approvalView.Version + 1,
+		ExpectedActionVersion:    approvalView.Actions[0].Version,
+		Subject:                  &approvalSubject,
+		Assignment:               reviewerAssignment,
+		Timeout:                  time.Hour,
+		CallerKey:                "id92-activate-demo2",
+		Content:                  receipt.Content{MediaType: "application/json", Bytes: []byte(`{}`)},
+	}); err != nil {
+		t.Fatalf("activate request action in demo2: %v", err)
+	}
+	afterActivate, err := invoke("jwt-reviewer", "execution.inspect", `{}`, "", nil,
+		map[string]string{"execution": approvalExec.ExecutionID})
+	if err != nil {
+		t.Fatalf("reviewer re-inspect in demo2: %v", err)
+	}
+	var activeView api.ExecutionInspectResult
+	decodeResult(t, afterActivate, &activeView)
+	if _, err := invoke("jwt-reviewer", "execution.request.resolve",
+		jsonBody(t, map[string]any{
+			"expected_action_version": activeView.Actions[0].Version,
+			"decision":                "pass",
+			"note":                    "approved by tenant-scoped reviewer",
+		}), "id92-resolve-demo2", nil, map[string]string{
+			"execution": approvalExec.ExecutionID,
+			"action":    string(reqActionID),
+		}); err != nil {
+		t.Fatalf("reviewer execution.request.resolve in demo2: %v", err)
+	}
+
+	// Reviewer cannot cancel an execution or start/cancel a task in demo2 -> forbidden.
+	v1 := uint64(1)
+	if _, err := invoke("jwt-reviewer", "execution.cancel", `{}`, "id92-rev-cancel", &v1,
+		map[string]string{"execution": demo2ExecID}); err == nil {
+		t.Fatal("reviewer execution.cancel in demo2 unexpectedly succeeded")
+	} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+		t.Fatalf("reviewer execution.cancel = %v; want forbidden", err)
+	}
+
+	// 3. Tenant-admin (tenant-wide admin + demo2 roles) can inspect executions,
+	// read logs, manage services by ID, and read/update/delete bindings by ID.
+	if _, err := invoke("jwt-tenant-admin", "execution.inspect", `{}`, "", nil,
+		map[string]string{"execution": demo2ExecID}); err != nil {
+		t.Fatalf("tenant-admin execution.inspect in demo2: %v", err)
+	}
+	if _, err := invoke("jwt-tenant-admin", "execution.logs.read",
+		jsonBody(t, map[string]any{"action_id": demo2ActionID, "stream": "stdout"}),
+		"", nil, map[string]string{"execution": demo2ExecID}); err != nil {
+		t.Fatalf("tenant-admin execution.logs.read in demo2: %v", err)
+	}
+	svcRes, err := invoke("jwt-tenant-admin", "service.create",
+		`{"service_id":"demo2-svc","roles":["engineer"]}`,
+		"id92-svc-create", nil, map[string]string{"project": "demo2"})
+	if err != nil {
+		t.Fatalf("tenant-admin service.create in demo2: %v", err)
+	}
+	var svc api.ServiceCreateResult
+	decodeResult(t, svcRes, &svc)
+	svcV := svc.Version
+	if _, err := invoke("jwt-tenant-admin", "service.update",
+		`{"roles":["engineer","reviewer"]}`, "id92-svc-update", &svcV,
+		map[string]string{"service": svc.ServiceID}); err != nil {
+		t.Fatalf("tenant-admin service.update by ID: %v", err)
+	}
+	svcV2 := svcV + 1
+	if _, err := invoke("jwt-tenant-admin", "service.credential.issue",
+		`{"ttl_seconds":300}`, "id92-svc-issue", &svcV2,
+		map[string]string{"service": svc.ServiceID}); err != nil {
+		t.Fatalf("tenant-admin service.credential.issue by ID: %v", err)
+	}
+
+	// Seed a resource row in demo2 so tenant-admin can register/read/update/delete a binding by ID.
+	h.seedResource(t, demo2Scope, "demo2-res", 1)
+	bindRes, err := invoke("jwt-tenant-admin", "resource.binding.register",
+		jsonBody(t, map[string]any{
+			"binding_id":        "demo2-binding",
+			"resource_id":       "demo2-res",
+			"enforcing_service": svc.ServiceID,
+			"trusted_origins":   []string{"https://git.local"},
+			"operations":        []string{"git.ref.update"},
+			"reportable_events": []string{"git.ref.updated"},
+		}), "id92-bind-reg", nil, map[string]string{"project": "demo2"})
+	if err != nil {
+		t.Fatalf("resource.binding.register in demo2: %v", err)
+	}
+	var bound api.ResourceBindingRegisterResult
+	decodeResult(t, bindRes, &bound)
+	if _, err := invoke("jwt-engineer", "resource.binding.read", `{}`, "", nil,
+		map[string]string{"binding": bound.BindingID}); err != nil {
+		t.Fatalf("engineer resource.binding.read by ID: %v", err)
+	}
+	if _, mcpErr := callMCP("jwt-engineer", "resource_binding_read", map[string]any{"binding_id": bound.BindingID}, ""); mcpErr != "" {
+		t.Fatalf("MCP resource_binding_read failed: %s", mcpErr)
+	}
+	bindV := bound.Version
+	if _, err := invoke("jwt-tenant-admin", "resource.binding.delete", `{}`,
+		"id92-bind-del", &bindV, map[string]string{"binding": bound.BindingID}); err != nil {
+		t.Fatalf("tenant-admin resource.binding.delete by ID: %v", err)
+	}
+
+	// 4. Seed a task and execution in secret-project (where engineer & reviewer
+	// have NO membership, and tenant-admin has ONLY tenant-wide RoleAdmin).
+	secretTaskRes, err := h.invokeKey(t, "token-admin", "task.create",
+		`{"title":"secret task"}`, "id92-secret-task", map[string]string{"project": "secret-project"})
+	if err != nil {
+		t.Fatalf("seed secret-project task: %v", err)
+	}
+	var secretTask api.TaskCreateResult
+	decodeResult(t, secretTaskRes, &secretTask)
+	secretExecRes, err := h.invokeKey(t, "token-admin", "pipeline.start",
+		`{"yaml":"`+yamlDoc+`"}`, "id92-secret-exec", map[string]string{"project": "secret-project"})
+	if err != nil {
+		t.Fatalf("seed secret-project exec: %v", err)
+	}
+	var secretExec api.PipelineStartResult
+	decodeResult(t, secretExecRes, &secretExec)
+
+	// Engineer (no membership in secret-project) gets uniform not_found, NEVER
+	// forbidden, identical to a nonexistent ID.
+	for _, probe := range []struct {
+		op, param, id string
+	}{
+		{"task.read", "task", secretTask.TaskID},
+		{"task.read", "task", "task-does-not-exist"},
+		{"execution.inspect", "execution", secretExec.ExecutionID},
+		{"execution.inspect", "execution", "execution-does-not-exist"},
+	} {
+		_, err := invoke("jwt-engineer", probe.op, `{}`, "", nil, map[string]string{probe.param: probe.id})
+		if class, ok := fault.ClassOf(err); !ok || class != fault.NotFound {
+			t.Fatalf("engineer %s(%s) = %v; want not_found", probe.op, probe.id, err)
+		}
+	}
+
+	// Tenant-admin can read secretTask (tenant-wide RoleAdmin allows task.read)
+	// but is forbidden on task.start in secret-project (no engineer role there).
+	if _, err := invoke("jwt-tenant-admin", "task.read", `{}`, "", nil,
+		map[string]string{"task": secretTask.TaskID}); err != nil {
+		t.Fatalf("tenant-admin task.read in secret-project: %v", err)
+	}
+	sv1 := secretTask.LifecycleVersion
+	if _, err := invoke("jwt-tenant-admin", "task.start", `{}`, "id92-ta-start-secret", &sv1,
+		map[string]string{"task": secretTask.TaskID}); err == nil {
+		t.Fatal("tenant-admin task.start in secret-project unexpectedly succeeded")
+	} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+		t.Fatalf("tenant-admin task.start in secret-project = %v; want forbidden", err)
+	}
+
+	// 5. Zero-membership OIDC user gets uniform unauthenticated for both
+	// existing and nonexistent IDs (never reveals existence).
+	for _, probe := range []struct {
+		op, param, id string
+	}{
+		{"task.read", "task", demo2TaskID},
+		{"task.read", "task", "task-does-not-exist"},
+		{"execution.inspect", "execution", demo2ExecID},
+		{"execution.inspect", "execution", "execution-does-not-exist"},
+	} {
+		_, err := invoke("jwt-unassigned", probe.op, `{}`, "", nil, map[string]string{probe.param: probe.id})
+		if class, ok := fault.ClassOf(err); !ok || class != fault.Unauthenticated {
+			t.Fatalf("unassigned %s(%s) = %v; want unauthenticated", probe.op, probe.id, err)
+		}
+	}
+}
+
+type memoryLogSink struct{}
+
+func (*memoryLogSink) Append(context.Context, tenancy.Scope, log.Chunk) (log.AppendResult, error) {
+	return log.AppendResult{}, nil
+}
+
+func (*memoryLogSink) Read(context.Context, log.ReadRequest) (log.ReadResult, error) {
+	return log.ReadResult{}, nil
+}
+
+type noLogOwnership struct{}
+
+func (noLogOwnership) Ownership(context.Context, tenancy.Scope, id.ExecutionID) (log.ExecutionOwnership, error) {
+	return log.ExecutionOwnership{}, fault.New(fault.NotFound, "not found")
 }
