@@ -8,13 +8,13 @@ import (
 )
 
 // DefaultOpenCodeSandboxPort is the default container TCP port served by
-// `kodema sandbox serve` in Option 2 Brain mode.
+// `kodema sandbox serve` in Option 2 sandbox mode.
 const DefaultOpenCodeSandboxPort = 8090
 
-// DefaultBrainDisabledLocalTools lists the built-in local shell and filesystem
-// tools that are disabled in Option 2 Brain mode so the Brain pod never runs
+// DefaultSandboxDisabledLocalTools lists the built-in local shell and filesystem
+// tools that are disabled in Option 2 sandbox mode so the OpenCode service pod never runs
 // untrusted local shell commands or mutates local files.
-var DefaultBrainDisabledLocalTools = []string{
+var DefaultSandboxDisabledLocalTools = []string{
 	"bash",
 	"write",
 	"edit",
@@ -23,16 +23,16 @@ var DefaultBrainDisabledLocalTools = []string{
 	"grep",
 }
 
-// NormalizeBrainConfig validates and applies safe defaults to OpenCodeBrainConfig.
-func NormalizeBrainConfig(cfg OpenCodeBrainConfig) (OpenCodeBrainConfig, error) {
+// NormalizeSandboxConfig validates and applies safe defaults to OpenCodeSandboxConfig.
+func NormalizeSandboxConfig(cfg OpenCodeSandboxConfig) (OpenCodeSandboxConfig, error) {
 	out := cfg
 	if len(out.DisabledLocalTools) == 0 {
-		out.DisabledLocalTools = append([]string(nil), DefaultBrainDisabledLocalTools...)
+		out.DisabledLocalTools = append([]string(nil), DefaultSandboxDisabledLocalTools...)
 	} else {
 		// Always ensure all required local shell/fs tools are included so a
-		// misconfiguration can never re-enable local shell execution in Brain mode.
-		seen := make(map[string]bool, len(out.DisabledLocalTools)+len(DefaultBrainDisabledLocalTools))
-		cleaned := make([]string, 0, len(out.DisabledLocalTools)+len(DefaultBrainDisabledLocalTools))
+		// misconfiguration can never re-enable local shell execution in sandbox mode.
+		seen := make(map[string]bool, len(out.DisabledLocalTools)+len(DefaultSandboxDisabledLocalTools))
+		cleaned := make([]string, 0, len(out.DisabledLocalTools)+len(DefaultSandboxDisabledLocalTools))
 		for _, tool := range out.DisabledLocalTools {
 			t := strings.TrimSpace(tool)
 			if t == "" || seen[t] {
@@ -41,7 +41,7 @@ func NormalizeBrainConfig(cfg OpenCodeBrainConfig) (OpenCodeBrainConfig, error) 
 			seen[t] = true
 			cleaned = append(cleaned, t)
 		}
-		for _, required := range DefaultBrainDisabledLocalTools {
+		for _, required := range DefaultSandboxDisabledLocalTools {
 			if !seen[required] {
 				seen[required] = true
 				cleaned = append(cleaned, required)
@@ -53,42 +53,42 @@ func NormalizeBrainConfig(cfg OpenCodeBrainConfig) (OpenCodeBrainConfig, error) 
 		out.SandboxPort = DefaultOpenCodeSandboxPort
 	}
 	if out.SandboxPort < 1024 || out.SandboxPort > 65535 {
-		return OpenCodeBrainConfig{}, fmt.Errorf("opencode brain sandbox port %d must be between 1024 and 65535", out.SandboxPort)
+		return OpenCodeSandboxConfig{}, fmt.Errorf("opencode sandbox port %d must be between 1024 and 65535", out.SandboxPort)
 	}
 	if strings.TrimSpace(out.DefaultSandboxImage) != "" {
 		out.DefaultSandboxImage = strings.TrimSpace(out.DefaultSandboxImage)
 		if !validSandboxImage(out.DefaultSandboxImage) {
-			return OpenCodeBrainConfig{}, fmt.Errorf("opencode brain default sandbox image %q is invalid", out.DefaultSandboxImage)
+			return OpenCodeSandboxConfig{}, fmt.Errorf("opencode default sandbox image %q is invalid", out.DefaultSandboxImage)
 		}
 	}
 	if len(out.DefaultSandboxCaches) > 0 {
 		caches, err := normalizeSandboxCaches(out.DefaultSandboxCaches)
 		if err != nil {
-			return OpenCodeBrainConfig{}, fmt.Errorf("opencode brain default sandbox caches: %w", err)
+			return OpenCodeSandboxConfig{}, fmt.Errorf("opencode default sandbox caches: %w", err)
 		}
 		out.DefaultSandboxCaches = caches
 	}
 	if strings.TrimSpace(out.DefaultSandboxMemory) != "" {
 		out.DefaultSandboxMemory = strings.TrimSpace(out.DefaultSandboxMemory)
 		if !validSandboxResourceQty(out.DefaultSandboxMemory) {
-			return OpenCodeBrainConfig{}, fmt.Errorf("opencode brain default sandbox memory %q is invalid", out.DefaultSandboxMemory)
+			return OpenCodeSandboxConfig{}, fmt.Errorf("opencode default sandbox memory %q is invalid", out.DefaultSandboxMemory)
 		}
 	}
 	if strings.TrimSpace(out.DefaultSandboxCPU) != "" {
 		out.DefaultSandboxCPU = strings.TrimSpace(out.DefaultSandboxCPU)
 		if !validSandboxResourceQty(out.DefaultSandboxCPU) {
-			return OpenCodeBrainConfig{}, fmt.Errorf("opencode brain default sandbox cpu %q is invalid", out.DefaultSandboxCPU)
+			return OpenCodeSandboxConfig{}, fmt.Errorf("opencode default sandbox cpu %q is invalid", out.DefaultSandboxCPU)
 		}
 	}
 	return out, nil
 }
 
-// GenerateBrainOpenCodeConfig builds a Brain-mode `opencode.json` policy
+// GenerateSandboxOpenCodeConfig builds a sandbox-mode `opencode.json` policy
 // document that disables every local shell/filesystem tool and optionally
 // points the LLM provider at the local loopback attribution proxy (never
 // embedding raw LLM API keys).
-func GenerateBrainOpenCodeConfig(cfg OpenCodeBrainConfig, proxyBaseURL, localAPIKey string) ([]byte, error) {
-	norm, err := NormalizeBrainConfig(cfg)
+func GenerateSandboxOpenCodeConfig(cfg OpenCodeSandboxConfig, proxyBaseURL, localAPIKey string) ([]byte, error) {
+	norm, err := NormalizeSandboxConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -123,31 +123,31 @@ func GenerateBrainOpenCodeConfig(cfg OpenCodeBrainConfig, proxyBaseURL, localAPI
 	return append(encoded, '\n'), nil
 }
 
-// ValidateBrainOpenCodeConfig verifies that an `opencode.json` policy document
+// ValidateSandboxOpenCodeConfig verifies that an `opencode.json` policy document
 // explicitly disables all local shell and filesystem tools (in both `tools` and
-// `permission`) required for Option 2 Brain mode.
-func ValidateBrainOpenCodeConfig(data []byte) error {
+// `permission`) required for Option 2 sandbox mode.
+func ValidateSandboxOpenCodeConfig(data []byte) error {
 	var parsed struct {
 		Tools      map[string]bool   `json:"tools"`
 		Permission map[string]string `json:"permission"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return fmt.Errorf("decode opencode brain config: %w", err)
+		return fmt.Errorf("decode opencode sandbox config: %w", err)
 	}
 	if len(parsed.Tools) == 0 {
-		return fmt.Errorf("opencode brain config must explicitly disable local tools")
+		return fmt.Errorf("opencode sandbox config must explicitly disable local tools")
 	}
 	if len(parsed.Permission) == 0 {
-		return fmt.Errorf("opencode brain config must explicitly deny local tool permissions")
+		return fmt.Errorf("opencode sandbox config must explicitly deny local tool permissions")
 	}
-	for _, required := range DefaultBrainDisabledLocalTools {
+	for _, required := range DefaultSandboxDisabledLocalTools {
 		enabled, present := parsed.Tools[required]
 		if !present || enabled {
-			return fmt.Errorf("opencode brain config must disable local tool %q (got present=%v enabled=%v)", required, present, enabled)
+			return fmt.Errorf("opencode sandbox config must disable local tool %q (got present=%v enabled=%v)", required, present, enabled)
 		}
 		perm, permPresent := parsed.Permission[required]
 		if !permPresent || perm != "deny" {
-			return fmt.Errorf("opencode brain config must deny permission for local tool %q (got present=%v value=%q)", required, permPresent, perm)
+			return fmt.Errorf("opencode sandbox config must deny permission for local tool %q (got present=%v value=%q)", required, permPresent, perm)
 		}
 	}
 	return nil

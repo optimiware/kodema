@@ -903,7 +903,7 @@ func BuildSandboxPipelineYAML(req OpenCodeSandboxRequest, tokenSecretName string
 
 // CommitAndPushViaSandboxMCP commits any dirty changes in the sandbox's
 // /workspace and pushes HEAD to refs/heads/work/<taskID> over the sandbox's
-// authenticated MCP `bash` tool, so the Brain pod never mounts or touches Git.
+// authenticated MCP `bash` tool, so the OpenCode service pod never mounts or touches Git.
 func CommitAndPushViaSandboxMCP(
 	ctx context.Context,
 	lease OpenCodeSandboxLease,

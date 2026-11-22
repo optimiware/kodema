@@ -40,18 +40,18 @@ type openCodeTaskLockEntry struct {
 	refs int
 }
 
-// OpenCodeAdapter is the per-project OpenCode brain service adapter.
+// OpenCodeAdapter is the per-project OpenCode service adapter.
 // It uses ONLY public Kodema APIs (task.inbox, execution.inspect, task.read,
 // kv.get, kv.put, event.publish, execution.request.resolve, and the project
 // HTTP SSE event stream), maintains persistent task_id -> opencode_session_id
-// mappings and isolated per-task local Git worktrees, and aborts active
-// OpenCode sessions immediately on cancellation or timeout.
+// mappings and isolated per-task local Git worktrees or ephemeral MCP sandboxes,
+// and aborts active OpenCode sessions immediately on cancellation or timeout.
 type OpenCodeAdapter struct {
 	serviceID           id.PrincipalID
 	tenant              id.TenantID
 	project             id.ProjectID
 	executionMode       OpenCodeExecutionMode
-	brain               OpenCodeBrainConfig
+	sandbox             OpenCodeSandboxConfig
 	handler             api.Handler
 	stream              client.EventStreamer
 	events              servicekit.EventSource
@@ -188,13 +188,13 @@ func NewOpenCodeAdapter(config OpenCodeAdapterConfig) (*OpenCodeAdapter, error) 
 	if !execMode.Valid() {
 		return nil, fmt.Errorf("opencode adapter execution mode %q is unsupported", execMode)
 	}
-	var brainCfg OpenCodeBrainConfig
-	if execMode == OpenCodeExecutionModeBrain {
+	var sandboxCfg OpenCodeSandboxConfig
+	if execMode == OpenCodeExecutionModeSandbox {
 		if config.Sandboxes == nil {
-			return nil, fmt.Errorf("opencode brain mode requires a sandbox manager")
+			return nil, fmt.Errorf("opencode sandbox mode requires a sandbox manager")
 		}
 		var err error
-		brainCfg, err = NormalizeBrainConfig(config.Brain)
+		sandboxCfg, err = NormalizeSandboxConfig(config.Sandbox)
 		if err != nil {
 			return nil, err
 		}
@@ -217,7 +217,7 @@ func NewOpenCodeAdapter(config OpenCodeAdapterConfig) (*OpenCodeAdapter, error) 
 		tenant:              config.TenantID,
 		project:             config.ProjectID,
 		executionMode:       execMode,
-		brain:               brainCfg,
+		sandbox:             sandboxCfg,
 		handler:             config.Handler,
 		stream:              config.Stream,
 		events:              config.Events,
@@ -726,7 +726,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 
 	// 7. Prepare execution workspace:
 	//   - Option 1 (worktree mode): isolated local per-task Git worktree.
-	//   - Option 2 (brain mode): optional ephemeral per-task MCP sandbox
+	//   - Option 2 (sandbox mode): optional ephemeral per-task MCP sandbox
 	//     (omitted for non-coding modes when no sandbox_image is requested).
 	var checkout WorktreeCheckout
 	var sandboxLease OpenCodeSandboxLease
@@ -746,7 +746,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		return sandboxDeathErr
 	}
 
-	if a.executionMode == OpenCodeExecutionModeBrain {
+	if a.executionMode == OpenCodeExecutionModeSandbox {
 		if subject.Repository != "" {
 			checkout = WorktreeCheckout{
 				Repository: subject.Repository,
@@ -794,7 +794,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 						}
 						setSandboxDeath(cause)
 						// Immediately cut off this turn's LLM proxy & in-flight
-						// SendMessage and abort ONLY this task's Brain session.
+						// SendMessage and abort ONLY this task's OpenCode session.
 						cancelTurnRun()
 						turn.abortSession(a.opencode)
 					case <-watchStop:
@@ -838,7 +838,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		return nil
 	}
 
-	// 8b. In Brain mode with an active sandbox, attach the ephemeral sandbox
+	// 8b. In sandbox mode with an active sandbox, attach the ephemeral sandbox
 	// MCP server to the OpenCode session and detach it cleanly on exit.
 	var mcpServers map[string]OpenCodeMCPServerConfig
 	if hasSandbox {
@@ -884,14 +884,14 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		ActionID:    scanned.ActionID,
 		TaskID:      taskID,
 	}
-	if a.executionMode == OpenCodeExecutionModeBrain {
-		// Brain mode never operates on a local filesystem directory; sandbox
+	if a.executionMode == OpenCodeExecutionModeSandbox {
+		// Sandbox mode never operates on a local filesystem directory; sandbox
 		// workspace paths exist only inside the remote sandbox container.
 		msgReq.Directory = ""
 		if hasSandbox {
 			msgReq.MCPServers = mcpServers
 		}
-		msgReq.DisabledTools = append([]string(nil), a.brain.DisabledLocalTools...)
+		msgReq.DisabledTools = append([]string(nil), a.sandbox.DisabledLocalTools...)
 	}
 	if a.perTurnProxyRouting {
 		msgReq.ProxyPathPrefix = fmt.Sprintf("/turn/%s/%s", scanned.ExecutionID, scanned.ActionID)
@@ -943,7 +943,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 	// 11. For coding modes, commit & push changes to refs/heads/work/<task-id>.
 	var branch, candidate string
 	var pushed bool
-	if subject.Mode.MutatesCode() && a.executionMode == OpenCodeExecutionModeBrain && hasSandbox {
+	if subject.Mode.MutatesCode() && a.executionMode == OpenCodeExecutionModeSandbox && hasSandbox {
 		commitMsg := fmt.Sprintf("opencode(%s): %s", subject.Mode, taskID)
 		if taskInfo != nil && strings.TrimSpace(taskInfo.Title) != "" {
 			commitMsg = fmt.Sprintf("opencode(%s): %s (%s)", subject.Mode, strings.TrimSpace(taskInfo.Title), taskID)
@@ -1043,22 +1043,22 @@ func (a *OpenCodeAdapter) buildSandboxRequest(
 ) (OpenCodeSandboxRequest, error) {
 	image := strings.TrimSpace(subject.SandboxImage)
 	if image == "" {
-		image = a.brain.DefaultSandboxImage
+		image = a.sandbox.DefaultSandboxImage
 	}
 	if image == "" {
-		return OpenCodeSandboxRequest{}, fmt.Errorf("opencode brain mode requires subject.sandbox_image or --sandbox-default-image for mode %q", subject.Mode)
+		return OpenCodeSandboxRequest{}, fmt.Errorf("opencode sandbox mode requires subject.sandbox_image or --sandbox-default-image for mode %q", subject.Mode)
 	}
 	caches := subject.SandboxCaches
-	if len(caches) == 0 && len(a.brain.DefaultSandboxCaches) > 0 {
-		caches = append([]string(nil), a.brain.DefaultSandboxCaches...)
+	if len(caches) == 0 && len(a.sandbox.DefaultSandboxCaches) > 0 {
+		caches = append([]string(nil), a.sandbox.DefaultSandboxCaches...)
 	}
 	mem := strings.TrimSpace(subject.SandboxMemory)
 	if mem == "" {
-		mem = a.brain.DefaultSandboxMemory
+		mem = a.sandbox.DefaultSandboxMemory
 	}
 	cpu := strings.TrimSpace(subject.SandboxCPU)
 	if cpu == "" {
-		cpu = a.brain.DefaultSandboxCPU
+		cpu = a.sandbox.DefaultSandboxCPU
 	}
 	workBranch := ""
 	if subject.Repository != "" {
@@ -1077,7 +1077,7 @@ func (a *OpenCodeAdapter) buildSandboxRequest(
 		Caches:      caches,
 		Memory:      mem,
 		CPU:         cpu,
-		Port:        a.brain.SandboxPort,
+		Port:        a.sandbox.SandboxPort,
 		Timeout:     timeout,
 	}, nil
 }

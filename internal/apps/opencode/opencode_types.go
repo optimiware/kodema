@@ -63,14 +63,14 @@ type OpenCodeExecutionMode string
 const (
 	// OpenCodeExecutionModeWorktree is Option 1: local per-task Git worktrees.
 	OpenCodeExecutionModeWorktree OpenCodeExecutionMode = "worktree"
-	// OpenCodeExecutionModeBrain is Option 2: lightweight Brain service with
+	// OpenCodeExecutionModeSandbox is Option 2: OpenCode service with
 	// local shell/fs tools disabled and ephemeral per-task MCP sandboxes.
-	OpenCodeExecutionModeBrain OpenCodeExecutionMode = "brain"
+	OpenCodeExecutionModeSandbox OpenCodeExecutionMode = "sandbox"
 )
 
 // Valid reports whether mode is a declared OpenCode execution mode.
 func (mode OpenCodeExecutionMode) Valid() bool {
-	return mode == OpenCodeExecutionModeWorktree || mode == OpenCodeExecutionModeBrain
+	return mode == OpenCodeExecutionModeWorktree || mode == OpenCodeExecutionModeSandbox
 }
 
 // OpenCode subject field names.
@@ -118,7 +118,7 @@ const (
 var ErrOpenCodeBudgetExceeded = errors.New("opencode turn exceeded LLM budget")
 
 // ErrOpenCodeSandboxTerminated signals that an ephemeral task sandbox crashed,
-// was killed, or OOM-terminated mid-turn while the Brain service stayed healthy.
+// was killed, or OOM-terminated mid-turn while the OpenCode service stayed healthy.
 var ErrOpenCodeSandboxTerminated = errors.New("opencode ephemeral sandbox terminated")
 
 // OpenCodeSubject is the validated subject of an OpenCode service request.
@@ -320,7 +320,7 @@ type OpenCodeSession struct {
 }
 
 // OpenCodeMCPServerConfig describes one remote MCP server attached dynamically
-// to an OpenCode Brain session (for example an ephemeral `kodema sandbox serve`
+// to an OpenCode session in sandbox mode (for example an ephemeral `kodema sandbox serve`
 // container endpoint with its per-sandbox bearer token).
 type OpenCodeMCPServerConfig struct {
 	Name      string            `json:"name"`
@@ -360,7 +360,7 @@ type OpenCodeClient interface {
 	AbortSession(ctx context.Context, sessionID string) error
 }
 
-// OpenCodeMCPClient is the optional Brain-mode extension of OpenCodeClient for
+// OpenCodeMCPClient is the optional sandbox-mode extension of OpenCodeClient for
 // dynamically attaching and detaching remote sandbox MCP servers per session.
 type OpenCodeMCPClient interface {
 	AttachMCPServer(ctx context.Context, sessionID string, cfg OpenCodeMCPServerConfig) error
@@ -487,12 +487,12 @@ type OpenCodeWorktreeManager interface {
 	Remove(ctx context.Context, repository, taskID string) error
 }
 
-// OpenCodeBrainConfig configures Option 2 Brain-mode tool policies and default
+// OpenCodeSandboxConfig configures Option 2 sandbox-mode tool policies and default
 // ephemeral toolchain sandbox parameters.
-type OpenCodeBrainConfig struct {
-	// DisabledLocalTools lists OpenCode built-in local tools disabled in Brain
-	// mode so the Brain pod never executes local shell commands or file edits.
-	// Defaults to DefaultBrainDisabledLocalTools.
+type OpenCodeSandboxConfig struct {
+	// DisabledLocalTools lists OpenCode built-in local tools disabled in sandbox
+	// mode so the OpenCode service pod never executes local shell commands or file edits.
+	// Defaults to DefaultSandboxDisabledLocalTools.
 	DisabledLocalTools []string
 	// DefaultSandboxImage is used when a coding turn omits subject.sandbox_image.
 	DefaultSandboxImage string
@@ -509,7 +509,7 @@ type OpenCodeBrainConfig struct {
 }
 
 // OpenCodeSandboxRequest describes one ephemeral per-task toolchain sandbox
-// requested by the OpenCode Brain service.
+// requested by the OpenCode service.
 type OpenCodeSandboxRequest struct {
 	TenantID      id.TenantID
 	ProjectID     id.ProjectID
@@ -543,7 +543,7 @@ type OpenCodeSandboxLease struct {
 }
 
 // OpenCodeSandboxManager is the consumer-owned lifecycle seam for ephemeral
-// per-task toolchain sandboxes in Brain mode (Option 2).
+// per-task toolchain sandboxes in sandbox mode (Option 2).
 type OpenCodeSandboxManager interface {
 	Acquire(ctx context.Context, req OpenCodeSandboxRequest) (OpenCodeSandboxLease, error)
 	Release(ctx context.Context, lease OpenCodeSandboxLease) error
@@ -551,7 +551,7 @@ type OpenCodeSandboxManager interface {
 
 // OpenCodeSandboxCommitter is an optional extension of OpenCodeSandboxManager
 // that commits and pushes work branch changes from inside the sandbox. When a
-// manager does not implement it, the Brain adapter commits and pushes over the
+// manager does not implement it, the OpenCode adapter commits and pushes over the
 // sandbox's authenticated MCP `bash` tool.
 type OpenCodeSandboxCommitter interface {
 	CommitAndPush(ctx context.Context, lease OpenCodeSandboxLease, repository, taskID, commitMessage string) (WorktreePushResult, error)
@@ -564,7 +564,7 @@ type OpenCodeAdapterConfig struct {
 	TenantID            id.TenantID
 	ProjectID           id.ProjectID
 	ExecutionMode       OpenCodeExecutionMode
-	Brain               OpenCodeBrainConfig
+	Sandbox             OpenCodeSandboxConfig
 	Handler             api.Handler
 	Stream              client.EventStreamer
 	Events              servicekit.EventSource

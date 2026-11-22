@@ -206,19 +206,19 @@ How Option 1 works:
 - **Live SSE cancellation:** Subscribes to the project event stream and invokes OpenCode `AbortSession` immediately when an execution is cancelled.
 - **Concurrent turns:** Static loopback proxy routing (`--llm-proxy-listen` without `--per-turn-proxy-routing`) enforces `--max-concurrency <= 1`. Pass `--per-turn-proxy-routing` (routing calls via `/turn/{exec}/{action}/llm/*`) to run multiple concurrent turns cleanly.
 
-## Agentic Service Option 2: Brain/Hands split (`--mode brain` + `kodema sandbox serve`)
+## Agentic Service Option 2: Sandbox mode (`--mode sandbox` + `kodema sandbox serve`)
 
-Option 2 separates LLM reasoning and persistent sessions (**Brain**) from build/test tool execution (**Hands**) so the Brain pod never executes local shell commands or mutates local files, and every task runs inside an ephemeral stock toolchain image (`golang:1.24`, `node:22`, `python:3.12`, etc.):
+Option 2 separates LLM reasoning and persistent sessions (the OpenCode service) from build/test tool execution (ephemeral sandboxes) so the OpenCode service pod never executes local shell commands or mutates local files, and every task runs inside an ephemeral stock toolchain image (`golang:1.24`, `node:22`, `python:3.12`, etc.):
 
-1. **`kodema sandbox serve` (Hands):** Compiled into `/kodema/bin/kodema` using pure Go standard library—zero custom agent images required. Serves Streamable HTTP MCP JSON-RPC 2.0 at `POST /mcp` (plus `GET /healthz`) jailed strictly to `/workspace` via `os.Root`:
+1. **`kodema sandbox serve` (ephemeral sandbox):** Compiled into `/kodema/bin/kodema` using pure Go standard library—zero custom agent images required. Serves Streamable HTTP MCP JSON-RPC 2.0 at `POST /mcp` (plus `GET /healthz`) jailed strictly to `/workspace` via `os.Root`:
    - 6 jailed tools: `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`.
    - Constant-time Bearer token auth (`--token-file`, with optional `--unlink-token-file` for writable token files outside `/workspace`, `--token-env` defaulting to `KODEMA_SANDBOX_TOKEN`, or `--generate-token-file`), failing closed when no token is configured.
    - Strips token env vars (`KODEMA_SANDBOX_TOKEN`, `KODEMA_SANDBOX_TOKEN_FILE`, `--token-env`) before launching child `bash` processes and kills entire process groups on timeout or cancellation (`--max-cmd-timeout`, `--max-output-bytes`, `--max-file-bytes`).
-2. **OpenCode Brain (`--mode brain`):** Disables all built-in local shell/filesystem tools (`bash`, `write`, `edit`, `read`, `glob`, `grep`) in OpenCode config and attaches ephemeral per-task sandboxes created through Kodema's public API (`KodemaExecutionSandboxManager`):
+2. **OpenCode service (`--mode sandbox`):** Disables all built-in local shell/filesystem tools (`bash`, `write`, `edit`, `read`, `glob`, `grep`) in OpenCode config and attaches ephemeral per-task sandboxes created through Kodema's public API (`KodemaExecutionSandboxManager`):
 
 ```sh
 kodema services --kind opencode \
-  --mode brain \
+  --mode sandbox \
   --service opencode-shop \
   --tenant tenant-local \
   --project project-local \
@@ -239,11 +239,11 @@ kodema services --kind opencode \
 
 Key Option 2 characteristics:
 
-- **Role requirement difference vs Option 1:** Brain mode's service account **requires the `engineer` role** so `KodemaExecutionSandboxManager` can invoke `pipeline.start` (spawning inline sandbox executions), `execution.cancel` (teardown), and `secret.write`/`secret.delete` (delivering ephemeral `KODEMA_SBOX_TOK_*` per-sandbox Bearer tokens out-of-band, never embedded in YAML or `/kodema/script`). Option 1 worktree mode requires **no `engineer` role**.
-- **Sandbox-free reasoning turns:** Non-coding modes (`plan`, `ai_review`) without `sandbox_image` execute directly in Brain without launching a sandbox container.
-- **Polyglot toolchains & OpenCode v2 concurrency constraint:** Each stage or task can specify its own stock upstream image and caches (for example `sandbox_image: docker.io/library/golang:1.24` with `sandbox_caches: go-mod,go-build` for a Go backend stage and `sandbox_image: docker.io/library/node:22` with `sandbox_caches: npm` for a Node frontend stage). Because OpenCode v2 runtime MCP attachment (`/api/experimental/mcp/{server}`) is location-scoped rather than session-scoped, Brain mode against an OpenCode v2 server enforces `--max-concurrency 1` per OpenCode v2 server instance (defaulting to `1`); run separate OpenCode v2 server instances for parallel Brain-mode sandboxes.
-- **Fault containment & cancellation teardown:** If a sandbox container crashes or is OOM-killed mid-turn, the Brain pod stays healthy, aborts only that turn (`ErrOpenCodeSandboxTerminated`), cancels the sandbox execution, and deletes the ephemeral token secret. Cancelling the parent execution tears down both the OpenCode session and the sandbox.
-- **Kubernetes NetworkPolicies (Helm):** Enable `opencodeBrain` in `deploy/charts/kodema/values.yaml` (rendered by `deploy/charts/kodema/templates/workloads-opencode-brain.yaml`) to isolate Brain and sandbox pods strictly by `(tenant, project)`: Brain pods deny all ingress and egress only to DNS, the Kodema API, and matching `kodema.dev/role: sandbox` pods on `sandboxPort`; sandbox pods accept ingress only from that exact project's Brain pod and cannot reach each other or Brain session storage. See [`examples/agentic-sdlc/opencode-brain-values.yaml`](../../examples/agentic-sdlc/opencode-brain-values.yaml).
+- **Role requirement difference vs Option 1:** Sandbox mode's service account **requires the `engineer` role** so `KodemaExecutionSandboxManager` can invoke `pipeline.start` (spawning inline sandbox executions), `execution.cancel` (teardown), and `secret.write`/`secret.delete` (delivering ephemeral `KODEMA_SBOX_TOK_*` per-sandbox Bearer tokens out-of-band, never embedded in YAML or `/kodema/script`). Option 1 worktree mode requires **no `engineer` role**.
+- **Sandbox-free reasoning turns:** Non-coding modes (`plan`, `ai_review`) without `sandbox_image` execute directly in the OpenCode service without launching a sandbox container.
+- **Polyglot toolchains & OpenCode v2 concurrency constraint:** Each stage or task can specify its own stock upstream image and caches (for example `sandbox_image: docker.io/library/golang:1.24` with `sandbox_caches: go-mod,go-build` for a Go backend stage and `sandbox_image: docker.io/library/node:22` with `sandbox_caches: npm` for a Node frontend stage). Because OpenCode v2 runtime MCP attachment (`/api/experimental/mcp/{server}`) is location-scoped rather than session-scoped, sandbox mode against an OpenCode v2 server enforces `--max-concurrency 1` per OpenCode v2 server instance (defaulting to `1`); run separate OpenCode v2 server instances for parallel sandbox-mode turns.
+- **Fault containment & cancellation teardown:** If a sandbox container crashes or is OOM-killed mid-turn, the OpenCode service pod stays healthy, aborts only that turn (`ErrOpenCodeSandboxTerminated`), cancels the sandbox execution, and deletes the ephemeral token secret. Cancelling the parent execution tears down both the OpenCode session and the sandbox.
+- **Kubernetes NetworkPolicies (Helm):** Enable `opencodeSandbox` in `deploy/charts/kodema/values.yaml` (rendered by `deploy/charts/kodema/templates/workloads-opencode-sandbox.yaml`) to isolate OpenCode service and sandbox pods strictly by `(tenant, project)`: OpenCode service pods deny all ingress and egress only to DNS, the Kodema API, and matching `kodema.dev/role: sandbox` pods on `sandboxPort`; sandbox pods accept ingress only from that exact project's OpenCode service pod and cannot reach each other or session storage. See [`examples/agentic-sdlc/opencode-sandbox-values.yaml`](../../examples/agentic-sdlc/opencode-sandbox-values.yaml).
 
 ## Inspecting per-execution token usage
 

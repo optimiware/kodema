@@ -202,8 +202,8 @@ builds**:
    interactive harness orchestration to always-on `kodsvc.` services:
    - **Per-project OpenCode service (Option 1 — worktrees):**
      `kodema services --kind opencode --mode worktree`
-   - **Brain/Hands split (Option 2 — ephemeral stock-image MCP sandboxes):**
-     `kodema services --kind opencode --mode brain` + `kodema sandbox serve`
+   - **Sandbox mode (Option 2 — ephemeral stock-image MCP sandboxes):**
+     `kodema services --kind opencode --mode sandbox` + `kodema sandbox serve`
    - **Serialized merge coordinator with cross-execution Decision IDs:**
      `kodema services --kind merge_coordinator`
 
@@ -254,7 +254,7 @@ Then follow the [Podman bundle runbook](docs/runbooks/podman-quickstart.md) to
 | [docs/README.md](docs/README.md) | Detailed specifications and runbooks. |
 | [docs/runbooks/quickstart.md](docs/runbooks/quickstart.md) | A local Kodema with `kodema up`, connecting your AI harness over MCP, and a first pipeline with `kodema run`. |
 | [docs/runbooks/llm-proxy-harnesses.md](docs/runbooks/llm-proxy-harnesses.md) | `kodema harness exec`, LLM budgets, attributed `kodsvc.` proxy, and Option 1 / Option 2 OpenCode services. |
-| [examples/agentic-sdlc/README.md](examples/agentic-sdlc/README.md) | Tested end-to-end Agentic SDLC pipelines (in-container harness, Option 1 worktrees, Option 2 Brain/Hands). |
+| [examples/agentic-sdlc/README.md](examples/agentic-sdlc/README.md) | Tested end-to-end Agentic SDLC pipelines (in-container harness, Option 1 worktrees, Option 2 sandbox mode). |
 | [docs/runbooks/podman-quickstart.md](docs/runbooks/podman-quickstart.md) | The Podman bundle: the single-host test installation the release smoke runs on. |
 | [docs/runbooks/production-deployment.md](docs/runbooks/production-deployment.md) | Deployment on Kubernetes (Scaleway, AWS, GCP). |
 | [docs/runbooks/release.md](docs/runbooks/release.md) | How a version is built and published. |

@@ -514,11 +514,13 @@ func runEnvironmentTests(t *testing.T, factory Factory) {
 
 		for _, want := range []string{
 			workspace.EnvGitURL + "=" + gitURL,
-			"GIT_CONFIG_COUNT=2",
+			"GIT_CONFIG_COUNT=3",
 			"GIT_CONFIG_KEY_0=credential.https://git.kodema.example:8443.helper",
 			"GIT_CONFIG_VALUE_0=",
 			"GIT_CONFIG_KEY_1=credential.https://git.kodema.example:8443.helper",
 			"GIT_CONFIG_VALUE_1=/kodema/bin/kodema --trusted-origin 'https://git.kodema.example:8443' git credential",
+			"GIT_CONFIG_KEY_2=safe.directory",
+			"GIT_CONFIG_VALUE_2=/workspace",
 			"GIT_AUTHOR_NAME=kept",
 		} {
 			if !slices.Contains(w.EnvList, want) {

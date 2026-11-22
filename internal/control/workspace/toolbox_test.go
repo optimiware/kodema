@@ -37,7 +37,8 @@ func TestEntrypointFrameStreamsWrapsToolboxLaunch(t *testing.T) {
 
 // TestGitEnvironment pins the Git configuration of a workload: scoped to the
 // origin of the installation's Git service, with the toolbox as the only
-// credential helper, restricted to that origin, and the CA bundle trusted for it alone.
+// credential helper, restricted to that origin, safe.directory pinned to
+// /workspace, and the CA bundle trusted for that origin alone.
 func TestGitEnvironment(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string
@@ -51,23 +52,27 @@ func TestGitEnvironment(t *testing.T) {
 			gitURL: "https://host.containers.internal:8443/git/", caFile: "/etc/kodema/ca/ca.crt", toolbox: true,
 			want: []string{
 				"KODEMA_GIT_URL=https://host.containers.internal:8443/git",
-				"GIT_CONFIG_COUNT=3",
+				"GIT_CONFIG_COUNT=4",
 				"GIT_CONFIG_KEY_0=credential.https://host.containers.internal:8443.helper",
 				"GIT_CONFIG_VALUE_0=",
 				"GIT_CONFIG_KEY_1=credential.https://host.containers.internal:8443.helper",
 				"GIT_CONFIG_VALUE_1=/kodema/bin/kodema --trusted-origin 'https://host.containers.internal:8443' git credential",
-				"GIT_CONFIG_KEY_2=http.https://host.containers.internal:8443.sslCAInfo",
-				"GIT_CONFIG_VALUE_2=/etc/kodema/ca/ca.crt",
+				"GIT_CONFIG_KEY_2=safe.directory",
+				"GIT_CONFIG_VALUE_2=/workspace",
+				"GIT_CONFIG_KEY_3=http.https://host.containers.internal:8443.sslCAInfo",
+				"GIT_CONFIG_VALUE_3=/etc/kodema/ca/ca.crt",
 			}},
 		{name: "a Git service and a toolbox, publicly trusted",
 			gitURL: "https://git.example.com", toolbox: true,
 			want: []string{
 				"KODEMA_GIT_URL=https://git.example.com",
-				"GIT_CONFIG_COUNT=2",
+				"GIT_CONFIG_COUNT=3",
 				"GIT_CONFIG_KEY_0=credential.https://git.example.com.helper",
 				"GIT_CONFIG_VALUE_0=",
 				"GIT_CONFIG_KEY_1=credential.https://git.example.com.helper",
 				"GIT_CONFIG_VALUE_1=/kodema/bin/kodema --trusted-origin 'https://git.example.com' git credential",
+				"GIT_CONFIG_KEY_2=safe.directory",
+				"GIT_CONFIG_VALUE_2=/workspace",
 			}},
 		{name: "a Git service without a toolbox has no helper to name",
 			gitURL: "https://git.example.com", caFile: "/etc/kodema/ca/ca.crt",

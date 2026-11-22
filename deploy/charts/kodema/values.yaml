@@ -375,26 +375,26 @@ services:
   #       existingSecret: kodema-email-mailbox
   #       key: password
 
-# Optional per-project OpenCode Brain service NetworkPolicies (Option 2:
-# Brain/Hands split). Off by default: with opencodeBrain.enabled false the
+# Optional per-project OpenCode service NetworkPolicies (Option 2:
+# sandbox mode). Off by default: with opencodeSandbox.enabled false the
 # chart renders nothing new.
 #
-# Each entry scopes one project's Brain pod (matched by tenant, project, and
-# app.kubernetes.io/component: opencode-brain) to reach ONLY ephemeral sandbox
+# Each entry scopes one project's OpenCode service pod (matched by tenant, project, and
+# app.kubernetes.io/component: opencode-service) to reach ONLY ephemeral sandbox
 # pods in kodema-tenant-<tenant> carrying the matching tenant, project, and
-# kodema.dev/role: sandbox labels on the configured sandbox MCP port. The Brain
-# pod denies all ingress so sandbox pods can never reach Brain session storage,
+# kodema.dev/role: sandbox labels on the configured sandbox MCP port. The OpenCode
+# service pod denies all ingress so sandbox pods can never reach session storage,
 # and tenant default-deny keeps sandbox pods unable to reach each other.
-opencodeBrain:
+opencodeSandbox:
   enabled: false
   sandboxPort: 8090
   projects: []
   # Example:
   # projects:
-  #   - name: project-a-brain
+  #   - name: project-a-opencode
   #     tenant: tenant-a
   #     project: project-a
-  #     # Optional namespace where the Brain pod runs (defaults to .Release.Namespace).
+  #     # Optional namespace where the OpenCode service pod runs (defaults to .Release.Namespace).
   #     namespace: ""
   #     # Optional per-project override for the sandbox MCP port (1024-65535).
   #     sandboxPort: 8090

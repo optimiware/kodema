@@ -59,7 +59,7 @@ const coreModelSummary = `Kodema is an API-first, multi-tenant software factory 
 Your role as a connected user harness (PM & Orchestrator):
 - When working on a Kodema project, act as the user's PM and Orchestrator: do NOT write application code directly on the user's laptop or run local builds/tests to deliver features.
 - Collaborate with the user to shape specs, tasks, and pipelines, then drive delivery through Kodema MCP tools: task_create / task_create_and_start / task_start / task_restart, pipeline_apply / pipeline_start, kv_put / kv_get (immutable kv:sha256:... specs, plans, and reviews), execution_inspect / execution_logs_read, task_reply, execution_request_resolve (pass | revise | fail), and task_complete.
-- Interactive orchestration uses the exact same pipelines and tasks that graduate to 24/7 service-account automation (service/opencode-* in worktree or brain mode, and service/merge-coordinator).
+- Interactive orchestration uses the exact same pipelines and tasks that graduate to 24/7 service-account automation (service/opencode-* in worktree or sandbox mode, and service/merge-coordinator).
 
 Core model:
 - A pipeline is an ordered list of actions (container or request); an execution runs a pipeline once with an immutable admission snapshot; a task is a conversation (with optional parent_id) that starts executions.
@@ -114,8 +114,8 @@ var catalog = buildCatalog([]topicSpec{
 	},
 	{
 		slug:        "agentic-services",
-		title:       "Agentic Services (Option 1 Worktree & Option 2 Brain/Hands)",
-		description: "Attributed service-account LLM proxy, OpenCode --mode worktree and --mode brain, kodema sandbox serve, and Helm NetworkPolicies.",
+		title:       "Agentic Services (Option 1 Worktree & Option 2 Sandbox Mode)",
+		description: "Attributed service-account LLM proxy, OpenCode --mode worktree and --mode sandbox, kodema sandbox serve, and Helm NetworkPolicies.",
 		content:     agenticServicesMD,
 	},
 })

@@ -136,33 +136,33 @@ func TestRunOpenCodeWiresPasswordAndHTTPSCA(t *testing.T) {
 	}
 }
 
-func TestRunOpenCodeBrainModeRejectsMultiConcurrencyWithV2HTTPClient(t *testing.T) {
+func TestRunOpenCodeSandboxModeRejectsMultiConcurrencyWithV2HTTPClient(t *testing.T) {
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	baseBrain := OpenCodeConfig{
-		ServiceID:      id.PrincipalID("opencode-brain"),
+	baseSandbox := OpenCodeConfig{
+		ServiceID:      id.PrincipalID("opencode-sandbox"),
 		TenantID:       id.TenantID("tenant-1"),
 		ProjectID:      id.ProjectID("project-1"),
-		ExecutionMode:  opencode.OpenCodeExecutionModeBrain,
+		ExecutionMode:  opencode.OpenCodeExecutionModeSandbox,
 		StateDirectory: t.TempDir(),
 		OpenCodeURL:    "http://127.0.0.1:4096",
 		Handler:        noopAPIHandler{},
 		Clock:          servicekit.SystemClock{},
 	}
 
-	// Default HTTPOpenCodeClient (OpenCode == nil) in Brain mode must reject MaxConcurrentTurns > 1.
-	tooMany := baseBrain
+	// Default HTTPOpenCodeClient (OpenCode == nil) in sandbox mode must reject MaxConcurrentTurns > 1.
+	tooMany := baseSandbox
 	tooMany.MaxConcurrentTurns = 2
 	err := RunOpenCode(cancelledCtx, tooMany)
 	if err == nil || !strings.Contains(err.Error(), "--max-concurrency 1") {
-		t.Fatalf("RunOpenCode Brain MaxConcurrentTurns=2 err = %v; want --max-concurrency 1 error", err)
+		t.Fatalf("RunOpenCode sandbox MaxConcurrentTurns=2 err = %v; want --max-concurrency 1 error", err)
 	}
 
 	// Default MaxConcurrentTurns <= 0 defaults safely to 1 and succeeds (exits nil on cancelled ctx).
-	defaultConc := baseBrain
+	defaultConc := baseSandbox
 	defaultConc.MaxConcurrentTurns = 0
 	if err := RunOpenCode(cancelledCtx, defaultConc); err != nil {
-		t.Fatalf("RunOpenCode Brain MaxConcurrentTurns=0: %v", err)
+		t.Fatalf("RunOpenCode sandbox MaxConcurrentTurns=0: %v", err)
 	}
 }

@@ -309,8 +309,8 @@ harness (**Claude Code**, **Codex**, **OpenCode**, or **Cursor**) to your local
    interactive harness orchestration to always-on `kodsvc.` services:
    - Per-project OpenCode service (Option 1 — isolated Git worktrees):
      `kodema services --kind opencode --mode worktree`
-   - Brain/Hands split (Option 2 — ephemeral stock-image MCP sandboxes):
-     `kodema services --kind opencode --mode brain` + `kodema sandbox serve`
+   - Sandbox mode (Option 2 — ephemeral stock-image MCP sandboxes):
+     `kodema services --kind opencode --mode sandbox` + `kodema sandbox serve`
    - Serialized merge coordinator with cross-execution Decision IDs:
      `kodema services --kind merge_coordinator`
 
@@ -325,7 +325,7 @@ Read Kodema's embedded documentation offline (including inside container steps) 
 ```sh
 kodema docs                                 # list topics
 kodema docs workload                        # container action contract
-kodema docs agentic-services                # Option 1 worktree & Option 2 Brain/Hands
+kodema docs agentic-services                # Option 1 worktree & Option 2 sandbox mode
 kodema docs install --target agents         # or claude, opencode, all
 ```
 

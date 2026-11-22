@@ -230,7 +230,7 @@ func TestBuildContainerEnvAndEnvStrings(t *testing.T) {
 		{Name: id.EnvTask, Value: "task-1"},
 		{Name: workspace.EnvCAFile, Value: WorkloadCAPath},
 		{Name: workspace.EnvGitURL, Value: "https://git.kodema.local/tenant-a"},
-		{Name: "GIT_CONFIG_COUNT", Value: "3"},
+		{Name: "GIT_CONFIG_COUNT", Value: "4"},
 	}
 	if len(vars) < len(wantPrefix) {
 		t.Fatalf("len(vars) = %d; want at least %d (%+v)", len(vars), len(wantPrefix), vars)

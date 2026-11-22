@@ -36,7 +36,7 @@ const (
 	KindResponder ServiceKind = "responder"
 	// KindMergeCoordinator serializes merges per repository/ref.
 	KindMergeCoordinator ServiceKind = "merge_coordinator"
-	// KindOpenCode runs a per-project OpenCode brain service with persistent
+	// KindOpenCode runs a per-project OpenCode service with persistent
 	// task sessions, isolated local Git worktrees, and attributed LLM calls.
 	KindOpenCode ServiceKind = "opencode"
 )

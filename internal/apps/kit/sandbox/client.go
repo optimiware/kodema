@@ -89,7 +89,7 @@ func (c *Client) Initialize(ctx context.Context) (map[string]any, error) {
 	err := c.rpc(ctx, "initialize", map[string]any{
 		"protocolVersion": mcpProtocolVersion,
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "kodema-brain", "version": "1"},
+		"clientInfo":      map[string]any{"name": "kodema-opencode", "version": "1"},
 	}, &out)
 	return out, err
 }

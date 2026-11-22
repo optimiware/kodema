@@ -1,17 +1,17 @@
-# Pattern C: Option 2 Brain/Hands Split (`--mode brain` + `kodema sandbox serve`)
+# Pattern C: Option 2 Sandbox Mode (`--mode sandbox` + `kodema sandbox serve`)
 #
-# Runs a lightweight OpenCode Brain pod (`kodema services --kind opencode --mode brain`)
+# Runs a lightweight OpenCode service pod (`kodema services --kind opencode --mode sandbox`)
 # with all local shell and filesystem tools disabled:
-#   1. `plan` runs directly in Brain with NO sandbox container (`sandbox_image` omitted).
+#   1. `plan` runs directly in the OpenCode service with NO sandbox container (`sandbox_image` omitted).
 #   2. `implement-backend` dynamically spawns an ephemeral Go sandbox on stock
 #      `docker.io/library/golang:1.24` with `go-mod,go-build` caches via
 #      `/kodema/bin/kodema sandbox serve`.
 #   3. `implement-frontend` dynamically spawns an ephemeral Node sandbox on stock
 #      `docker.io/library/node:22` with `npm` cache on the same task session.
-#   4. `ai-review` runs sandbox-free directly in Brain.
+#   4. `ai-review` runs sandbox-free directly in the OpenCode service.
 #   5. `review` gates protected Git integration on a human `role/reviewer` decision.
 #
-# Note: Brain mode's service account requires the `engineer` role (for inline
+# Note: Sandbox mode's service account requires the `engineer` role (for inline
 # sandbox `pipeline.start`, `execution.cancel`, and ephemeral sandbox secrets).
 inputs:
   - repository

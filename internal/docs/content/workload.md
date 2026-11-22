@@ -96,7 +96,7 @@ When any active limit is reached or exceeded, the LLM proxy rejects the call wit
   ```
 - **Inspect or comment on the task:** `kodema task show "$KODEMA_TASK"`, `kodema call task.comment ...`
 - **Connect an in-container harness over MCP:** `kodema mcp stdio` bridges stdin/stdout to `$KODEMA_URL/mcp` using `/kodema/secrets/KODEMA_TOKEN`.
-- **Run an ephemeral jailed MCP tool sandbox (Option 2 Hands):** `kodema sandbox serve --listen 0.0.0.0:8090 --workspace /workspace --token-file /kodema/secrets/<NAME> --token-env <NAME>` (pure Go stdlib, `os.Root`-jailed `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`; reserve `--unlink-token-file` for writable token files outside `/workspace`, never read-only `/kodema/secrets/` mounts).
+- **Run an ephemeral jailed MCP tool sandbox (Option 2):** `kodema sandbox serve --listen 0.0.0.0:8090 --workspace /workspace --token-file /kodema/secrets/<NAME> --token-env <NAME>` (pure Go stdlib, `os.Root`-jailed `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`; reserve `--unlink-token-file` for writable token files outside `/workspace`, never read-only `/kodema/secrets/` mounts).
 - **Submit outputs early (optional):** `kodema output push` (also run automatically after the final command).
 
 ## Execution permissions boundary
