@@ -76,7 +76,7 @@ type serverOptions struct {
 	// through, separate from the client-facing public URL.
 	WorkloadURL string
 	// WorkloadCAFile optionally names the PEM CA bundle mounted read-only into
-	// Podman workloads at /kodema/ca.crt (with KODEMA_CA_FILE=/kodema/ca.crt).
+	// Podman workloads at /etc/kodema/ca/ca.crt (with KODEMA_CA_FILE=/etc/kodema/ca/ca.crt).
 	WorkloadCAFile string
 	// WorkloadGitURL optionally names the base URL of the installation's Git
 	// service as workloads reach it. It is exposed as KODEMA_GIT_URL and
@@ -367,7 +367,7 @@ func parseServerOptions(args []string, stderr io.Writer) (serverOptions, int) {
 	flags.StringVar(&options.InstallationID, "installation-id", options.InstallationID, "installation identity")
 	flags.StringVar(&options.PublicURL, "public-url", options.PublicURL, "public URL")
 	flags.StringVar(&options.WorkloadURL, "workload-url", options.WorkloadURL, "test profile: base URL workloads reach the server through")
-	flags.StringVar(&options.WorkloadCAFile, "workload-ca-file", options.WorkloadCAFile, "test profile: PEM CA bundle mounted read-only into workloads at /kodema/ca.crt")
+	flags.StringVar(&options.WorkloadCAFile, "workload-ca-file", options.WorkloadCAFile, "test profile: PEM CA bundle mounted read-only into workloads at /etc/kodema/ca/ca.crt")
 	flags.StringVar(&options.WorkloadGitURL, "workload-git-url", options.WorkloadGitURL, "HTTPS base URL of the Git service as workloads reach it; production replaces {tenant}")
 	flags.StringVar(&options.ToolboxFile, "toolbox-file", options.ToolboxFile, "test profile: kodema binary for the containers' platform, mounted into workloads at /kodema/bin (default on Linux: this executable)")
 	flags.StringVar(&options.WorkloadMemory, "workload-memory", options.WorkloadMemory, "test profile: default memory limit for workload containers (e.g. 2Gi, 4Gi)")

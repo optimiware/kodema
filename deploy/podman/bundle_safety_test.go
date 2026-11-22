@@ -661,7 +661,7 @@ func TestRunbookDocumentsVerifiedLimitations(t *testing.T) {
 		"deny-by-default",
 		"not configurable",
 		"`/workspace`",
-		"/kodema/ca.crt",
+		"/etc/kodema/ca/ca.crt",
 		"KODEMA_CA_FILE",
 		"Retained logs are collected",
 		"submit declared outputs over HTTPS",

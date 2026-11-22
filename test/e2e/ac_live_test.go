@@ -279,31 +279,53 @@ func TestE2E_AC09CleanupAttributable(t *testing.T) {
 	instance.record(t, "AC09", "9.2", "TestE2E_AC09CleanupAttributable", &view, started, finished, nil)
 }
 
-// TestE2E_AC11Materialization proves literal environment, working directory,
-// the reserved runtime variables and a shared workspace are materialized in the
-// run, and the action's exit is observable as succeeded.
+// TestE2E_AC11Materialization proves the canonical S07 in-container runtime
+// contract: literal environment, exact /workspace working directory, immutable
+// /kodema/bin/kodema toolbox on PATH, automatic launcher output push and
+// read-only downstream output materialization, optional read-only installation
+// CA at /etc/kodema/ca/ca.crt, mounted execution credential redaction in
+// retained logs, task-free absence of /kodema/task*, and shared workspace
+// persistence across actions.
 func TestE2E_AC11Materialization(t *testing.T) {
 	e2eParallel(t)
 	instance := startLive(t)
 	started := time.Now().UTC()
 
+	const contractOutputValue = "ac11-contract-output"
+	writeCommands := []string{
+		`test "$AC11_ENV" = "ac11-value"`,
+		`test "$(pwd)" = "/workspace"`,
+		`test -w /workspace`,
+		`test -x /kodema/bin/kodema`,
+		`test "$(command -v kodema)" = "/kodema/bin/kodema"`,
+		`if ( : >> /kodema/bin/kodema ) 2>/dev/null; then exit 1; fi`,
+		`test ! -e /kodema/task && test ! -e /kodema/task.json && test -z "${KODEMA_TASK:-}"`,
+		`test -r /kodema/secrets/KODEMA_TOKEN && test -s /kodema/secrets/KODEMA_TOKEN`,
+		`printf 'token_check=%s\n' "$(cat /kodema/secrets/KODEMA_TOKEN)"`,
+		`echo "ac11-env=$AC11_ENV"`,
+		`echo "ac11-pwd=$(pwd)"`,
+		`echo "ac11-execution=$KODEMA_EXECUTION"`,
+		`echo "ac11-action=$KODEMA_ACTION"`,
+		`echo "ac11-materialized" > /workspace/ac11.txt`,
+		`printf '%s\n' "` + contractOutputValue + `" > /kodema/outputs/ac11-write/contract_out`,
+	}
+	if instance.config.WorkloadCAFile != "" || instance.config.CAPEM != "" {
+		writeCommands = append(writeCommands,
+			`test "$KODEMA_CA_FILE" = "/etc/kodema/ca/ca.crt"`,
+			`test -r /etc/kodema/ca/ca.crt`,
+			`if ( : >> /etc/kodema/ca/ca.crt ) 2>/dev/null; then exit 1; fi`,
+		)
+	}
+
 	document, err := (harness.Document{
 		Env: map[string]string{"AC11_ENV": "ac11-value"},
 		Actions: []harness.Action{
 			{
-				Name:    "ac11-write",
-				Image:   instance.image,
-				Timeout: "10m",
-				Commands: []string{
-					`test "$AC11_ENV" = "ac11-value"`,
-					`case "$(pwd)" in /*) ;; *) exit 3 ;; esac`,
-					`test -w /workspace`,
-					`echo "ac11-env=$AC11_ENV"`,
-					`echo "ac11-pwd=$(pwd)"`,
-					`echo "ac11-execution=$KODEMA_EXECUTION"`,
-					`echo "ac11-action=$KODEMA_ACTION"`,
-					`echo "ac11-materialized" > /workspace/ac11.txt`,
-				},
+				Name:     "ac11-write",
+				Image:    instance.image,
+				Timeout:  "10m",
+				Outputs:  []string{"contract_out"},
+				Commands: writeCommands,
 			},
 			{
 				Name:    "ac11-read",
@@ -312,9 +334,14 @@ func TestE2E_AC11Materialization(t *testing.T) {
 				Env:     map[string]string{"AC11_ENV": "ac11-override"},
 				Commands: []string{
 					`test "$AC11_ENV" = "ac11-override"`,
+					`test "$(pwd)" = "/workspace"`,
 					`test "$(cat /workspace/ac11.txt)" = "ac11-materialized"`,
+					`test -r /kodema/outputs/ac11-write/contract_out`,
+					`if ( : >> /kodema/outputs/ac11-write/contract_out ) 2>/dev/null; then exit 1; fi`,
+					`test "$(cat /kodema/outputs/ac11-write/contract_out)" = "` + contractOutputValue + `"`,
 					`echo "ac11-override=$AC11_ENV"`,
 					`echo "ac11-shared-workspace-ok"`,
+					`echo "ac11-contract-output-ok"`,
 				},
 			},
 		},
@@ -331,6 +358,10 @@ func TestE2E_AC11Materialization(t *testing.T) {
 	if writeAction.State != "succeeded" || readAction.State != "succeeded" {
 		t.Fatalf("materialization actions = %q/%q; want succeeded/succeeded", writeAction.State, readAction.State)
 	}
+	if writeAction.Outputs["contract_out"] != contractOutputValue {
+		t.Fatalf("ac11-write contract_out = %q; want %q (outputs=%+v)",
+			writeAction.Outputs["contract_out"], contractOutputValue, writeAction.Outputs)
+	}
 	writeLog := instance.readLogs(t, admitted.ExecutionID, writeAction.ActionID, "stdout")
 	readLog := instance.readLogs(t, admitted.ExecutionID, readAction.ActionID, "stdout")
 	for _, log := range [][]byte{writeLog, readLog} {
@@ -339,11 +370,13 @@ func TestE2E_AC11Materialization(t *testing.T) {
 		}
 	}
 	requireLogContains(t, "ac11-write", writeLog, "ac11-env=ac11-value")
+	requireLogContains(t, "ac11-write", writeLog, "ac11-pwd=/workspace")
 	requireLogContains(t, "ac11-write", writeLog, "ac11-execution="+admitted.ExecutionID)
 	requireLogContains(t, "ac11-write", writeLog, "ac11-action=ac11-write")
-	requireAbsolutePwd(t, writeLog)
+	requireLogContains(t, "ac11-write", writeLog, "token_check=[REDACTED]")
 	requireLogContains(t, "ac11-read", readLog, "ac11-override=ac11-override")
 	requireLogContains(t, "ac11-read", readLog, "ac11-shared-workspace-ok")
+	requireLogContains(t, "ac11-read", readLog, "ac11-contract-output-ok")
 
 	finished := time.Now().UTC()
 	instance.record(t, "AC11", "11.1", "TestE2E_AC11Materialization", &view, started, finished, nil)

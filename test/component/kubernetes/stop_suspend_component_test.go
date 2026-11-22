@@ -26,11 +26,11 @@ import (
 	"time"
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
-	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // newFixtureAdapter reconstructs the production adapter over the same cluster,
@@ -83,9 +83,8 @@ func TestPendingJobStopConfirmsAfterSuspension(t *testing.T) {
 	})
 
 	identity := testIdentity("exec-stop-pending", "action-stop-pending", "workload-stop-pending", "idem-stop-pending")
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`printf 'pending-stop-marker\n'`, `sleep 300`}, nil), nil, "tok-stop-pending",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`printf 'pending-stop-marker\n'`, `sleep 300`}, "tok-stop-pending",
 	))
 	pod := waitForUnscheduledPod(t, ctx, fx, identity)
 	if pod.NodeName != "" {
@@ -121,7 +120,7 @@ func TestPendingJobStopConfirmsAfterSuspension(t *testing.T) {
 	// The controller removes the never-started pod and acknowledges the
 	// suspension. Only then may the guarded branch confirm.
 	waitForNoWorkloadPods(t, ctx, fx, identity)
-	confirmed := waitForStopConfirmed(t, ctx, fx, identity, workspaceID)
+	confirmed := runtimesupport.WaitForStopConfirmed(t, ctx, fx.Adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID}, 3*time.Minute, 200*time.Millisecond)
 	if confirmed.Detail == "" {
 		t.Fatal("confirmed stop has no detail")
 	}
@@ -156,11 +155,11 @@ func TestSuspendedStopConvergesAfterPodDisappears(t *testing.T) {
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-stop-running", "action-stop-running", "workload-stop-running", "idem-stop-running")
 	const marker = "live-stop-marker"
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID,
 		// The trap is installed before the marker, so a readable marker proves
 		// the workload ignores SIGTERM and must not be assumed stopped.
-		testContainer([]string{`trap '' TERM`, `printf 'live-stop-marker\n'`, `sleep 20`}, nil), nil, "tok-stop-running",
+		[]string{`trap '' TERM`, `printf 'live-stop-marker\n'`, `sleep 20`}, "tok-stop-running",
 	))
 	waitForWorkloadContainerRunning(t, ctx, fx, identity, marker)
 	jobBefore := oneJob(t, ctx, fx.Client, identity)
@@ -189,7 +188,7 @@ func TestSuspendedStopConvergesAfterPodDisappears(t *testing.T) {
 	}
 
 	waitForNoWorkloadPods(t, ctx, fx, identity)
-	confirmed := waitForStopConfirmed(t, ctx, fx, identity, workspaceID)
+	confirmed := runtimesupport.WaitForStopConfirmed(t, ctx, fx.Adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID}, 3*time.Minute, 200*time.Millisecond)
 	if confirmed.Detail == "" {
 		t.Fatal("confirmed stop has no detail")
 	}
@@ -219,9 +218,8 @@ func TestSuspendedStopRecoveryUsesSurvivingJob(t *testing.T) {
 	workspaceID := id.WorkspaceID("workspace-kube-stop-recovery")
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-stop-recovery", "action-stop-recovery", "workload-stop-recovery", "idem-stop-recovery")
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`sleep 120`}, nil), nil, "tok-stop-recovery",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`sleep 120`}, "tok-stop-recovery",
 	))
 	waitForPodRunning(t, ctx, fx, fx.Client, identity)
 	jobBefore := oneJob(t, ctx, fx.Client, identity)
@@ -278,9 +276,8 @@ func TestSuspendJobUIDMismatchIsRejectedAndClassified(t *testing.T) {
 	workspaceID := id.WorkspaceID("workspace-kube-stop-mismatch")
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-stop-mismatch", "action-stop-mismatch", "workload-stop-mismatch", "idem-stop-mismatch")
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`sleep 30`}, nil), nil, "tok-stop-mismatch",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`sleep 30`}, "tok-stop-mismatch",
 	))
 	job := oneJob(t, ctx, fx.Client, identity)
 	if job.UID == "" {
@@ -327,9 +324,8 @@ func TestRemoveRefusesWhileWorkloadPodLive(t *testing.T) {
 	workspaceID := id.WorkspaceID("workspace-kube-remove-live")
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-remove-live", "action-remove-live", "workload-remove-live", "idem-remove-live")
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`trap '' TERM`, `sleep 60`}, nil), nil, "tok-remove-live",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`trap '' TERM`, `sleep 60`}, "tok-remove-live",
 	))
 	waitForPodRunning(t, ctx, fx, fx.Client, identity)
 	claimName, err := runtimekube.WorkspaceClaimName(workspaceID)
@@ -510,29 +506,4 @@ func waitForNoWorkloadPods(t *testing.T, ctx context.Context, fx *fixture, ident
 	if err := harness.WaitReady(ctx, harness.RealClock{}, "workload pod removal", probe, options); err != nil {
 		t.Fatalf("wait for the workload pod to disappear: %v (last %d)", err, last)
 	}
-}
-
-// waitForStopConfirmed retries the production Stop until it reports affirmative
-// confirmation.
-func waitForStopConfirmed(t *testing.T, ctx context.Context, fx *fixture, identity reconcile.EffectIdentity, workspaceID id.WorkspaceID) engine.StopEvidence {
-	t.Helper()
-	var last engine.StopEvidence
-	probe := func(ctx context.Context) error {
-		evidence, err := fx.Adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
-		if err != nil {
-			return err
-		}
-		last = evidence
-		if !evidence.IsConfirmed() {
-			return fmt.Errorf("stop still pending: %s", evidence.Detail)
-		}
-		return nil
-	}
-	options := harness.DefaultWaitOptions()
-	options.Timeout = 3 * time.Minute
-	options.AttemptTimeout = 20 * time.Second
-	if err := harness.WaitReady(ctx, harness.RealClock{}, "confirmed stop", probe, options); err != nil {
-		t.Fatalf("stop did not confirm: %v (last %+v)", err, last)
-	}
-	return last
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	kubesupport "github.com/optimiware/kodema/test/support/infrastructure/kubernetes"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // TestCreateClaimRetain proves the seam-external claim provisioning primitive
@@ -135,7 +136,7 @@ func TestCreateClaimRetain(t *testing.T) {
 		Size:         "64Mi",
 		AccessMode:   "ReadWriteOnce",
 	})
-	requireFaultClass(t, err, fault.Forbidden)
+	runtimesupport.RequireFaultClass(t, err, fault.Forbidden)
 	if errors.Is(err, runtimekube.ErrAlreadyExists) {
 		t.Fatalf("foreign claim refusal %v leaked ErrAlreadyExists as the outcome", err)
 	}

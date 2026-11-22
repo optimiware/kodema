@@ -1,6 +1,12 @@
-// Lifecycle behavior: stable identities, lost responses, the declared
-// observation vocabulary, the stop barrier, idempotent attributed cleanup,
-// credential refresh without restart and adapter reconstruction.
+// Kubernetes-specific lifecycle behavior: lost CreateJob/SuspendJob responses,
+// Pod-vs-Job observation & stop evidence, terminating-pod confirmation,
+// bounded cleanup retries with claim attribution, stale-version credential
+// refresh, controller reconstruction, OOMKilled pod inspection, and resource
+// request clamping / default-equals-max policy ceilings.
+//
+// Shared lifecycle invariants (Start reuse, absent/running/exited Observe,
+// in-process 5-op workspace ownership, live RefreshCredential, Remove
+// idempotency) are verified in TestKubeConformance.
 package kube
 
 import (
@@ -14,7 +20,6 @@ import (
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/id"
 )
 
 func setupStarted(t *testing.T) (*fakeCluster, *fakeClock, *Adapter, reconcile.PrepareRequest) {
@@ -222,48 +227,6 @@ func TestObserveUsesKernelVocabulary(t *testing.T) {
 			}
 			if testCase.want != engine.ObservationExited && observation.StopConfirmed() {
 				t.Fatal("non-exited observation claims a confirmed stop")
-			}
-		})
-	}
-}
-
-// TestObserveReportsExitAndStopBarrier proves exit status and stop confirmation
-// come only from affirmative container termination evidence.
-func TestObserveReportsExitAndStopBarrier(t *testing.T) {
-	identity := testIdentity()
-
-	cases := []struct {
-		name     string
-		pod      Pod
-		wantCode int
-	}{
-		{name: "success", pod: testTerminatedPod(identity, "Succeeded", 0), wantCode: 0},
-		{name: "failure", pod: testTerminatedPod(identity, "Failed", 137), wantCode: 137},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			fake, _, adapter, _ := setupStarted(t)
-			fake.addPod(testCase.pod)
-
-			observation, err := adapter.Observe(context.Background(), reconcile.ObserveRequest{
-				Identity:    identity,
-				WorkspaceID: testWorkspaceID(),
-			})
-			if err != nil {
-				t.Fatalf("Observe returned error: %v", err)
-			}
-			if observation.Kind != engine.ObservationExited {
-				t.Fatalf("observation kind = %q; want %q", observation.Kind, engine.ObservationExited)
-			}
-			code, ok := observation.ExitStatus()
-			if !ok || code != testCase.wantCode {
-				t.Fatalf("exit status = %d (present=%v); want %d", code, ok, testCase.wantCode)
-			}
-			if !observation.StopConfirmed() {
-				t.Fatal("terminated container did not confirm the stop barrier")
-			}
-			if !observation.Valid() {
-				t.Fatalf("observation is not internally consistent: %+v", observation)
 			}
 		})
 	}
@@ -556,57 +519,9 @@ func TestStopLostResponseStaysPending(t *testing.T) {
 	}
 }
 
-// TestRemoveIsIdempotentAndAttributed proves cleanup removes owned resources,
-// is safe to repeat, and never creates a workload.
-func TestRemoveIsIdempotentAndAttributed(t *testing.T) {
-	fake, _, adapter, request := setupStarted(t)
-	fake.addPod(testTerminatedPod(request.Identity, "Succeeded", 0))
-	createsBefore := fake.callCount("CreateJob")
-
-	removal, err := adapter.Remove(context.Background(), reconcile.RemoveRequest{
-		Identity:    request.Identity,
-		WorkspaceID: request.WorkspaceID,
-	})
-	if err != nil {
-		t.Fatalf("Remove returned error: %v", err)
-	}
-	if !removal.Removed {
-		t.Fatalf("removal = %+v; want the owned resources removed", removal)
-	}
-	if removal.Detail == "" {
-		t.Fatal("removal has no detail")
-	}
-	if fake.jobCount() != 0 {
-		t.Fatal("Remove left the Job behind")
-	}
-	if len(fake.configMapsSnapshot()) != 0 || len(fake.secretsSnapshot()) != 0 {
-		t.Fatal("Remove left activation resources behind")
-	}
-	claimName := testClaimName(t, request.WorkspaceID)
-	if !fake.claimExists(testNamespace, claimName) {
-		t.Fatal("Remove deleted the workspace claim; Remove never releases a retained workspace")
-	}
-	if fake.callCount("DeleteClaim") != 0 {
-		t.Fatal("Remove attempted to delete the workspace claim")
-	}
-
-	second, err := adapter.Remove(context.Background(), reconcile.RemoveRequest{
-		Identity:    request.Identity,
-		WorkspaceID: request.WorkspaceID,
-	})
-	if err != nil {
-		t.Fatalf("repeated Remove returned error: %v", err)
-	}
-	if !second.Removed {
-		t.Fatalf("repeated removal = %+v; want idempotent success", second)
-	}
-	if fake.callCount("CreateJob") != createsBefore {
-		t.Fatal("Remove created a workload")
-	}
-}
-
 // TestRemoveRetainsWorkspaceWhilePodLive proves a live pod keeps the retained
-// workspace claim and that an unreachable API never reports false success.
+// workspace claim, terminated pods allow deleting Job/ConfigMap/Secret without
+// touching the claim, and an unreachable API never reports false success.
 func TestRemoveRetainsWorkspaceWhilePodLive(t *testing.T) {
 	fake, _, adapter, request := setupStarted(t)
 	claimName := testClaimName(t, request.WorkspaceID)
@@ -643,7 +558,10 @@ func TestRemoveRetainsWorkspaceWhilePodLive(t *testing.T) {
 	if !removal.Removed {
 		t.Fatalf("removal after termination = %+v; want success", removal)
 	}
-	if !fake.claimExists(testNamespace, claimName) {
+	if fake.jobCount() != 0 || len(fake.configMapsSnapshot()) != 0 || len(fake.secretsSnapshot()) != 0 {
+		t.Fatal("Remove left Job, ConfigMap, or Secret behind")
+	}
+	if !fake.claimExists(testNamespace, claimName) || fake.callCount("DeleteClaim") != 0 {
 		t.Fatal("Remove released the workspace claim; Workspace.Release owns that decision")
 	}
 
@@ -719,46 +637,6 @@ func TestRemoveBoundsRetriesWithInjectedBackoff(t *testing.T) {
 	}
 }
 
-// TestRefreshCredentialDoesNotRestartWorkload proves token replacement updates
-// only the credential Secret and never replays the command.
-func TestRefreshCredentialDoesNotRestartWorkload(t *testing.T) {
-	fake, _, adapter, request := setupStarted(t)
-	jobBefore := onlyJob(t, fake)
-	createsBefore := fake.callCount("CreateJob")
-
-	refresh, err := adapter.RefreshCredential(context.Background(), reconcile.CredentialRequest{
-		Identity:   request.Identity,
-		Credential: "tok-new",
-	})
-	if err != nil {
-		t.Fatalf("RefreshCredential returned error: %v", err)
-	}
-	if !refresh.Delivered {
-		t.Fatalf("refresh = %+v; want delivered", refresh)
-	}
-
-	secrets := fake.secretsSnapshot()
-	if len(secrets) != 1 {
-		t.Fatalf("cluster has %d secrets; want exactly 1", len(secrets))
-	}
-	if got := string(secrets[0].Data[id.SecretTokenName]); got != "tok-new" {
-		t.Fatalf("credential = %q; want the refreshed value", got)
-	}
-	if got := string(secrets[0].Data["API_KEY"]); got != "s3cr3t" {
-		t.Fatalf("declared secret = %q; refresh must not disturb other mounted values", got)
-	}
-	if fake.callCount("CreateJob") != createsBefore {
-		t.Fatal("RefreshCredential created a new Job")
-	}
-	if fake.callCount("DeleteJob") != 0 {
-		t.Fatal("RefreshCredential deleted the Job")
-	}
-	jobAfter := onlyJob(t, fake)
-	if jobAfter.ResourceVersion != jobBefore.ResourceVersion || jobAfter.Name != jobBefore.Name {
-		t.Fatal("RefreshCredential replaced or mutated the Job")
-	}
-}
-
 // TestRefreshCredentialRecoversLostResponseAndStaleVersion proves delivery is
 // recoverable after a lost update and a stale resource version.
 func TestRefreshCredentialRecoversLostResponseAndStaleVersion(t *testing.T) {
@@ -821,28 +699,6 @@ func TestRefreshCredentialRecoversLostResponseAndStaleVersion(t *testing.T) {
 		})
 		if err != nil || !retry.Delivered {
 			t.Fatalf("retry after stale version = %+v, %v; want delivered", retry, err)
-		}
-	})
-
-	t.Run("empty credential", func(t *testing.T) {
-		fake, _, adapter, request := setupStarted(t)
-		putsBefore := fake.callCount("PutSecret")
-
-		refresh, err := adapter.RefreshCredential(context.Background(), reconcile.CredentialRequest{
-			Identity:   request.Identity,
-			Credential: "",
-		})
-		if err == nil {
-			t.Fatal("RefreshCredential accepted an empty credential")
-		}
-		if refresh.Delivered {
-			t.Fatal("empty credential was reported as delivered")
-		}
-		if fake.callCount("PutSecret") != putsBefore {
-			t.Fatal("empty credential reached the API")
-		}
-		if fake.callCount("CreateJob") != 1 {
-			t.Fatal("empty credential restarted the workload")
 		}
 	})
 }
@@ -984,6 +840,31 @@ func TestPrepareAppliesBoundedResourcesAndEnforcesPolicyMaximum(t *testing.T) {
 		}
 		if job.Spec.Resources.CPULimit != "2" || job.Spec.Resources.CPURequest != "500m" {
 			t.Fatalf("job cpu = %+v; want request=500m limit=2", job.Spec.Resources)
+		}
+	})
+
+	t.Run("omitted Policy maximum pins ceiling to default limit rather than widening", func(t *testing.T) {
+		// testSetup sets MemoryLimit=256Mi, CPULimit=1, MaxMemoryLimit="", MaxCPULimit="".
+		// Requesting above those defaults (even below Podman's 4Gi / 4 CPU defaults)
+		// must be refused.
+		_, _, adapter := testSetup(t)
+		request := testPrepareRequest()
+		request.Container.Resources = &definition.Resources{Memory: "512Mi"}
+		_, err := adapter.Prepare(context.Background(), request)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("Prepare memory above default ceiling = %v; want invalid_input", err)
+		}
+		if !strings.Contains(err.Error(), "exceeds installation maximum") {
+			t.Fatalf("error = %v; want installation maximum diagnostic", err)
+		}
+
+		request.Container.Resources = &definition.Resources{CPU: "2"}
+		_, err = adapter.Prepare(context.Background(), request)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("Prepare cpu above default ceiling = %v; want invalid_input", err)
+		}
+		if !strings.Contains(err.Error(), "exceeds installation maximum") {
+			t.Fatalf("error = %v; want installation maximum diagnostic", err)
 		}
 	})
 

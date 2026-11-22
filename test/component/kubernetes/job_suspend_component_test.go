@@ -36,11 +36,11 @@ func TestJobSuspensionPreservesUIDAndAcceptsTerminalJobs(t *testing.T) {
 
 	t.Run("running Job", func(t *testing.T) {
 		identity := testIdentity("exec-suspend", "action-suspend", "workload-suspend", "idem-suspend")
-		startPrepared(t, ctx, fx, prepareRequest(
-			identity, workspaceID, "build", "",
+		startPrepared(t, ctx, fx, workloadRequest(
+			identity, workspaceID,
 			// No TERM trap: a suspended running pod is deleted promptly, so the
 			// test does not wait out the full termination grace period.
-			testContainer([]string{`sleep 120`}, nil), nil, "tok-suspend",
+			[]string{`sleep 120`}, "tok-suspend",
 		))
 		podBefore := waitForPodRunning(t, ctx, fx, fx.Client, identity)
 		podUIDBefore := objectUID(t, ctx, fx, "pod", podBefore.Name)
@@ -97,9 +97,8 @@ func TestJobSuspensionPreservesUIDAndAcceptsTerminalJobs(t *testing.T) {
 
 	t.Run("complete Job accepts patch", func(t *testing.T) {
 		identity := testIdentity("exec-complete", "action-complete", "workload-complete", "idem-complete")
-		startPrepared(t, ctx, fx, prepareRequest(
-			identity, workspaceID, "build", "",
-			testContainer([]string{`exit 0`}, nil), nil, "tok-complete",
+		startPrepared(t, ctx, fx, workloadRequest(
+			identity, workspaceID, []string{`exit 0`}, "tok-complete",
 		))
 		waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 			Identity: identity, WorkspaceID: workspaceID,
@@ -113,9 +112,8 @@ func TestJobSuspensionPreservesUIDAndAcceptsTerminalJobs(t *testing.T) {
 
 	t.Run("failed Job accepts patch", func(t *testing.T) {
 		identity := testIdentity("exec-failed", "action-failed", "workload-failed", "idem-failed")
-		startPrepared(t, ctx, fx, prepareRequest(
-			identity, workspaceID, "build", "",
-			testContainer([]string{`exit 7`}, nil), nil, "tok-failed",
+		startPrepared(t, ctx, fx, workloadRequest(
+			identity, workspaceID, []string{`exit 7`}, "tok-failed",
 		))
 		waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 			Identity: identity, WorkspaceID: workspaceID,

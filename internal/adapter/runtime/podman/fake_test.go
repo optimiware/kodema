@@ -521,6 +521,9 @@ type fakeLibpod struct {
 	// CreateContainer returns, so a test can cancel or observe the exact window
 	// between container creation and the caller's next durable step.
 	createHook func()
+	// removeHook runs once at the start of RemoveContainer before state is
+	// checked, so a test can model a concurrent Start or external deletion.
+	removeHook func()
 
 	gates map[string]*fakeGate
 }
@@ -640,6 +643,14 @@ func (f *fakeLibpod) onCreate(hook func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createHook = hook
+}
+
+// onRemove installs a one-shot hook that runs inside RemoveContainer before
+// the fake checks container state.
+func (f *fakeLibpod) onRemove(hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeHook = hook
 }
 
 // failNext fails the next call of one operation. effect reports whether the
@@ -900,7 +911,10 @@ func (f *fakeLibpod) StopContainer(ctx context.Context, name string) error {
 	if hasFailure {
 		apply = failure.effect
 	}
-	if apply {
+	if apply && state.Status == ContainerStatusRunning {
+		// Real libpod leaves a "created" container in "created" status (pid 0,
+		// zero FinishedAt) when StopContainer is called. Only a running
+		// container transitions to exited with whole-container stop evidence.
 		state.Status = ContainerStatusExited
 		state.ExitCode = 0
 		state.WholeStopped = true
@@ -917,6 +931,8 @@ func (f *fakeLibpod) RemoveContainer(ctx context.Context, name string) error {
 	gate := f.begin("RemoveContainer")
 	f.mu.Lock()
 	f.removeRequests = append(f.removeRequests, name)
+	hook := f.removeHook
+	f.removeHook = nil
 	if f.removeFailures > 0 {
 		f.removeFailures--
 		err := f.removeFailErr
@@ -935,11 +951,21 @@ func (f *fakeLibpod) RemoveContainer(ctx context.Context, name string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if hook != nil {
+		hook()
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if hasFailure && !failure.effect {
 		return failure.err
+	}
+	state, ok := f.containers[name]
+	if !ok {
+		return ErrNotFound
+	}
+	if state.Status == ContainerStatusRunning {
+		return errFakeRunningRemove
 	}
 	delete(f.containers, name)
 	if hasFailure {
@@ -1198,6 +1224,18 @@ func (f *fixture) kodemaRoot() string {
 	return filepath.Join(f.workloadRoot(), "kodema")
 }
 
+func (f *fixture) secretsParentRoot() string {
+	return filepath.Join(f.workloadRoot(), secretsDirectoryName)
+}
+
+func (f *fixture) secretsRoot() string {
+	return filepath.Join(f.secretsParentRoot(), secretsMountDirectoryName)
+}
+
+func (f *fixture) secretPath(name id.SecretName) string {
+	return filepath.Join(f.secretsRoot(), string(name))
+}
+
 func (f *fixture) hostPath(logical string) string {
 	return filepath.Join(f.workloadRoot(), logical)
 }
@@ -1207,7 +1245,7 @@ func (f *fixture) scriptPath() string {
 }
 
 func (f *fixture) credentialPath() string {
-	return filepath.Join(f.kodemaRoot(), "secrets", "KODEMA_TOKEN")
+	return filepath.Join(f.secretsRoot(), "KODEMA_TOKEN")
 }
 
 func (f *fixture) prepare(t *testing.T) reconcile.Preparation {
@@ -1401,6 +1439,7 @@ func joinEnv(name, value string) string {
 }
 
 var (
-	errFakeUnavailable = errors.New("libpod: daemon unavailable")
-	errFakeLost        = errors.New("libpod: response lost")
+	errFakeUnavailable   = errors.New("libpod: daemon unavailable")
+	errFakeLost          = errors.New("libpod: response lost")
+	errFakeRunningRemove = errors.New("libpod: running container cannot be removed without force")
 )

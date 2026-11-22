@@ -19,10 +19,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime"
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
@@ -32,33 +31,37 @@ import (
 const (
 	// MaxLogBytes bounds one log read per stream. A request above this bound is
 	// refused before any libpod call.
-	MaxLogBytes = 1 << 20
+	MaxLogBytes = container.MaxLogBytes
 	// Redacted replaces configured credential and secret values in log output.
-	Redacted = "[REDACTED]"
+	Redacted = container.Redacted
+	// WorkloadCAKey is the filename carrying the installation CA bundle.
+	WorkloadCAKey = container.WorkloadCAKey
+	// WorkloadCAMountPath is the fixed read-only mount root of the workload CA.
+	WorkloadCAMountPath = container.WorkloadCAMountPath
 	// WorkloadCAPath is the read-only mounted CA bundle path inside the
 	// container when Config.WorkloadCAFile is configured.
-	WorkloadCAPath = "/kodema/ca.crt"
+	WorkloadCAPath = container.WorkloadCAPath
 	// EnvWorkloadCAFile exposes WorkloadCAPath in the container environment
 	// when Config.WorkloadCAFile is configured.
 	EnvWorkloadCAFile = workspace.EnvCAFile
 	// DefaultMemoryBytes is the default container memory limit for local Podman
 	// workloads (2 GiB), sufficient for standard Node/Next.js/Go builds.
-	DefaultMemoryBytes int64 = 2 << 30
+	DefaultMemoryBytes = container.DefaultMemoryBytes
 	// DefaultMaxMemoryBytes is the default installation ceiling for per-action
 	// memory requests (4 GiB) when no explicit maximum is configured.
-	DefaultMaxMemoryBytes int64 = 4 << 30
+	DefaultMaxMemoryBytes = container.DefaultMaxMemoryBytes
 	// DefaultCPUMillicores is the default container CPU limit (2 CPUs).
-	DefaultCPUMillicores int64 = 2000
+	DefaultCPUMillicores = container.DefaultCPUMillicores
 	// DefaultMaxCPUMillicores is the default installation ceiling for
 	// per-action CPU requests (4 CPUs) when no explicit maximum is configured.
-	DefaultMaxCPUMillicores int64 = 4000
+	DefaultMaxCPUMillicores = container.DefaultMaxCPUMillicores
 	// DefaultCPUPeriod is the CFS cgroup period in microseconds (100ms).
 	DefaultCPUPeriod int64 = 100000
 )
 
 // Container statuses the adapter interprets. Any other status stays unknown.
 const (
-	// ContainerStatusCreated is a container that exists and was never started.
+	// ContainerStatusCreated is a container that exists in created state.
 	ContainerStatusCreated = "created"
 	// ContainerStatusRunning is a container whose process may still be alive.
 	ContainerStatusRunning = "running"
@@ -70,16 +73,24 @@ const (
 // names the adapter derives, so a retry finds exactly the same object.
 const (
 	// LabelExecution names the execution.
-	LabelExecution = "kodema.dev/execution"
+	LabelExecution = container.LabelExecution
 	// LabelAction names the action.
-	LabelAction = "kodema.dev/action"
+	LabelAction = container.LabelAction
 	// LabelWorkload names the stable runtime workload identity.
-	LabelWorkload = "kodema.dev/workload"
+	LabelWorkload = container.LabelWorkload
 	// LabelWorkspace names the retained execution workspace.
-	LabelWorkspace = "kodema.dev/workspace"
+	LabelWorkspace = container.LabelWorkspace
+	// LabelProject names the owning project when supplied by the Shell.
+	LabelProject = container.LabelProject
+	// LabelRole names the optional workload role (for example RoleSandbox).
+	LabelRole = container.LabelRole
+	// RoleSandbox is the pinned LabelRole value for ephemeral sandbox workloads.
+	RoleSandbox = container.RoleSandbox
 	// LabelIdempotencyKey carries the persisted idempotency key so a retry can
 	// be attributed to the original effect.
-	LabelIdempotencyKey = "kodema.dev/idempotency-key"
+	LabelIdempotencyKey = container.LabelIdempotencyKey
+	// LabelPreparation carries the deterministic preparation declaration digest.
+	LabelPreparation = container.LabelPreparation
 )
 
 // Sentinel errors the Libpod seam wraps. The adapter interprets them; an absent
@@ -90,33 +101,23 @@ var (
 	ErrNotFound = errors.New("podman: object not found")
 	// ErrAlreadyExists reports that an object with the same name exists.
 	ErrAlreadyExists = errors.New("podman: object already exists")
+	// ErrRedactionSourceUnavailable reports that the configured credential or
+	// secret values needed to redact log output could not be loaded.
+	ErrRedactionSourceUnavailable = container.ErrRedactionSourceUnavailable
 )
 
 // Clock is the injected time source. Production uses the real clock; tests use
 // a deterministic clock that never sleeps in wall-clock time.
-type Clock interface {
-	Now() time.Time
-	Sleep(context.Context, time.Duration) error
-}
+type Clock = container.Clock
 
 // CleanupPolicy bounds one Remove call.
-type CleanupPolicy struct {
-	// Attempts is the total attempts per resource per Remove call; at least 1.
-	Attempts int
-	// Backoff is the delay between attempts, applied through Clock.Sleep.
-	Backoff time.Duration
-}
+type CleanupPolicy = container.CleanupPolicy
 
 // ResourcePolicy bounds container memory and CPU limits for one Podman
 // installation. Zero fields select the adapter defaults; installation maximums
 // are always enforced so a pipeline can never request unbounded host memory or
 // CPU.
-type ResourcePolicy struct {
-	DefaultMemoryBytes   int64
-	MaxMemoryBytes       int64
-	DefaultCPUMillicores int64
-	MaxCPUMillicores     int64
-}
+type ResourcePolicy = container.ResourcePolicy
 
 // Config binds one adapter instance to one adapter root.
 type Config struct {
@@ -129,8 +130,9 @@ type Config struct {
 	// KodemaURL is the reserved KODEMA_URL value injected into workloads.
 	KodemaURL string
 	// WorkloadCAFile optionally names an absolute host PEM CA bundle mounted
-	// read-only at /kodema/ca.crt with KODEMA_CA_FILE=/kodema/ca.crt. Empty
-	// mounts no CA file and sets no KODEMA_CA_FILE variable.
+	// read-only at /etc/kodema/ca/ca.crt with
+	// KODEMA_CA_FILE=/etc/kodema/ca/ca.crt. Empty mounts no CA file and sets no
+	// KODEMA_CA_FILE variable.
 	WorkloadCAFile string
 	// ToolboxFile optionally names the absolute host path of the kodema
 	// binary, built for the containers' platform, that every workload mounts
@@ -184,8 +186,8 @@ type ContainerSpec struct {
 	Labels map[string]string
 	// WorkingDir is the directory the commands start in.
 	WorkingDir string
-	// Mounts is the activation bind and the retained workspace volume, then
-	// the toolbox bind and the output tmpfs when the workload has them.
+	// Mounts is the activation bind, isolated secrets bind, retained workspace
+	// volume, and any optional CA, toolbox, output tmpfs, or cache mounts.
 	Mounts []Mount
 	// RestartPolicy is "no": the command is never replayed automatically.
 	RestartPolicy string
@@ -233,8 +235,7 @@ type LogPage struct {
 
 // Files is the host file/directory boundary. Lstat never follows a symlink, so
 // a symlink escape is observable instead of silently accepted. ReadDir reports
-// entry type bits without following a symlinked entry, so a workspace reference
-// scan can refuse to traverse an escape.
+// entry type bits without following a symlinked entry.
 type Files interface {
 	MkdirAll(context.Context, string, os.FileMode) error
 	WriteFile(context.Context, string, []byte, os.FileMode) error
@@ -272,6 +273,8 @@ type Adapter struct {
 	root          string
 	kodemaURL     string
 	workloadCAPEM []byte
+	caDir         string
+	caMu          sync.Mutex
 	gitURL        string
 	resources     ResourcePolicy
 	cleanup       CleanupPolicy
@@ -284,43 +287,11 @@ type Adapter struct {
 	toolboxDir  string
 	toolboxMu   sync.Mutex
 
-	mu    sync.Mutex
-	locks map[id.WorkloadID]*keyedLock
+	mu       sync.Mutex
+	prepared map[id.WorkloadID]preparedWorkload
 
-	workspaceMu    sync.Mutex
-	workspaceLocks map[id.WorkspaceID]*keyedLock
-}
-
-// keyedLock is one reference-counted per-key mutex whose map entry is removed
-// once the last holder releases it.
-type keyedLock struct {
-	mu   sync.Mutex
-	refs int
-}
-
-func acquireKeyedLock[K comparable](mu *sync.Mutex, locks *map[K]*keyedLock, key K) func() {
-	mu.Lock()
-	if *locks == nil {
-		*locks = make(map[K]*keyedLock)
-	}
-	lock := (*locks)[key]
-	if lock == nil {
-		lock = &keyedLock{}
-		(*locks)[key] = lock
-	}
-	lock.refs++
-	mu.Unlock()
-
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
-		mu.Lock()
-		lock.refs--
-		if lock.refs == 0 {
-			delete(*locks, key)
-		}
-		mu.Unlock()
-	}
+	locks          container.KeyedLock[id.WorkloadID]
+	workspaceLocks container.KeyedLock[id.WorkspaceID]
 }
 
 // New validates one adapter configuration. An incomplete configuration is
@@ -338,21 +309,20 @@ func New(config Config) (*Adapter, error) {
 	if strings.TrimSpace(config.KodemaURL) == "" {
 		return nil, fault.New(fault.InvalidInput, "podman adapter requires the Kodema URL")
 	}
-	if config.Cleanup.Attempts < 1 {
-		return nil, fault.New(fault.InvalidInput, "podman adapter requires at least one cleanup attempt")
+	if err := config.Cleanup.Validate(); err != nil {
+		return nil, err
 	}
-	if config.Cleanup.Backoff < 0 {
-		return nil, fault.New(fault.InvalidInput, "podman adapter cleanup backoff is negative")
-	}
+	root := filepath.Clean(config.Root)
 	var workloadCAPEM []byte
+	caDir := ""
 	if caFile := strings.TrimSpace(config.WorkloadCAFile); caFile != "" {
 		loaded, err := loadWorkloadCAPEM(caFile)
 		if err != nil {
 			return nil, err
 		}
 		workloadCAPEM = loaded
+		caDir = filepath.Join(root, caDirectory, container.StableDigest(string(loaded)))
 	}
-	root := filepath.Clean(config.Root)
 	toolboxFile, toolboxDir := "", ""
 	if file := strings.TrimSpace(config.ToolboxFile); file != "" {
 		digest, err := toolboxDigest(file)
@@ -367,65 +337,29 @@ func New(config Config) (*Adapter, error) {
 			return nil, err
 		}
 	}
-	resources, err := normalizeResourcePolicy(config.Resources)
+	resources, err := container.NormalizeResourcePolicy(config.Resources)
 	if err != nil {
 		return nil, err
 	}
 	clock := config.Clock
 	if clock == nil {
-		clock = adapterutil.RealClock{}
+		clock = container.RealClock{}
 	}
 	return &Adapter{
-		libpod:         config.Libpod,
-		files:          config.Files,
-		root:           root,
-		kodemaURL:      config.KodemaURL,
-		workloadCAPEM:  workloadCAPEM,
-		gitURL:         gitURL,
-		resources:      resources,
-		toolboxFile:    toolboxFile,
-		toolboxDir:     toolboxDir,
-		cleanup:        config.Cleanup,
-		clock:          clock,
-		locks:          map[id.WorkloadID]*keyedLock{},
-		workspaceLocks: map[id.WorkspaceID]*keyedLock{},
+		libpod:        config.Libpod,
+		files:         config.Files,
+		root:          root,
+		kodemaURL:     config.KodemaURL,
+		workloadCAPEM: workloadCAPEM,
+		caDir:         caDir,
+		gitURL:        gitURL,
+		resources:     resources,
+		toolboxFile:   toolboxFile,
+		toolboxDir:    toolboxDir,
+		cleanup:       config.Cleanup,
+		clock:         clock,
+		prepared:      map[id.WorkloadID]preparedWorkload{},
 	}, nil
-}
-
-func normalizeResourcePolicy(policy ResourcePolicy) (ResourcePolicy, error) {
-	if policy.DefaultMemoryBytes < 0 || policy.MaxMemoryBytes < 0 {
-		return ResourcePolicy{}, fault.New(fault.InvalidInput, "podman adapter memory limit must not be negative")
-	}
-	if policy.DefaultCPUMillicores < 0 || policy.MaxCPUMillicores < 0 {
-		return ResourcePolicy{}, fault.New(fault.InvalidInput, "podman adapter CPU limit must not be negative")
-	}
-	if policy.DefaultMemoryBytes == 0 {
-		if policy.MaxMemoryBytes > 0 && policy.MaxMemoryBytes < DefaultMemoryBytes {
-			policy.DefaultMemoryBytes = policy.MaxMemoryBytes
-		} else {
-			policy.DefaultMemoryBytes = DefaultMemoryBytes
-		}
-	}
-	if policy.MaxMemoryBytes == 0 {
-		policy.MaxMemoryBytes = max(DefaultMaxMemoryBytes, policy.DefaultMemoryBytes)
-	}
-	if policy.DefaultMemoryBytes > policy.MaxMemoryBytes {
-		return ResourcePolicy{}, fault.New(fault.InvalidInput, "podman adapter default memory limit exceeds maximum memory limit")
-	}
-	if policy.DefaultCPUMillicores == 0 {
-		if policy.MaxCPUMillicores > 0 && policy.MaxCPUMillicores < DefaultCPUMillicores {
-			policy.DefaultCPUMillicores = policy.MaxCPUMillicores
-		} else {
-			policy.DefaultCPUMillicores = DefaultCPUMillicores
-		}
-	}
-	if policy.MaxCPUMillicores == 0 {
-		policy.MaxCPUMillicores = max(DefaultMaxCPUMillicores, policy.DefaultCPUMillicores)
-	}
-	if policy.DefaultCPUMillicores > policy.MaxCPUMillicores {
-		return ResourcePolicy{}, fault.New(fault.InvalidInput, "podman adapter default CPU limit exceeds maximum CPU limit")
-	}
-	return policy, nil
 }
 
 func loadWorkloadCAPEM(path string) ([]byte, error) {
@@ -484,10 +418,9 @@ func toolboxDigest(path string) (string, error) {
 func toolboxDigestName(sum []byte) string { return hex.EncodeToString(sum)[:24] }
 
 // lockFor acquires the per-workload mutex that serializes lifecycle effects on
-// one stable identity inside this process and returns its unlock function. It
-// never substitutes for the durable removal fence.
+// one stable identity inside this process and returns its unlock function.
 func (a *Adapter) lockFor(workload id.WorkloadID) func() {
-	return acquireKeyedLock(&a.mu, &a.locks, workload)
+	return a.locks.Lock(workload)
 }
 
 // lockForWorkspace acquires the per-workspace mutex shared by every operation
@@ -496,7 +429,7 @@ func (a *Adapter) lockFor(workload id.WorkloadID) func() {
 // this lock second, so the ordering is consistent and a release can never
 // interleave with a start.
 func (a *Adapter) lockForWorkspace(workspace id.WorkspaceID) func() {
-	return acquireKeyedLock(&a.workspaceMu, &a.workspaceLocks, workspace)
+	return a.workspaceLocks.Lock(workspace)
 }
 
 // Version reports the pinned libpod API surface without contacting the daemon.
@@ -517,16 +450,11 @@ func (a *Adapter) Capabilities(context.Context) (reconcile.Capabilities, error) 
 
 // CheckRequirements refuses admitted work the Podman family cannot run.
 func CheckRequirements(required []string) error {
-	supported := make(map[string]bool)
-	for _, capability := range runtime.CapabilitiesFor(runtime.AdapterPodman) {
-		supported[string(capability)] = true
+	capabilities := make([]runtime.Capability, len(required))
+	for index, name := range required {
+		capabilities[index] = runtime.Capability(name)
 	}
-	for _, name := range required {
-		if !supported[name] {
-			return fault.New(fault.UnsupportedCapability, "podman adapter does not support required capability "+name)
-		}
-	}
-	return nil
+	return container.CheckRequirements(runtime.AdapterPodman, capabilities)
 }
 
 // ContainerName returns the deterministic container name for one stable
@@ -535,17 +463,14 @@ func ContainerName(workload id.WorkloadID) (string, error) {
 	if _, err := id.ParseWorkloadID(string(workload)); err != nil {
 		return "", fault.Wrap(fault.InvalidInput, "workload id is invalid", err)
 	}
-	return "kodema-workload-" + adapterutil.StableDigest(string(workload)), nil
+	return "kodema-workload-" + container.StableDigest(string(workload)), nil
 }
 
 // WorkspaceVolumeName returns the deterministic name of one retained workspace
 // volume. The Shell provisions the volume before Prepare; the adapter attaches
 // exactly this volume and never creates or removes it.
 func WorkspaceVolumeName(workspace id.WorkspaceID) (string, error) {
-	if _, err := id.ParseWorkspaceID(string(workspace)); err != nil {
-		return "", fault.Wrap(fault.InvalidInput, "workspace id is invalid", err)
-	}
-	return "kodema-workspace-" + adapterutil.StableDigest(string(workspace)), nil
+	return container.WorkspaceResourceName(workspace)
 }
 
 // CacheVolumeName returns the deterministic Podman named volume for one

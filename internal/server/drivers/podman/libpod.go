@@ -363,12 +363,13 @@ func (c *Libpod) StopContainer(ctx context.Context, name string) error {
 
 // RemoveContainer removes one container without touching its named volumes.
 //
-// Removal is deliberately not forced. The adapter only calls this seam after
-// affirmative evidence that the container is created-never-started or has
-// whole-container stop evidence, and a non-forced DELETE refuses a container
-// that another controller started in the meantime instead of silently killing
-// it. A running container must be stopped first; the refusal is surfaced as an
-// uncertain removal, never as success.
+// Removal is deliberately not forced. The adapter calls this seam either after
+// affirmative whole-container stop evidence (exited with whole-container stop)
+// or from Stop for a container stuck in "created" status: a non-forced DELETE
+// refuses a container that started concurrently instead of silently killing
+// it, so a clean deletion of a "created" container proves no process is
+// running and no delayed start can launch it. A running container must be
+// stopped first; the refusal is surfaced as an error, never as success.
 func (c *Libpod) RemoveContainer(ctx context.Context, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return fault.New(fault.InvalidInput, "podman remove requires a container name")

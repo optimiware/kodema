@@ -59,56 +59,10 @@ func workspaceClaim(t *testing.T, fake *fakeCluster, workspaceID id.WorkspaceID)
 	return claim
 }
 
-// TestWorkspaceStatusRequiresOwnedClaim proves Status reports availability only
-// for an owned claim in the adapter's own tenant namespace, and that it never
-// recreates or adopts a missing, foreign or unlabelled claim.
+// TestWorkspaceStatusRequiresOwnedClaim proves Status enforces Kubernetes
+// tenant namespace & claim label ownership and treats terminating claims as
+// unavailable.
 func TestWorkspaceStatusRequiresOwnedClaim(t *testing.T) {
-	t.Run("owned claim is available", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		workspaceID := testWorkspaceID()
-
-		observation, err := adapter.Status(context.Background(), workspaceID)
-		if err != nil {
-			t.Fatalf("Status returned error: %v", err)
-		}
-		if !observation.Available {
-			t.Fatalf("observation = %+v; want an available retained workspace", observation)
-		}
-		if observation.WorkspaceID != workspaceID {
-			t.Fatalf("observation workspace = %q; want %q", observation.WorkspaceID, workspaceID)
-		}
-		if observation.Detail == "" {
-			t.Fatal("available observation has no detail")
-		}
-		if fake.callCount("UpdateClaim") != 0 || fake.callCount("DeleteClaim") != 0 {
-			t.Fatal("Status mutated the claim")
-		}
-	})
-
-	t.Run("missing claim is unavailable and never recreated", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		workspaceID := testWorkspaceID()
-		claimName := testClaimName(t, workspaceID)
-		fake.removeClaim(testNamespace, claimName)
-
-		observation, err := adapter.Status(context.Background(), workspaceID)
-		if err != nil {
-			t.Fatalf("Status returned error for a missing claim: %v", err)
-		}
-		if observation.Available {
-			t.Fatal("missing claim was reported available")
-		}
-		if !strings.Contains(strings.ToLower(observation.Detail), "missing") {
-			t.Fatalf("missing detail = %q; want an explicit missing explanation", observation.Detail)
-		}
-		if fake.claimExists(testNamespace, claimName) {
-			t.Fatal("Status recreated a missing claim")
-		}
-		if fake.callCount("UpdateClaim") != 0 || fake.callCount("DeleteClaim") != 0 {
-			t.Fatal("Status attempted to create or delete a claim")
-		}
-	})
-
 	t.Run("foreign tenant claim never counts", func(t *testing.T) {
 		fake, _, adapter := testSetup(t)
 		workspaceID := testWorkspaceID()
@@ -269,55 +223,23 @@ func TestWorkspaceRetainIsIdempotentAndDurable(t *testing.T) {
 	}
 }
 
-func TestWorkspaceRetainRefusesMissingAndForeignClaims(t *testing.T) {
-	t.Run("missing claim is never recreated", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		workspaceID := testWorkspaceID()
-		claimName := testClaimName(t, workspaceID)
-		fake.removeClaim(testNamespace, claimName)
-
-		err := adapter.Retain(context.Background(), workspaceID)
-		requireFaultClass(t, err, fault.NotFound)
-		if fake.claimExists(testNamespace, claimName) {
-			t.Fatal("Retain recreated a missing workspace claim")
-		}
-		if fake.callCount("UpdateClaim") != 0 {
-			t.Fatal("Retain wrote a missing claim")
-		}
+func TestWorkspaceRetainRefusesForeignClaims(t *testing.T) {
+	fake, _, adapter := testSetup(t)
+	workspaceID := testWorkspaceID()
+	claimName := testClaimName(t, workspaceID)
+	fake.mutateClaim(testNamespace, claimName, func(claim *Claim) {
+		claim.Labels[LabelTenant] = "tenant-other"
 	})
 
-	t.Run("foreign claim is refused", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		workspaceID := testWorkspaceID()
-		claimName := testClaimName(t, workspaceID)
-		fake.mutateClaim(testNamespace, claimName, func(claim *Claim) {
-			claim.Labels[LabelTenant] = "tenant-other"
-		})
-
-		err := adapter.Retain(context.Background(), workspaceID)
-		requireFaultClass(t, err, fault.Forbidden)
-		claim := workspaceClaim(t, fake, workspaceID)
-		if claim.Annotations[AnnotationRetained] != "" {
-			t.Fatal("Retain adopted a foreign claim")
-		}
-		if fake.callCount("UpdateClaim") != 0 {
-			t.Fatal("Retain wrote a foreign claim")
-		}
-	})
-
-	t.Run("cancelled context has no effect", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-
-		err := adapter.Retain(ctx, testWorkspaceID())
-		if err == nil {
-			t.Fatal("Retain succeeded with a cancelled context")
-		}
-		if fake.callCount("UpdateClaim") != 0 {
-			t.Fatal("cancelled Retain reached the API")
-		}
-	})
+	err := adapter.Retain(context.Background(), workspaceID)
+	requireFaultClass(t, err, fault.Forbidden)
+	claim := workspaceClaim(t, fake, workspaceID)
+	if claim.Annotations[AnnotationRetained] != "" {
+		t.Fatal("Retain adopted a foreign claim")
+	}
+	if fake.callCount("UpdateClaim") != 0 {
+		t.Fatal("Retain wrote a foreign claim")
+	}
 }
 
 // TestWorkspaceRetainSurvivesLostResponse proves an uncertain retention write is
@@ -1062,28 +984,6 @@ func TestWorkspaceCancellationAtBarrier(t *testing.T) {
 			t.Fatal("cancelled Release deleted the claim")
 		}
 	})
-}
-
-// TestWorkspaceDetailsCarryNoSecrets proves workspace evidence never leaks
-// configured secret values.
-func TestWorkspaceDetailsCarryNoSecrets(t *testing.T) {
-	fake, _, adapter := testSetup(t)
-	request := testPrepareRequest()
-	prepareTestWorkload(t, adapter, request)
-	fake.removeClaim(testNamespace, testClaimName(t, request.WorkspaceID))
-
-	observation, err := adapter.Status(context.Background(), request.WorkspaceID)
-	if err != nil {
-		t.Fatalf("Status returned error: %v", err)
-	}
-	if strings.Contains(observation.Detail, "s3cr3t") {
-		t.Fatalf("Status detail leaked a secret: %q", observation.Detail)
-	}
-	if err := adapter.Retain(context.Background(), request.WorkspaceID); err == nil {
-		t.Fatal("Retain of a missing claim succeeded")
-	} else if strings.Contains(err.Error(), "s3cr3t") {
-		t.Fatalf("Retain error leaked a secret: %v", err)
-	}
 }
 
 // TestWorkspaceConcurrentRetainReleaseIsRaceFree exercises mixed retention and

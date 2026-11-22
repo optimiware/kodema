@@ -34,27 +34,53 @@ const pinnedTenantLabel = "kodema.dev/tenant"
 // contains "tenant" (for example kodema.io/tenant or kodema.dev/tenant).
 var tenantLabelTokenPattern = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[Tt]enant[A-Za-z0-9._-]*`)
 
+// readKubeRuntimeConst resolves a constant declared in
+// internal/adapter/runtime/kube/api.go. It accepts either a direct string
+// literal declaration or a direct alias to a constant in
+// internal/adapter/runtime/container/constants.go, verifying both the alias
+// and the underlying literal string so neither file can drift silently.
+func readKubeRuntimeConst(t *testing.T, name string) string {
+	t.Helper()
+	apiPath := filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "kube", "api.go")
+	apiBody, err := os.ReadFile(apiPath)
+	if err != nil {
+		t.Fatalf("read adapter constant source %s: %v", apiPath, err)
+	}
+	literalDecl := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(name) + `[ \t]*=[ \t]*"([^"]+)"[ \t]*$`)
+	if match := literalDecl.FindStringSubmatch(string(apiBody)); match != nil {
+		return match[1]
+	}
+	aliasDecl := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(name) + `[ \t]*=[ \t]*container\.([A-Za-z0-9_]+)[ \t]*$`)
+	aliasMatch := aliasDecl.FindStringSubmatch(string(apiBody))
+	if aliasMatch == nil {
+		t.Fatalf("%s: no %s constant declaration or container alias found", apiPath, name)
+	}
+	target := aliasMatch[1]
+	constPath := filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "container", "constants.go")
+	constBody, err := os.ReadFile(constPath)
+	if err != nil {
+		t.Fatalf("read shared container constant source %s: %v", constPath, err)
+	}
+	targetDecl := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(target) + `[ \t]*=[ \t]*"([^"]+)"[ \t]*$`)
+	targetMatch := targetDecl.FindStringSubmatch(string(constBody))
+	if targetMatch == nil {
+		t.Fatalf("%s: missing constant %s referenced by %s (%s)", constPath, target, apiPath, name)
+	}
+	return targetMatch[1]
+}
+
 // adapterTenantLabel reads the runtime adapter's LabelTenant declaration from
 // its source text. It fails when the declaration disappears or no longer
 // matches the pinned literal, so the chart test cannot drift away from the
 // adapter it is supposed to satisfy.
 func adapterTenantLabel(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "kube", "api.go")
-	body, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read adapter label source %s: %v", path, err)
+	got := readKubeRuntimeConst(t, "LabelTenant")
+	if got != pinnedTenantLabel {
+		t.Fatalf("adapter tenant label drift: kube.LabelTenant resolves to %q, test pins %q; update the chart and this test together",
+			got, pinnedTenantLabel)
 	}
-	declaration := regexp.MustCompile(`(?m)^[ \t]*LabelTenant[ \t]*=[ \t]*"([^"]+)"[ \t]*$`)
-	match := declaration.FindStringSubmatch(string(body))
-	if match == nil {
-		t.Fatalf("%s: no LabelTenant declaration found", path)
-	}
-	if match[1] != pinnedTenantLabel {
-		t.Fatalf("adapter tenant label drift: %s declares %q, test pins %q; update the chart and this test together",
-			path, match[1], pinnedTenantLabel)
-	}
-	return match[1]
+	return got
 }
 
 // requireOnlyTenantLabel fails when body mentions any tenant label token other

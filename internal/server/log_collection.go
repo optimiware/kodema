@@ -80,6 +80,7 @@ import (
 	"sync"
 	"time"
 
+	runtimecontainer "github.com/optimiware/kodema/internal/adapter/runtime/container"
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	shelllog "github.com/optimiware/kodema/internal/control/log"
 	"github.com/optimiware/kodema/internal/control/store"
@@ -774,7 +775,7 @@ func retainedLogFailureCause(err error) string {
 		return logCausePodLogBadRequest
 	case errors.Is(err, runtimekube.ErrPodLogServerError):
 		return logCausePodLogServerError
-	case errors.Is(err, runtimekube.ErrRedactionSourceUnavailable):
+	case errors.Is(err, runtimecontainer.ErrRedactionSourceUnavailable):
 		return logCauseRedactionSourceMissing
 	default:
 		return logCauseLogReadFailed

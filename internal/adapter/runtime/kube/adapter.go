@@ -16,7 +16,7 @@ import (
 	"strings"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime"
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/definition"
@@ -44,7 +44,7 @@ var (
 	ErrPodLogServerError = errors.New("kubernetes: workload pod log read failed")
 	// ErrRedactionSourceUnavailable reports that the configured values needed to
 	// redact output could not be read, so no output may be emitted.
-	ErrRedactionSourceUnavailable = errors.New("kubernetes: log redaction source is unavailable")
+	ErrRedactionSourceUnavailable = container.ErrRedactionSourceUnavailable
 )
 
 // checkPreparedWorkspace refuses a request that names a different workspace
@@ -64,36 +64,33 @@ func (a *Adapter) checkPreparedWorkspace(identity reconcile.EffectIdentity, work
 // retained workspace claim. It never starts a workload and never recreates a
 // missing workspace.
 func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest) (reconcile.Preparation, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return reconcile.Preparation{}, err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return reconcile.Preparation{}, err
 	}
-	if err := adapterutil.ValidatePrepareContext(request.ActionName, request.TaskID); err != nil {
+	if err := container.ValidatePrepareContext(request.ActionName, request.TaskID); err != nil {
 		return reconcile.Preparation{}, err
 	}
 	if err := workspace.ValidateCacheMounts(request.Container.Caches, request.Caches); err != nil {
 		return reconcile.Preparation{}, err
 	}
-	if strings.TrimSpace(request.Container.Image) == "" {
-		return reconcile.Preparation{}, fault.New(fault.InvalidInput, "container image is empty")
+	if err := container.ValidatePinnedImage(request.Container.Image); err != nil {
+		return reconcile.Preparation{}, err
 	}
 	resources, err := a.resolveResources(request.Container.Resources)
 	if err != nil {
 		return reconcile.Preparation{}, err
 	}
-	for index, entry := range request.Container.Env {
-		if _, err := id.ParseEnvName(string(entry.Name)); err != nil {
-			return reconcile.Preparation{}, fault.Wrap(fault.InvalidInput,
-				fmt.Sprintf("container environment entry %d is invalid", index), err)
-		}
+	if err := container.ValidateContainerEnv(request.Container.Env); err != nil {
+		return reconcile.Preparation{}, err
 	}
 	renderedScript, err := script.Render(request.Container.Commands)
 	if err != nil {
 		return reconcile.Preparation{}, err
 	}
-	materialization, err := adapterutil.BuildMaterialization(request, readOnlyMode)
+	materialization, err := container.BuildMaterialization(request, container.ReadOnlyFileMode)
 	if err != nil {
 		return reconcile.Preparation{}, err
 	}
@@ -101,9 +98,9 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 		return reconcile.Preparation{}, fault.Wrap(fault.DependencyUnavailable, "preparation cancelled before any effect", err)
 	}
 
-	digest := a.preparationDigest(request, materialization)
+	digest := container.PreparationDigest(request, materialization, a.kodemaURL)
 
-	unlock := a.lockWorkspace(request.WorkspaceID)
+	unlock := a.locks.Lock(request.WorkspaceID)
 	defer unlock()
 
 	a.mu.Lock()
@@ -138,8 +135,8 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 		return reconcile.Preparation{}, fault.New(fault.Forbidden, "workspace claim is not owned by this workspace")
 	}
 
-	configMap := a.activationConfigMap(request.Identity, request.WorkspaceID, materialization, digest)
-	plan, err := a.prepareToolboxPlan(ctx, &configMap, request, renderedScript)
+	configMap := a.activationConfigMap(request.Identity, request.WorkspaceID, materialization, renderedScript, digest)
+	plan, err := a.prepareToolboxPlan(ctx, &configMap, request)
 	if err != nil {
 		return reconcile.Preparation{}, err
 	}
@@ -160,8 +157,7 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 	if plan.CASecret != "" {
 		caFile = WorkloadCAPath
 	}
-	gitEnv, err := workspace.GitEnvironment(plan.GitURL, caFile, plan.Image != "")
-	if err != nil {
+	if _, err := workspace.GitEnvironment(plan.GitURL, caFile, plan.Image != ""); err != nil {
 		return reconcile.Preparation{}, err
 	}
 	outputDir := ""
@@ -177,13 +173,11 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 		return reconcile.Preparation{}, fault.Wrap(fault.DependencyUnavailable, "credential secret write outcome is unknown", err)
 	}
 
-	activationPaths := make([]string, 0, len(materialization.Files))
+	activationPaths := make([]string, 0, len(materialization.Files)+1)
 	for _, file := range materialization.Files {
 		activationPaths = append(activationPaths, file.Path)
 	}
-	if plan.Image != "" {
-		activationPaths = append(activationPaths, workloadScript)
-	}
+	activationPaths = append(activationPaths, container.WorkloadScriptPath)
 	sort.Strings(activationPaths)
 	secretNames := make([]id.SecretName, 0, len(materialization.Secrets))
 	for _, declared := range materialization.Secrets {
@@ -224,13 +218,12 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 		digest:     digest,
 		workspace:  request.WorkspaceID,
 		project:    projectID,
-		role:       workloadRole(request),
+		role:       container.WorkloadRole(request),
 		actionName: request.ActionName,
 		taskID:     request.TaskID,
 		container: containerDeclaration{
-			image:  request.Container.Image,
-			script: renderedScript,
-			env:    copyContainerEnv(request.Container.Env),
+			image: request.Container.Image,
+			env:   append([]definition.EnvVar(nil), request.Container.Env...),
 		},
 		claimName:       claimName,
 		configMap:       configMap.Name,
@@ -239,7 +232,7 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 		activationPaths: activationPaths,
 		toolboxImage:    plan.Image,
 		caSecret:        plan.CASecret,
-		gitEnv:          gitEnv,
+		gitURL:          plan.GitURL,
 		outputDir:       outputDir,
 		caches:          caches,
 		secretNames:     secretNames,
@@ -252,7 +245,7 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 	return reconcile.Preparation{
 		WorkspaceID: request.WorkspaceID,
 		Detail: fmt.Sprintf("materialized activation snapshot %q and credential secret %q for %s",
-			configMap.Name, secret.Name, adapterutil.DescribeIdentity(request.Identity)),
+			configMap.Name, secret.Name, container.DescribeIdentity(request.Identity)),
 	}, nil
 }
 
@@ -265,7 +258,7 @@ type toolboxPlan struct {
 	Outputs  []id.OutputKey
 }
 
-func (a *Adapter) prepareToolboxPlan(ctx context.Context, cm *ConfigMap, request reconcile.PrepareRequest, rendered string) (toolboxPlan, error) {
+func (a *Adapter) prepareToolboxPlan(ctx context.Context, cm *ConfigMap, request reconcile.PrepareRequest) (toolboxPlan, error) {
 	plan := toolboxPlan{Image: a.toolboxImage, GitURL: a.gitURL, CASecret: a.workloadCA.SecretName, Outputs: request.Container.Outputs}
 	existing, err := a.cluster.GetConfigMap(ctx, a.namespace, cm.Name)
 	switch {
@@ -305,7 +298,6 @@ func (a *Adapter) prepareToolboxPlan(ctx context.Context, cm *ConfigMap, request
 			return toolboxPlan{}, err
 		}
 		cm.Data[toolboxPlanKey] = payload
-		cm.Data[workloadScript] = []byte(rendered)
 	}
 	return plan, nil
 }
@@ -328,16 +320,6 @@ func checkStoredActivationConfigMap(stored ConfigMap, identity reconcile.EffectI
 			"activation snapshot content changed for the same workload identity")
 	}
 	return nil
-}
-
-// copyContainerEnv copies the admitted literal environment so later mutation of
-// the request cannot change an already-prepared workload.
-func copyContainerEnv(env []definition.EnvVar) []EnvVar {
-	copied := make([]EnvVar, len(env))
-	for index, entry := range env {
-		copied[index] = EnvVar{Name: string(entry.Name), Value: entry.Value}
-	}
-	return copied
 }
 
 // checkDeclaredSecretContent refuses different declared secret values for an
@@ -384,17 +366,17 @@ func (a *Adapter) Start(ctx context.Context, request reconcile.StartRequest) (re
 			Detail:     detail,
 		}, err
 	}
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return unknown("start request identity is invalid", err)
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return unknown("start request workspace is invalid", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return unknown("start cancelled before any effect", fault.Wrap(fault.DependencyUnavailable, "start cancelled before any effect", err))
 	}
 
-	unlock := a.lockWorkspace(request.WorkspaceID)
+	unlock := a.locks.Lock(request.WorkspaceID)
 	defer unlock()
 
 	a.mu.Lock()
@@ -426,7 +408,7 @@ func (a *Adapter) Start(ctx context.Context, request reconcile.StartRequest) (re
 	}
 
 	if prepared.workspace != request.WorkspaceID {
-		return unknown("start workspace does not match the prepared workspace", fault.New(fault.InvalidInput, "start workspace does not match the prepared workspace"))
+		return unknown("start workspace does not match the prepared workspace", fault.New(fault.Forbidden, "start workspace does not match the prepared workspace"))
 	}
 	if prepared.identity != request.Identity {
 		return unknown("start identity does not match the prepared identity", fault.New(fault.ChangedIdempotencyContent, "start identity does not match the prepared identity"))
@@ -468,7 +450,10 @@ func (a *Adapter) Start(ctx context.Context, request reconcile.StartRequest) (re
 		return unknown("Job state is unreachable", fault.Wrap(fault.DependencyUnavailable, "Job state is unreachable", err))
 	}
 
-	job := a.jobManifest(prepared, request.Identity)
+	job, err := a.jobManifest(prepared, request.Identity)
+	if err != nil {
+		return unknown("Job manifest construction failed", err)
+	}
 	if _, err := a.cluster.CreateJob(ctx, job); err != nil {
 		if errors.Is(err, ErrAlreadyExists) {
 			if existing, getErr := a.cluster.GetJob(ctx, a.namespace, prepared.job); getErr == nil {
@@ -497,10 +482,10 @@ func (a *Adapter) Start(ctx context.Context, request reconcile.StartRequest) (re
 // Observe reports the declared Kernel vocabulary for the stable identity.
 // Absence and node loss stay uncertain.
 func (a *Adapter) Observe(ctx context.Context, request reconcile.ObserveRequest) (engine.Observation, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return engine.UnknownObservation(), err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.UnknownObservation(), err
 	}
 	if err := a.checkPreparedWorkspace(request.Identity, request.WorkspaceID); err != nil {
@@ -540,19 +525,13 @@ func (a *Adapter) memoryLimitFor(workload id.WorkloadID) string {
 // Logs returns ordered, bounded and redacted chunks. It carries no lifecycle
 // authority and fails closed when the redaction source is unavailable.
 func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reconcile.LogBatch, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateLogsRequest(request); err != nil {
 		return reconcile.LogBatch{}, err
-	}
-	if request.Limit <= 0 || request.Limit > MaxLogBytes {
-		return reconcile.LogBatch{}, fault.New(fault.InvalidInput, "log read limit is outside the bounded range")
-	}
-	if request.AfterOffset < 0 {
-		return reconcile.LogBatch{}, fault.New(fault.InvalidInput, "log read offset is negative")
 	}
 	// The pod log is one interleaved stream: stock clusters cannot separate
 	// stdout from stderr, so the combined log is attributed to stdout and the
 	// stderr position of the continuation token stays zero.
-	offset, stderrOffset := adapterutil.DecodeLogCursor(request.AfterOffset)
+	offset, stderrOffset := container.DecodeLogCursor(request.AfterOffset)
 	if stderrOffset != 0 {
 		// A cursor from the retired two-stream reader carries a stderr
 		// position. Reinterpreting its high half as a combined-log offset would
@@ -617,24 +596,25 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 	// inside it may still complete after the page. Only the final page (no
 	// truncation) is known to hold the whole remaining log, so nothing there can
 	// extend past its last byte.
-	consumed, data := adapterutil.RedactLogPage(page.Data, values, request.Limit, page.Truncated)
-	nextPos, err := adapterutil.NextStreamLogPosition(reconcile.LogStdout, offset, len(consumed))
+	chunk, hasChunk, nextPos, err := container.BuildLogChunk(container.LogPageInput{
+		Stream:        reconcile.LogStdout,
+		Offset:        offset,
+		Sequence:      1,
+		Raw:           page.Data,
+		PageTruncated: page.Truncated,
+		Values:        values,
+		Limit:         request.Limit,
+		MayGrow:       page.Truncated,
+	})
 	if err != nil {
 		// The page itself was already read, but a position that does not fit the
 		// token must never surface as a negative cursor.
 		return reconcile.LogBatch{}, err
 	}
-	batch := reconcile.LogBatch{NextOffset: adapterutil.EncodeLogCursor(nextPos, 0)}
-	if len(consumed) == 0 {
-		return batch, nil
+	batch := reconcile.LogBatch{NextOffset: container.EncodeLogCursor(nextPos, 0)}
+	if hasChunk {
+		batch.Chunks = append(batch.Chunks, chunk)
 	}
-	batch.Chunks = append(batch.Chunks, reconcile.LogChunk{
-		Stream:    reconcile.LogStdout,
-		Offset:    offset,
-		Sequence:  1,
-		Data:      data,
-		Truncated: page.Truncated,
-	})
 	return batch, nil
 }
 
@@ -654,10 +634,10 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 // an affirmatively terminated container still confirms. Absence of pods is never
 // stop evidence.
 func (a *Adapter) Stop(ctx context.Context, request reconcile.StopRequest) (engine.StopEvidence, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return engine.PendingStop("stop request identity is invalid"), err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.PendingStop("stop request workspace is invalid"), err
 	}
 	if err := a.checkPreparedWorkspace(request.Identity, request.WorkspaceID); err != nil {
@@ -765,17 +745,17 @@ func (a *Adapter) Stop(ctx context.Context, request reconcile.StopRequest) (engi
 // decision. A live or unreachable workload retains the claim and names it in
 // Detail.
 func (a *Adapter) Remove(ctx context.Context, request reconcile.RemoveRequest) (reconcile.Removal, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return reconcile.Removal{Detail: "removal request identity is invalid"}, err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return reconcile.Removal{Detail: "removal request workspace is invalid"}, err
 	}
 	if err := a.checkPreparedWorkspace(request.Identity, request.WorkspaceID); err != nil {
 		return reconcile.Removal{Detail: "removal request workspace does not match the prepared workspace"}, err
 	}
 
-	unlock := a.lockWorkspace(request.WorkspaceID)
+	unlock := a.locks.Lock(request.WorkspaceID)
 	defer unlock()
 
 	claimName, err := WorkspaceClaimName(request.WorkspaceID)
@@ -793,17 +773,26 @@ func (a *Adapter) Remove(ctx context.Context, request reconcile.RemoveRequest) (
 		return reconcile.Removal{Detail: retainedDetail(claimName, "a workload pod is still live")}, nil
 	}
 
-	if err := a.deleteWithRetry(ctx, func(ctx context.Context) error {
+	deleteResource := func(remove func(context.Context) error) error {
+		return container.RetryWithBackoff(ctx, a.clock, a.cleanup, func(ctx context.Context) error {
+			err := remove(ctx)
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		})
+	}
+	if err := deleteResource(func(ctx context.Context) error {
 		return a.cluster.DeleteJob(ctx, a.namespace, workloadJobName(request.Identity.WorkloadID))
 	}); err != nil {
 		return reconcile.Removal{Detail: retainedDetail(claimName, "Job deletion failed: "+err.Error())}, nil
 	}
-	if err := a.deleteWithRetry(ctx, func(ctx context.Context) error {
+	if err := deleteResource(func(ctx context.Context) error {
 		return a.cluster.DeleteConfigMap(ctx, a.namespace, activationConfigMapName(request.Identity.WorkloadID))
 	}); err != nil {
 		return reconcile.Removal{Detail: retainedDetail(claimName, "activation snapshot deletion failed: "+err.Error())}, nil
 	}
-	if err := a.deleteWithRetry(ctx, func(ctx context.Context) error {
+	if err := deleteResource(func(ctx context.Context) error {
 		return a.cluster.DeleteSecret(ctx, a.namespace, credentialSecretName(request.Identity.WorkloadID))
 	}); err != nil {
 		return reconcile.Removal{Detail: retainedDetail(claimName, "credential secret deletion failed: "+err.Error())}, nil
@@ -820,25 +809,6 @@ func (a *Adapter) Remove(ctx context.Context, request reconcile.RemoveRequest) (
 	}, nil
 }
 
-// deleteWithRetry bounds deletion attempts per call with the injected clock.
-func (a *Adapter) deleteWithRetry(ctx context.Context, remove func(context.Context) error) error {
-	attempts := max(a.cleanup.Attempts, 1)
-	var lastErr error
-	for attempt := range attempts {
-		if attempt > 0 {
-			if err := a.clock.Sleep(ctx, a.cleanup.Backoff); err != nil {
-				return err
-			}
-		}
-		err := remove(ctx)
-		if err == nil || errors.Is(err, ErrNotFound) {
-			return nil
-		}
-		lastErr = err
-	}
-	return lastErr
-}
-
 // retainedDetail names the retained workspace claim so pending cleanup is
 // attributable.
 func retainedDetail(claimName, reason string) string {
@@ -849,7 +819,7 @@ func retainedDetail(claimName, reason string) string {
 // restarts or replaces the Job and is recoverable after a lost update response
 // or a stale resource version.
 func (a *Adapter) RefreshCredential(ctx context.Context, request reconcile.CredentialRequest) (reconcile.CredentialRefresh, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return reconcile.CredentialRefresh{}, err
 	}
 	if strings.TrimSpace(request.Credential) == "" {
@@ -880,6 +850,6 @@ func (a *Adapter) RefreshCredential(ctx context.Context, request reconcile.Crede
 	}
 	return reconcile.CredentialRefresh{
 		Delivered: true,
-		Detail:    fmt.Sprintf("replaced credential for %s without restarting the Job", adapterutil.DescribeIdentity(request.Identity)),
+		Detail:    fmt.Sprintf("replaced credential for %s without restarting the Job", container.DescribeIdentity(request.Identity)),
 	}, nil
 }

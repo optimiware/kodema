@@ -93,7 +93,7 @@ func TestProductionClaimProvisioningUsesBothHalves(t *testing.T) {
 	}
 	t.Cleanup(func() { builder.cleanup(context.Background()) })
 
-	if _, ok := environment.workspace.(*kubeProvisioningWorkspace); !ok {
+	if _, ok := environment.workspace.(*provisioningWorkspace); !ok {
 		t.Fatalf("production workspace = %T; want the claim-provisioning decorator", environment.workspace)
 	}
 }
@@ -230,7 +230,7 @@ func TestProductionBuildsEachPoolFromItsOwnRoleDSN(t *testing.T) {
 	if consumers.Identity == nil || consumers.Receipts == nil || consumers.Deliverer == nil {
 		t.Fatal("the production composition did not build every store-backed consumer")
 	}
-	provisioning, ok := environment.workspace.(*kubeProvisioningWorkspace)
+	provisioning, ok := environment.workspace.(*provisioningWorkspace)
 	if !ok {
 		t.Fatalf("production workspace = %T; want the claim-provisioning decorator", environment.workspace)
 	}
@@ -723,21 +723,34 @@ func TestProductionComposesMultiTenantRouting(t *testing.T) {
 	}
 	originalWorkspaces := map[id.TenantID]kernelengine.Workspace{"tenant-a": workspaceA, "tenant-b": workspaceB}
 	for tenant, inner := range workspaceDispatcher.tenants {
-		provisioning, ok := inner.(*kubeProvisioningWorkspace)
+		provisioning, ok := inner.(*provisioningWorkspace)
 		if !ok {
 			t.Fatalf("tenant %s workspace = %T; want the claim-provisioning decorator", tenant, inner)
 		}
-		if provisioning.claim.TenantID != tenant {
-			t.Fatalf("tenant %s claim template tenant = %s; want its own tenant", tenant, provisioning.claim.TenantID)
-		}
-		if provisioning.claim.Namespace != "kodema-tenant-"+string(tenant) {
-			t.Fatalf("tenant %s claim namespace = %s; want its own namespace", tenant, provisioning.claim.Namespace)
-		}
-		if provisioning.provisioner != provisioner {
-			t.Fatalf("tenant %s claim provisioner = %T; want the composed cluster client", tenant, provisioning.provisioner)
+		if provisioning.expectedTenant != tenant {
+			t.Fatalf("tenant %s expected tenant = %s; want its own tenant", tenant, provisioning.expectedTenant)
 		}
 		if provisioning.inner != originalWorkspaces[tenant] {
 			t.Fatalf("tenant %s decorator does not wrap that tenant's workspace", tenant)
+		}
+		beforeCount := provisioner.count()
+		wsID := id.WorkspaceID("workspace-" + string(tenant))
+		if err := provisioning.provision(context.Background(), wsID); err != nil {
+			t.Fatalf("tenant %s provision: %v", tenant, err)
+		}
+		specs := provisioner.requested()
+		if len(specs) != beforeCount+1 {
+			t.Fatalf("tenant %s claim provision calls = %d; want %d", tenant, len(specs), beforeCount+1)
+		}
+		got := specs[len(specs)-1]
+		if got.TenantID != tenant {
+			t.Fatalf("tenant %s claim template tenant = %s; want its own tenant", tenant, got.TenantID)
+		}
+		if got.Namespace != "kodema-tenant-"+string(tenant) {
+			t.Fatalf("tenant %s claim namespace = %s; want its own namespace", tenant, got.Namespace)
+		}
+		if got.WorkspaceID != wsID {
+			t.Fatalf("tenant %s claim workspace = %s; want %s", tenant, got.WorkspaceID, wsID)
 		}
 	}
 

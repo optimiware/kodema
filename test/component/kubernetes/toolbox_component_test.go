@@ -14,9 +14,9 @@ import (
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	"github.com/optimiware/kodema/internal/engine"
-	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // Load the checkout's real image into this test's disposable kind node. The
@@ -78,10 +78,9 @@ func TestJobToolboxGitAndFileOutput(t *testing.T) {
 	// This ordinary image provides Git and Python, not Kodema. The loopback
 	// fixture accepts exactly the authenticated output written by the script.
 	identity := testIdentity("exec-toolbox", "act-build", "workload-toolbox", "toolbox")
-	request := prepareRequest(identity, ws, "build", "", definition.Container{
-		Image:   "docker.io/library/buildpack-deps@sha256:712f969c9d81a35f9f00cce701faae521891d42a20b592b61bd0e6c5328fad7c",
-		Outputs: []id.OutputKey{"result"},
-		Commands: []string{
+	request := runtimesupport.StandardPrepareRequest(identity, ws,
+		"docker.io/library/buildpack-deps@sha256:712f969c9d81a35f9f00cce701faae521891d42a20b592b61bd0e6c5328fad7c",
+		[]string{
 			`test "$PWD" = /workspace && test "$(command -v kodema)" = /kodema/bin/kodema`,
 			`kodema version`,
 			`test ! -e /kodema/toolbox-plan.json && test -s "$KODEMA_CA_FILE"`,
@@ -89,8 +88,13 @@ func TestJobToolboxGitAndFileOutput(t *testing.T) {
 			`printf 'url=%s/repo\n\n' "$KODEMA_GIT_URL" | GIT_TERMINAL_PROMPT=0 git credential fill >/dev/null`,
 			`cat /kodema/outputs/earlier/out-a > /kodema/outputs/build/result`,
 			`python3 /kodema/inputs/server`,
-		},
-	}, nil, "test-execution-token")
+		})
+	request.TaskID = ""
+	request.Container.Env = nil
+	request.Container.Secrets = nil
+	request.Container.Outputs = []id.OutputKey{"result"}
+	request.Secrets = nil
+	request.Credential = "test-execution-token"
 	request.Inputs["server"] = `import http.server, json, os
 class API(http.server.BaseHTTPRequestHandler):
     def reply(self, op, body):
@@ -123,8 +127,8 @@ if os.fork() == 0:
 		t.Fatalf("toolbox Job: %v\n%s\n%s", waitErr, events.Stdout, logs.Stdout)
 	}
 	observed := waitForObservation(t, ctx, adapter, reconcile.ObserveRequest{Identity: identity, WorkspaceID: ws}, engine.ObservationExited)
-	combined, _ := readAllLogs(t, ctx, adapter, identity, 1<<20)
-	if code, ok := observed.ExitStatus(); !ok || code != 0 || !strings.Contains(string(combined), "submitted outputs result") {
+	combined, _ := runtimesupport.ReadAllLogs(t, ctx, adapter, identity, 1<<20)
+	if code, ok := observed.ExitStatus(); !ok || code != 0 || !strings.Contains(combined, "submitted outputs result") {
 		t.Fatalf("workload exit=%d/%t log=%s", code, ok, combined)
 	}
 }

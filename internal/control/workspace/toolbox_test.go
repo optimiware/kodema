@@ -33,7 +33,7 @@ func TestGitEnvironment(t *testing.T) {
 	}{
 		{name: "no Git service"},
 		{name: "a Git service, a toolbox and a CA bundle",
-			gitURL: "https://host.containers.internal:8443/git/", caFile: "/kodema/ca.crt", toolbox: true,
+			gitURL: "https://host.containers.internal:8443/git/", caFile: "/etc/kodema/ca/ca.crt", toolbox: true,
 			want: []string{
 				"KODEMA_GIT_URL=https://host.containers.internal:8443/git",
 				"GIT_CONFIG_COUNT=3",
@@ -42,7 +42,7 @@ func TestGitEnvironment(t *testing.T) {
 				"GIT_CONFIG_KEY_1=credential.https://host.containers.internal:8443.helper",
 				"GIT_CONFIG_VALUE_1=/kodema/bin/kodema --trusted-origin 'https://host.containers.internal:8443' git credential",
 				"GIT_CONFIG_KEY_2=http.https://host.containers.internal:8443.sslCAInfo",
-				"GIT_CONFIG_VALUE_2=/kodema/ca.crt",
+				"GIT_CONFIG_VALUE_2=/etc/kodema/ca/ca.crt",
 			}},
 		{name: "a Git service and a toolbox, publicly trusted",
 			gitURL: "https://git.example.com", toolbox: true,
@@ -55,7 +55,7 @@ func TestGitEnvironment(t *testing.T) {
 				"GIT_CONFIG_VALUE_1=/kodema/bin/kodema --trusted-origin 'https://git.example.com' git credential",
 			}},
 		{name: "a Git service without a toolbox has no helper to name",
-			gitURL: "https://git.example.com", caFile: "/kodema/ca.crt",
+			gitURL: "https://git.example.com", caFile: "/etc/kodema/ca/ca.crt",
 			want: []string{"KODEMA_GIT_URL=https://git.example.com"}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

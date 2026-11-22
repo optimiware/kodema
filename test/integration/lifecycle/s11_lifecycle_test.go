@@ -103,12 +103,7 @@ func TestExitedWorkloadStopEvidenceSurvivesRestart(t *testing.T) {
 		t.Fatalf("execution failure detail = %q; want the observed exit status", execution.Failure.Detail)
 	}
 	before := actionByName(t, execution, "exited")
-	if before.Stop == nil || before.Stop.State != "confirmed" {
-		t.Fatalf("exited action stop evidence = %+v; want confirmed", before.Stop)
-	}
-	if !strings.Contains(before.Stop.Detail, "exited with code 3") {
-		t.Fatalf("exited action stop detail = %q; want the observed exit code", before.Stop.Detail)
-	}
+	assertConfirmedStop(t, before, "exited with code 3")
 	beforeLogs := executionLogs(t, harness, harness.ProjectToken, started.ExecutionID, "exited")
 	if !strings.Contains(beforeLogs, "runs-before-exit=1") {
 		t.Fatalf("retained logs before restart do not show exactly one command execution:\n%s", beforeLogs)
@@ -121,9 +116,7 @@ func TestExitedWorkloadStopEvidenceSurvivesRestart(t *testing.T) {
 		t.Fatalf("terminal failure changed across restart: before=%+v after=%+v", execution.Failure, after.Failure)
 	}
 	afterAction := actionByName(t, after, "exited")
-	if afterAction.Stop == nil || afterAction.Stop.State != "confirmed" {
-		t.Fatalf("exited action stop evidence after restart = %+v; want the persisted confirmed barrier", afterAction.Stop)
-	}
+	assertConfirmedStop(t, afterAction, before.Stop.Detail)
 	if afterAction.Stop.Detail != before.Stop.Detail {
 		t.Fatalf("stop detail changed across restart: before=%q after=%q", before.Stop.Detail, afterAction.Stop.Detail)
 	}
@@ -138,13 +131,7 @@ func TestExitedWorkloadStopEvidenceSurvivesRestart(t *testing.T) {
 	if len(containers) != 0 {
 		t.Fatalf("exited workload left containers after terminal cleanup: %v", containers)
 	}
-	count, err := harness.ExecutionCount(t.Context(), applied.PipelineID)
-	if err != nil {
-		t.Fatalf("count executions: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("execution count = %d; want exactly the original execution", count)
-	}
+	assertExecutionCount(t, harness, applied.PipelineID, 1)
 }
 
 // TestCleanupRecoveryAfterControllerCrash (AC9) proves a terminal execution's
@@ -569,20 +556,8 @@ func TestStartReceiptReplayAfterPipelineEdit(t *testing.T) {
 		t.Fatalf("replayed start version = %d; want the original %d", replayed.Version, started.Version)
 	}
 
-	count, err := harness.ExecutionCount(t.Context(), applied.PipelineID)
-	if err != nil {
-		t.Fatalf("count executions: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("execution count after replay = %d; want exactly 1", count)
-	}
-	receipts, err := harness.ReceiptCount(t.Context(), "start-replay-key")
-	if err != nil {
-		t.Fatalf("count start receipts: %v", err)
-	}
-	if receipts != 1 {
-		t.Fatalf("start receipt count = %d; want exactly 1", receipts)
-	}
+	assertExecutionCount(t, harness, applied.PipelineID, 1)
+	assertReceiptCount(t, harness, "start-replay-key", 1)
 
 	// The admitted bytes are still the original definition, not the edit.
 	admitted, _, err := harness.ExecutionRow(t.Context(), started.ExecutionID)
@@ -603,11 +578,5 @@ func TestStartReceiptReplayAfterPipelineEdit(t *testing.T) {
 		t.Fatalf("fresh start at the stale pipeline version = %q (%s); want %q",
 			publicError.Code, publicError.Message, api.CodeVersionConflict)
 	}
-	count, err = harness.ExecutionCount(t.Context(), applied.PipelineID)
-	if err != nil {
-		t.Fatalf("count executions after stale start: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("stale start wrote an execution: count = %d", count)
-	}
+	assertExecutionCount(t, harness, applied.PipelineID, 1)
 }

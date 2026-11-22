@@ -547,22 +547,6 @@ func findAction(view api.ExecutionInspectResult, name string) (api.ExecutionActi
 	return api.ExecutionAction{}, false
 }
 
-// requireAbsolutePwd asserts the run reported an absolute working directory.
-func requireAbsolutePwd(t *testing.T, log []byte) {
-	t.Helper()
-	for line := range strings.SplitSeq(string(log), "\n") {
-		if !strings.HasPrefix(line, "ac11-pwd=") {
-			continue
-		}
-		value := strings.TrimPrefix(line, "ac11-pwd=")
-		if !strings.HasPrefix(value, "/") {
-			t.Fatalf("materialized working directory %q is not absolute", value)
-		}
-		return
-	}
-	t.Fatalf("materialization log does not report a working directory (log bytes=%d)", len(log))
-}
-
 // cancelCurrent cancels an execution at its current version, retrying one
 // version conflict after a fresh inspection.
 func (instance *live) cancelCurrent(t *testing.T, executionID, idempotencyKey string) api.ExecutionCancelResult {

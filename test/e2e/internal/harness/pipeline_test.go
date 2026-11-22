@@ -247,6 +247,7 @@ func TestHarnessOutputSubmissionScript(t *testing.T) {
 		"import urllib.request",
 		`"/kodema/secrets/KODEMA_TOKEN"`,
 		caPath,
+		`"KODEMA_CA_FILE"`,
 		`"KODEMA_EXECUTION"`,
 		`"KODEMA_ACTION"`,
 		`"artifact": "ac12-ok"`,
@@ -290,6 +291,89 @@ func TestHarnessOutputSubmissionScript(t *testing.T) {
 		if _, err := OutputSubmissionScript(rejected, caPath); err == nil {
 			t.Fatalf("submission outputs %v were accepted", rejected)
 		}
+	}
+}
+
+// TestHarnessOutputSubmissionScriptCAFallback proves an empty explicit caFile
+// falls back to the runtime-provided KODEMA_CA_FILE environment variable (and
+// to system roots when unset), while an explicit caFile takes precedence.
+func TestHarnessOutputSubmissionScriptCAFallback(t *testing.T) {
+	fallbackScript, err := OutputSubmissionScript(map[string]string{"artifact": "ac12-ok"}, "")
+	if err != nil {
+		t.Fatalf("build fallback submission script: %v", err)
+	}
+	if !strings.Contains(fallbackScript, `CA_FILE = "" or os.environ.get("KODEMA_CA_FILE", "")`) {
+		t.Fatalf("empty caFile script does not fall back to KODEMA_CA_FILE:\n%s", fallbackScript)
+	}
+	explicitScript, err := OutputSubmissionScript(map[string]string{"artifact": "ac12-ok"}, "/workspace/w49-ca.crt")
+	if err != nil {
+		t.Fatalf("build explicit submission script: %v", err)
+	}
+
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		return
+	}
+	cases := []struct {
+		name         string
+		script       string
+		envCA        string
+		wantResolved string
+	}{
+		{
+			name:         "empty caFile uses KODEMA_CA_FILE",
+			script:       fallbackScript,
+			envCA:        "/etc/kodema/ca/ca.crt",
+			wantResolved: "/etc/kodema/ca/ca.crt",
+		},
+		{
+			name:         "empty caFile with unset KODEMA_CA_FILE uses system roots",
+			script:       fallbackScript,
+			envCA:        "",
+			wantResolved: "",
+		},
+		{
+			name:         "explicit caFile overrides KODEMA_CA_FILE",
+			script:       explicitScript,
+			envCA:        "/etc/kodema/ca/ca.crt",
+			wantResolved: "/workspace/w49-ca.crt",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			program := submissionProgram(t, tc.script)
+			path := filepath.Join(t.TempDir(), "submit.py")
+			if err := os.WriteFile(path, []byte(program), 0o600); err != nil {
+				t.Fatalf("write submission program: %v", err)
+			}
+			cmd := exec.Command(python, "-c",
+				`import importlib.util, sys; spec = importlib.util.spec_from_file_location("submit", sys.argv[1]); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); print(mod.CA_FILE, end="")`,
+				path,
+			)
+			env := make([]string, 0, len(os.Environ())+4)
+			for _, entry := range os.Environ() {
+				if strings.HasPrefix(entry, "KODEMA_") {
+					continue
+				}
+				env = append(env, entry)
+			}
+			env = append(env,
+				"KODEMA_URL=https://kodema.example",
+				"KODEMA_EXECUTION=exec-1",
+				"KODEMA_ACTION=build",
+			)
+			if tc.envCA != "" {
+				env = append(env, "KODEMA_CA_FILE="+tc.envCA)
+			}
+			cmd.Env = env
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("evaluate submission CA_FILE: %v\n%s", err, output)
+			}
+			if got := string(output); got != tc.wantResolved {
+				t.Fatalf("resolved CA_FILE = %q; want %q", got, tc.wantResolved)
+			}
+		})
 	}
 }
 

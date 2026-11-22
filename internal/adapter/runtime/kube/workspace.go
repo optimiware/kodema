@@ -15,40 +15,13 @@ import (
 	"fmt"
 	"maps"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 )
 
 const retainedValue = "true"
-
-// lockWorkspace serializes one workspace's lifecycle inside this adapter and
-// shares the lock with Prepare, Start and Remove.
-func (a *Adapter) lockWorkspace(workspaceID id.WorkspaceID) func() {
-	a.locksMu.Lock()
-	if a.locks == nil {
-		a.locks = map[id.WorkspaceID]*workspaceLock{}
-	}
-	lock := a.locks[workspaceID]
-	if lock == nil {
-		lock = &workspaceLock{}
-		a.locks[workspaceID] = lock
-	}
-	lock.refs++
-	a.locksMu.Unlock()
-
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
-		a.locksMu.Lock()
-		lock.refs--
-		if lock.refs == 0 {
-			delete(a.locks, workspaceID)
-		}
-		a.locksMu.Unlock()
-	}
-}
 
 // checkTenantNamespace proves the adapter's bound namespace still belongs to
 // this tenant before any workspace effect.
@@ -83,14 +56,14 @@ func (a *Adapter) unownedClaimReason(claim Claim, workspaceID id.WorkspaceID) st
 // recreated or adopted.
 func (a *Adapter) Status(ctx context.Context, workspaceID id.WorkspaceID) (reconcile.WorkspaceObservation, error) {
 	observation := reconcile.WorkspaceObservation{WorkspaceID: workspaceID}
-	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(workspaceID); err != nil {
 		return observation, err
 	}
 	if err := ctx.Err(); err != nil {
 		return observation, err
 	}
 
-	unlock := a.lockWorkspace(workspaceID)
+	unlock := a.locks.Lock(workspaceID)
 	defer unlock()
 
 	if err := a.checkTenantNamespace(ctx); err != nil {
@@ -124,14 +97,14 @@ func (a *Adapter) Status(ctx context.Context, workspaceID id.WorkspaceID) (recon
 // Retain persists a durable retention marker. It is idempotent and never
 // recreates a missing claim or adopts a foreign one.
 func (a *Adapter) Retain(ctx context.Context, workspaceID id.WorkspaceID) error {
-	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(workspaceID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	unlock := a.lockWorkspace(workspaceID)
+	unlock := a.locks.Lock(workspaceID)
 	defer unlock()
 
 	if err := a.checkTenantNamespace(ctx); err != nil {
@@ -208,14 +181,14 @@ func (a *Adapter) Retain(ctx context.Context, workspaceID id.WorkspaceID) error 
 // settle instead of exhausting cleanup retries on a workspace Kubernetes is
 // already removing.
 func (a *Adapter) Release(ctx context.Context, workspaceID id.WorkspaceID) error {
-	if err := adapterutil.ValidateWorkspaceID(workspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(workspaceID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	unlock := a.lockWorkspace(workspaceID)
+	unlock := a.locks.Lock(workspaceID)
 	defer unlock()
 
 	if err := a.checkTenantNamespace(ctx); err != nil {

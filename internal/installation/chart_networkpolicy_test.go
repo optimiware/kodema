@@ -443,24 +443,13 @@ func TestOpenCodeBrainSchemaValidation(t *testing.T) {
 // internal/shell/runtime/kube/{api,manifest}.go so NetworkPolicy selectors and
 // real Kubernetes workload pod labels can never drift out of sync.
 func TestOpenCodeBrainSandboxSelectorsMatchRuntimeKubeLabels(t *testing.T) {
-	kubeAPI := readText(t, filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "kube", "api.go"))
 	kubeManifest := readText(t, filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "kube", "manifest.go"))
 	template := readText(t, chartPath(t, "templates", "workloads-opencode-brain.yaml"))
 
-	readConst := func(name string) string {
-		t.Helper()
-		re := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(name) + `[ \t]*=[ \t]*"([^"]+)"[ \t]*$`)
-		m := re.FindStringSubmatch(kubeAPI)
-		if m == nil {
-			t.Fatalf("internal/adapter/runtime/kube/api.go missing constant %s", name)
-		}
-		return m[1]
-	}
-
-	tenantKey := readConst("LabelTenant")
-	projectKey := readConst("LabelProject")
-	roleKey := readConst("LabelRole")
-	roleSandbox := readConst("RoleSandbox")
+	tenantKey := readKubeRuntimeConst(t, "LabelTenant")
+	projectKey := readKubeRuntimeConst(t, "LabelProject")
+	roleKey := readKubeRuntimeConst(t, "LabelRole")
+	roleSandbox := readKubeRuntimeConst(t, "RoleSandbox")
 
 	// Verify manifest.go actually emits every one of those labels onto Job/Pod labels.
 	for _, wantRef := range []string{

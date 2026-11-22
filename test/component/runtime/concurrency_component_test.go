@@ -128,7 +128,7 @@ func TestRuntimeConcurrentTwinIsolation(t *testing.T) {
 		if start.Outcome != reconcile.StartAccepted {
 			t.Fatalf("start outcome for %q = %q; want accepted", identity.WorkloadID, start.Outcome)
 		}
-		waitForPodmanObservation(t, ctx, fixture.adapter,
+		waitObservation(t, ctx, fixture.adapter,
 			reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 	}
 	launch(firstTwin, firstIdentity)

@@ -172,7 +172,7 @@ func waitForPredecessorTrap(t *testing.T, harness *factory.Harness, executionID,
 			lastErr = fmt.Errorf("pod status: %w", err)
 			return false, nil
 		}
-		if !workloadContainerRunning(document) {
+		if !podContainerRunning(document, "workload") {
 			lastErr = errors.New("workload container is not running")
 			return false, nil
 		}
@@ -191,26 +191,6 @@ func waitForPredecessorTrap(t *testing.T, harness *factory.Harness, executionID,
 		return fmt.Sprintf("last error: %v", lastErr)
 	})
 	return podName
-}
-
-// workloadContainerRunning reports whether the workload container's
-// state.running is set in one decoded pod document.
-func workloadContainerRunning(document map[string]any) bool {
-	status, _ := document["status"].(map[string]any)
-	containers, _ := status["containerStatuses"].([]any)
-	for _, raw := range containers {
-		container, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if name, _ := container["name"].(string); name != "workload" {
-			continue
-		}
-		states, _ := container["state"].(map[string]any)
-		_, running := states["running"]
-		return running
-	}
-	return false
 }
 
 // uncertainStopPipeline renders the TERM-resistant first execution and the
@@ -263,83 +243,33 @@ func uncertainStopPipeline(t *testing.T, image, answer, firstMarker, replacement
 // merge with kubernetes_test.go's barrier cannot clash.
 func waitUncertainStopExecution(t *testing.T, harness *factory.Harness, executionID string) api.ExecutionInspectResult {
 	t.Helper()
-	token := harness.ProjectToken
-	var last api.ExecutionInspectResult
-	var resources executionResources
-	defer func() {
-		if t.Failed() {
-			t.Logf("execution %s last inspect: state=%q version=%d cleanup=%+v failure=%+v actions=%+v",
-				last.ExecutionID, last.State, last.Version, last.Cleanup, last.Failure, last.Actions)
-			t.Logf("execution %s last live resources: %s", executionID, resources)
-			dumpExecutionLogs(t, harness, token, executionID, last)
-		}
-	}()
-	harness.Eventually(t, 2*time.Minute, func() bool {
-		result, publicError := harness.REST(token, "execution.inspect", api.ExecutionInspectRequest{
-			ExecutionID: executionID,
-		}, nil, "")
-		if publicError.Code != "" {
-			return false
-		}
-		harness.Decode(result, &last)
-		switch last.State {
-		case "succeeded", "failed", "cancelled":
-			return true
-		default:
-			return false
-		}
-	})
-
-	const noneGrace = 2 * time.Second
-	probeAfter := time.Now().Add(noneGrace)
-	probedNone := false
 	pacedAttempts := 0
-	deadline := time.Now().Add(uncertainStopCleanupTimeout)
-	for {
-		inspected := false
-		result, publicError := harness.REST(token, "execution.inspect", api.ExecutionInspectRequest{
-			ExecutionID: executionID,
-		}, nil, "")
-		if publicError.Code == "" {
-			harness.Decode(result, &last)
-			inspected = true
-			switch last.Cleanup.State {
-			case "complete":
-				return last
-			case "none":
-				if !probedNone && !time.Now().Before(probeAfter) {
-					probedNone = true
-					resources = probeExecutionResources(t.Context(), harness, executionID)
-					if cleanupNoneCanBeTrue(last) && resources.clean() {
-						return last
-					}
-				}
+	return waitExecutionWithOptions(t, harness, harness.ProjectToken, executionID, waitExecutionOptions{
+		cleanupTimeout:   uncertainStopCleanupTimeout,
+		pollInterval:     uncertainStopPollInterval,
+		allowCleanupNone: true,
+		onPendingCleanup: func(cleanup api.ExecutionCleanup) {
+			if cleanup.Attempts <= pacedAttempts {
+				return
 			}
-		}
-		if !time.Now().Before(deadline) {
-			if !probedNone {
-				resources = probeExecutionResources(t.Context(), harness, executionID)
-			}
-			t.Fatalf("execution %s reached state %q but cleanup did not settle within %s: cleanup=%+v; live resources: %s\ncomposition log:\n%s",
-				executionID, last.State, uncertainStopCleanupTimeout, last.Cleanup, resources, factory.SanitizeDiagnostic(harness.Logs()))
-		}
-		if inspected && last.Cleanup.State == "pending" && last.Cleanup.Attempts > pacedAttempts {
 			// One failed attempt is paced exactly once. Wait the producer's
 			// real backoff before moving the frozen clock past next_retry_at,
 			// so the external deletion this attempt waits on has the same
 			// wall-clock opportunity it gets in production.
-			delay := uncertainStopRetryDelay(last.Cleanup.Attempts)
+			delay := uncertainStopRetryDelay(cleanup.Attempts)
 			timer := time.NewTimer(delay)
 			select {
 			case <-timer.C:
 			case <-t.Context().Done():
 				timer.Stop()
 			}
-			pacedAttempts = last.Cleanup.Attempts
+			pacedAttempts = cleanup.Attempts
 			harness.Clock.Advance(delay)
-		}
-		time.Sleep(uncertainStopPollInterval)
-	}
+		},
+		onFailure: func(context.Context, api.ExecutionInspectResult) {
+			t.Logf("%s", debugKubernetesExecution(t, harness, executionID))
+		},
+	})
 }
 
 // TestKubernetesUncertainStopBlocksHandoff is the real-cluster proof that a
@@ -446,20 +376,18 @@ func TestKubernetesUncertainStopBlocksHandoff(t *testing.T) {
 	// Each execution ran its own action exactly once: the replacement marker is
 	// present only in the replacement's retained stdout and the predecessor
 	// marker only in the predecessor's.
-	predecessorFinal := inspectExecution(t, harness, harness.ProjectToken, firstExecution)
-	predecessorAction := actionByName(t, predecessorFinal, "resist")
-	predecessorLogs := readActionLog(t, harness, harness.ProjectToken, firstExecution, predecessorAction.ActionID, "stdout")
+	predecessorLogs := executionLogs(t, harness, harness.ProjectToken, firstExecution, "resist")
 	if !strings.Contains(predecessorLogs, firstMarker) {
-		t.Fatalf("predecessor retained stdout does not contain its own marker:\n%s", predecessorLogs)
+		t.Fatalf("predecessor retained logs do not contain its own marker:\n%s", predecessorLogs)
 	}
 	if strings.Contains(predecessorLogs, replacementMarker) {
-		t.Fatalf("predecessor retained stdout contains the replacement marker; the replacement ran early")
+		t.Fatalf("predecessor retained logs contain the replacement marker; the replacement ran early")
 	}
-	replacementLogs := readActionLog(t, harness, harness.ProjectToken, replied.ExecutionID, replacementAction.ActionID, "stdout")
+	replacementLogs := executionLogs(t, harness, harness.ProjectToken, replied.ExecutionID, "resist")
 	if !strings.Contains(replacementLogs, replacementMarker) {
-		t.Fatalf("replacement retained stdout does not contain its own marker:\n%s", replacementLogs)
+		t.Fatalf("replacement retained logs do not contain its own marker:\n%s", replacementLogs)
 	}
 	if strings.Contains(replacementLogs, firstMarker) {
-		t.Fatalf("replacement retained stdout contains the predecessor marker; work was replayed")
+		t.Fatalf("replacement retained logs contain the predecessor marker; work was replayed")
 	}
 }

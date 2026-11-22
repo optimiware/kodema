@@ -17,8 +17,6 @@ import (
 	"testing"
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
-	"github.com/optimiware/kodema/internal/control/secret"
-	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/factory"
 )
@@ -29,29 +27,9 @@ import (
 // the unconsumed claim released and no workload ephemera left behind.
 func TestKubernetesPreparationFailureCleanup(t *testing.T) {
 	acquireLifecycleKindSlot(t)
-	harness := factory.StartKubernetes(t,
-		factory.WithSecretRules(secret.NameRule{
-			Scope: tenancy.Scope{
-				TenantID:  id.TenantID(factory.TenantID),
-				ProjectID: id.ProjectID(factory.ProjectID),
-			},
-			Names: []id.SecretName{pipelineSecretName},
-		}),
-		factory.WithSecrets(map[string]string{
-			pipelineSecretName: pipelineSecretValue,
-			deniedSecretName:   deniedSecretValue,
-		}),
-	)
+	harness := factory.StartKubernetes(t, deniedSecretOptions()...)
 
-	document := marshalPipeline(t, pipelineDoc{
-		Actions: []pipelineActionDoc{{
-			Name:     "denied",
-			Image:    harness.Image.Reference,
-			Secrets:  []string{deniedSecretName},
-			Commands: []string{"true"},
-			Timeout:  kubeActionTimeout,
-		}},
-	})
+	document := deniedSecretPipeline(t, harness, kubeActionTimeout)
 	applied := applyPipeline(t, harness, "preparation-failure", document)
 	started := startPipeline(t, harness, harness.ProjectToken, applied.PipelineID, nil, "start-preparation-failure")
 	if started.ExecutionID == "" {
@@ -68,31 +46,7 @@ func TestKubernetesPreparationFailureCleanup(t *testing.T) {
 	}
 
 	execution := waitKubernetesExecution(t, harness, started.ExecutionID)
-	if execution.State != "failed" {
-		t.Fatalf("execution state = %q; want failed", execution.State)
-	}
-	if execution.Failure == nil || execution.Failure.Kind != "preparation" {
-		t.Fatalf("failure = %+v; want preparation", execution.Failure)
-	}
-	if execution.Cleanup.State != "complete" {
-		t.Fatalf("cleanup state = %q; want complete (%+v)", execution.Cleanup.State, execution.Cleanup)
-	}
-	if execution.Cleanup.WorkspaceID != workspaceID {
-		t.Fatalf("cleanup workspace = %q; want %q", execution.Cleanup.WorkspaceID, workspaceID)
-	}
-	if execution.Cleanup.WorkloadID == "" {
-		t.Fatal("cleanup did not name the failed identity; the record is not attributable")
-	}
-
-	// The failed action never started, so no confirmed stop evidence exists and
-	// nothing may claim a workload ran.
-	action := actionByName(t, execution, "denied")
-	if action.State != "failed" {
-		t.Fatalf("failed action state = %q; want failed", action.State)
-	}
-	if action.Stop != nil && action.Stop.State == "confirmed" {
-		t.Fatalf("preparation failure fabricated stop evidence: %+v", action.Stop)
-	}
+	assertPreparationFailure(t, execution, "denied", workspaceID)
 
 	// No partial Job, Pod, Secret or ConfigMap survives the failed identity, and
 	// the unconsumed claim is gone. Both are bounded observable barriers.

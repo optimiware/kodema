@@ -15,6 +15,7 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // podRunningTimeout bounds the wait for the workload pod to be scheduled and
@@ -35,10 +36,9 @@ func TestJobCompletesWithPodEvidence(t *testing.T) {
 		`printf 'hello-stdout\n'`,
 		`printf 'hello-stderr\n' >&2`,
 	}
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "task-k1",
-		testContainer(commands, nil), nil, "tok-k1",
-	))
+	req := workloadRequest(identity, workspaceID, commands, "tok-k1")
+	req.TaskID = "task-k1"
+	startPrepared(t, ctx, fx, req)
 
 	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
@@ -75,11 +75,11 @@ func TestJobCompletesWithPodEvidence(t *testing.T) {
 		t.Fatalf("pod has no workload container status: %+v", pod.Containers)
 	}
 
-	stdout, stderr := readAllLogs(t, ctx, fx.Adapter, identity, 1<<20)
-	if !containsLine(string(stdout), "hello-stdout") {
+	stdout, stderr := runtimesupport.ReadAllLogs(t, ctx, fx.Adapter, identity, 1<<20)
+	if !runtimesupport.ContainsLine(stdout, "hello-stdout") {
 		t.Fatalf("stdout = %q; want the workload line", stdout)
 	}
-	if !containsLine(string(stdout), "hello-stderr") || len(stderr) != 0 {
+	if !runtimesupport.ContainsLine(stdout, "hello-stderr") || len(stderr) != 0 {
 		t.Fatalf("combined log = %q, stderr = %q; want both lines in the combined log", stdout, stderr)
 	}
 }
@@ -92,9 +92,8 @@ func TestJobFailureIsObservedNotReplayed(t *testing.T) {
 	workspaceID := id.WorkspaceID("workspace-kube-2")
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-k2", "action-k2", "workload-k2", "idem-k2")
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`exit 7`}, nil), nil, "tok-k2",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`exit 7`}, "tok-k2",
 	))
 
 	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
@@ -159,9 +158,8 @@ func TestFreshAdapterAdoptsRunningJob(t *testing.T) {
 			}
 		}
 	})
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`printf 'adopt\n'; sleep 120`}, nil), nil, "tok-adopt",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`printf 'adopt\n'; sleep 120`}, "tok-adopt",
 	))
 	// Observe may report Running from the Job alone while the pod is still
 	// Pending (image pull or scheduling), so the pod itself must reach Running

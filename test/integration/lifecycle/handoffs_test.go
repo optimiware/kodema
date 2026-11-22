@@ -1407,27 +1407,6 @@ func waitExecutionCredential(t *testing.T, harness *factory.Harness, executionID
 	return credential
 }
 
-// executionLogs concatenates the retained stdout and stderr of one action.
-func executionLogs(t *testing.T, harness *factory.Harness, token, executionID, actionName string) string {
-	t.Helper()
-	execution := inspectExecution(t, harness, token, executionID)
-	action := actionByName(t, execution, actionName)
-	var builder strings.Builder
-	for _, stream := range []string{"stdout", "stderr"} {
-		result := harness.MustREST(token, "execution.logs.read", api.ExecutionLogsReadRequest{
-			ExecutionID: executionID,
-			ActionID:    action.ActionID,
-			Stream:      stream,
-		}, nil, "")
-		var read api.ExecutionLogsReadResult
-		harness.Decode(result, &read)
-		for _, chunk := range read.Chunks {
-			_, _ = builder.Write(chunk.Data)
-		}
-	}
-	return builder.String()
-}
-
 // --- pipeline builders ------------------------------------------------------
 
 // holdPipeline is one container action that records a workspace marker and

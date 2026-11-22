@@ -4,14 +4,7 @@ package kubernetesconformance
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
-	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +15,7 @@ import (
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // workloadCAImage is the ordinary smoke workload used by this test. It is the
@@ -53,7 +47,7 @@ func TestWorkloadMountedCAHTTPS(t *testing.T) {
 
 	trustCA := clusterTrustCA(t, ctx, fx)
 	putWorkloadCASecret(t, ctx, fx, workloadCASecret, trustCA)
-	putWorkloadCASecret(t, ctx, fx, workloadCAWrongSecret, generateWrongCA(t))
+	putWorkloadCASecret(t, ctx, fx, workloadCAWrongSecret, string(runtimesupport.GenerateTestCAPEM(t, "kodema-wrong-workload-ca")))
 	waitForClusterDNS(t, ctx, fx)
 
 	intended := newWorkloadCAAdapter(t, fx, workloadCASecret)
@@ -68,7 +62,7 @@ func TestWorkloadMountedCAHTTPS(t *testing.T) {
 	if code, ok := observation.ExitStatus(); !ok || code != 0 {
 		t.Fatalf("workload with the intended CA exit = %d/%v; want 0/true (%+v)\noutput: %s", code, ok, observation, stdout)
 	}
-	if !strings.Contains(string(stdout), `"major"`) {
+	if !strings.Contains(stdout, `"major"`) {
 		t.Fatalf("workload HTTPS response = %q; want the API server version document", stdout)
 	}
 	job := oneJob(t, ctx, fx.Client, identity)
@@ -84,7 +78,7 @@ func TestWorkloadMountedCAHTTPS(t *testing.T) {
 	}
 	// Stock clusters serve one combined log: curl's stderr arrives there,
 	// attributed to stdout, and the split stderr stream stays empty.
-	if !strings.Contains(strings.ToLower(string(combined)), "certificate") || len(stderr) != 0 {
+	if !strings.Contains(strings.ToLower(combined), "certificate") || len(stderr) != 0 {
 		t.Fatalf("unintended-CA combined log = %q (stderr %q); want a certificate verification failure",
 			combined, stderr)
 	}
@@ -102,7 +96,7 @@ func TestWorkloadMountedCAHTTPS(t *testing.T) {
 	if code, ok := observation.ExitStatus(); !ok || code == 0 {
 		t.Fatalf("workload with a mismatched hostname exit = %d/%v; want a nonzero curl exit (%+v)", code, ok, observation)
 	}
-	if !strings.Contains(strings.ToLower(string(combined)), "certificate") || len(stderr) != 0 {
+	if !strings.Contains(strings.ToLower(combined), "certificate") || len(stderr) != 0 {
 		t.Fatalf("mismatched-hostname combined log = %q (stderr %q); want a certificate verification failure",
 			combined, stderr)
 	}
@@ -143,7 +137,7 @@ func runCAWorkload(
 	identity reconcile.EffectIdentity,
 	workspaceID id.WorkspaceID,
 	script string,
-) (engine.Observation, []byte, []byte) {
+) (engine.Observation, string, string) {
 	t.Helper()
 	request := reconcile.PrepareRequest{
 		Identity:    identity,
@@ -168,7 +162,7 @@ func runCAWorkload(
 	observation := waitForObservation(t, ctx, adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
 	}, engine.ObservationExited)
-	stdout, stderr := readAllLogs(t, ctx, adapter, identity, 1<<20)
+	stdout, stderr := runtimesupport.ReadAllLogs(t, ctx, adapter, identity, 1<<20)
 	return observation, stdout, stderr
 }
 
@@ -318,28 +312,4 @@ func assertLiveCAVolume(t *testing.T, ctx context.Context, fx *fixture, jobName 
 		return
 	}
 	t.Fatalf("Job has no volume named %q: %v", mountName, volumes)
-}
-
-// generateWrongCA returns a fresh self-signed CA that did not sign the API
-// server certificate, so trusting it must fail verification.
-func generateWrongCA(t *testing.T) string {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate wrong-CA key: %v", err)
-	}
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "kodema-wrong-workload-ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("create wrong CA: %v", err)
-	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/internal/adapter/integration/registry"
+	runtimecontainer "github.com/optimiware/kodema/internal/adapter/runtime/container"
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/id"
@@ -238,6 +241,11 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 		Test:                 testConfig,
 	}
 
+	workloadResources, err := resolveTestWorkloadResources(options, getenv)
+	if err != nil {
+		return productionBuild{}, err
+	}
+
 	if runtimeKind == installation.RuntimePodman {
 		socket := values["KODEMA_PODMAN_SOCKET"]
 		if !filepath.IsAbs(socket) {
@@ -263,10 +271,6 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 		if err != nil {
 			return productionBuild{}, err
 		}
-		workloadResources, err := resolveTestWorkloadResources(options, getenv)
-		if err != nil {
-			return productionBuild{}, err
-		}
 		adapter, err := runtimepodman.New(runtimepodman.Config{
 			Libpod:         libpod,
 			Files:          files,
@@ -288,6 +292,10 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 		testConfig.RuntimeCloser = libpod.Close
 	} else {
 		tenants, err := parseProductionTenants(getenv)
+		if err != nil {
+			return productionBuild{}, err
+		}
+		kubePolicy, err := resolveTestKubePolicy(workloadResources, getenv)
 		if err != nil {
 			return productionBuild{}, err
 		}
@@ -319,7 +327,7 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 		if tenants.list {
 			testConfig.Tenants = make([]shellapp.ProductionTenant, 0, len(tenants.entries))
 			for _, entry := range tenants.entries {
-				adapter, err := newProductionTenantAdapter(getenv, cluster, entry, kubeOptions)
+				adapter, err := newTenantAdapterWithPolicy(getenv, cluster, entry, kubeOptions, kubePolicy)
 				if err != nil {
 					return productionBuild{}, err
 				}
@@ -333,7 +341,7 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 			}
 		} else {
 			entry := tenants.entries[0]
-			adapter, err := newProductionTenantAdapter(getenv, cluster, entry, kubeOptions)
+			adapter, err := newTenantAdapterWithPolicy(getenv, cluster, entry, kubeOptions, kubePolicy)
 			if err != nil {
 				return productionBuild{}, err
 			}
@@ -471,46 +479,74 @@ func testBrokerTLS(getenv productionEnv) (*natsdriver.TLSConfig, error) {
 	return &natsdriver.TLSConfig{CAFile: caFile, CertFile: certFile, KeyFile: keyFile}, nil
 }
 
-// resolveTestWorkloadResources parses the optional test-profile default and
-// maximum workload memory/CPU settings. Unset settings remain zero so the
-// Podman runtime applies its bounded defaults.
-func resolveTestWorkloadResources(options serverOptions, getenv productionEnv) (runtimepodman.ResourcePolicy, error) {
+// resolveTestWorkloadResources parses and normalizes the optional test-profile
+// default and maximum workload memory/CPU settings into the shared container
+// resource policy so both Podman and Kubernetes (k3s) test runtimes enforce
+// identical defaults (2 GiB / 2 CPUs) and ceilings (4 GiB / 4 CPUs).
+func resolveTestWorkloadResources(options serverOptions, getenv productionEnv) (runtimecontainer.ResourcePolicy, error) {
 	pick := func(explicit, envName string) string {
 		if value := strings.TrimSpace(explicit); value != "" {
 			return value
 		}
 		return strings.TrimSpace(getenv(envName))
 	}
-	var policy runtimepodman.ResourcePolicy
-	if raw := pick(options.WorkloadMemory, "KODEMA_WORKLOAD_MEMORY_LIMIT"); raw != "" {
-		bytes, err := definition.ParseMemoryQuantity(raw)
-		if err != nil {
-			return runtimepodman.ResourcePolicy{}, fmt.Errorf("test profile workload memory (--workload-memory or KODEMA_WORKLOAD_MEMORY_LIMIT): %w", err)
+	rawMem := pick(options.WorkloadMemory, "KODEMA_WORKLOAD_MEMORY_LIMIT")
+	rawMaxMem := pick(options.WorkloadMaxMemory, "KODEMA_WORKLOAD_MAX_MEMORY_LIMIT")
+	rawCPU := pick(options.WorkloadCPUs, "KODEMA_WORKLOAD_CPU_LIMIT")
+	rawMaxCPU := pick(options.WorkloadMaxCPUs, "KODEMA_WORKLOAD_MAX_CPU_LIMIT")
+
+	policy, err := runtimecontainer.ParseRawResourcePolicy(rawMem, rawMaxMem, rawCPU, rawMaxCPU)
+	if err != nil {
+		var parseErr *runtimecontainer.ResourcePolicyParseError
+		if errors.As(err, &parseErr) {
+			switch parseErr.Field {
+			case runtimecontainer.ResourceFieldDefaultMemory:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload memory (--workload-memory or KODEMA_WORKLOAD_MEMORY_LIMIT): %w", err)
+			case runtimecontainer.ResourceFieldMaxMemory:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload max memory (--workload-max-memory or KODEMA_WORKLOAD_MAX_MEMORY_LIMIT): %w", err)
+			case runtimecontainer.ResourceFieldDefaultCPU:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload CPUs (--workload-cpus or KODEMA_WORKLOAD_CPU_LIMIT): %w", err)
+			case runtimecontainer.ResourceFieldMaxCPU:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload max CPUs (--workload-max-cpus or KODEMA_WORKLOAD_MAX_CPU_LIMIT): %w", err)
+			}
 		}
-		policy.DefaultMemoryBytes = bytes
+		return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload resources: %w", err)
 	}
-	if raw := pick(options.WorkloadMaxMemory, "KODEMA_WORKLOAD_MAX_MEMORY_LIMIT"); raw != "" {
-		bytes, err := definition.ParseMemoryQuantity(raw)
-		if err != nil {
-			return runtimepodman.ResourcePolicy{}, fmt.Errorf("test profile workload max memory (--workload-max-memory or KODEMA_WORKLOAD_MAX_MEMORY_LIMIT): %w", err)
-		}
-		policy.MaxMemoryBytes = bytes
+	normalized, err := runtimecontainer.NormalizeResourcePolicy(policy)
+	if err != nil {
+		return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload resources: %w", err)
 	}
-	if raw := pick(options.WorkloadCPUs, "KODEMA_WORKLOAD_CPU_LIMIT"); raw != "" {
-		millicores, err := definition.ParseCPUQuantity(raw)
-		if err != nil {
-			return runtimepodman.ResourcePolicy{}, fmt.Errorf("test profile workload CPUs (--workload-cpus or KODEMA_WORKLOAD_CPU_LIMIT): %w", err)
-		}
-		policy.DefaultCPUMillicores = millicores
+	return normalized, nil
+}
+
+// resolveTestKubePolicy adapts a normalized test-profile ResourcePolicy onto
+// the Kubernetes runtime's Policy with identical defaults and ceilings as the
+// Podman test runtime, clamping pod requests so they never exceed lower
+// configured limits.
+func resolveTestKubePolicy(resources runtimecontainer.ResourcePolicy, getenv productionEnv) (runtimekube.Policy, error) {
+	normalized, err := runtimecontainer.NormalizeResourcePolicy(resources)
+	if err != nil {
+		return runtimekube.Policy{}, fmt.Errorf("test profile workload resources: %w", err)
 	}
-	if raw := pick(options.WorkloadMaxCPUs, "KODEMA_WORKLOAD_MAX_CPU_LIMIT"); raw != "" {
-		millicores, err := definition.ParseCPUQuantity(raw)
-		if err != nil {
-			return runtimepodman.ResourcePolicy{}, fmt.Errorf("test profile workload max CPUs (--workload-max-cpus or KODEMA_WORKLOAD_MAX_CPU_LIMIT): %w", err)
-		}
-		policy.MaxCPUMillicores = millicores
-	}
-	return policy, nil
+	cpuRequest := runtimecontainer.ClampKubeRequest(
+		envOrGetenv(getenv, "KODEMA_WORKLOAD_CPU_REQUEST", defaultKubeCPURequest),
+		normalized.DefaultCPUMillicores,
+		false,
+	)
+	memoryRequest := runtimecontainer.ClampKubeRequest(
+		envOrGetenv(getenv, "KODEMA_WORKLOAD_MEMORY_REQUEST", defaultKubeMemoryRequest),
+		normalized.DefaultMemoryBytes,
+		true,
+	)
+	return runtimekube.Policy{
+		CPURequest:     cpuRequest,
+		CPULimit:       definition.FormatCPUMillicores(normalized.DefaultCPUMillicores),
+		MaxCPULimit:    definition.FormatCPUMillicores(normalized.MaxCPUMillicores),
+		MemoryRequest:  memoryRequest,
+		MemoryLimit:    runtimecontainer.FormatMemoryQuantity(normalized.DefaultMemoryBytes),
+		MaxMemoryLimit: runtimecontainer.FormatMemoryQuantity(normalized.MaxMemoryBytes),
+		JobTTLSeconds:  defaultKubeJobTTLSeconds,
+	}, nil
 }
 
 // resolveTestToolboxFile selects the kodema binary workloads mount at
@@ -536,9 +572,10 @@ func resolveTestToolboxFile(explicit, goos string, executable func() (string, er
 }
 
 // resolveTestWorkloadCAFile selects the optional CA bundle materialized into
-// Podman workloads at /kodema/ca.crt. An explicit --workload-ca-file or
-// KODEMA_WORKLOAD_CA_FILE must be an absolute readable PEM certificate bundle;
-// when unset, <KODEMA_TLS_DIR>/ca.crt is adopted automatically if present.
+// Podman workloads at /etc/kodema/ca/ca.crt (with KODEMA_CA_FILE=/etc/kodema/ca/ca.crt).
+// An explicit --workload-ca-file or KODEMA_WORKLOAD_CA_FILE must be an absolute
+// readable PEM certificate bundle; when unset, <KODEMA_TLS_DIR>/ca.crt is
+// adopted automatically if present.
 func resolveTestWorkloadCAFile(options serverOptions, tlsDir string, getenv productionEnv) (string, error) {
 	explicit := strings.TrimSpace(options.WorkloadCAFile)
 	if explicit == "" {

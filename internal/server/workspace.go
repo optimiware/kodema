@@ -2,40 +2,111 @@
 //
 // The Kernel calls engine.Workspace.Retain before it commits an activation
 // (internal/kernel/engine/reconcile.go activate), so the activating action is
-// still pending when Retain runs. The Podman adapter's Retain deliberately
-// refuses an absent volume: a missing workspace of an execution that already
-// ran is evidence of loss, never permission to recreate empty scratch state.
-// The composition therefore provisions the deterministic owned volume before
-// Retain, but only for a never-activated workspace.
+// still pending when Retain runs. Both the Podman and Kubernetes runtime
+// adapters deliberately refuse an absent volume or PersistentVolumeClaim: a
+// missing workspace of an execution that already ran is evidence of loss,
+// never permission to recreate empty scratch state. The composition therefore
+// provisions the deterministic owned resource before Retain, but only for a
+// never-activated workspace.
 //
 // The engine.Workspace.Retain request carries only the workspace id, so
 // the decorator takes one app-owned fact source, WorkspaceActivation. Its real
 // implementation reads durable persisted execution/action facts, so it survives
-// a controller restart and never infers activation from volume presence or
+// a controller restart and never infers activation from resource presence or
 // process memory.
 package server
 
 import (
 	"context"
 	"errors"
+	"strings"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/internal/engine"
 	kernelengine "github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
 )
 
-// VolumeProvisioner is the one external effect the fresh-only decorator adds:
-// the idempotent creation of the deterministic owned workspace volume. It is
-// satisfied by the real *drivers/podman.Libpod client.
+// VolumeProvisioner is the one external effect the fresh-only Podman decorator
+// adds: the idempotent creation of the deterministic owned workspace volume. It
+// is satisfied by the real *drivers/podman.Libpod client.
 type VolumeProvisioner interface {
 	CreateVolume(ctx context.Context, volume runtimepodman.Volume) (runtimepodman.Volume, error)
 }
 
 var _ VolumeProvisioner = (*podmandriver.Libpod)(nil)
+
+// ClaimProvisioner is the one external effect the fresh-only Kubernetes
+// decorator adds: the idempotent creation of the deterministic owned workspace
+// claim. It is satisfied by the real *drivers/kube.Cluster.
+type ClaimProvisioner interface {
+	CreateClaim(ctx context.Context, spec driverkube.ClaimSpec) (runtimekube.Claim, error)
+}
+
+var _ ClaimProvisioner = (*driverkube.Cluster)(nil)
+
+// WorkspacePVC is the trusted workspace claim template.
+//
+// Every value comes from composition configuration and is never derived from a
+// request, a principal or a rendered workload. The template namespace must
+// equal the runtime adapter's configured tenant namespace; the
+// engine.Workspace seam exposes no namespace, so that pairing is an operator
+// configuration invariant, while the durable owning tenant is checked by the
+// decorator for every fresh workspace.
+type WorkspacePVC struct {
+	// Namespace is the tenant namespace that owns the claim. Required.
+	Namespace string
+	// TenantID is the tenant ownership label value. Required and validated.
+	TenantID id.TenantID
+	// StorageClass is the requested StorageClass. Empty selects the cluster's
+	// default StorageClass.
+	StorageClass string
+	// Size is the requested storage quantity, for example "64Mi". Required.
+	Size string
+	// AccessMode is one of the four Kubernetes PVC access modes. Required.
+	AccessMode string
+}
+
+// workspaceClaimAccessModes is the closed set of PVC access modes accepted by
+// the driver's CreateClaim. It mirrors the driver-owned set; a template value
+// outside it would be refused by the driver after the tenant fact was read, so
+// it is refused at construction and validation instead.
+var workspaceClaimAccessModes = map[string]bool{
+	"ReadWriteOnce":    true,
+	"ReadOnlyMany":     true,
+	"ReadWriteMany":    true,
+	"ReadWriteOncePod": true,
+}
+
+// validateWorkspacePVC refuses an incomplete or unusable trusted template
+// before any adapter or external effect exists. It never renders a configured
+// value.
+func validateWorkspacePVC(template WorkspacePVC) error {
+	if strings.TrimSpace(template.Namespace) == "" {
+		return fault.New(fault.InvalidInput, "workspace claim template requires a namespace")
+	}
+	if _, err := id.ParseTenantID(string(template.TenantID)); err != nil {
+		return fault.New(fault.InvalidInput, "workspace claim template tenant id is invalid")
+	}
+	if template.StorageClass != "" && strings.TrimSpace(template.StorageClass) == "" {
+		return fault.New(fault.InvalidInput, "workspace claim template storage class must not be blank")
+	}
+	if strings.TrimSpace(template.Size) == "" {
+		return fault.New(fault.InvalidInput, "workspace claim template requires a storage size")
+	}
+	if strings.TrimSpace(template.AccessMode) == "" {
+		return fault.New(fault.InvalidInput, "workspace claim template requires an access mode")
+	}
+	if !workspaceClaimAccessModes[template.AccessMode] {
+		return fault.New(fault.InvalidInput, "workspace claim template access mode is not supported")
+	}
+	return nil
+}
 
 // WorkspaceActivation reports whether the workspace's execution had already
 // activated an action before the activation that triggered this Retain.
@@ -43,8 +114,8 @@ var _ VolumeProvisioner = (*podmandriver.Libpod)(nil)
 // false means the Kernel is about to commit the first activation of a fresh
 // queued workspace: no action of the execution has left pending yet. The
 // implementation must read durable persisted state: process memory loses the
-// fact on restart and volume presence cannot distinguish a fresh workspace from
-// a lost one.
+// fact on restart and volume/claim presence cannot distinguish a fresh
+// workspace from a lost one.
 type WorkspaceActivation interface {
 	PreviouslyActivated(ctx context.Context, workspaceID id.WorkspaceID) (bool, error)
 	// OwningTenant reports the durable tenant that owns the workspace's
@@ -55,19 +126,21 @@ type WorkspaceActivation interface {
 }
 
 // provisioningWorkspace decorates the Kernel workspace port with fresh-only
-// volume provisioning. Status and Release delegate unchanged.
+// workspace provisioning (Podman volumes or Kubernetes claims). Status and
+// Release delegate unchanged.
 type provisioningWorkspace struct {
-	inner       kernelengine.Workspace
-	provisioner VolumeProvisioner
-	activation  WorkspaceActivation
+	inner          kernelengine.Workspace
+	activation     WorkspaceActivation
+	expectedTenant id.TenantID
+	provision      func(ctx context.Context, workspaceID id.WorkspaceID) error
 }
 
 var _ kernelengine.Workspace = (*provisioningWorkspace)(nil)
 
-// newProvisioningWorkspace validates every dependency and returns the
-// decorator. An incomplete decorator is refused at construction rather than
-// failing open later.
-func newProvisioningWorkspace(inner kernelengine.Workspace, provisioner VolumeProvisioner, activation WorkspaceActivation) (kernelengine.Workspace, error) {
+// newProvisioningWorkspace validates every dependency and returns a fresh-only
+// Podman volume provisioning decorator. An incomplete decorator is refused at
+// construction rather than failing open later.
+func newProvisioningWorkspace(inner kernelengine.Workspace, provisioner VolumeProvisioner, activation WorkspaceActivation) (*provisioningWorkspace, error) {
 	if inner == nil {
 		return nil, fault.New(fault.InvalidInput, "provisioning workspace requires a workspace adapter")
 	}
@@ -77,7 +150,75 @@ func newProvisioningWorkspace(inner kernelengine.Workspace, provisioner VolumePr
 	if activation == nil {
 		return nil, fault.New(fault.InvalidInput, "provisioning workspace requires an activation fact source")
 	}
-	return &provisioningWorkspace{inner: inner, provisioner: provisioner, activation: activation}, nil
+	return &provisioningWorkspace{
+		inner:      inner,
+		activation: activation,
+		provision: func(ctx context.Context, workspaceID id.WorkspaceID) error {
+			volumeName, err := runtimepodman.WorkspaceVolumeName(workspaceID)
+			if err != nil {
+				return err
+			}
+			volume := runtimepodman.Volume{
+				Name:   volumeName,
+				Labels: map[string]string{runtimepodman.LabelWorkspace: string(workspaceID)},
+			}
+			if _, err := provisioner.CreateVolume(ctx, volume); err != nil {
+				if errors.Is(err, podmandriver.ErrAmbiguous) {
+					return fault.Wrap(fault.UncertainExternalEffect,
+						"workspace volume provisioning outcome is unknown", err)
+				}
+				return err
+			}
+			return nil
+		},
+	}, nil
+}
+
+// newKubeProvisioningWorkspace validates every dependency and the trusted
+// template and returns a fresh-only Kubernetes claim provisioning decorator.
+// An incomplete decorator is refused at construction rather than failing open
+// later.
+//
+// The decorator never waits for the claim to become Bound. A
+// WaitForFirstConsumer StorageClass only binds the claim when the workload Job
+// runs, so waiting during Retain would deadlock the activation that triggered
+// Retain.
+func newKubeProvisioningWorkspace(inner kernelengine.Workspace, provisioner ClaimProvisioner, activation WorkspaceActivation, claim WorkspacePVC) (*provisioningWorkspace, error) {
+	if inner == nil {
+		return nil, fault.New(fault.InvalidInput, "claim provisioning workspace requires a workspace adapter")
+	}
+	if provisioner == nil {
+		return nil, fault.New(fault.InvalidInput, "claim provisioning workspace requires a claim provisioner")
+	}
+	if activation == nil {
+		return nil, fault.New(fault.InvalidInput, "claim provisioning workspace requires an activation fact source")
+	}
+	if err := validateWorkspacePVC(claim); err != nil {
+		return nil, err
+	}
+	return &provisioningWorkspace{
+		inner:          inner,
+		activation:     activation,
+		expectedTenant: claim.TenantID,
+		provision: func(ctx context.Context, workspaceID id.WorkspaceID) error {
+			spec := driverkube.ClaimSpec{
+				Namespace:    claim.Namespace,
+				TenantID:     claim.TenantID,
+				WorkspaceID:  workspaceID,
+				StorageClass: claim.StorageClass,
+				Size:         claim.Size,
+				AccessMode:   claim.AccessMode,
+			}
+			if _, err := provisioner.CreateClaim(ctx, spec); err != nil {
+				if errors.Is(err, driverkube.ErrAmbiguous) {
+					return fault.Wrap(fault.UncertainExternalEffect,
+						"workspace claim provisioning outcome is unknown", err)
+				}
+				return err
+			}
+			return nil
+		},
+	}, nil
 }
 
 // Status delegates unchanged and never provisions.
@@ -90,15 +231,18 @@ func (workspace *provisioningWorkspace) Release(ctx context.Context, workspaceID
 	return workspace.inner.Release(ctx, workspaceID)
 }
 
-// Retain provisions the deterministic owned volume exactly once for a fresh
-// workspace, then delegates retention. An already-activated workspace is never
-// provisioned: a missing volume surfaces from the adapter's Retain as
-// not_found, which is the intended workspace-loss evidence.
+// Retain provisions the deterministic owned workspace resource exactly once
+// for a fresh workspace, then delegates retention. An already-activated
+// workspace is never provisioned: a missing resource surfaces from the
+// adapter's Retain as not_found, which is the intended workspace-loss
+// evidence.
 //
-// A cancelled context performs no external effect. A failed or uncertain
-// provisioning is returned without delegating Retain. The driver's ambiguous
-// outcome stays uncertain, and no volume or label value is rendered into an
-// error.
+// When an expected tenant is configured (Kubernetes), the durable owning
+// tenant of the workspace's execution must match it; any mismatch is forbidden
+// before any external effect. A cancelled context performs no external effect
+// and reads no fact. A failed or uncertain provisioning is returned without
+// delegating Retain, and no resource, label, tenant, or template detail is
+// rendered into an error.
 func (workspace *provisioningWorkspace) Retain(ctx context.Context, workspaceID id.WorkspaceID) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -115,20 +259,23 @@ func (workspace *provisioningWorkspace) Retain(ctx context.Context, workspaceID 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	volumeName, err := runtimepodman.WorkspaceVolumeName(workspaceID)
-	if err != nil {
-		return err
-	}
-	volume := runtimepodman.Volume{
-		Name:   volumeName,
-		Labels: map[string]string{runtimepodman.LabelWorkspace: string(workspaceID)},
-	}
-	if _, err := workspace.provisioner.CreateVolume(ctx, volume); err != nil {
-		if errors.Is(err, podmandriver.ErrAmbiguous) {
-			return fault.Wrap(fault.UncertainExternalEffect,
-				"workspace volume provisioning outcome is unknown", err)
+	if workspace.expectedTenant != "" {
+		tenant, err := workspace.activation.OwningTenant(ctx, workspaceID)
+		if err != nil {
+			// An unknown tenant fact fails closed exactly like an unknown
+			// activation fact.
+			return err
 		}
+		if tenant != workspace.expectedTenant {
+			// Fixed text: neither tenant value is rendered.
+			return fault.New(fault.Forbidden,
+				"workspace claim template tenant does not own the workspace execution")
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if err := workspace.provision(ctx, workspaceID); err != nil {
 		return err
 	}
 	return workspace.inner.Retain(ctx, workspaceID)

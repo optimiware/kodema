@@ -35,17 +35,17 @@ import (
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	"github.com/optimiware/kodema/internal/engine"
-	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	kubesupport "github.com/optimiware/kodema/test/support/infrastructure/kubernetes"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 const (
-	testKodemaURL = "https://kodema.example.com"
+	testKodemaURL = runtimesupport.StandardKodemaURL
 	testNamespace = "tenant-acme"
 	// workloadImage is the pinned workload image. The digest is resolved by the
 	// kind node's own registry pull; the tag is fixed, never "latest".
@@ -255,42 +255,25 @@ func testIdentity(execution, action, workload, key string) reconcile.EffectIdent
 	}
 }
 
-// testContainer builds one admitted container declaration.
-func testContainer(commands []string, env []definition.EnvVar) definition.Container {
-	return definition.Container{Image: workloadImage, Commands: commands, Env: env}
-}
-
-// prepareRequest builds one complete preparation with inputs, an earlier
-// output, a task snapshot, one declared secret and the execution credential.
-func prepareRequest(
+// workloadRequest builds a minimal Kubernetes PrepareRequest derived from
+// StandardPrepareRequest with no declared secrets or custom environment.
+func workloadRequest(
 	identity reconcile.EffectIdentity,
 	workspaceID id.WorkspaceID,
-	actionName id.ActionName,
-	taskID id.TaskID,
-	container definition.Container,
-	secrets []reconcile.SecretValue,
+	commands []string,
 	credential string,
 ) reconcile.PrepareRequest {
-	return reconcile.PrepareRequest{
-		Identity:    identity,
-		WorkspaceID: workspaceID,
-		ActionName:  actionName,
-		TaskID:      taskID,
-		Container:   container,
-		Secrets:     secrets,
-		Inputs: map[id.InputKey]string{
-			"input-a": "line1\nline2\n",
-		},
-		Outputs: map[id.ActionName]engine.Outputs{
-			"earlier": {"out-a": "earlier-output"},
-		},
-		Task:       []byte(`{"id":"task-1"}`),
-		Credential: credential,
-	}
+	req := runtimesupport.StandardPrepareRequest(identity, workspaceID, workloadImage, commands)
+	req.TaskID = ""
+	req.Container.Env = nil
+	req.Container.Secrets = nil
+	req.Secrets = nil
+	req.Credential = credential
+	return req
 }
 
 // startPrepared prepares and starts one workload, requiring an accepted start.
-func startPrepared(t *testing.T, ctx context.Context, fx *fixture, request reconcile.PrepareRequest) {
+func startPrepared(t testing.TB, ctx context.Context, fx *fixture, request reconcile.PrepareRequest) {
 	t.Helper()
 	if _, err := fx.Adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
@@ -310,38 +293,18 @@ func startPrepared(t *testing.T, ctx context.Context, fx *fixture, request recon
 // waitForObservation blocks until Observe reports want and returns that
 // observation.
 func waitForObservation(
-	t *testing.T,
+	t testing.TB,
 	ctx context.Context,
 	adapter *runtimekube.Adapter,
 	request reconcile.ObserveRequest,
 	want engine.ObservationKind,
 ) engine.Observation {
 	t.Helper()
-	var last engine.Observation
-	probe := func(ctx context.Context) error {
-		observation, err := adapter.Observe(ctx, request)
-		if err != nil {
-			return err
-		}
-		last = observation
-		if observation.Kind != want {
-			return fmt.Errorf("observation = %s; want %s", observation.Kind, want)
-		}
-		return nil
-	}
-	options := harness.DefaultWaitOptions()
-	options.Timeout = observationTimeout
-	options.AttemptTimeout = 15 * time.Second
-	options.InitialBackoff = 200 * time.Millisecond
-	options.MaxBackoff = 2 * time.Second
-	if err := harness.WaitReady(ctx, harness.RealClock{}, "workload observation", probe, options); err != nil {
-		t.Fatalf("wait for %s observation: %v (last %+v)", want, err, last)
-	}
-	return last
+	return runtimesupport.WaitForObservation(t, ctx, adapter, request, observationTimeout, 200*time.Millisecond, runtimesupport.ObservationKindIs(want))
 }
 
 // onePod returns the single pod carrying the workload label.
-func onePod(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Pod {
+func onePod(t testing.TB, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Pod {
 	t.Helper()
 	pods, err := client.ListPods(ctx, testNamespace, map[string]string{
 		runtimekube.LabelWorkload: string(identity.WorkloadID),
@@ -358,7 +321,7 @@ func onePod(t *testing.T, ctx context.Context, client *driverkube.Cluster, ident
 // waitForPod blocks until exactly one workload pod is observable. Observe can
 // report Running from the Job alone (the pod is not scheduled yet), so a test
 // that needs the pod must wait for it instead of assuming it exists.
-func waitForPod(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Pod {
+func waitForPod(t testing.TB, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Pod {
 	t.Helper()
 	var last runtimekube.Pod
 	probe := func(ctx context.Context) error {
@@ -416,7 +379,7 @@ func waitForJobSettled(t *testing.T, ctx context.Context, client *driverkube.Clu
 }
 
 // oneJob returns the single Job carrying the workload label.
-func oneJob(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Job {
+func oneJob(t testing.TB, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Job {
 	t.Helper()
 	jobs, err := client.ListJobs(ctx, testNamespace, map[string]string{
 		runtimekube.LabelWorkload: string(identity.WorkloadID),
@@ -482,7 +445,7 @@ func waitForClaimGone(ctx context.Context, client *driverkube.Cluster, name stri
 // response; those keep the documented fault classes and are retried here. Any
 // other fault class, a live claim without a deletion timestamp, or a timeout
 // still fails the test.
-func releaseWorkspaceEventually(t *testing.T, ctx context.Context, fx *fixture, workspaceID id.WorkspaceID) {
+func releaseWorkspaceEventually(t testing.TB, ctx context.Context, fx *fixture, workspaceID id.WorkspaceID) {
 	t.Helper()
 	claimName, err := runtimekube.WorkspaceClaimName(workspaceID)
 	if err != nil {
@@ -531,7 +494,7 @@ func releaseWorkspaceEventually(t *testing.T, ctx context.Context, fx *fixture, 
 // fails: it would mean the adapter reports something the Kernel cleanup loop is
 // not specified to retry. An accepted deletion in progress must be nil, not an
 // error, so a "terminating" error here is a regression.
-func requireRetryableRelease(t *testing.T, err error) {
+func requireRetryableRelease(t testing.TB, err error) {
 	t.Helper()
 	class, ok := fault.ClassOf(err)
 	if !ok {
@@ -545,89 +508,65 @@ func requireRetryableRelease(t *testing.T, err error) {
 	}
 }
 
-// readAllLogs paginates adapter.Logs with a small limit and returns each stream.
-func readAllLogs(
-	t *testing.T,
-	ctx context.Context,
-	adapter *runtimekube.Adapter,
-	identity reconcile.EffectIdentity,
-	limit int,
-) (stdout, stderr []byte) {
-	t.Helper()
-	var offset int64
-	for page := 0; page < 10000; page++ {
-		batch, err := adapter.Logs(ctx, reconcile.LogsRequest{
-			Identity:    identity,
-			AfterOffset: offset,
-			Limit:       limit,
-		})
-		if err != nil {
-			t.Fatalf("Logs at offset %d: %v", offset, err)
-		}
-		for _, chunk := range batch.Chunks {
-			switch chunk.Stream {
-			case reconcile.LogStdout:
-				stdout = append(stdout, chunk.Data...)
-			case reconcile.LogStderr:
-				stderr = append(stderr, chunk.Data...)
-			}
-		}
-		if batch.NextOffset == offset {
-			return stdout, stderr
-		}
-		offset = batch.NextOffset
-	}
-	t.Fatal("log pagination did not terminate")
-	return nil, nil
-}
-
-// requireFaultClass asserts the stable public fault class.
-func requireFaultClass(t *testing.T, err error, want fault.Class) {
-	t.Helper()
-	if err == nil {
-		t.Fatalf("error = nil; want fault class %s", want)
-	}
-	class, ok := fault.ClassOf(err)
-	if !ok {
-		t.Fatalf("error %v carries no fault class; want %s", err, want)
-	}
-	if class != want {
-		t.Fatalf("fault class = %s; want %s (error %v)", class, want, err)
-	}
-}
-
-// containsLine reports whether text contains want as a complete line.
-func containsLine(text, want string) bool {
-	for _, line := range strings.Split(text, "\n") {
-		if line == want {
-			return true
-		}
-	}
-	return false
-}
-
 // runReader runs one short read-only workload in the same retained workspace and
 // returns its stdout. It is how tests inspect /workspace without exec.
-func runReader(t *testing.T, ctx context.Context, fx *fixture, workspaceID id.WorkspaceID, name string, commands []string) string {
+func runReader(t testing.TB, ctx context.Context, fx *fixture, workspaceID id.WorkspaceID, name string, commands []string) string {
 	t.Helper()
 	identity := testIdentity("exec-"+name, "action-"+name, "workload-"+name, "idem-"+name)
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, id.ActionName("read"), "",
-		testContainer(commands, nil), nil, "tok-reader-"+name,
-	))
+	req := workloadRequest(identity, workspaceID, commands, "tok-reader-"+name)
+	req.ActionName = "read"
+	startPrepared(t, ctx, fx, req)
 	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
 	}, engine.ObservationExited)
 	if code, ok := observation.ExitStatus(); !ok || code != 0 {
 		t.Fatalf("reader %q exit = %d/%v; want 0/true", name, code, ok)
 	}
-	stdout, _ := readAllLogs(t, ctx, fx.Adapter, identity, 1<<20)
-	return string(stdout)
+	stdout, _ := runtimesupport.ReadAllLogs(t, ctx, fx.Adapter, identity, 1<<20)
+	return stdout
+}
+
+// harness builds the shared S07 ContainerHarness backed by this kind fixture.
+func (fx *fixture) harness(t testing.TB, workspaceID id.WorkspaceID) runtimesupport.ContainerHarness {
+	t.Helper()
+	readSeq := 0
+	return runtimesupport.ContainerHarness{
+		Runtime:       fx.Adapter,
+		Workspace:     fx.Adapter,
+		WorkspaceID:   workspaceID,
+		Image:         workloadImage,
+		KodemaURL:     testKodemaURL,
+		ActionTimeout: observationTimeout,
+		PollInterval:  200 * time.Millisecond,
+		NewIdentity: func(_ testing.TB, label string) reconcile.EffectIdentity {
+			return testIdentity("exec-"+label, "action-"+label, "workload-"+label, "idem-"+label)
+		},
+		ReadWorkspaceFile: func(t testing.TB, ctx context.Context, path string) string {
+			t.Helper()
+			readSeq++
+			label := fmt.Sprintf("read-%d", readSeq)
+			out := runReader(t, ctx, fx, workspaceID, label, []string{"cat /workspace/" + path})
+			readerID := testIdentity("exec-"+label, "action-"+label, "workload-"+label, "idem-"+label)
+			if _, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: readerID, WorkspaceID: workspaceID}); err != nil {
+				t.Fatalf("Remove reader %q: %v", label, err)
+			}
+			waitForWorkspaceUnreferenced(t, ctx, fx.Client, workspaceID)
+			return out
+		},
+		AfterRemove: func(t testing.TB, ctx context.Context, _ reconcile.EffectIdentity) {
+			t.Helper()
+			waitForWorkspaceUnreferenced(t, ctx, fx.Client, workspaceID)
+		},
+		ReleaseWorkspace: func(t testing.TB, ctx context.Context, ws id.WorkspaceID) {
+			t.Helper()
+			releaseWorkspaceEventually(t, ctx, fx, ws)
+		},
+	}
 }
 
 // waitForWorkspaceUnreferenced blocks until no Job or Pod carries the workspace
 // label, so Release has no outstanding reference to refuse.
-func waitForWorkspaceUnreferenced(t *testing.T, ctx context.Context, client *driverkube.Cluster, workspaceID id.WorkspaceID) {
+func waitForWorkspaceUnreferenced(t testing.TB, ctx context.Context, client *driverkube.Cluster, workspaceID id.WorkspaceID) {
 	t.Helper()
 	selector := map[string]string{runtimekube.LabelWorkspace: string(workspaceID)}
 	probe := func(ctx context.Context) error {

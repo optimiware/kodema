@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 )
 
@@ -66,7 +66,7 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 				t.Fatalf("fixture %d issued no log read", fixtures)
 			}
 			forwarded := requests[len(requests)-1]
-			position, _ := adapterutil.DecodeLogCursor(cursor)
+			position, _ := container.DecodeLogCursor(cursor)
 			if forwarded.Offset != position {
 				t.Fatalf("fixture %d forwarded offset %d; want %d", fixtures, forwarded.Offset, position)
 			}
@@ -77,6 +77,7 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 				t.Fatalf("fixture %d forwarded stream %q; want combined", fixtures, forwarded.Stream)
 			}
 
+			next, _ := container.DecodeLogCursor(batch.NextOffset)
 			var page []byte
 			for _, chunk := range batch.Chunks {
 				if chunk.Sequence != 1 {
@@ -86,7 +87,7 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 					t.Fatalf("fixture %d emitted %d bytes over the bound %d",
 						fixtures, len(chunk.Data), limit)
 				}
-				wantTruncated := position+int64(limit) < int64(len(log))
+				wantTruncated := next < int64(len(log))
 				if chunk.Truncated != wantTruncated {
 					t.Fatalf("fixture %d truncated = %v; want %v", fixtures, chunk.Truncated, wantTruncated)
 				}
@@ -107,7 +108,6 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 				}
 				break
 			}
-			next, _ := adapterutil.DecodeLogCursor(batch.NextOffset)
 			if next <= position || next > int64(len(log)) {
 				t.Fatalf("fixture %d cursor moved %d -> %d over %d bytes", fixtures, position, next, len(log))
 			}

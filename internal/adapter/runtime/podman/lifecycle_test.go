@@ -1,7 +1,11 @@
-// Lifecycle behavior: stable identities, start outcomes, restart recovery, the
-// declared observation vocabulary, the whole-container stop barrier, idempotent
-// identity-scoped cleanup, the durable removal fence and credential refresh
-// without a restart.
+// Podman-specific lifecycle behavior: lost libpod responses, ContainerStatusCreated
+// conservative handling, restart recovery, whole-container stop evidence,
+// bounded cleanup retries, post-restart workspace ownership, atomic host
+// credential rename, cgroup OOMKilled/memory/CPU limits, and diagnostic hygiene.
+//
+// Shared lifecycle invariants (Start reuse, absent/running/exited Observe,
+// in-process 5-op workspace ownership, live RefreshCredential, Remove
+// idempotency) are verified in TestPodmanConformance.
 package podman
 
 import (
@@ -48,56 +52,7 @@ func removeRequest(fx *fixture) reconcile.RemoveRequest {
 	}
 }
 
-func TestStartCreatesOneStableContainerAndReusesOnRetry(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-
-	result := fx.start(t)
-	if result.Outcome != reconcile.StartAccepted {
-		t.Fatalf("start outcome = %q, want %q", result.Outcome, reconcile.StartAccepted)
-	}
-	if result.WorkloadID != fx.request.Identity.WorkloadID {
-		t.Fatalf("start workload = %q, want the persisted identity", result.WorkloadID)
-	}
-	if result.Detail == "" {
-		t.Fatal("accepted start has no detail")
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
-		t.Fatalf("CreateContainer calls = %d, want exactly 1", calls)
-	}
-	if calls := fx.libpod.callsFor("StartContainer"); calls != 1 {
-		t.Fatalf("StartContainer calls = %d, want exactly 1", calls)
-	}
-	state, ok := fx.libpod.container(fx.containerName)
-	if !ok {
-		t.Fatal("Start did not create the stable container")
-	}
-	if state.Status != ContainerStatusRunning {
-		t.Fatalf("container status = %q, want running", state.Status)
-	}
-
-	again := fx.start(t)
-	if again.Outcome != reconcile.StartAccepted {
-		t.Fatalf("retry outcome = %q, want accepted reuse", again.Outcome)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
-		t.Fatalf("retry created a second container: %d creates", calls)
-	}
-	if calls := fx.libpod.callsFor("StartContainer"); calls != 1 {
-		t.Fatalf("retry restarted the running container: %d starts", calls)
-	}
-
-	fx.seedExited(t, 0, true)
-	afterExit := fx.start(t)
-	if afterExit.Outcome != reconcile.StartAccepted {
-		t.Fatalf("start after exit outcome = %q, want accepted reuse", afterExit.Outcome)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
-		t.Fatalf("start after exit replayed the command: %d creates", calls)
-	}
-}
-
-func TestStartLostCreateReplyStaysUnknownAndRetryReuses(t *testing.T) {
+func TestStartLostCreateReplyStaysUnknownAndCreatedContainerStaysUncertain(t *testing.T) {
 	fx := newFixture(t)
 	fx.prepare(t)
 	fx.libpod.failNext("CreateContainer", errFakeLost, true)
@@ -109,22 +64,45 @@ func TestStartLostCreateReplyStaysUnknownAndRetryReuses(t *testing.T) {
 	if result.Outcome != reconcile.StartUnknown {
 		t.Fatalf("lost-create outcome = %q, want %q", result.Outcome, reconcile.StartUnknown)
 	}
-	if result.Outcome == reconcile.StartProvenNotStarted {
-		t.Fatal("a lost create response collapsed into proven-not-started")
-	}
 	if count := fx.libpod.containerCount(); count != 1 {
 		t.Fatalf("lost create response left %d containers, want 1", count)
 	}
 
-	retry := fx.start(t)
-	if retry.Outcome != reconcile.StartAccepted {
-		t.Fatalf("retry outcome = %q, want accepted reuse", retry.Outcome)
+	// Without local disk state machines, a container left in "created" status
+	// stays conservative: Start reports StartUnknown (UncertainExternalEffect)
+	// and never creates a second container or replays StartContainer.
+	retry, retryErr := fx.startResult(t)
+	assertFaultClass(t, retryErr, fault.UncertainExternalEffect)
+	if retry.Outcome != reconcile.StartUnknown {
+		t.Fatalf("retry outcome = %q, want unknown", retry.Outcome)
 	}
 	if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
 		t.Fatalf("retry created a second container: %d creates", calls)
 	}
-	if calls := fx.libpod.callsFor("StartContainer"); calls != 1 {
-		t.Fatalf("retry started %d times, want the one stable start", calls)
+	if calls := fx.libpod.callsFor("StartContainer"); calls != 0 {
+		t.Fatalf("retry issued StartContainer %d times for a created container", calls)
+	}
+
+	// Stop confirms termination via non-forced removal of the created container
+	// (never calling StopContainer, which is a no-op on created containers in
+	// libpod), and Remove then cleans up the host materialization tree.
+	if evidence := fx.stop(t); !evidence.IsConfirmed() {
+		t.Fatal("Stop on a created container did not confirm termination")
+	}
+	if calls := fx.libpod.callsFor("StopContainer"); calls != 0 {
+		t.Fatalf("StopContainer calls on created container = %d, want 0", calls)
+	}
+	if calls := fx.libpod.callsFor("RemoveContainer"); calls != 1 {
+		t.Fatalf("RemoveContainer calls for created stop = %d, want 1", calls)
+	}
+	if count := fx.libpod.containerCount(); count != 0 {
+		t.Fatalf("containers remaining after created stop = %d, want 0", count)
+	}
+	if removal := fx.remove(t); !removal.Removed {
+		t.Fatalf("Remove after confirmed stop = %+v, want success", removal)
+	}
+	if hostFileExists(t, fx.workloadRoot()) {
+		t.Fatal("Remove left host materialization behind after created-container stop")
 	}
 }
 
@@ -189,9 +167,6 @@ func TestStartLostStartReplyStaysUnknownAndNeverReplays(t *testing.T) {
 	t.Run("failure before the effect", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.prepare(t)
-		// A transport error does not prove the start request had no effect: the
-		// durable attempt marker was already written, so the outcome stays
-		// unknown and the start is never replayed.
 		fx.libpod.failNext("StartContainer", errFakeUnavailable, false)
 
 		result, err := fx.startResult(t)
@@ -203,19 +178,17 @@ func TestStartLostStartReplyStaysUnknownAndNeverReplays(t *testing.T) {
 		}
 		state, ok := fx.libpod.container(fx.containerName)
 		if !ok || state.Status != ContainerStatusCreated || state.Started {
-			t.Fatalf("container after failed start = %+v, want created-never-started", state)
+			t.Fatalf("container after failed start = %+v, want created", state)
 		}
 		if observation := fx.observe(t); observation.Kind != engine.ObservationUnknown {
 			t.Fatalf("observation after an ambiguous start = %q, want unknown", observation.Kind)
 		}
 		if removal := fx.remove(t); removal.Removed {
-			t.Fatal("Remove succeeded while a start may still be delivered")
+			t.Fatal("Remove succeeded while a created container may still start")
 		}
 
 		retry, err := fx.startResult(t)
-		if err == nil {
-			t.Fatal("retry hid the recorded start attempt")
-		}
+		assertFaultClass(t, err, fault.UncertainExternalEffect)
 		if retry.Outcome != reconcile.StartUnknown {
 			t.Fatalf("retry outcome = %q, want unknown", retry.Outcome)
 		}
@@ -230,10 +203,68 @@ func TestStartLostStartReplyStaysUnknownAndNeverReplays(t *testing.T) {
 		}
 
 		if evidence := fx.stop(t); !evidence.IsConfirmed() {
-			t.Fatal("Stop on a marked created container did not confirm whole-container termination")
+			t.Fatal("Stop on a created container did not confirm termination via non-forced remove")
+		}
+		if calls := fx.libpod.callsFor("StopContainer"); calls != 0 {
+			t.Fatalf("StopContainer calls on created container = %d, want 0", calls)
 		}
 		if removal := fx.remove(t); !removal.Removed {
 			t.Fatalf("removal after confirmed stop = %+v, want success", removal)
+		}
+	})
+
+	t.Run("created container started concurrently before non-forced remove falls through to stop", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedCreated(t, false)
+		fx.libpod.onRemove(func() {
+			fx.seedRunning(t)
+		})
+
+		evidence := fx.stop(t)
+		if !evidence.IsConfirmed() {
+			t.Fatalf("stop after concurrent start = %+v, want confirmed", evidence)
+		}
+		if calls := fx.libpod.callsFor("RemoveContainer"); calls != 1 {
+			t.Fatalf("RemoveContainer calls = %d, want 1", calls)
+		}
+		if calls := fx.libpod.callsFor("StopContainer"); calls != 1 {
+			t.Fatalf("StopContainer calls after refused remove = %d, want 1", calls)
+		}
+		if removal := fx.remove(t); !removal.Removed {
+			t.Fatalf("removal after confirmed stop = %+v, want success", removal)
+		}
+	})
+
+	t.Run("created container externally removed before non-forced remove stays pending", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedCreated(t, false)
+		fx.libpod.onRemove(func() {
+			fx.libpod.mu.Lock()
+			delete(fx.libpod.containers, fx.containerName)
+			fx.libpod.mu.Unlock()
+		})
+
+		evidence := fx.stop(t)
+		if evidence.IsConfirmed() {
+			t.Fatalf("stop confirmed when created container vanished externally: %+v", evidence)
+		}
+	})
+
+	t.Run("created container non-forced remove transport error stays uncertain", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedCreated(t, false)
+		fx.libpod.failNext("RemoveContainer", errFakeLost, false)
+
+		evidence, err := fx.adapter.Stop(context.Background(), stopRequest(fx))
+		assertFaultClass(t, err, fault.UncertainExternalEffect)
+		if evidence.IsConfirmed() {
+			t.Fatalf("stop confirmed on lost remove response: %+v", evidence)
+		}
+		if count := fx.libpod.containerCount(); count != 1 {
+			t.Fatalf("container count = %d, want 1 retained after failed remove", count)
 		}
 	})
 }
@@ -244,9 +275,7 @@ func TestStartPendingDelayedStartIsUnknownAndNotRestarted(t *testing.T) {
 	fx.seedCreated(t, true)
 
 	result, err := fx.startResult(t)
-	if err == nil {
-		t.Fatal("Start hid a delayed start")
-	}
+	assertFaultClass(t, err, fault.UncertainExternalEffect)
 	if result.Outcome != reconcile.StartUnknown {
 		t.Fatalf("outcome = %q, want unknown", result.Outcome)
 	}
@@ -266,172 +295,79 @@ func TestStartPendingDelayedStartIsUnknownAndNotRestarted(t *testing.T) {
 	}
 }
 
-func TestStartRefusesWithoutPreparationOrWorkspace(t *testing.T) {
-	t.Run("no preparation", func(t *testing.T) {
+func TestStartAfterReconstructionReusesExistingContainerOrRequiresPrepare(t *testing.T) {
+	t.Run("without container requires completed preparation", func(t *testing.T) {
 		fx := newFixture(t)
-		result, err := fx.startResult(t)
-		if err == nil {
-			t.Fatal("Start without preparation returned no error")
-		}
+		fx.prepare(t)
+
+		reconstructed := newAdapterWithRoot(t, fx)
+		result, err := reconstructed.Start(context.Background(), startRequest(fx))
 		assertFaultClass(t, err, fault.InvalidInput)
 		if result.Outcome != reconcile.StartUnknown {
 			t.Fatalf("outcome = %q, want unknown", result.Outcome)
 		}
 		if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-			t.Fatal("Start created a container without preparation")
+			t.Fatalf("CreateContainer calls = %d, want 0 without preparation", calls)
+		}
+
+		// Re-preparing idempotently repopulates in-process state and Start succeeds.
+		if _, err := reconstructed.Prepare(context.Background(), fx.request); err != nil {
+			t.Fatalf("reconstructed Prepare: %v", err)
+		}
+		result, err = reconstructed.Start(context.Background(), startRequest(fx))
+		if err != nil {
+			t.Fatalf("Start after re-Prepare: %v", err)
+		}
+		if result.Outcome != reconcile.StartAccepted {
+			t.Fatalf("outcome = %q, want accepted", result.Outcome)
 		}
 	})
 
-	t.Run("missing workspace volume after preparation", func(t *testing.T) {
+	t.Run("reuses existing running or exited container without re-Prepare", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.prepare(t)
-		fx.libpod.deleteVolume(fx.volumeName)
-		result, err := fx.startResult(t)
-		if err == nil {
-			t.Fatal("Start hid a missing workspace volume")
+		fx.start(t)
+
+		reconstructed := newAdapterWithRoot(t, fx)
+		result, err := reconstructed.Start(context.Background(), startRequest(fx))
+		if err != nil {
+			t.Fatalf("reconstructed Start on running container: %v", err)
 		}
-		if result.Outcome != reconcile.StartUnknown {
-			t.Fatalf("outcome = %q, want unknown", result.Outcome)
+		if result.Outcome != reconcile.StartAccepted {
+			t.Fatalf("outcome = %q, want accepted reuse", result.Outcome)
 		}
-		if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-			t.Fatal("Start created a container without the retained workspace volume")
+		if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
+			t.Fatalf("reconstruction replayed the container: %d creates", calls)
 		}
 	})
 
-	t.Run("workspace mismatch", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		result, err := fx.adapter.Start(context.Background(), reconcile.StartRequest{
-			Identity:    fx.request.Identity,
-			WorkspaceID: "workspace-2",
-		})
-		if err == nil {
-			t.Fatal("Start hid a workspace mismatch")
-		}
-		if result.Outcome != reconcile.StartUnknown {
-			t.Fatalf("outcome = %q, want unknown", result.Outcome)
-		}
-		if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-			t.Fatal("Start created a container for a mismatched workspace")
-		}
-	})
-}
-
-func TestStartAfterReconstructionUsesPersistedIdentity(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-
-	reconstructed := newAdapterWithRoot(t, fx)
-	result, err := reconstructed.Start(context.Background(), startRequest(fx))
-	if err != nil {
-		t.Fatalf("Start after reconstruction returned error: %v", err)
-	}
-	if result.Outcome != reconcile.StartAccepted {
-		t.Fatalf("outcome = %q, want accepted", result.Outcome)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
-		t.Fatalf("CreateContainer calls = %d, want 1", calls)
-	}
-	specs := fx.libpod.createSpecs()
-	if len(specs) != 1 || specs[0].Name != fx.containerName || specs[0].Image != testImage {
-		t.Fatalf("reconstructed spec = %+v", specs)
-	}
-
-	again := newAdapterWithRoot(t, fx)
-	result, err = again.Start(context.Background(), startRequest(fx))
-	if err != nil {
-		t.Fatalf("second reconstructed Start returned error: %v", err)
-	}
-	if result.Outcome != reconcile.StartAccepted {
-		t.Fatalf("outcome = %q, want accepted reuse", result.Outcome)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
-		t.Fatalf("reconstruction replayed the container: %d creates", calls)
-	}
-}
-
-func TestObserveUsesKernelVocabulary(t *testing.T) {
-	t.Run("absent after a recorded start attempt", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		// Absence is only "absent" when a start may have run. Without a durable
-		// start-attempt marker the same container evidence is affirmative
-		// never-started proof, not absence; see
-		// TestObserveAbsentAfterPreparationWithoutStartAttemptProvesNonexecution.
-		if err := fx.adapter.writeStartAttempt(context.Background(), fx.request.Identity, fx.request.WorkspaceID); err != nil {
-			t.Fatalf("recording the start attempt: %v", err)
-		}
-		observation := fx.observe(t)
-		if observation.Kind != engine.ObservationAbsent {
-			t.Fatalf("observation = %q, want absent", observation.Kind)
-		}
-		if observation.ProofOfNonexecution() {
-			t.Fatal("absence was treated as proof of nonexecution")
-		}
-		if !observation.Valid() {
-			t.Fatalf("observation is not internally consistent: %+v", observation)
-		}
-	})
-
-	t.Run("created never started", func(t *testing.T) {
+	t.Run("created container stays uncertain after reconstruction", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.prepare(t)
 		fx.seedCreated(t, false)
-		observation := fx.observe(t)
-		if observation.Kind != engine.ObservationNeverStarted {
-			t.Fatalf("observation = %q, want never_started", observation.Kind)
-		}
-		if !observation.ProofOfNonexecution() || observation.Proof == "" {
-			t.Fatalf("never-started observation has no affirmative proof: %+v", observation)
-		}
-		if !observation.Valid() {
-			t.Fatalf("observation is not internally consistent: %+v", observation)
+
+		reconstructed := newAdapterWithRoot(t, fx)
+		result, err := reconstructed.Start(context.Background(), startRequest(fx))
+		assertFaultClass(t, err, fault.UncertainExternalEffect)
+		if result.Outcome != reconcile.StartUnknown {
+			t.Fatalf("outcome = %q, want unknown", result.Outcome)
 		}
 	})
+}
 
-	t.Run("delayed start pending", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedCreated(t, true)
-		observation := fx.observe(t)
-		if observation.Kind != engine.ObservationUnknown {
-			t.Fatalf("observation = %q, want unknown while a delayed start is possible", observation.Kind)
-		}
-		if observation.ProofOfNonexecution() {
-			t.Fatal("a pending start was treated as never started")
-		}
-	})
-
-	t.Run("running", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedRunning(t)
-		observation := fx.observe(t)
-		if observation.Kind != engine.ObservationRunning {
-			t.Fatalf("observation = %q, want running", observation.Kind)
-		}
-		if observation.StopConfirmed() {
-			t.Fatal("a running container reported a confirmed stop")
-		}
-	})
-
-	t.Run("exited with whole-container stop", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedExited(t, 7, true)
-		observation := fx.observe(t)
-		if observation.Kind != engine.ObservationExited {
-			t.Fatalf("observation = %q, want exited", observation.Kind)
-		}
-		code, ok := observation.ExitStatus()
-		if !ok || code != 7 {
-			t.Fatalf("exit status = %d (present=%v), want 7", code, ok)
-		}
-		if !observation.StopConfirmed() {
-			t.Fatal("affirmative whole-container termination did not confirm the stop")
-		}
-		if !observation.Valid() {
-			t.Fatalf("observation is not internally consistent: %+v", observation)
+func TestObservePodmanSpecificEvidence(t *testing.T) {
+	t.Run("created container stays unknown conservatively", func(t *testing.T) {
+		for _, startPending := range []bool{false, true} {
+			fx := newFixture(t)
+			fx.prepare(t)
+			fx.seedCreated(t, startPending)
+			observation := fx.observe(t)
+			if observation.Kind != engine.ObservationUnknown {
+				t.Fatalf("startPending=%t: observation = %q, want unknown", startPending, observation.Kind)
+			}
+			if observation.ProofOfNonexecution() {
+				t.Fatalf("startPending=%t: created container was treated as never started", startPending)
+			}
 		}
 	})
 
@@ -481,10 +417,56 @@ func TestObserveUsesKernelVocabulary(t *testing.T) {
 		if observation.Kind != engine.ObservationUnknown {
 			t.Fatalf("observation = %q, want unknown for a foreign container", observation.Kind)
 		}
-		if observation.ProofOfNonexecution() {
-			t.Fatal("a foreign container was treated as never started")
-		}
 	})
+}
+
+func TestPostRestartWorkspaceOwnershipEnforcedAcrossAllFiveOperations(t *testing.T) {
+	wrongWorkspace := id.WorkspaceID("workspace-2")
+	fx := newFixture(t)
+	fx.prepare(t)
+	fx.seedExited(t, 0, true)
+
+	otherVol, err := WorkspaceVolumeName(wrongWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.libpod.addVolume(otherVol, map[string]string{LabelWorkspace: string(wrongWorkspace)})
+
+	reconstructed := newAdapterWithRoot(t, fx)
+
+	prepReq := fx.request
+	prepReq.WorkspaceID = wrongWorkspace
+	_, err = reconstructed.Prepare(context.Background(), prepReq)
+	assertFaultClass(t, err, fault.Forbidden)
+
+	_, err = reconstructed.Start(context.Background(), reconcile.StartRequest{
+		Identity: fx.request.Identity, WorkspaceID: wrongWorkspace,
+	})
+	assertFaultClass(t, err, fault.Forbidden)
+
+	_, err = reconstructed.Observe(context.Background(), reconcile.ObserveRequest{
+		Identity: fx.request.Identity, WorkspaceID: wrongWorkspace,
+	})
+	assertFaultClass(t, err, fault.Forbidden)
+
+	evidence, err := reconstructed.Stop(context.Background(), reconcile.StopRequest{
+		Identity: fx.request.Identity, WorkspaceID: wrongWorkspace,
+	})
+	assertFaultClass(t, err, fault.Forbidden)
+	if evidence.IsConfirmed() {
+		t.Fatal("post-restart Stop confirmed on mismatched workspace")
+	}
+
+	removal, err := reconstructed.Remove(context.Background(), reconcile.RemoveRequest{
+		Identity: fx.request.Identity, WorkspaceID: wrongWorkspace,
+	})
+	assertFaultClass(t, err, fault.Forbidden)
+	if removal.Removed {
+		t.Fatal("post-restart Remove succeeded on mismatched workspace")
+	}
+	if _, ok := fx.libpod.container(fx.containerName); !ok {
+		t.Fatal("post-restart Remove deleted container bound to another workspace")
+	}
 }
 
 func TestStopAcknowledgmentIsNotConfirmation(t *testing.T) {
@@ -596,6 +578,9 @@ func TestRemoveIsIdempotentAndIdentityScoped(t *testing.T) {
 	if !hostFileExists(t, filepath.Join(otherRoot, "kodema", "keep")) {
 		t.Fatal("Remove deleted another identity's materialization")
 	}
+	if removed := fx.libpod.removedVolumes(); len(removed) != 0 {
+		t.Fatalf("Remove issued volume removals %v, want none", removed)
+	}
 	if volume, ok := fx.libpod.volume(fx.volumeName); !ok {
 		t.Fatal("Remove deleted the retained workspace volume")
 	} else if volume.Labels[LabelWorkspace] != string(fx.request.WorkspaceID) {
@@ -606,36 +591,9 @@ func TestRemoveIsIdempotentAndIdentityScoped(t *testing.T) {
 			t.Fatalf("Remove removed a container it does not own: %q", name)
 		}
 	}
-
-	second := fx.remove(t)
-	if !second.Removed {
-		t.Fatalf("repeated removal = %+v, want idempotent success", second)
-	}
-	if _, ok := fx.libpod.container(otherName); !ok {
-		t.Fatal("repeated Remove deleted another identity's container")
-	}
 }
 
 func TestRemoveRetainsWhileContainerMayRun(t *testing.T) {
-	t.Run("running", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedRunning(t)
-		removal := fx.remove(t)
-		if removal.Removed {
-			t.Fatal("Remove reported success while the container may still run")
-		}
-		if !strings.Contains(removal.Detail, fx.containerName) {
-			t.Fatalf("removal detail %q does not name the retained container %q", removal.Detail, fx.containerName)
-		}
-		if !hostFileExists(t, fx.workloadRoot()) {
-			t.Fatal("Remove deleted the materialization while the container may run")
-		}
-		if calls := fx.libpod.removedNames(); len(calls) != 0 {
-			t.Fatalf("Remove removed a live container: %v", calls)
-		}
-	})
-
 	t.Run("exited without whole-container evidence", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.prepare(t)
@@ -649,19 +607,21 @@ func TestRemoveRetainsWhileContainerMayRun(t *testing.T) {
 		}
 	})
 
-	t.Run("created never started", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedCreated(t, false)
-		removal := fx.remove(t)
-		if !removal.Removed {
-			t.Fatalf("a created-never-started container was not removable: %+v", removal)
-		}
-		if _, ok := fx.libpod.container(fx.containerName); ok {
-			t.Fatal("Remove left the never-started container behind")
-		}
-		if hostFileExists(t, fx.workloadRoot()) {
-			t.Fatal("Remove left the materialization behind")
+	t.Run("created container is conservatively non-removable", func(t *testing.T) {
+		for _, startPending := range []bool{false, true} {
+			fx := newFixture(t)
+			fx.prepare(t)
+			fx.seedCreated(t, startPending)
+			removal := fx.remove(t)
+			if removal.Removed {
+				t.Fatalf("startPending=%t: Remove reported success for created container", startPending)
+			}
+			if _, ok := fx.libpod.container(fx.containerName); !ok {
+				t.Fatalf("startPending=%t: Remove deleted created container", startPending)
+			}
+			if !hostFileExists(t, fx.workloadRoot()) {
+				t.Fatalf("startPending=%t: Remove deleted materialization of created container", startPending)
+			}
 		}
 	})
 }
@@ -788,300 +748,10 @@ func TestRemoveCancellationDuringBackoff(t *testing.T) {
 	}
 }
 
-func TestRemoveFenceRejectsPrepareAndStartAfterReconstruction(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedExited(t, 0, true)
-	if removal := fx.remove(t); !removal.Removed {
-		t.Fatalf("removal = %+v, want success", removal)
-	}
-
-	reconstructed := newAdapterWithRoot(t, fx)
-	if _, err := reconstructed.Prepare(context.Background(), fx.request); err == nil {
-		t.Fatal("Prepare re-created a removed identity")
-	} else {
-		assertFaultClass(t, err, fault.NotFound)
-	}
-
-	result, err := reconstructed.Start(context.Background(), startRequest(fx))
-	if err == nil {
-		t.Fatal("Start revived a removed identity")
-	}
-	if result.Outcome != reconcile.StartUnknown {
-		t.Fatalf("start outcome = %q, want unknown", result.Outcome)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-		t.Fatalf("Start created a container for a removed identity: %d", calls)
-	}
-
-	observation, err := reconstructed.Observe(context.Background(), observeRequest(fx))
-	if err != nil {
-		t.Fatalf("Observe returned error: %v", err)
-	}
-	if observation.Kind != engine.ObservationAbsent {
-		t.Fatalf("observation after removal = %q, want absent", observation.Kind)
-	}
-	if observation.ProofOfNonexecution() {
-		t.Fatal("removal was reported as never-started proof")
-	}
-}
-
-// TestRemoveWritesTheFenceBeforeEveryDestructiveStep pins the ordering that the
-// absent-container proof depends on: the durable removal fence must exist before
-// Remove touches the container or the workload materialization. If the fence
-// were written after either step, a crash or a partial materialization removal
-// could delete the start-attempt marker while leaving the preparation record,
-// which Observe would read as affirmative never-started proof for a command that
-// ran; the Kernel would then skip Stop, release the workspace and replace the
-// identity.
-func TestRemoveWritesTheFenceBeforeEveryDestructiveStep(t *testing.T) {
-	workload := testIdentity().WorkloadID
-	fenceExists := func(t *testing.T, fx *fixture) bool {
-		t.Helper()
-		return hostFileExists(t, fencePath(fx.root, workload))
-	}
-
-	// runRemove starts Remove in a goroutine, waits for the injected barrier,
-	// records whether the fence already exists at that point, then releases the
-	// barrier and returns the settled removal. It never calls t.Fatalf while the
-	// Remove goroutine is blocked, so a failure cannot leak a stuck goroutine.
-	runRemove := func(t *testing.T, fx *fixture, entered <-chan struct{}, release chan struct{}, barrier string) (bool, reconcile.Removal) {
-		t.Helper()
-		type outcome struct {
-			removal reconcile.Removal
-			err     error
-		}
-		done := make(chan outcome, 1)
-		go func() {
-			removal, err := fx.adapter.Remove(context.Background(), removeRequest(fx))
-			done <- outcome{removal: removal, err: err}
-		}()
-		waitFor(t, entered, "Remove at the "+barrier)
-		fenceBefore := fenceExists(t, fx)
-		close(release)
-
-		select {
-		case got := <-done:
-			if got.err != nil {
-				t.Fatalf("Remove returned error after the %s barrier: %v", barrier, got.err)
-			}
-			return fenceBefore, got.removal
-		case <-time.After(5 * time.Second):
-			t.Fatalf("Remove did not return after the %s barrier was released", barrier)
-			return false, reconcile.Removal{}
-		}
-	}
-
-	t.Run("before the container removal", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedExited(t, 0, true)
-		gate := fx.libpod.newGate("RemoveContainer")
-
-		fenceBefore, removal := runRemove(t, fx, gate.entered, gate.release, "container removal")
-		if !removal.Removed {
-			t.Fatalf("removal = %+v, want success", removal)
-		}
-		if !fenceBefore {
-			t.Fatal("Remove reached RemoveContainer before writing the durable removal fence")
-		}
-	})
-
-	t.Run("before the materialization removal", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedCreated(t, false)
-		gate := fx.files.newGate("RemoveAll")
-
-		fenceBefore, removal := runRemove(t, fx, gate.entered, gate.release, "materialization removal")
-		if !removal.Removed {
-			t.Fatalf("removal = %+v, want success", removal)
-		}
-		if !fenceBefore {
-			t.Fatal("Remove reached RemoveAll of the workload root before writing the durable removal fence")
-		}
-	})
-}
-
-// TestRemoveFenceSurvivesPartialMaterializationRemoval reproduces the failure
-// that the fence ordering prevents. An identity whose start was attempted and
-// whose container is gone loses the start-attempt marker while the preparation
-// record survives a failed materialization removal. Because the fence is written
-// first, Observe must report the identity as absent without proof; it must never
-// collapse the partial state into affirmative never-started evidence. A retry
-// after the partial failure then completes the removal.
-func TestRemoveFenceSurvivesPartialMaterializationRemoval(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	workload := fx.request.Identity.WorkloadID
-
-	// A start was attempted (the durable marker exists) and the container it
-	// targeted is gone, so absence alone is not proof.
-	fx.libpod.failNext("StartContainer", errFakeUnavailable, false)
-	if _, err := fx.startResult(t); err == nil {
-		t.Fatal("Start hid a transport error")
-	}
-	assertStartAttemptRecorded(t, fx)
-	if err := fx.libpod.RemoveContainer(context.Background(), fx.containerName); err != nil {
-		t.Fatalf("removing the container out of band: %v", err)
-	}
-	if observation := fx.observe(t); observation.Kind != engine.ObservationAbsent || observation.ProofOfNonexecution() {
-		t.Fatalf("pre-removal observation = %+v, want absent without proof", observation)
-	}
-
-	fenceAtRemoval := false
-	fx.files.onRemoveAll(filepath.Join(string(filepath.Separator), string(workload)), func(string) error {
-		fenceAtRemoval = hostFileExists(t, fencePath(fx.root, workload))
-		// Simulate a partial RemoveAll: the start-attempt marker is deleted but
-		// the preparation record survives, then removal fails.
-		if err := os.Remove(startAttemptPath(fx.root, workload)); err != nil {
-			t.Fatalf("simulating a partial materialization removal: %v", err)
-		}
-		return errFakeUnavailable
-	})
-
-	removal := fx.remove(t)
-	if removal.Removed {
-		t.Fatalf("Remove reported success although the materialization removal failed: %+v", removal)
-	}
-	if !fenceAtRemoval {
-		t.Fatal("Remove started removing the workload root before writing the durable removal fence")
-	}
-	if !hostFileExists(t, fencePath(fx.root, workload)) {
-		t.Fatal("Remove left no durable removal fence after the partial failure")
-	}
-	if hostFileExists(t, startAttemptPath(fx.root, workload)) {
-		t.Fatal("the simulated partial removal did not delete the start-attempt marker")
-	}
-	if !hostFileExists(t, preparationRecordPath(fx.root, workload)) {
-		t.Fatal("the simulated partial removal deleted the preparation record")
-	}
-
-	observation := fx.observe(t)
-	if observation.Kind != engine.ObservationAbsent {
-		t.Fatalf("observation after a partial removal = %+v, want absent", observation)
-	}
-	if observation.ProofOfNonexecution() {
-		t.Fatalf("a partially removed attempted identity was reported as never-started: %+v", observation)
-	}
-
-	// The failure was one-shot and only the fenced identity remains, so a retry
-	// completes the removal.
-	retry := fx.remove(t)
-	if !retry.Removed {
-		t.Fatalf("retry after the partial removal = %+v, want success", retry)
-	}
-	if hostFileExists(t, fx.workloadRoot()) {
-		t.Fatal("retry left the materialization behind")
-	}
-	if !hostFileExists(t, fencePath(fx.root, workload)) {
-		t.Fatal("retry removed the durable removal fence")
-	}
-}
-
-// TestRemoveFenceWriteFailureRetainsEverything pins that a failed fence write is
-// a failed removal. Continuing to remove the container or the materialization
-// without the durable fence would leave exactly the unfenced partial state the
-// absent-container proof forbids.
-func TestRemoveFenceWriteFailureRetainsEverything(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedCreated(t, false)
-	workload := fx.request.Identity.WorkloadID
-	fx.files.injectBefore("WriteFile", filepath.Join(fenceDirectory, string(workload)+".json"), errFakeUnavailable)
-
-	removal, err := fx.adapter.Remove(context.Background(), removeRequest(fx))
-	if err != nil {
-		t.Fatalf("Remove returned error on a fence write failure: %v", err)
-	}
-	if removal.Removed {
-		t.Fatalf("Remove reported success although the fence write failed: %+v", removal)
-	}
-	if _, ok := fx.libpod.container(fx.containerName); !ok {
-		t.Fatal("Remove removed the container without a durable removal fence")
-	}
-	if !hostFileExists(t, fx.workloadRoot()) {
-		t.Fatal("Remove deleted the materialization without a durable removal fence")
-	}
-	if hostFileExists(t, fencePath(fx.root, workload)) {
-		t.Fatal("a removal fence exists despite the injected write failure")
-	}
-}
-
-// TestRemoveRefusesWhenStartAttemptStateIsUnreadable pins the Remove-side
-// evidence rule: an unreadable start-attempt marker is unknown, never "no
-// attempt". Removing a possibly-started container on an unreadable marker would
-// destroy the only evidence that the command may have run.
-func TestRemoveRefusesWhenStartAttemptStateIsUnreadable(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedCreated(t, false)
-	fx.files.injectBefore("Lstat", startAttemptRecordName, errFakeUnavailable)
-
-	removal, err := fx.adapter.Remove(context.Background(), removeRequest(fx))
-	if err == nil {
-		t.Fatal("Remove hid an unreadable start attempt state")
-	}
-	if removal.Removed {
-		t.Fatalf("Remove reported success on unreadable start-attempt state: %+v", removal)
-	}
-	if _, ok := fx.libpod.container(fx.containerName); !ok {
-		t.Fatal("Remove removed the container while the start attempt was unreadable")
-	}
-	if !hostFileExists(t, fx.workloadRoot()) {
-		t.Fatal("Remove deleted the materialization while the start attempt was unreadable")
-	}
-}
-
-// TestRemoveRetainsCreatedContainerWithoutAffirmativeProof pins the two created
-// states that are not affirmative never-started evidence: a delayed start that
-// may still be delivered and an ambiguous accepted start without a durable
-// attempt marker. Neither may be removed.
-func TestRemoveRetainsCreatedContainerWithoutAffirmativeProof(t *testing.T) {
-	t.Run("delayed start pending", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedCreated(t, true)
-
-		removal := fx.remove(t)
-		if removal.Removed {
-			t.Fatalf("Remove reported success while a delayed start was possible: %+v", removal)
-		}
-		if _, ok := fx.libpod.container(fx.containerName); !ok {
-			t.Fatal("Remove deleted a container with a pending start")
-		}
-		if !hostFileExists(t, fx.workloadRoot()) {
-			t.Fatal("Remove deleted the materialization with a pending start")
-		}
-	})
-
-	t.Run("ambiguous accepted start", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		state := fx.seedCreated(t, false)
-		state.Started = true
-		fx.libpod.setContainer(state)
-
-		removal := fx.remove(t)
-		if removal.Removed {
-			t.Fatalf("Remove reported success for an ambiguous accepted start: %+v", removal)
-		}
-		if _, ok := fx.libpod.container(fx.containerName); !ok {
-			t.Fatal("Remove deleted a container with an ambiguous accepted start")
-		}
-		if !hostFileExists(t, fx.workloadRoot()) {
-			t.Fatal("Remove deleted the materialization with an ambiguous accepted start")
-		}
-	})
-}
-
-// TestRemoveRefusesForeignContainerWithSameName pins identity scoping beyond the
-// container name. A container that happens to carry this workload's name but a
-// different execution identity is never removed.
 func TestRemoveRefusesForeignContainerWithSameName(t *testing.T) {
 	fx := newFixture(t)
 	fx.prepare(t)
-	state := fx.seedCreated(t, false)
+	state := fx.seedExited(t, 0, true)
 	state.Labels[LabelExecution] = "exec-other"
 	fx.libpod.setContainer(state)
 
@@ -1097,28 +767,6 @@ func TestRemoveRefusesForeignContainerWithSameName(t *testing.T) {
 	}
 }
 
-// TestRepeatedRemoveDoesNotRewriteTheDurableFence pins idempotent cleanup: once
-// the fence exists, a repeated Remove needs no further fence write. A failed
-// rewrite must not turn an already-completed removal into a retained one.
-func TestRepeatedRemoveDoesNotRewriteTheDurableFence(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedCreated(t, false)
-	if removal := fx.remove(t); !removal.Removed {
-		t.Fatalf("first removal = %+v, want success", removal)
-	}
-	workload := fx.request.Identity.WorkloadID
-	fx.files.injectBefore("WriteFile", filepath.Join(fenceDirectory, string(workload)+".json"), errFakeUnavailable)
-
-	second := fx.remove(t)
-	if !second.Removed {
-		t.Fatalf("repeated removal = %+v, want idempotent success without a fence rewrite", second)
-	}
-}
-
-// TestRemoveIssuesNoContainerRemovalForAnAbsentContainer pins bounded cleanup:
-// when inspection proves the container is absent, Remove completes without
-// issuing a RemoveContainer call for an object that does not exist.
 func TestRemoveIssuesNoContainerRemovalForAnAbsentContainer(t *testing.T) {
 	fx := newFixture(t)
 	fx.prepare(t)
@@ -1132,15 +780,11 @@ func TestRemoveIssuesNoContainerRemovalForAnAbsentContainer(t *testing.T) {
 	}
 }
 
-func TestRefreshCredentialReplacesTokenWithoutRestart(t *testing.T) {
+func TestRefreshCredentialIsAtomicAndSurvivesRestart(t *testing.T) {
 	fx := newFixture(t)
 	fx.prepare(t)
 	fx.seedRunning(t)
 
-	createCalls := fx.libpod.callsFor("CreateContainer")
-	startCalls := fx.libpod.callsFor("StartContainer")
-	stopCalls := fx.libpod.callsFor("StopContainer")
-	removeCalls := fx.libpod.callsFor("RemoveContainer")
 	directWrites := fx.files.countPath("WriteFile", fx.credentialPath())
 	renames := fx.files.countPath("Rename", fx.credentialPath())
 
@@ -1148,26 +792,8 @@ func TestRefreshCredentialReplacesTokenWithoutRestart(t *testing.T) {
 	if !refresh.Delivered {
 		t.Fatalf("refresh = %+v, want delivered", refresh)
 	}
-	if refresh.Detail == "" {
-		t.Fatal("refresh has no detail")
-	}
-	if got := readHostFile(t, fx.credentialPath()); string(got) != "tok-new" {
-		t.Fatalf("credential bytes = %q, want tok-new", got)
-	}
 	if mode := hostFileMode(t, fx.credentialPath()); mode != 0o444 {
 		t.Fatalf("credential mode = %o, want 0444", mode)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != createCalls {
-		t.Fatalf("refresh created a container: %d -> %d", createCalls, calls)
-	}
-	if calls := fx.libpod.callsFor("StartContainer"); calls != startCalls {
-		t.Fatalf("refresh restarted the container: %d -> %d", startCalls, calls)
-	}
-	if calls := fx.libpod.callsFor("StopContainer"); calls != stopCalls {
-		t.Fatalf("refresh stopped the container: %d -> %d", stopCalls, calls)
-	}
-	if calls := fx.libpod.callsFor("RemoveContainer"); calls != removeCalls {
-		t.Fatalf("refresh removed the container: %d -> %d", removeCalls, calls)
 	}
 	if got := fx.files.countPath("WriteFile", fx.credentialPath()); got != directWrites {
 		t.Fatalf("refresh wrote the token in place (%d direct writes), want an atomic rename", got)
@@ -1175,8 +801,18 @@ func TestRefreshCredentialReplacesTokenWithoutRestart(t *testing.T) {
 	if got := fx.files.countPath("Rename", fx.credentialPath()); got != renames+1 {
 		t.Fatalf("refresh renames = %d, want one atomic replacement", got-renames)
 	}
-	if !hostFileExists(t, filepath.Join(fx.kodemaRoot(), "secrets", "API_KEY")) {
-		t.Fatal("refresh disturbed the declared secret mounts")
+
+	// RefreshCredential also works after controller restart without in-memory state.
+	reconstructed := newAdapterWithRoot(t, fx)
+	afterRestart, err := reconstructed.RefreshCredential(context.Background(), reconcile.CredentialRequest{
+		Identity:   fx.request.Identity,
+		Credential: "tok-after-restart",
+	})
+	if err != nil || !afterRestart.Delivered {
+		t.Fatalf("reconstructed RefreshCredential = (%+v, %v); want delivered", afterRestart, err)
+	}
+	if got := readHostFile(t, fx.credentialPath()); string(got) != "tok-after-restart" {
+		t.Fatalf("credential after restart = %q, want tok-after-restart", got)
 	}
 }
 
@@ -1190,85 +826,35 @@ func TestRefreshCredentialRecoversLostResponseAndAtomicity(t *testing.T) {
 		Identity:   fx.request.Identity,
 		Credential: "tok-failed",
 	})
-	if err == nil {
-		t.Fatal("refresh hid a failed atomic replacement")
-	}
-	if refresh.Delivered {
-		t.Fatal("a failed replacement reported delivery")
+	if err == nil || refresh.Delivered {
+		t.Fatalf("failed Rename = (%+v, %v); want undelivered error", refresh, err)
 	}
 	if got := readHostFile(t, fx.credentialPath()); string(got) != "tok-abc" {
-		t.Fatalf("failed replacement corrupted the previous token: %q", got)
+		t.Fatalf("failed replacement corrupted previous token: %q", got)
 	}
 
 	fx.files.clear("Rename", "KODEMA_TOKEN")
-	refresh = fx.refresh(t, "tok-b")
-	if !refresh.Delivered {
-		t.Fatalf("retry refresh = %+v, want delivered", refresh)
-	}
-	if got := readHostFile(t, fx.credentialPath()); string(got) != "tok-b" {
-		t.Fatalf("credential bytes = %q, want tok-b", got)
+	if refresh = fx.refresh(t, "tok-b"); !refresh.Delivered || string(readHostFile(t, fx.credentialPath())) != "tok-b" {
+		t.Fatalf("retry refresh failed: %+v", refresh)
 	}
 
-	// A lost response after the rename still leaves the new token in place and
-	// a retry converges without a restart.
 	fx.files.injectAfter("Rename", "KODEMA_TOKEN", errFakeLost)
 	refresh, err = fx.adapter.RefreshCredential(context.Background(), reconcile.CredentialRequest{
 		Identity:   fx.request.Identity,
 		Credential: "tok-c",
 	})
-	if err == nil {
-		t.Fatal("refresh hid a lost replacement response")
-	}
-	if refresh.Delivered {
-		t.Fatal("a lost replacement response reported delivery")
+	if err == nil || refresh.Delivered {
+		t.Fatalf("lost Rename reply = (%+v, %v); want undelivered error", refresh, err)
 	}
 	if got := readHostFile(t, fx.credentialPath()); string(got) != "tok-c" {
 		t.Fatalf("lost-response token = %q, want tok-c", got)
 	}
 	fx.files.clear("Rename", "KODEMA_TOKEN")
-	refresh = fx.refresh(t, "tok-c")
-	if !refresh.Delivered {
+	if refresh = fx.refresh(t, "tok-c"); !refresh.Delivered {
 		t.Fatalf("recovered refresh = %+v, want delivered", refresh)
 	}
 	if calls := fx.libpod.callsFor("StartContainer"); calls != 0 {
 		t.Fatalf("credential recovery restarted the container %d times", calls)
-	}
-
-	if _, err := fx.adapter.RefreshCredential(context.Background(), reconcile.CredentialRequest{
-		Identity:   fx.request.Identity,
-		Credential: "  ",
-	}); err == nil {
-		t.Fatal("refresh accepted an empty credential")
-	} else {
-		assertFaultClass(t, err, fault.InvalidInput)
-	}
-}
-
-func TestRefreshRefusedAfterRemoval(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedExited(t, 0, true)
-	if removal := fx.remove(t); !removal.Removed {
-		t.Fatalf("removal = %+v, want success", removal)
-	}
-	writesBefore := fx.files.callCount("WriteFile")
-	renamesBefore := fx.files.callCount("Rename")
-
-	refresh, err := fx.adapter.RefreshCredential(context.Background(), reconcile.CredentialRequest{
-		Identity:   fx.request.Identity,
-		Credential: "tok-after-removal",
-	})
-	if err == nil {
-		t.Fatal("refresh accepted a removed identity")
-	}
-	if refresh.Delivered {
-		t.Fatal("refresh delivered a credential for a removed identity")
-	}
-	if writes := fx.files.callCount("WriteFile"); writes != writesBefore {
-		t.Fatalf("refresh wrote %d files for a removed identity", writes-writesBefore)
-	}
-	if renames := fx.files.callCount("Rename"); renames != renamesBefore {
-		t.Fatalf("refresh renamed %d files for a removed identity", renames-renamesBefore)
 	}
 }
 
@@ -1304,28 +890,6 @@ func TestSecretValuesNeverAppearInDiagnostics(t *testing.T) {
 		t.Fatal("refresh hid a failed replacement")
 	}
 	assertClean("refresh error", err.Error(), refresh.Detail)
-}
-
-func TestRemoveNeverCallsAnExternalVolumeRemoval(t *testing.T) {
-	// Volume removal is exclusively the engine.Workspace Release operation.
-	// This test pins the behavioral consequence for Remove: cleanup leaves the
-	// workspace volume and never issues a volume removal.
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedExited(t, 0, true)
-	if removal := fx.remove(t); !removal.Removed {
-		t.Fatalf("removal = %+v, want success", removal)
-	}
-	if removed := fx.libpod.removedVolumes(); len(removed) != 0 {
-		t.Fatalf("Remove issued volume removals %v, want none", removed)
-	}
-	volume, ok := fx.libpod.volume(fx.volumeName)
-	if !ok {
-		t.Fatal("the retained workspace volume disappeared")
-	}
-	if volume.Name != fx.volumeName {
-		t.Fatalf("workspace volume name = %q, want %q", volume.Name, fx.volumeName)
-	}
 }
 
 func TestObserveSurfacesOOMKilledAndMemoryLimit(t *testing.T) {
@@ -1396,8 +960,8 @@ func TestPrepareAppliesBoundedResourcesAndEnforcesInstallationMax(t *testing.T) 
 		if !strings.Contains(err.Error(), "exceeds installation maximum") {
 			t.Fatalf("error = %v; want installation maximum diagnostic", err)
 		}
-		if hostFileExists(t, preparationRecordPath(fx.root, fx.request.Identity.WorkloadID)) {
-			t.Fatal("refused memory request wrote a preparation marker")
+		if hostFileExists(t, fx.workloadRoot()) {
+			t.Fatal("refused memory request created workload root")
 		}
 
 		fx2 := newFixture(t)

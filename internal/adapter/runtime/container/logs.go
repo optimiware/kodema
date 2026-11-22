@@ -1,11 +1,32 @@
-package adapterutil
+package container
 
 import (
+	"errors"
 	"sort"
 
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
+
+// ErrRedactionSourceUnavailable reports that the configured credential or
+// secret values needed to redact log output could not be loaded, so no output
+// may be emitted.
+var ErrRedactionSourceUnavailable = errors.New("log redaction source unavailable")
+
+// ValidateLogsRequest refuses an invalid identity, out-of-range limit, or
+// negative offset before any runtime boundary call.
+func ValidateLogsRequest(request reconcile.LogsRequest) error {
+	if err := ValidateIdentity(request.Identity); err != nil {
+		return err
+	}
+	if request.Limit <= 0 || request.Limit > MaxLogBytes {
+		return fault.New(fault.InvalidInput, "log read limit is outside the bounded range")
+	}
+	if request.AfterOffset < 0 {
+		return fault.New(fault.InvalidInput, "log read offset is negative")
+	}
+	return nil
+}
 
 // SortRedactionValues returns all non-empty values ordered longest first (with
 // lexicographic tie-break) so a shorter value cannot partially obscure a longer
@@ -27,8 +48,6 @@ func SortRedactionValues(values []string) []string {
 	return filtered
 }
 
-// logSegment is one decoded piece of a log page: a raw byte range and the
-// bytes it contributes after redaction (a raw copy or the fixed marker).
 type logSegment struct {
 	start  int
 	end    int
@@ -36,10 +55,6 @@ type logSegment struct {
 	data   []byte
 }
 
-// scanLogSegments splits a page into raw runs and configured-value matches,
-// left to right and longest value first (SortRedactionValues orders them that
-// way). A value is consumed atomically, so no page boundary can be placed
-// inside one.
 func scanLogSegments(data []byte, values []string) []logSegment {
 	segments := make([]logSegment, 0, len(data))
 	for index := 0; index < len(data); {
@@ -73,10 +88,6 @@ func scanLogSegments(data []byte, values []string) []logSegment {
 	return segments
 }
 
-// couldExtend reports whether tail is a proper prefix of a configured value, so
-// a longer match could still start there once the log grows past this page. The
-// whole visible tail must match, not just the bytes already recognised: every
-// byte the page does contain is fixed in the log.
 func couldExtend(tail []byte, values []string) bool {
 	for _, value := range values {
 		if len(value) <= len(tail) {
@@ -89,7 +100,6 @@ func couldExtend(tail []byte, values []string) bool {
 	return false
 }
 
-// hasStringPrefix reports whether value starts with prefix without allocating.
 func hasStringPrefix(value string, prefix []byte) bool {
 	if len(prefix) > len(value) {
 		return false
@@ -109,6 +119,9 @@ func hasStringPrefix(value string, prefix []byte) bool {
 // bytes exist past it, so a match near its end may still be extended by a
 // longer configured value on a later page.
 func RedactLogPage(raw []byte, values []string, limit int, mayGrow bool) ([]byte, []byte) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	segments := scanLogSegments(raw, values)
 	end := len(segments)
 	hold := end
@@ -132,14 +145,8 @@ func RedactLogPage(raw []byte, values []string, limit int, mayGrow bool) ([]byte
 	}
 	if end == 0 {
 		if len(segments) == 0 || hold == 0 {
-			// Nothing before the held position resolved, so no raw value bytes
-			// must be emitted and no bytes may be skipped.
 			return nil, nil
 		}
-		// Only reachable when the first segment is a marker that alone exceeds
-		// the bound. A held first segment returned above, so this marker is
-		// complete: its bytes may be clipped and the value consumed, while any
-		// held tail after it is re-read from the cursor.
 		first := segments[0]
 		data := first.data
 		if len(data) > limit {
@@ -156,9 +163,6 @@ func RedactLogPage(raw []byte, values []string, limit int, mayGrow bool) ([]byte
 	return consumed, data
 }
 
-// logCursorStreamBits splits the single log continuation token into one
-// position per stream: the high 32 bits carry stdout (or combined log) and the
-// low 32 bits carry stderr.
 const logCursorStreamBits = 32
 
 const logCursorStreamMask int64 = (1 << logCursorStreamBits) - 1
@@ -194,4 +198,38 @@ func NextStreamLogPosition(stream reconcile.LogStream, offset int64, consumed in
 			"log position exceeds the continuation-token range")
 	}
 	return offset + int64(consumed), nil
+}
+
+// LogPageInput holds one raw runtime log page and the bounded redaction
+// parameters needed to produce an ordered, redacted chunk and next cursor.
+type LogPageInput struct {
+	Stream        reconcile.LogStream
+	Offset        int64
+	Sequence      int64
+	Raw           []byte
+	PageTruncated bool
+	Values        []string
+	Limit         int
+	MayGrow       bool
+}
+
+// BuildLogChunk redacts one raw stream page, advances the stream cursor over
+// only the consumed raw bytes, and constructs the resulting LogChunk when any
+// raw bytes were consumed.
+func BuildLogChunk(in LogPageInput) (chunk reconcile.LogChunk, hasChunk bool, nextPos int64, err error) {
+	consumed, data := RedactLogPage(in.Raw, in.Values, in.Limit, in.MayGrow)
+	nextPos, err = NextStreamLogPosition(in.Stream, in.Offset, len(consumed))
+	if err != nil {
+		return reconcile.LogChunk{}, false, 0, err
+	}
+	if len(consumed) == 0 {
+		return reconcile.LogChunk{}, false, nextPos, nil
+	}
+	return reconcile.LogChunk{
+		Stream:    in.Stream,
+		Offset:    in.Offset,
+		Sequence:  in.Sequence,
+		Data:      data,
+		Truncated: in.PageTruncated || len(consumed) < len(in.Raw),
+	}, true, nextPos, nil
 }

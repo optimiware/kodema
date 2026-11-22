@@ -25,11 +25,9 @@ package lifecycle
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/api"
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/id"
@@ -63,6 +61,37 @@ printf 'runs=%%s\n' "$(wc -l < /workspace/runs)"
 printf 'restart-complete\n'`, restartHoldSeconds)},
 		}},
 	})
+}
+
+// holdRestartPipeline builds a long-running action used to prove explicit
+// cancellation still stops an adopted workload after a controller restart.
+func holdRestartPipeline(t *testing.T, harness *factory.Harness) []byte {
+	t.Helper()
+	return marshalPipeline(t, pipelineDoc{
+		Actions: []pipelineActionDoc{{
+			Name:    "hold",
+			Image:   harness.Image.Reference,
+			Timeout: restartActionTimeout,
+			Commands: []string{`printf 'hold-start\n'
+sleep 300`},
+		}},
+	})
+}
+
+// waitPodmanSingleContainer waits until exactly one Podman container exists
+// for executionID and returns its container name.
+func waitPodmanSingleContainer(t *testing.T, harness *factory.Harness, executionID string) string {
+	t.Helper()
+	var container string
+	harness.Eventually(t, 2*time.Minute, func() bool {
+		containers, err := harness.Containers(t.Context(), runtimepodman.LabelExecution, executionID)
+		if err != nil || len(containers) != 1 {
+			return false
+		}
+		container = containers[0]
+		return true
+	})
+	return container
 }
 
 // workloadIdentity is the immutable identity of one live Kubernetes workload.
@@ -103,7 +132,7 @@ func readRunningWorkloadIdentity(t *testing.T, harness *factory.Harness, executi
 		if phase != "Running" {
 			return false, fmt.Errorf("pod phase = %q; want Running", phase)
 		}
-		if !podContainerRunning(t, pod) {
+		if !podContainerRunning(pod, "workload") {
 			return false, fmt.Errorf("workload container is not running yet")
 		}
 		identity = workloadIdentity{
@@ -115,31 +144,6 @@ func readRunningWorkloadIdentity(t *testing.T, harness *factory.Harness, executi
 		return true, nil
 	}, func() string { return debugKubernetesExecution(t, harness, executionID) })
 	return identity
-}
-
-// podContainerRunning reports whether the workload container has a running
-// state (not merely a Running pod phase, which a terminating container can also
-// report).
-func podContainerRunning(t *testing.T, pod map[string]any) bool {
-	t.Helper()
-	statuses, ok := nestedMap(t, pod, "status")["containerStatuses"].([]any)
-	if !ok {
-		return false
-	}
-	for _, raw := range statuses {
-		status, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		state, ok := status["state"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if _, running := state["running"]; running {
-			return true
-		}
-	}
-	return false
 }
 
 // assertAdoptedWorkload proves the post-restart controller observes the same
@@ -212,17 +216,8 @@ func TestKubernetesControllerRestart(t *testing.T) {
 	// The single command finishes, the execution succeeds and cleanup completes.
 	execution := waitKubernetesExecution(t, harness, started.ExecutionID)
 	requireSucceeded(t, execution)
-
 	logs := executionLogs(t, harness, harness.ProjectToken, started.ExecutionID, "restart")
-	if !strings.Contains(logs, "restart-complete") {
-		t.Fatalf("retained logs after restart = %q; want the completion marker", logs)
-	}
-	if !strings.Contains(logs, "runs=1") {
-		t.Fatalf("retained logs after restart = %q; want exactly one command execution (runs=1)", logs)
-	}
-	if strings.Contains(logs, "runs=2") {
-		t.Fatalf("retained logs show a replayed command after restart: %q", logs)
-	}
+	assertSingleRunLogs(t, logs, []string{"restart-complete"}, nil)
 }
 
 // TestKubernetesCancellationStopsAdoptedWorkload proves the shutdown policy
@@ -234,27 +229,16 @@ func TestKubernetesCancellationStopsAdoptedWorkload(t *testing.T) {
 	if harness.Cluster == nil || harness.KubernetesClient == nil {
 		t.Fatalf("Kubernetes harness did not expose its cluster and client")
 	}
-	document := marshalPipeline(t, pipelineDoc{
-		Actions: []pipelineActionDoc{{
-			Name:    "hold",
-			Image:   harness.Image.Reference,
-			Timeout: restartActionTimeout,
-			Commands: []string{`printf 'hold-start\n'
-sleep 300`},
-		}},
-	})
-	applied := applyPipeline(t, harness, "restart-cancel", document)
+	applied := applyPipeline(t, harness, "restart-cancel", holdRestartPipeline(t, harness))
 	started := startPipeline(t, harness, harness.ProjectToken, applied.PipelineID, nil, "restart-cancel-start")
 	identity := readRunningWorkloadIdentity(t, harness, started.ExecutionID)
 
 	harness.RestartController()
 	assertAdoptedWorkload(t, harness, started.ExecutionID, identity)
 
-	cancelExecutionOnce(t, harness, harness.ProjectToken, started.ExecutionID, "restart-cancel")
+	cancelExecutionCurrent(t, harness, harness.ProjectToken, started.ExecutionID, "restart-cancel")
 	execution := waitKubernetesExecution(t, harness, started.ExecutionID)
-	if execution.State != "cancelled" {
-		t.Fatalf("execution after cancellation = %q; want cancelled", execution.State)
-	}
+	assertCancelledExecution(t, execution, true)
 	waitJobsGone(t, harness, started.ExecutionID)
 }
 
@@ -266,21 +250,12 @@ func TestPodmanControllerRestartPreservesRunningWorkload(t *testing.T) {
 	applied := applyPipeline(t, harness, "podman-restart", restartPipeline(t, harness))
 	started := startPipeline(t, harness, harness.ProjectToken, applied.PipelineID, nil, "podman-restart-start")
 
-	ctx := t.Context()
-	var container string
-	harness.Eventually(t, 2*time.Minute, func() bool {
-		containers, err := harness.Containers(ctx, runtimepodman.LabelExecution, started.ExecutionID)
-		if err != nil || len(containers) != 1 {
-			return false
-		}
-		container = containers[0]
-		return true
-	})
+	container := waitPodmanSingleContainer(t, harness, started.ExecutionID)
 	harness.RestartController()
 
 	// The same deterministic container must still exist immediately after the
 	// restart; deleting it on close would remove the running workload.
-	containers, err := harness.Containers(ctx, runtimepodman.LabelExecution, started.ExecutionID)
+	containers, err := harness.Containers(t.Context(), runtimepodman.LabelExecution, started.ExecutionID)
 	if err != nil {
 		t.Fatalf("list workload containers after restart: %v", err)
 	}
@@ -291,48 +266,23 @@ func TestPodmanControllerRestartPreservesRunningWorkload(t *testing.T) {
 	execution := waitExecution(t, harness, harness.ProjectToken, started.ExecutionID)
 	requireSucceeded(t, execution)
 	logs := executionLogs(t, harness, harness.ProjectToken, started.ExecutionID, "restart")
-	if !strings.Contains(logs, "restart-complete") {
-		t.Fatalf("retained logs after restart = %q; want the completion marker", logs)
-	}
-	if !strings.Contains(logs, "runs=1") {
-		t.Fatalf("retained logs after restart = %q; want exactly one command execution (runs=1)", logs)
-	}
+	assertSingleRunLogs(t, logs, []string{"restart-complete"}, nil)
 }
 
 // TestPodmanCancellationAfterRestartStopsWorkload proves an adopted Podman
 // workload is still stoppable through the persisted cancellation control.
 func TestPodmanCancellationAfterRestartStopsWorkload(t *testing.T) {
 	harness := factory.Start(t)
-	document := marshalPipeline(t, pipelineDoc{
-		Actions: []pipelineActionDoc{{
-			Name:    "hold",
-			Image:   harness.Image.Reference,
-			Timeout: restartActionTimeout,
-			Commands: []string{`printf 'hold-start\n'
-sleep 300`},
-		}},
-	})
-	applied := applyPipeline(t, harness, "podman-restart-cancel", document)
+	applied := applyPipeline(t, harness, "podman-restart-cancel", holdRestartPipeline(t, harness))
 	started := startPipeline(t, harness, harness.ProjectToken, applied.PipelineID, nil, "podman-restart-cancel-start")
 
-	ctx := t.Context()
-	var container string
-	harness.Eventually(t, 2*time.Minute, func() bool {
-		containers, err := harness.Containers(ctx, runtimepodman.LabelExecution, started.ExecutionID)
-		if err != nil || len(containers) != 1 {
-			return false
-		}
-		container = containers[0]
-		return true
-	})
+	container := waitPodmanSingleContainer(t, harness, started.ExecutionID)
 	harness.RestartController()
 
-	cancelExecutionOnce(t, harness, harness.ProjectToken, started.ExecutionID, "podman-restart-cancel")
+	cancelExecutionCurrent(t, harness, harness.ProjectToken, started.ExecutionID, "podman-restart-cancel")
 	execution := waitExecution(t, harness, harness.ProjectToken, started.ExecutionID)
-	if execution.State != "cancelled" {
-		t.Fatalf("execution after cancellation = %q; want cancelled", execution.State)
-	}
-	containers, err := harness.Containers(ctx, runtimepodman.LabelExecution, started.ExecutionID)
+	assertCancelledExecution(t, execution, false)
+	containers, err := harness.Containers(t.Context(), runtimepodman.LabelExecution, started.ExecutionID)
 	if err != nil {
 		t.Fatalf("list workload containers after cancellation: %v", err)
 	}
@@ -342,29 +292,4 @@ sleep 300`},
 	if container == "" {
 		t.Fatal("the test never observed the running workload it cancelled")
 	}
-}
-
-// cancelExecutionOnce cancels one execution with the human project token,
-// retrying a stale expected version so a concurrent Kernel observation cannot
-// make the cancellation flaky.
-func cancelExecutionOnce(t *testing.T, harness *factory.Harness, token, executionID, key string) {
-	t.Helper()
-	for range 20 {
-		execution := inspectExecution(t, harness, token, executionID)
-		switch execution.State {
-		case "succeeded", "failed", "cancelled":
-			return
-		}
-		_, publicError := harness.REST(token, "execution.cancel",
-			api.ExecutionCancelRequest{ExecutionID: executionID}, &execution.Version, key)
-		if publicError.Code == api.CodeVersionConflict {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		if publicError.Code != "" {
-			t.Fatalf("execution.cancel refused: %s (%s)", publicError.Code, publicError.Message)
-		}
-		return
-	}
-	t.Fatalf("execution.cancel did not converge on a current execution version")
 }

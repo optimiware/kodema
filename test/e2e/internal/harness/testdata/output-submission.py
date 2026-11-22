@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.request
 
-CA_FILE = __KODEMA_CA_FILE__
+CA_FILE = __KODEMA_CA_FILE__ or os.environ.get("KODEMA_CA_FILE", "")
 OUTPUTS = __KODEMA_OUTPUTS__
 TOKEN_FILE = "/kodema/secrets/KODEMA_TOKEN"
 MAX_BODY = 262144

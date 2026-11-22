@@ -362,10 +362,10 @@ func TestBuildProductionMapsEveryEnvironmentSettingToItsOwnField(t *testing.T) {
 		"KODEMA_WORKSPACE_PVC_STORAGE_CLASS": "storage-class-sentinel",
 		"KODEMA_WORKSPACE_PVC_SIZE":          "42Gi",
 		"KODEMA_WORKSPACE_PVC_ACCESS_MODE":   "ReadWriteMany",
-		"KODEMA_WORKLOAD_CPU_REQUEST":        "cpu-request-sentinel",
-		"KODEMA_WORKLOAD_CPU_LIMIT":          "cpu-limit-sentinel",
-		"KODEMA_WORKLOAD_MEMORY_REQUEST":     "memory-request-sentinel",
-		"KODEMA_WORKLOAD_MEMORY_LIMIT":       "memory-limit-sentinel",
+		"KODEMA_WORKLOAD_CPU_REQUEST":        "750m",
+		"KODEMA_WORKLOAD_CPU_LIMIT":          "3500m",
+		"KODEMA_WORKLOAD_MEMORY_REQUEST":     "384Mi",
+		"KODEMA_WORKLOAD_MEMORY_LIMIT":       "5Gi",
 		"KODEMA_WORKLOAD_CA_SECRET":          "workload-ca-sentinel",
 		"KODEMA_WORKLOAD_CACHE_CLAIM":        "workload-cache-sentinel",
 		"KUBERNETES_SERVICE_HOST":            "kubernetes-service-host-sentinel",
@@ -489,10 +489,10 @@ func TestBuildProductionMapsEveryEnvironmentSettingToItsOwnField(t *testing.T) {
 
 	adapter := inspectKubeAdapter(t, config.Production.Runtime)
 	wantAdapter := kubeAdapterView{
-		cpuRequest:      "cpu-request-sentinel",
-		cpuLimit:        "cpu-limit-sentinel",
-		memoryRequest:   "memory-request-sentinel",
-		memoryLimit:     "memory-limit-sentinel",
+		cpuRequest:      "750m",
+		cpuLimit:        "3500m",
+		memoryRequest:   "384Mi",
+		memoryLimit:     "5Gi",
 		jobTTLSeconds:   600,
 		workloadCA:      "workload-ca-sentinel",
 		cacheClaimName:  "workload-cache-sentinel",
@@ -655,7 +655,7 @@ func TestBuildProductionMapsTenantListSettings(t *testing.T) {
 		case "KODEMA_WORKSPACE_PVC_ACCESS_MODE":
 			return "ReadWriteMany"
 		case "KODEMA_WORKLOAD_CPU_LIMIT":
-			return "cpu-limit-sentinel"
+			return "3500m"
 		}
 		return getenv(name)
 	}
@@ -672,7 +672,7 @@ func TestBuildProductionMapsTenantListSettings(t *testing.T) {
 		if template == nil || template.StorageClass != "storage-class-sentinel" || template.Size != "42Gi" || template.AccessMode != "ReadWriteMany" {
 			t.Fatalf("tenant %s claim template = %+v; want the configured storage settings", tenant.TenantID, template)
 		}
-		if adapter := inspectKubeAdapter(t, tenant.Runtime); adapter.cpuLimit != "cpu-limit-sentinel" {
+		if adapter := inspectKubeAdapter(t, tenant.Runtime); adapter.cpuLimit != "3500m" {
 			t.Fatalf("tenant %s cpu limit = %q; want the configured workload policy", tenant.TenantID, adapter.cpuLimit)
 		}
 	}

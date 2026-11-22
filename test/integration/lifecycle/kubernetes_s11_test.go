@@ -26,7 +26,6 @@ package lifecycle
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -34,84 +33,12 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/client"
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 
 const kindActionTimeout = "1h"
-
-// kindInvokeStart issues exactly one pipeline.start through the public client.
-// A transport failure is returned to the caller so the lost-response path can
-// observe it instead of treating it as a refusal.
-func kindInvokeStart(t *testing.T, transport *client.HTTPTransport, pipelineID string, expected uint64, key string) (api.PipelineStartResult, error) {
-	t.Helper()
-	input, err := json.Marshal(api.PipelineStartRequest{
-		ProjectID:  factory.ProjectID,
-		PipelineID: pipelineID,
-	})
-	if err != nil {
-		t.Fatalf("marshal start input: %v", err)
-	}
-	result, err := transport.Invoke(t.Context(), api.Invocation{
-		Operation: "pipeline.start",
-		Request: api.Request{
-			Input:           input,
-			ExpectedVersion: &expected,
-			IdempotencyKey:  key,
-		},
-	})
-	if err != nil {
-		return api.PipelineStartResult{}, err
-	}
-	var started api.PipelineStartResult
-	if err := json.Unmarshal(result.Body, &started); err != nil {
-		t.Fatalf("decode start result: %v; body=%s", err, string(result.Body))
-	}
-	if err := started.Validate(); err != nil {
-		t.Fatalf("start result: %v", err)
-	}
-	return started, nil
-}
-
-// kindInvokeCancel issues exactly one execution.cancel through the public
-// client at an observed execution version.
-func kindInvokeCancel(t *testing.T, transport *client.HTTPTransport, executionID string, expected uint64, key string) (api.ExecutionCancelResult, error) {
-	t.Helper()
-	input, err := json.Marshal(api.ExecutionCancelRequest{ExecutionID: executionID})
-	if err != nil {
-		t.Fatalf("marshal cancel input: %v", err)
-	}
-	result, err := transport.Invoke(t.Context(), api.Invocation{
-		Operation: "execution.cancel",
-		Request: api.Request{
-			Input:           input,
-			ExpectedVersion: &expected,
-			IdempotencyKey:  key,
-		},
-	})
-	if err != nil {
-		return api.ExecutionCancelResult{}, err
-	}
-	var cancelled api.ExecutionCancelResult
-	if err := json.Unmarshal(result.Body, &cancelled); err != nil {
-		t.Fatalf("decode cancel result: %v; body=%s", err, string(result.Body))
-	}
-	if err := cancelled.Validate(); err != nil {
-		t.Fatalf("cancel result: %v", err)
-	}
-	return cancelled, nil
-}
-
-// kindDroppingClient returns a public client that commits the next request and
-// then reports a transport failure instead of returning the response.
-func kindDroppingClient(harness *factory.Harness, token string) *client.HTTPTransport {
-	transport := harness.Client(token)
-	transport.RoundTripper = &dropOnceRoundTripper{base: transport.RoundTripper}
-	transport.Retry = client.RetryPolicy{MaxAttempts: 1, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
-	return transport
-}
 
 // kindSingleExecutionID returns the one committed execution of a pipeline,
 // proving a lost start did not create a second execution.
@@ -198,7 +125,7 @@ func kindCancelWithLostResponse(t *testing.T, harness *factory.Harness, executio
 			t.Fatalf("execution state before cancel attempt %d = %q; want running", attempt, current.State)
 		}
 		version = current.Version
-		if _, err := kindInvokeCancel(t, kindDroppingClient(harness, harness.ProjectToken), executionID, version, key); err == nil {
+		if _, err := invokeCancelViaClient(t, newDroppingClient(harness, harness.ProjectToken, 1), executionID, version, key); err == nil {
 			t.Fatalf("cancel attempt %d returned a response after the transport was configured to lose it", attempt)
 		}
 		receipts, err := harness.ReceiptCount(t.Context(), key)
@@ -339,9 +266,7 @@ func TestKubernetesLostWorkspaceFailsWithoutReplay(t *testing.T) {
 	if build.State != "failed" {
 		t.Fatalf("build action state = %q; want failed", build.State)
 	}
-	if build.Stop == nil || build.Stop.State != "confirmed" {
-		t.Fatalf("build action stop evidence = %+v; want the confirmed stop of the lost-workspace workload", build.Stop)
-	}
+	assertConfirmedStop(t, build, "")
 	next := actionByName(t, finished, "next")
 	if next.State != "cancelled" {
 		t.Fatalf("successor action state = %q; want cancelled", next.State)
@@ -354,23 +279,9 @@ func TestKubernetesLostWorkspaceFailsWithoutReplay(t *testing.T) {
 	// The retained log shows exactly one execution of the action; a replay
 	// would append a second runs line or the completion marker.
 	logs := executionLogs(t, harness, harness.ProjectToken, started.ExecutionID, "build")
-	if got := strings.Count(logs, "runs="); got != 1 {
-		t.Fatalf("retained log has %d runs lines; want exactly one:\n%s", got, logs)
-	}
-	if !strings.Contains(logs, "runs=1") {
-		t.Fatalf("retained log does not show exactly one command execution:\n%s", logs)
-	}
-	if strings.Contains(logs, "runs=2") || strings.Contains(logs, "lost-workspace-complete") {
-		t.Fatalf("retained log shows a replayed or completed action after workspace loss:\n%s", logs)
-	}
+	assertSingleRunLogs(t, logs, nil, []string{"lost-workspace-complete"})
 
-	count, err := harness.ExecutionCount(t.Context(), applied.PipelineID)
-	if err != nil {
-		t.Fatalf("count executions: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("execution count = %d; want exactly the original execution", count)
-	}
+	assertExecutionCount(t, harness, applied.PipelineID, 1)
 	requireSubjectEventCount(t, harness, "execution.failed", started.ExecutionID, 1)
 
 	// The claim is never recreated: the terminated claim is gone and stays gone.
@@ -409,23 +320,11 @@ func TestKubernetesLostStartResponseAcrossRestart(t *testing.T) {
 
 	// The server commits the execution and start receipt, then the response is
 	// lost. The client sees only the transport failure.
-	if _, err := kindInvokeStart(t, kindDroppingClient(harness, harness.ProjectToken), applied.PipelineID, expected, key); err == nil {
+	if _, err := invokeStartViaClient(t, newDroppingClient(harness, harness.ProjectToken, 1), applied.PipelineID, nil, expected, key); err == nil {
 		t.Fatal("start with a dropped response returned a result; the lost-response path was not exercised")
 	}
-	count, err := harness.ExecutionCount(t.Context(), applied.PipelineID)
-	if err != nil {
-		t.Fatalf("count executions after the lost start: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("execution count after the lost start = %d; want the one committed execution", count)
-	}
-	receipts, err := harness.ReceiptCount(t.Context(), key)
-	if err != nil {
-		t.Fatalf("count start receipts after the lost start: %v", err)
-	}
-	if receipts != 1 {
-		t.Fatalf("start receipt count after the lost start = %d; want exactly 1", receipts)
-	}
+	assertExecutionCount(t, harness, applied.PipelineID, 1)
+	assertReceiptCount(t, harness, key, 1)
 
 	executionID := kindSingleExecutionID(t, harness, applied.PipelineID)
 	identity := readRunningWorkloadIdentity(t, harness, executionID)
@@ -438,42 +337,22 @@ func TestKubernetesLostStartResponseAcrossRestart(t *testing.T) {
 
 	// Retry the exact lost request after the restart: same key, same expected
 	// version and the same stored pipeline selection.
-	replayed, err := kindInvokeStart(t, harness.Client(harness.ProjectToken), applied.PipelineID, expected, key)
+	replayed, err := invokeStartViaClient(t, harness.Client(harness.ProjectToken), applied.PipelineID, nil, expected, key)
 	if err != nil {
 		t.Fatalf("replayed start after restart: %v", err)
 	}
 	if replayed.ExecutionID != executionID {
 		t.Fatalf("replayed start returned execution %q; want the original %q", replayed.ExecutionID, executionID)
 	}
-	count, err = harness.ExecutionCount(t.Context(), applied.PipelineID)
-	if err != nil {
-		t.Fatalf("count executions after the replay: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("execution count after the start replay = %d; want exactly 1", count)
-	}
-	receipts, err = harness.ReceiptCount(t.Context(), key)
-	if err != nil {
-		t.Fatalf("count start receipts after the replay: %v", err)
-	}
-	if receipts != 1 {
-		t.Fatalf("start receipt count after the replay = %d; want exactly 1", receipts)
-	}
+	assertExecutionCount(t, harness, applied.PipelineID, 1)
+	assertReceiptCount(t, harness, key, 1)
 
 	kindTouchPodFile(t, harness, identity.podName, "/workspace/lost-start-release")
 	finished := waitKubernetesExecution(t, harness, executionID)
 	requireSucceeded(t, finished)
 
 	logs := executionLogs(t, harness, harness.ProjectToken, executionID, "survive")
-	if got := strings.Count(logs, "runs="); got != 1 {
-		t.Fatalf("retained log has %d runs lines; want exactly one:\n%s", got, logs)
-	}
-	if !strings.Contains(logs, "runs=1") || !strings.Contains(logs, "lost-start-complete") {
-		t.Fatalf("retained log does not show the single completed workload execution:\n%s", logs)
-	}
-	if strings.Contains(logs, "runs=2") {
-		t.Fatalf("retained log shows a replayed workload after the controller restart:\n%s", logs)
-	}
+	assertSingleRunLogs(t, logs, []string{"lost-start-complete"}, nil)
 	requireSubjectEventCount(t, harness, "execution.started", executionID, 1)
 }
 
@@ -510,13 +389,7 @@ func TestKubernetesLostStopResponseAcrossRestart(t *testing.T) {
 
 	// The cancellation committed before its response was lost: the durable
 	// receipt and the terminal state are already visible.
-	receipts, err := harness.ReceiptCount(t.Context(), key)
-	if err != nil {
-		t.Fatalf("count cancel receipts after the lost stop: %v", err)
-	}
-	if receipts != 1 {
-		t.Fatalf("cancel receipt count after the lost stop = %d; want exactly 1", receipts)
-	}
+	assertReceiptCount(t, harness, key, 1)
 	cancelled := inspectExecution(t, harness, harness.ProjectToken, started.ExecutionID)
 	if cancelled.State != "cancelled" {
 		t.Fatalf("execution state after the lost stop = %q; want cancelled", cancelled.State)
@@ -529,49 +402,21 @@ func TestKubernetesLostStopResponseAcrossRestart(t *testing.T) {
 	if afterRestart.State != "cancelled" {
 		t.Fatalf("execution state after restart = %q; want the durable cancelled outcome", afterRestart.State)
 	}
-	replayed, err := kindInvokeCancel(t, harness.Client(harness.ProjectToken), started.ExecutionID, expected, key)
+	replayed, err := invokeCancelViaClient(t, harness.Client(harness.ProjectToken), started.ExecutionID, expected, key)
 	if err != nil {
 		t.Fatalf("replayed cancel after restart: %v", err)
 	}
 	if replayed.ExecutionVersion == 0 {
 		t.Fatalf("replayed cancel returned no execution version")
 	}
-	receipts, err = harness.ReceiptCount(t.Context(), key)
-	if err != nil {
-		t.Fatalf("count cancel receipts after the replay: %v", err)
-	}
-	if receipts != 1 {
-		t.Fatalf("cancel receipt count after the replay = %d; want exactly 1", receipts)
-	}
+	assertReceiptCount(t, harness, key, 1)
 
 	finished := waitKubernetesExecution(t, harness, started.ExecutionID)
-	if finished.State != "cancelled" {
-		t.Fatalf("terminal state = %q; want cancelled", finished.State)
-	}
-	if finished.Failure != nil {
-		t.Fatalf("cancelled execution carries a failure: %+v", finished.Failure)
-	}
-	if finished.Cleanup.State != "complete" {
-		t.Fatalf("cleanup after the lost stop = %+v; want complete", finished.Cleanup)
-	}
+	assertCancelledExecution(t, finished, true)
 
 	logs := executionLogs(t, harness, harness.ProjectToken, started.ExecutionID, "stop")
-	if got := strings.Count(logs, "runs="); got != 1 {
-		t.Fatalf("retained log has %d runs lines; want exactly one:\n%s", got, logs)
-	}
-	if !strings.Contains(logs, "runs=1") || !strings.Contains(logs, "lost-stop-ready") {
-		t.Fatalf("retained log does not show the single workload execution that was stopped:\n%s", logs)
-	}
-	if strings.Contains(logs, "runs=2") {
-		t.Fatalf("retained log shows a replayed workload after the lost stop:\n%s", logs)
-	}
-	count, err := harness.ExecutionCount(t.Context(), applied.PipelineID)
-	if err != nil {
-		t.Fatalf("count executions: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("execution count = %d; want exactly the cancelled execution", count)
-	}
+	assertSingleRunLogs(t, logs, []string{"lost-stop-ready"}, nil)
+	assertExecutionCount(t, harness, applied.PipelineID, 1)
 	requireSubjectEventCount(t, harness, "execution.cancelled", started.ExecutionID, 1)
 	waitJobsGone(t, harness, started.ExecutionID)
 }

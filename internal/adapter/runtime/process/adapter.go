@@ -16,7 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/internal/adapterutil"
+	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
@@ -29,13 +29,13 @@ import (
 // execution workspace. It never starts a process and never recreates a missing
 // workspace.
 func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest) (reconcile.Preparation, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return reconcile.Preparation{}, err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return reconcile.Preparation{}, err
 	}
-	if err := adapterutil.ValidatePrepareContext(request.ActionName, request.TaskID); err != nil {
+	if err := container.ValidatePrepareContext(request.ActionName, request.TaskID); err != nil {
 		return reconcile.Preparation{}, err
 	}
 	if err := workspace.ValidateCacheMounts(request.Container.Caches, request.Caches); err != nil {
@@ -69,7 +69,7 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 	if err != nil {
 		return reconcile.Preparation{}, err
 	}
-	materialization, err := adapterutil.BuildMaterialization(request, readOnlyMode)
+	materialization, err := container.BuildMaterialization(request, readOnlyMode)
 	if err != nil {
 		return reconcile.Preparation{}, err
 	}
@@ -114,7 +114,7 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 		}
 		return reconcile.Preparation{
 			WorkspaceID: request.WorkspaceID,
-			Detail:      fmt.Sprintf("reused activation snapshot for %s", adapterutil.DescribeIdentity(request.Identity)),
+			Detail:      fmt.Sprintf("reused activation snapshot for %s", container.DescribeIdentity(request.Identity)),
 		}, nil
 	}
 
@@ -149,7 +149,7 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 	}
 	return reconcile.Preparation{
 		WorkspaceID: request.WorkspaceID,
-		Detail:      fmt.Sprintf("materialized activation snapshot for %s", adapterutil.DescribeIdentity(request.Identity)),
+		Detail:      fmt.Sprintf("materialized activation snapshot for %s", container.DescribeIdentity(request.Identity)),
 	}, nil
 }
 
@@ -203,10 +203,10 @@ func (a *Adapter) Start(ctx context.Context, request reconcile.StartRequest) (re
 			Detail:     detail,
 		}, err
 	}
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return unknown("start request identity is invalid", err)
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return unknown("start request workspace is invalid", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -402,10 +402,10 @@ func (a *Adapter) Start(ctx context.Context, request reconcile.StartRequest) (re
 
 // Observe reports the declared Kernel vocabulary for the stable identity.
 func (a *Adapter) Observe(ctx context.Context, request reconcile.ObserveRequest) (engine.Observation, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return engine.UnknownObservation(), err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.UnknownObservation(), err
 	}
 
@@ -449,14 +449,8 @@ func (a *Adapter) Observe(ctx context.Context, request reconcile.ObserveRequest)
 // Logs returns ordered, bounded and redacted chunks. It carries no lifecycle
 // authority and fails closed when the redaction source is unavailable.
 func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reconcile.LogBatch, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateLogsRequest(request); err != nil {
 		return reconcile.LogBatch{}, err
-	}
-	if request.Limit <= 0 || request.Limit > MaxLogBytes {
-		return reconcile.LogBatch{}, fault.New(fault.InvalidInput, "log read limit is outside the bounded range")
-	}
-	if request.AfterOffset < 0 {
-		return reconcile.LogBatch{}, fault.New(fault.InvalidInput, "log read offset is negative")
 	}
 
 	a.mu.Lock()
@@ -485,7 +479,7 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 		return reconcile.LogBatch{}, err
 	}
 
-	stdoutOffset, stderrOffset := adapterutil.DecodeLogCursor(request.AfterOffset)
+	stdoutOffset, stderrOffset := container.DecodeLogCursor(request.AfterOffset)
 	positions := map[reconcile.LogStream]int64{
 		reconcile.LogStdout: stdoutOffset,
 		reconcile.LogStderr: stderrOffset,
@@ -503,26 +497,27 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 		if err != nil {
 			return reconcile.LogBatch{}, fault.Wrap(fault.DependencyUnavailable, "process log read is unavailable", err)
 		}
-		mayGrow := page.Truncated && len(page.Data) == request.Limit
-		consumed, data := adapterutil.RedactLogPage(page.Data, values, request.Limit, mayGrow)
-		nextPosition, err := adapterutil.NextStreamLogPosition(stream, offset, len(consumed))
+		chunk, hasChunk, nextPosition, err := container.BuildLogChunk(container.LogPageInput{
+			Stream:        stream,
+			Offset:        offset,
+			Sequence:      sequence + 1,
+			Raw:           page.Data,
+			PageTruncated: page.Truncated,
+			Values:        values,
+			Limit:         request.Limit,
+			MayGrow:       page.Truncated && len(page.Data) == request.Limit,
+		})
 		if err != nil {
 			return reconcile.LogBatch{}, err
 		}
 		positions[stream] = nextPosition
-		if len(consumed) == 0 {
+		if !hasChunk {
 			continue
 		}
 		sequence++
-		batch.Chunks = append(batch.Chunks, reconcile.LogChunk{
-			Stream:    stream,
-			Offset:    offset,
-			Sequence:  sequence,
-			Data:      data,
-			Truncated: page.Truncated || len(consumed) < len(page.Data),
-		})
+		batch.Chunks = append(batch.Chunks, chunk)
 	}
-	batch.NextOffset = adapterutil.EncodeLogCursor(positions[reconcile.LogStdout], positions[reconcile.LogStderr])
+	batch.NextOffset = container.EncodeLogCursor(positions[reconcile.LogStdout], positions[reconcile.LogStderr])
 	return batch, nil
 }
 
@@ -542,16 +537,16 @@ func (a *Adapter) redactionSource(ctx context.Context, resourceRoot string, load
 		return nil, fault.Wrap(fault.DependencyUnavailable, "redaction source is unavailable; log read refused", err)
 	}
 	values = append(values, string(credential))
-	return adapterutil.SortRedactionValues(values), nil
+	return container.SortRedactionValues(values), nil
 }
 
 // Stop requests whole-process-group termination. A signal acknowledgment is
 // not confirmation; only affirmative whole-group termination confirms.
 func (a *Adapter) Stop(ctx context.Context, request reconcile.StopRequest) (engine.StopEvidence, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return engine.PendingStop("stop request identity is invalid"), err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return engine.PendingStop("stop request workspace is invalid"), err
 	}
 
@@ -605,10 +600,10 @@ func (a *Adapter) Stop(ctx context.Context, request reconcile.StopRequest) (engi
 // the execution workspace and refuses to remove resources while the process
 // group may still run.
 func (a *Adapter) Remove(ctx context.Context, request reconcile.RemoveRequest) (reconcile.Removal, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return reconcile.Removal{Detail: "removal request identity is invalid"}, err
 	}
-	if err := adapterutil.ValidateWorkspaceID(request.WorkspaceID); err != nil {
+	if err := container.ValidateWorkspaceID(request.WorkspaceID); err != nil {
 		return reconcile.Removal{Detail: "removal request workspace is invalid"}, err
 	}
 
@@ -635,7 +630,7 @@ func (a *Adapter) Remove(ctx context.Context, request reconcile.RemoveRequest) (
 		if !rootExists {
 			return reconcile.Removal{
 				Removed: true,
-				Detail:  fmt.Sprintf("owned resources for %s were already removed", adapterutil.DescribeIdentity(request.Identity)),
+				Detail:  fmt.Sprintf("owned resources for %s were already removed", container.DescribeIdentity(request.Identity)),
 			}, nil
 		}
 		return a.cleanupRoot(ctx, resourceRoot, group)
@@ -649,7 +644,7 @@ func (a *Adapter) Remove(ctx context.Context, request reconcile.RemoveRequest) (
 		if !rootExists {
 			return reconcile.Removal{
 				Removed: true,
-				Detail:  fmt.Sprintf("no owned resources exist for %s", adapterutil.DescribeIdentity(request.Identity)),
+				Detail:  fmt.Sprintf("no owned resources exist for %s", container.DescribeIdentity(request.Identity)),
 			}, nil
 		}
 		if err := a.writeTombstone(ctx, request.Identity.WorkloadID); err != nil {
@@ -709,28 +704,22 @@ func (a *Adapter) Remove(ctx context.Context, request reconcile.RemoveRequest) (
 
 // cleanupRoot removes only the identity's resource root with bounded retries.
 func (a *Adapter) cleanupRoot(ctx context.Context, resourceRoot string, group GroupID) (reconcile.Removal, error) {
-	attempts := max(a.cleanup.Attempts, 1)
-	var lastErr error
-	for attempt := range attempts {
-		if attempt > 0 {
-			if err := a.clock.Sleep(ctx, a.cleanup.Backoff); err != nil {
-				return reconcile.Removal{Detail: retainedDetail(group, "cleanup backoff interrupted")}, err
-			}
-		}
-		if err := a.files.RemoveAll(ctx, resourceRoot); err != nil {
-			lastErr = err
-			continue
-		}
+	maxAttempts := max(a.cleanup.Attempts, 1)
+	attemptsMade := 0
+	err := container.RetryWithBackoff(ctx, a.clock, a.cleanup, func(ctx context.Context) error {
+		attemptsMade++
+		return a.files.RemoveAll(ctx, resourceRoot)
+	})
+	if err == nil {
 		return reconcile.Removal{
 			Removed: true,
 			Detail:  fmt.Sprintf("removed owned resources and process group %q", group),
 		}, nil
 	}
-	reason := "resource removal failed"
-	if lastErr != nil {
-		reason = "resource removal failed: " + lastErr.Error()
+	if attemptsMade < maxAttempts {
+		return reconcile.Removal{Detail: retainedDetail(group, "cleanup backoff interrupted")}, err
 	}
-	return reconcile.Removal{Detail: retainedDetail(group, reason)}, nil
+	return reconcile.Removal{Detail: retainedDetail(group, "resource removal failed: "+err.Error())}, nil
 }
 
 // pathExists reports whether one host path exists.
@@ -755,7 +744,7 @@ func retainedDetail(group GroupID, reason string) string {
 // restarts or re-signals the process group and never revives a removed
 // identity.
 func (a *Adapter) RefreshCredential(ctx context.Context, request reconcile.CredentialRequest) (reconcile.CredentialRefresh, error) {
-	if err := adapterutil.ValidateIdentity(request.Identity); err != nil {
+	if err := container.ValidateIdentity(request.Identity); err != nil {
 		return reconcile.CredentialRefresh{}, err
 	}
 	if strings.TrimSpace(request.Credential) == "" {
@@ -796,6 +785,6 @@ func (a *Adapter) RefreshCredential(ctx context.Context, request reconcile.Crede
 	}
 	return reconcile.CredentialRefresh{
 		Delivered: true,
-		Detail:    fmt.Sprintf("replaced credential for %s without restarting the process group", adapterutil.DescribeIdentity(request.Identity)),
+		Detail:    fmt.Sprintf("replaced credential for %s without restarting the process group", container.DescribeIdentity(request.Identity)),
 	}, nil
 }
