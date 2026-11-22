@@ -4,25 +4,26 @@ This runbook describes how a Kodema version is built, versioned and published.
 
 - Workflows: [`release.yml`](../../.github/workflows/release.yml) and
   [`ci.yml`](../../.github/workflows/ci.yml)
-- Build scripts: [`scripts/dist`](../../scripts/dist) and
-  [`scripts/image`](../../scripts/image)
+- Build and version scripts: [`scripts/dist`](../../scripts/dist),
+  [`scripts/image`](../../scripts/image) and
+  [`scripts/release-version`](../../scripts/release-version)
 - Changes and known limitations per version: [CHANGELOG.md](../../CHANGELOG.md)
 
 ## Versions
 
-The [`VERSION`](../../VERSION) file holds the one release version of the tree.
+The [`VERSION`](../../VERSION) file holds the base release version of the tree.
 `TestReleaseVersionIsConsistent` (`internal/installation`) fails `make check`
 unless both charts, the stack chart's dependency, the default image tags and
-the default tag of `scripts/lib/deploy.sh` carry the same value. Set the
-version with `make release-prepare VERSION=<version>`, never by hand.
+the default tag of `scripts/lib/deploy.sh` carry the same value. Change
+`VERSION` with `make release-prepare VERSION=<version>`, never by hand.
 
 A version has one of three forms:
 
 | Form | Example | Meaning |
 |---|---|---|
-| Release | `0.2.0` | Published. The README and the Podman quickstart install it, and the changelog has its section. |
-| Release candidate | `0.2.0-rc.1` | Published as a pre-release; `latest` does not move. The documents keep naming the last release. |
-| Development | `0.3.0-dev` | The state of `master` between releases. It is never published. |
+| Release | `0.8.0` | Published. The README and the Podman quickstart install it, and the changelog has its section. Subsequent merges to `master` that leave `VERSION` untouched automatically publish patch releases (`0.8.1`, `0.8.2`, ...) directly on the merged commit. |
+| Release candidate | `0.9.0-rc.1` | Published as a pre-release; `latest` does not move. The documents keep naming the last release. Subsequent merges do not auto-patch a pre-release. |
+| Development | `0.9.0-dev` | Optional state of `master` when you want to pause automatic patch releases between minor or major releases. It is never published. |
 
 `0.1.0` is the first public release.
 
@@ -62,30 +63,56 @@ repository.
 
 ## Cut a release
 
-1. Prepare the version on a branch and open a pull request:
+### Automatic patch releases
+
+Every merge to `master` that leaves an already-released `MAJOR.MINOR.PATCH`
+`VERSION` unchanged automatically publishes the next patch version
+(`MAJOR.MINOR.(max_patch + 1)`):
+
+- No release commit is created and `VERSION`, the charts, the README and
+  `CHANGELOG.md` in git stay untouched; the merged commit itself is tagged
+  `v<version>` and becomes the release.
+- [`scripts/release-version`](../../scripts/release-version) finds the highest
+  existing `vMAJOR.MINOR.*` tag on `origin` and increments its patch number.
+- `scripts/dist --version <version>` and `scripts/image --version <version>`
+  stamp the binaries, image and packaged Helm charts with the resolved patch
+  version without modifying the checkout.
+- The workflow runs the CI jobs and [`scripts/release-smoke`](../../scripts/release-smoke)
+  before pushing the image (including `:latest`), charts and GitHub release
+  (with commit summary notes).
+
+### Manual minor, major, and pre-release releases
+
+Minor, major and release-candidate releases keep the explicit release commit
+and curated changelog:
+
+1. Add an `## Unreleased` section to `CHANGELOG.md` (if not already present),
+   then prepare the version on a branch and open a pull request:
 
    ```sh
-   make release-prepare VERSION=0.2.0
+   make release-prepare VERSION=0.9.0
    ```
 
    It rewrites every file that carries the version. For a release it also
    updates the version the README and the Podman quickstart install, and
    renames the changelog's `Unreleased` section to the version. Review that
    section before you commit.
-2. Merge the pull request. The change of `VERSION` on `master` starts the
-   release workflow. It runs the CI jobs, builds every artifact, installs the
-   image with the Podman bundle and runs a pipeline
-   ([`scripts/release-smoke`](../../scripts/release-smoke)), and only then
-   publishes and creates the tag `v<version>` on that commit.
-3. Set the next development version the same way, for example
-   `make release-prepare VERSION=0.3.0-dev`, and merge it. Builds and charts
-   from `master` then no longer carry the released version.
+2. Merge the pull request. Because `VERSION` holds an unreleased version, the
+   release workflow publishes that exact version after running CI and
+   [`scripts/release-smoke`](../../scripts/release-smoke), and creates the tag
+   `v<version>` on that commit.
+3. Leave `VERSION` at the released version on `master` so subsequent merges
+   publish automatic patch releases (`0.9.1`, `0.9.2`, ...). If you instead
+   want to accumulate work on `master` without publishing patch releases in
+   between, set a development version such as
+   `make release-prepare VERSION=0.10.0-dev` and merge it.
 
-For a large change, publish a release candidate first (`0.2.0-rc.1`), try it,
+For a large change, publish a release candidate first (`0.9.0-rc.1`), try it,
 then prepare the release.
 
-A released version is never replaced. The workflow refuses a version whose
-GitHub release exists, and the repository rules in
+A released version or commit is never replaced. The workflow refuses a commit
+that already carries a released `v*` tag and refuses an explicit `VERSION`
+change whose target version already exists; the repository rules in
 [`.github/rulesets`](../../.github/rulesets) refuse deleting or moving a `v*`
 tag and rewriting `master`. They are applied once per repository:
 

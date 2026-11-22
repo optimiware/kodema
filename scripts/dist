@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # scripts/dist: build the release artifacts of this checkout. Nothing is pushed.
 #
-#   scripts/dist [--output <directory>]
+#   scripts/dist [--output <directory>] [--version <version>]
 #
-# For the version in the VERSION file it writes, into dist/ by default:
+# For the version in the VERSION file (or --version, used by automatic patch
+# releases without touching the checkout) it writes, into dist/ by default:
 #
 #   kodema_<version>_<os>_<arch>.tar.gz    kodema and LICENSE, one per platform
 #   kodema-<version>.tgz                   the control-plane Helm chart
@@ -20,10 +21,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 die() { printf 'scripts/dist: %s\n' "$*" >&2; exit 1; }
 
 output="${repo_root}/dist"
+version=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) [[ $# -ge 2 ]] || die "--output requires a value"; output="$2"; shift 2 ;;
-    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --version) [[ $# -ge 2 ]] || die "--version requires a value"; version="$2"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -32,19 +35,30 @@ for tool in go helm git tar sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || die "${tool} is required"
 done
 
-version="$(<"${repo_root}/VERSION")"
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "VERSION '${version}' is not MAJOR.MINOR.PATCH"
+base_version="$(<"${repo_root}/VERSION")"
+[[ "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "VERSION '${base_version}' is not MAJOR.MINOR.PATCH"
+[[ -n "$version" ]] || version="$base_version"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "version '${version}' is not MAJOR.MINOR.PATCH"
+if [[ "$version" != "$base_version" ]]; then
+  command -v perl >/dev/null 2>&1 || die "perl is required when --version differs from VERSION"
+fi
 revision="$(git -C "$repo_root" rev-parse HEAD)"
 # Archive entries carry the commit time, so the same commit gives the same bytes.
 commit_time="$(git -C "$repo_root" log -1 --format=%ct HEAD)"
 platforms="${DIST_PLATFORMS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64}"
 
-# helm package takes the chart version from Chart.yaml; refuse a chart that
-# disagrees with VERSION instead of publishing two versions under one tag.
+# helm package takes the chart version from Chart.yaml; refuse a checkout whose
+# charts disagree with VERSION instead of publishing inconsistent versions.
 for chart in kodema kodema-stack; do
   chart_version="$(sed -n 's/^version: *//p' "${repo_root}/deploy/charts/${chart}/Chart.yaml")"
-  [[ "$chart_version" == "$version" ]] || die "chart ${chart} is version '${chart_version}', VERSION is '${version}'"
+  [[ "$chart_version" == "$base_version" ]] || die "chart ${chart} is version '${chart_version}', VERSION is '${base_version}'"
 done
+
+replace() {
+  local file=$1 from=$2 to=$3
+  grep -qF -- "$from" "$file" || die "${file} does not contain '${from}'"
+  FROM="$from" TO="$to" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/g' "$file"
+}
 
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
@@ -67,8 +81,16 @@ for platform in $platforms; do
 done
 
 # The stack chart's dependency is file://../kodema. Package a copy, so the
-# vendored subchart never lands in the checkout.
+# vendored subchart and any --version override never land in the checkout.
 cp -R "${repo_root}/deploy/charts" "${stage}/charts"
+if [[ "$version" != "$base_version" ]]; then
+  for chart in kodema kodema-stack; do
+    replace "${stage}/charts/${chart}/Chart.yaml" "version: ${base_version}"$'\n' "version: ${version}"$'\n'
+    replace "${stage}/charts/${chart}/Chart.yaml" "appVersion: \"${base_version}\"" "appVersion: \"${version}\""
+    replace "${stage}/charts/${chart}/values.yaml" "tag: \"${base_version}\"" "tag: \"${version}\""
+  done
+  replace "${stage}/charts/kodema-stack/Chart.yaml" "    version: \"${base_version}\"" "    version: \"${version}\""
+fi
 helm package "${stage}/charts/kodema" --destination "$output" >/dev/null
 helm package --dependency-update "${stage}/charts/kodema-stack" --destination "$output" >/dev/null
 

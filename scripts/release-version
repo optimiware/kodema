@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# scripts/release-version: resolve the release version for a commit.
+#
+#   scripts/release-version [--repo-root <dir>] [--commit <sha>]
+#                           [--before <sha>] [--remote <name>]
+#                           [--repo <owner/repo>] [--no-check-releases]
+#                           [--publish] [--explicit-publish]
+#
+# Resolves the version to build and (when --publish is set) release:
+#
+#   - Development versions (*-dev*) are never published.
+#   - An explicit manual release (VERSION holds an unreleased MAJOR.MINOR.PATCH
+#     or prerelease, e.g. from `make release-prepare VERSION=0.9.0`) resolves to
+#     that exact version (RELEASE_MODE=manual).
+#   - Any subsequent merge to master that leaves a released MAJOR.MINOR.PATCH
+#     VERSION untouched resolves to the next patch version in that series,
+#     MAJOR.MINOR.(max_patch + 1), derived from existing vMAJOR.MINOR.* tags on
+#     the remote, without requiring a release commit (RELEASE_MODE=patch).
+#
+# Prints KEY=VALUE lines on stdout:
+#   VERSION, BASE_VERSION, PREVIOUS_VERSION, RELEASE_MODE, PUBLISH, PRERELEASE.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+commit=""
+before=""
+remote="origin"
+repo="${GITHUB_REPOSITORY:-}"
+check_releases=true
+want_publish=false
+explicit_publish=false
+
+die() { printf 'scripts/release-version: %s\n' "$*" >&2; exit 1; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo-root) [[ $# -ge 2 ]] || die "--repo-root requires a value"; repo_root="$2"; shift 2 ;;
+    --commit) [[ $# -ge 2 ]] || die "--commit requires a value"; commit="$2"; shift 2 ;;
+    --before) [[ $# -ge 2 ]] || die "--before requires a value"; before="$2"; shift 2 ;;
+    --remote) [[ $# -ge 2 ]] || die "--remote requires a value"; remote="$2"; shift 2 ;;
+    --repo) [[ $# -ge 2 ]] || die "--repo requires a value"; repo="$2"; shift 2 ;;
+    --no-check-releases) check_releases=false; shift ;;
+    --publish) want_publish=true; shift ;;
+    --explicit-publish) explicit_publish=true; want_publish=true; shift ;;
+    -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+for tool in git awk; do
+  command -v "$tool" >/dev/null 2>&1 || die "${tool} is required"
+done
+if [[ "$check_releases" == "true" ]]; then
+  command -v gh >/dev/null 2>&1 || die "gh is required unless --no-check-releases is set"
+  [[ -n "$repo" ]] || die "--repo (or GITHUB_REPOSITORY) is required unless --no-check-releases is set"
+fi
+
+[[ -f "${repo_root}/VERSION" ]] || die "VERSION file not found in ${repo_root}"
+base="$(<"${repo_root}/VERSION")"
+if [[ ! "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+  die "VERSION '${base}' is not MAJOR.MINOR.PATCH"
+fi
+major="${BASH_REMATCH[1]}"
+minor="${BASH_REMATCH[2]}"
+patch="${BASH_REMATCH[3]}"
+suffix="${BASH_REMATCH[4]}"
+
+if [[ -z "$commit" ]]; then
+  commit="$(git -C "$repo_root" rev-parse HEAD)"
+fi
+
+is_prerelease() {
+  local v="$1"
+  if [[ "$v" == 0.0.* || "$v" == *-* ]]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
+emit() {
+  local ver="$1" prev="$2" mode="$3" pub="$4"
+  local pre
+  pre="$(is_prerelease "$ver")"
+  printf 'VERSION=%s\n' "$ver"
+  printf 'BASE_VERSION=%s\n' "$base"
+  printf 'PREVIOUS_VERSION=%s\n' "$prev"
+  printf 'RELEASE_MODE=%s\n' "$mode"
+  printf 'PUBLISH=%s\n' "$pub"
+  printf 'PRERELEASE=%s\n' "$pre"
+}
+
+# Branch 1: Development versions are never published.
+if [[ "$base" == *-dev* ]]; then
+  if [[ "$explicit_publish" == "true" ]]; then
+    die "${base} is a development version and is never published"
+  fi
+  emit "$base" "" "dev" "false"
+  exit 0
+fi
+
+# Determine whether this push explicitly changed VERSION.
+version_changed=false
+if [[ -n "$before" && "$before" != "0000000000000000000000000000000000000000" ]]; then
+  if git -C "$repo_root" cat-file -e "${before}^{commit}" 2>/dev/null; then
+    if ! git -C "$repo_root" diff --quiet "$before" "$commit" -- VERSION; then
+      version_changed=true
+    fi
+  fi
+fi
+
+# release_status <version> prints "exists" or "not_found". Any API failure is
+# fatal so an outage is never mistaken for "not released yet".
+release_status() {
+  local ver="$1"
+  if [[ "$check_releases" != "true" ]]; then
+    printf 'not_found\n'
+    return 0
+  fi
+  local found
+  if found="$(gh api "repos/${repo}/releases/tags/v${ver}" --jq .tag_name 2>&1)"; then
+    printf 'exists\n'
+  elif [[ "$found" == *"HTTP 404"* ]]; then
+    printf 'not_found\n'
+  else
+    die "cannot tell whether ${ver} is released: ${found}"
+  fi
+}
+
+# Fetch all v* tags from the remote once and peel annotated tags to commits.
+peeled_tags="$(mktemp)"
+trap 'rm -f "$peeled_tags"' EXIT
+raw_tags="$(git -C "$repo_root" ls-remote --tags "$remote" 'refs/tags/v*')"
+if [[ -n "$raw_tags" ]]; then
+  printf '%s\n' "$raw_tags" | awk '
+    {
+      sha = $1
+      ref = $2
+      sub(/^refs\/tags\//, "", ref)
+      if (sub(/\^\{\}$/, "", ref)) {
+        tags[ref] = sha
+      } else if (!(ref in tags)) {
+        tags[ref] = sha
+      }
+    }
+    END {
+      for (t in tags) {
+        printf "%s\t%s\n", t, tags[t]
+      }
+    }
+  ' >"$peeled_tags"
+fi
+
+tag_commit_for() {
+  awk -F '\t' -v want="$1" '$1 == want { print $2; exit }' "$peeled_tags"
+}
+
+max_patch_below() {
+  local limit="$1"
+  awk -F '\t' -v prefix="v${major}.${minor}." -v limit="$limit" '
+    BEGIN { max = -1 }
+    index($1, prefix) == 1 {
+      rest = substr($1, length(prefix) + 1)
+      if (rest ~ /^(0|[1-9][0-9]*)$/) {
+        n = rest + 0
+        if (limit < 0 || n < limit) {
+          if (n > max) max = n
+        }
+      }
+    }
+    END { print max }
+  ' "$peeled_tags"
+}
+
+# Guard: if this exact commit is already tagged with a version tag, never mint
+# a second version on the same commit. Resume if the tag exists without a
+# GitHub release (incomplete publication), otherwise fail when publishing.
+commit_tags="$(awk -F '\t' -v sha="$commit" \
+  '$2 == sha && $1 ~ /^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$/ { print $1 }' \
+  "$peeled_tags" | sort -r)"
+if [[ -n "$commit_tags" ]]; then
+  resumable=""
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    ver="${tag#v}"
+    status="$(release_status "$ver")"
+    if [[ "$status" == "exists" ]]; then
+      if [[ "$want_publish" == "true" ]]; then
+        die "commit ${commit} is already released as ${tag}. A released version is never replaced."
+      fi
+      mode="patch"
+      prev=""
+      if [[ "$ver" == "$base" ]]; then
+        mode="manual"
+      fi
+      emit "$ver" "$prev" "$mode" "false"
+      exit 0
+    fi
+    if [[ -z "$resumable" ]]; then
+      resumable="$ver"
+    fi
+  done <<<"$commit_tags"
+  if [[ -n "$resumable" ]]; then
+    mode="patch"
+    prev=""
+    if [[ "$resumable" == "$base" ]]; then
+      mode="manual"
+    elif [[ "$resumable" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ && "${BASH_REMATCH[1]}" == "$major" && "${BASH_REMATCH[2]}" == "$minor" ]]; then
+      prev_patch="$(max_patch_below "${BASH_REMATCH[3]}")"
+      if [[ "$prev_patch" -ge 0 ]]; then
+        prev="${major}.${minor}.${prev_patch}"
+      else
+        prev="$base"
+      fi
+    fi
+    emit "$resumable" "$prev" "$mode" "$want_publish"
+    exit 0
+  fi
+fi
+
+# Branch 2: Non-dev pre-release versions (e.g. 0.9.0-rc.1) are manual only and
+# never auto-increment a patch number.
+if [[ -n "$suffix" ]]; then
+  base_tag_commit="$(tag_commit_for "v${base}")"
+  base_release_status="$(release_status "$base")"
+  if [[ "$base_release_status" == "exists" ]]; then
+    if [[ "$version_changed" == "true" || "$explicit_publish" == "true" ]]; then
+      die "version ${base} is already released (v${base}). A released version is never replaced; set the next one with scripts/release-prepare."
+    fi
+    emit "$base" "" "prerelease-unchanged" "false"
+    exit 0
+  fi
+  if [[ -n "$base_tag_commit" && "$base_tag_commit" != "$commit" ]]; then
+    if [[ "$version_changed" == "true" || "$explicit_publish" == "true" ]]; then
+      die "the tag v${base} exists on ${base_tag_commit}, not on this commit ${commit}"
+    fi
+    emit "$base" "" "prerelease-unchanged" "false"
+    exit 0
+  fi
+  emit "$base" "" "manual" "$want_publish"
+  exit 0
+fi
+
+# Branch 3: Standard MAJOR.MINOR.PATCH version.
+max_series_patch="$(max_patch_below -1)"
+base_tag_commit="$(tag_commit_for "v${base}")"
+base_release_status="$(release_status "$base")"
+
+base_taken=false
+if [[ "$base_release_status" == "exists" ]]; then
+  base_taken=true
+elif [[ -n "$base_tag_commit" && "$base_tag_commit" != "$commit" ]]; then
+  base_taken=true
+elif [[ "$max_series_patch" -gt "$patch" ]]; then
+  base_taken=true
+fi
+
+if [[ "$base_taken" == "false" ]]; then
+  # Manual minor, major, or explicit release prepared via scripts/release-prepare.
+  emit "$base" "" "manual" "$want_publish"
+  exit 0
+fi
+
+# VERSION is already released or superseded.
+if [[ "$version_changed" == "true" ]]; then
+  if [[ "$want_publish" == "true" ]]; then
+    if [[ "$base_release_status" == "exists" ]]; then
+      die "VERSION was changed to ${base}, which is already released (v${base}). A released version is never replaced; set a newer version with scripts/release-prepare."
+    fi
+    if [[ -n "$base_tag_commit" && "$base_tag_commit" != "$commit" ]]; then
+      die "the tag v${base} exists on ${base_tag_commit}, not on this commit ${commit}"
+    fi
+    die "VERSION was changed to ${base}, which is superseded by existing tag v${major}.${minor}.${max_series_patch}. Set a newer version with scripts/release-prepare."
+  fi
+fi
+
+# Automatic patch release: increment the highest patch in MAJOR.MINOR.*.
+highest_patch="$patch"
+if [[ "$max_series_patch" -gt "$highest_patch" ]]; then
+  highest_patch="$max_series_patch"
+fi
+next_patch=$((highest_patch + 1))
+next="${major}.${minor}.${next_patch}"
+previous="${major}.${minor}.${highest_patch}"
+
+next_release_status="$(release_status "$next")"
+if [[ "$next_release_status" == "exists" ]]; then
+  die "computed patch version ${next} already has a GitHub release (v${next})"
+fi
+next_tag_commit="$(tag_commit_for "v${next}")"
+if [[ -n "$next_tag_commit" && "$next_tag_commit" != "$commit" ]]; then
+  die "computed patch tag v${next} already exists on ${next_tag_commit}, not on this commit ${commit}"
+fi
+
+emit "$next" "$previous" "patch" "$want_publish"

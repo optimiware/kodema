@@ -52,12 +52,12 @@ build:
 
 dist:
 	rm -rf dist
-	scripts/dist
+	scripts/dist --version "$(VERSION)"
 
 # make image builds the image `kodema up` starts by default for this checkout:
 # the released repository, tagged with this checkout's version.
 image:
-	scripts/image build --repository ghcr.io/optimiware/kodema/kodema --tag "$(VERSION)"
+	scripts/image build --repository ghcr.io/optimiware/kodema/kodema --tag "$(VERSION)" --version "$(VERSION)"
 
 # make release-prepare VERSION=0.2.0 sets the version of the checkout in every
 # file that carries it (docs/runbooks/release.md). Nothing is pushed.

@@ -1,20 +1,25 @@
 name: Release
 
-# A change of the VERSION file on master publishes that version: the kodema
-# image and both Helm charts to GHCR, and a GitHub release with the kodema
-# archives, the chart packages and SHA256SUMS. The workflow creates the
-# tag v<VERSION> itself. A development version (-dev) and a manual run build
-# everything and publish nothing, unless the manual run asks to publish from
-# master. A version that is already released is never replaced.
+# Publishes Kodema releases from master: the multi-arch kodema image and both
+# Helm charts to GHCR, and a GitHub release with the kodema archives, the chart
+# packages and SHA256SUMS. The workflow creates the tag v<VERSION> itself.
+#
+# - Manual minor, major, and pre-release releases: prepare VERSION, charts,
+#   docs and CHANGELOG.md with `make release-prepare VERSION=<version>` and
+#   merge the release commit to master.
+# - Automatic patch releases: any merge to master that leaves a released
+#   MAJOR.MINOR.PATCH VERSION unchanged publishes MAJOR.MINOR.(max_patch + 1)
+#   directly on that commit, with no release commit.
+# - Development versions (*-dev*) and manual runs with publish=false publish
+#   nothing. A released version or commit is never replaced.
 # See docs/runbooks/release.md.
 on:
   push:
     branches: [master]
-    paths: [VERSION]
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish the version in VERSION. Only on master; off builds everything and publishes nothing."
+        description: "Publish the resolved version from master; off rehearses the build without publishing."
         type: boolean
         default: false
 
@@ -42,6 +47,7 @@ jobs:
       CHART_REGISTRY: oci://ghcr.io/${{ github.repository }}/charts
       GH_TOKEN: ${{ github.token }}
       PUBLISH_INPUT: ${{ inputs.publish }}
+      PUSH_BEFORE: ${{ github.event.before }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -50,57 +56,63 @@ jobs:
         with:
           go-version-file: .go-version
 
-      # Sets VERSION, PUBLISH and PRERELEASE for the steps below.
+      # Sets VERSION, BASE_VERSION, PREVIOUS_VERSION, RELEASE_MODE, PUBLISH,
+      # PRERELEASE and RUN_BUILD for the steps below.
       - name: Resolve the version
         run: |
-          version="$(cat VERSION)"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::VERSION '${version}' is not MAJOR.MINOR.PATCH"
-            exit 1
-          fi
-          publish=false
-          if [[ "$GITHUB_EVENT_NAME" == "push" || "$PUBLISH_INPUT" == "true" ]]; then
+          args=(--commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY")
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
               echo "::error::a version is published from master, not from ${GITHUB_REF}"
               exit 1
             fi
-            if [[ "$version" == *-dev* ]]; then
-              if [[ "$PUBLISH_INPUT" == "true" ]]; then
-                echo "::error::${version} is a development version and is never published"
-                exit 1
-              fi
-              echo "::notice::${version} is a development version: building everything, publishing nothing"
-            else
-              # The GitHub release is created last, so it marks a complete
-              # publication. Only "not found" lets the run continue: an API
-              # failure must not be read as "not released yet".
-              if found="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${version}" --jq .tag_name 2>&1)"; then
-                echo "::error::version ${version} is already released (${found}). A released version is never replaced; set the next one with scripts/release-prepare."
-                exit 1
-              elif [[ "$found" != *"HTTP 404"* ]]; then
-                echo "::error::cannot tell whether ${version} is released: ${found}"
-                exit 1
-              fi
-              tagged="$(git ls-remote origin "refs/tags/v${version}" "refs/tags/v${version}^{}" | tail -n 1 | cut -f 1)"
-              if [[ -n "$tagged" && "$tagged" != "$GITHUB_SHA" ]]; then
-                echo "::error::the tag v${version} exists on ${tagged}, not on this commit ${GITHUB_SHA}"
-                exit 1
-              fi
-              publish=true
+            args+=(--publish)
+            if [[ -n "$PUSH_BEFORE" ]]; then
+              args+=(--before "$PUSH_BEFORE")
             fi
+          elif [[ "$PUBLISH_INPUT" == "true" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+              echo "::error::a version is published from master, not from ${GITHUB_REF}"
+              exit 1
+            fi
+            args+=(--explicit-publish)
           fi
-          prerelease=false
-          if [[ "$version" == 0.0.* || "$version" == *-* ]]; then
-            prerelease=true
+          resolved="$(scripts/release-version "${args[@]}")"
+          while IFS='=' read -r key value; do
+            case "$key" in
+              VERSION|BASE_VERSION|PREVIOUS_VERSION|RELEASE_MODE|PUBLISH|PRERELEASE)
+                printf '%s=%s\n' "$key" "$value" >>"$GITHUB_ENV"
+                printf -v "$key" '%s' "$value"
+                ;;
+              *)
+                echo "::error::unexpected output from scripts/release-version: ${key}"
+                exit 1
+                ;;
+            esac
+          done <<<"$resolved"
+          run_build=false
+          if [[ "$PUBLISH" == "true" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            run_build=true
           fi
-          {
-            echo "VERSION=${version}"
-            echo "PUBLISH=${publish}"
-            echo "PRERELEASE=${prerelease}"
-          } >>"$GITHUB_ENV"
-          echo "version ${version}, publish ${publish}, prerelease ${prerelease}"
+          echo "RUN_BUILD=${run_build}" >>"$GITHUB_ENV"
+          case "$RELEASE_MODE" in
+            dev)
+              echo "::notice::${VERSION} is a development version: skipping publication"
+              ;;
+            prerelease-unchanged)
+              echo "::notice::VERSION is unchanged pre-release ${VERSION}: skipping automatic patch release"
+              ;;
+            patch)
+              echo "::notice::Automatic patch release ${VERSION} (over ${BASE_VERSION}, previous ${PREVIOUS_VERSION}); publish=${PUBLISH}"
+              ;;
+            manual)
+              echo "::notice::Manual release ${VERSION}; publish=${PUBLISH}, prerelease=${PRERELEASE}"
+              ;;
+          esac
+          echo "version ${VERSION}, mode ${RELEASE_MODE}, publish ${PUBLISH}, prerelease ${PRERELEASE}, run_build ${run_build}"
 
       - name: Enable multi-arch container runtime support
+        if: env.RUN_BUILD == 'true'
         run: |
           sudo apt-get update
           # qemu-user-binfmt registers the emulators the arm64 image stage runs
@@ -108,21 +120,26 @@ jobs:
           sudo apt-get install -y --no-install-recommends qemu-user-binfmt socat
 
       - name: Build the release artifacts
-        run: make dist
+        if: env.RUN_BUILD == 'true'
+        run: |
+          rm -rf dist
+          scripts/dist --version "$VERSION"
 
       - name: Build the image
+        if: env.RUN_BUILD == 'true'
         run: |
-          ref="$(scripts/image build --repository "$IMAGE_REPOSITORY" --tag "$VERSION")"
+          ref="$(scripts/image build --repository "$IMAGE_REPOSITORY" --tag "$VERSION" --version "$VERSION")"
           line="$(podman run --rm "$ref" version)"
           echo "$line"
           [[ "$line" == "kodema ${VERSION} (revision ${GITHUB_SHA},"* ]] || { echo "::error::the image reports another version or revision"; exit 1; }
           if [[ "$PUBLISH" != "true" ]]; then
-            scripts/image build --repository "$IMAGE_REPOSITORY" --tag "${VERSION}-multiarch" --platforms linux/amd64,linux/arm64
+            scripts/image build --repository "$IMAGE_REPOSITORY" --tag "${VERSION}-multiarch" --version "$VERSION" --platforms linux/amd64,linux/arm64
           fi
 
       # The gate before anything is pushed: the image must install with the
       # Podman bundle and run a pipeline.
       - name: Install the image and run a pipeline
+        if: env.RUN_BUILD == 'true'
         run: |
           socket="${RUNNER_TEMP}/podman.sock"
           podman system service --time=0 "unix://${socket}" &
@@ -147,7 +164,7 @@ jobs:
           if [[ "$PRERELEASE" == "false" ]]; then
             extra_args+=(--also-tag latest)
           fi
-          reference="$(scripts/image build-push --repository "$IMAGE_REPOSITORY" --tag "$VERSION" "${extra_args[@]}")"
+          reference="$(scripts/image build-push --repository "$IMAGE_REPOSITORY" --tag "$VERSION" --version "$VERSION" "${extra_args[@]}")"
           echo "IMAGE_REFERENCE=${reference}" >>"$GITHUB_ENV"
           echo "pushed ${reference}"
 
@@ -165,6 +182,27 @@ jobs:
             image_tags="tags \`${VERSION}\`, \`latest\`"
           fi
           {
+            if [[ "$RELEASE_MODE" == "patch" ]]; then
+              echo "## Changes"
+              echo
+              prev_tag=""
+              if [[ -n "$PREVIOUS_VERSION" ]]; then
+                if ! git rev-parse --verify -q "refs/tags/v${PREVIOUS_VERSION}^{commit}" >/dev/null; then
+                  git fetch --no-tags origin "refs/tags/v${PREVIOUS_VERSION}:refs/tags/v${PREVIOUS_VERSION}" >/dev/null 2>&1 || true
+                fi
+                if git rev-parse --verify -q "refs/tags/v${PREVIOUS_VERSION}^{commit}" >/dev/null; then
+                  prev_tag="v${PREVIOUS_VERSION}"
+                fi
+              fi
+              changes=""
+              if [[ -n "$prev_tag" ]]; then
+                changes="$(git log --first-parent --format='- %s (%h)' "${prev_tag}..${GITHUB_SHA}")"
+              fi
+              if [[ -z "$changes" ]]; then
+                changes="$(git log -1 --format='- %s (%h)' "$GITHUB_SHA")"
+              fi
+              printf '%s\n\n' "$changes"
+            fi
             echo "## Artifacts"
             echo
             echo "| Artifact | Reference |"
@@ -174,7 +212,15 @@ jobs:
             echo "| Chart \`kodema-stack\` | \`${CHART_REGISTRY}/kodema-stack\` version \`${VERSION}\` |"
             echo "| \`kodema\` | the archives below; verify with \`sha256sum --check SHA256SUMS\` |"
             echo
-            echo "Source revision: \`${GITHUB_SHA}\`. Changes and known limitations: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/CHANGELOG.md)."
+            if [[ "$RELEASE_MODE" == "patch" ]]; then
+              compare=""
+              if [[ -n "$PREVIOUS_VERSION" ]]; then
+                compare=" Full diff: [v${PREVIOUS_VERSION}...v${VERSION}](https://github.com/${GITHUB_REPOSITORY}/compare/v${PREVIOUS_VERSION}...v${VERSION})."
+              fi
+              echo "Source revision: \`${GITHUB_SHA}\` (automatic patch release over \`${BASE_VERSION}\`).${compare} Minor and major release history: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/CHANGELOG.md)."
+            else
+              echo "Source revision: \`${GITHUB_SHA}\`. Changes and known limitations: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/CHANGELOG.md)."
+            fi
           } >"${RUNNER_TEMP}/notes.md"
           flags=()
           if [[ "$PRERELEASE" == "true" ]]; then
