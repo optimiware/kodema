@@ -42,10 +42,10 @@ var requiredAgenticSDLCPipelines = []string{
 	"pattern-a-verify-review.yaml",
 	"pattern-a-merge.yaml",
 	"pattern-b-worktree-sdlc.yaml",
-	"pattern-c-brain-polyglot.yaml",
+	"pattern-c-sandbox-polyglot.yaml",
 }
 
-const agenticSDLCBrainValuesFile = "opencode-brain-values.yaml"
+const agenticSDLCSandboxValuesFile = "opencode-sandbox-values.yaml"
 
 // TestAgenticSDLCExamplePipelinesValidate proves every shipped Agentic SDLC
 // pipeline under examples/agentic-sdlc/ decodes cleanly through Kodema's real
@@ -54,16 +54,16 @@ const agenticSDLCBrainValuesFile = "opencode-brain-values.yaml"
 func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 	allYAML := sortedExampleYAML(t, "agentic-sdlc")
 	var pipelines []string
-	foundBrainValues := false
+	foundSandboxValues := false
 	for _, name := range allYAML {
-		if name == agenticSDLCBrainValuesFile {
-			foundBrainValues = true
+		if name == agenticSDLCSandboxValuesFile {
+			foundSandboxValues = true
 			continue
 		}
 		pipelines = append(pipelines, name)
 	}
-	if !foundBrainValues {
-		t.Fatalf("examples/agentic-sdlc is missing %s", agenticSDLCBrainValuesFile)
+	if !foundSandboxValues {
+		t.Fatalf("examples/agentic-sdlc is missing %s", agenticSDLCSandboxValuesFile)
 	}
 	requireSameExampleInventory(t, "examples/agentic-sdlc pipelines", pipelines, requiredAgenticSDLCPipelines)
 
@@ -141,36 +141,36 @@ func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 		}
 	})
 
-	t.Run("pattern-c brain polyglot opencode contracts", func(t *testing.T) {
-		decoded := decodeExample(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml")
-		assertKinds(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded, "request", "request", "request", "request", "request")
+	t.Run("pattern-c sandbox polyglot opencode contracts", func(t *testing.T) {
+		decoded := decodeExample(t, "agentic-sdlc/pattern-c-sandbox-polyglot.yaml")
+		assertKinds(t, "agentic-sdlc/pattern-c-sandbox-polyglot.yaml", decoded, "request", "request", "request", "request", "request")
 
-		planSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded.Actions[0])
+		planSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-sandbox-polyglot.yaml", decoded.Actions[0])
 		if planSubj.Mode != opencode.OpenCodeModePlan || planSubj.SandboxImage != "" {
-			t.Fatalf("brain plan turn must be sandbox-free (mode=plan, sandbox_image empty); got %+v", planSubj)
+			t.Fatalf("sandbox-mode plan turn must be sandbox-free (mode=plan, sandbox_image empty); got %+v", planSubj)
 		}
 
-		goSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded.Actions[1])
+		goSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-sandbox-polyglot.yaml", decoded.Actions[1])
 		if goSubj.SandboxImage != "docker.io/library/golang:1.24" || len(goSubj.SandboxCaches) != 2 {
 			t.Fatalf("backend sandbox subject = %+v; want golang:1.24 with 2 caches", goSubj)
 		}
 
-		nodeSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded.Actions[2])
+		nodeSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-sandbox-polyglot.yaml", decoded.Actions[2])
 		if nodeSubj.SandboxImage != "docker.io/library/node:22" || len(nodeSubj.SandboxCaches) != 1 || nodeSubj.SandboxCaches[0] != "npm" {
 			t.Fatalf("frontend sandbox subject = %+v; want node:22 with [npm] cache", nodeSubj)
 		}
 
-		aiRevSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded.Actions[3])
+		aiRevSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-sandbox-polyglot.yaml", decoded.Actions[3])
 		if aiRevSubj.Mode != opencode.OpenCodeModeAIReview || aiRevSubj.SandboxImage != "" {
-			t.Fatalf("brain ai-review turn must be sandbox-free; got %+v", aiRevSubj)
+			t.Fatalf("sandbox-mode ai-review turn must be sandbox-free; got %+v", aiRevSubj)
 		}
 	})
 
-	t.Run("helm opencodeBrain values snippet", func(t *testing.T) {
-		raw := readExample(t, "agentic-sdlc/"+agenticSDLCBrainValuesFile)
+	t.Run("helm opencodeSandbox values snippet", func(t *testing.T) {
+		raw := readExample(t, "agentic-sdlc/"+agenticSDLCSandboxValuesFile)
 		var parsed struct {
-			Tenants       []string `yaml:"tenants"`
-			OpenCodeBrain struct {
+			Tenants         []string `yaml:"tenants"`
+			OpenCodeSandbox struct {
 				Enabled     bool `yaml:"enabled"`
 				SandboxPort int  `yaml:"sandboxPort"`
 				Projects    []struct {
@@ -180,27 +180,27 @@ func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 					Namespace   string `yaml:"namespace"`
 					SandboxPort int    `yaml:"sandboxPort"`
 				} `yaml:"projects"`
-			} `yaml:"opencodeBrain"`
+			} `yaml:"opencodeSandbox"`
 		}
 		if err := yaml.Unmarshal(raw, &parsed); err != nil {
-			t.Fatalf("unmarshal %s: %v", agenticSDLCBrainValuesFile, err)
+			t.Fatalf("unmarshal %s: %v", agenticSDLCSandboxValuesFile, err)
 		}
-		if !parsed.OpenCodeBrain.Enabled || len(parsed.OpenCodeBrain.Projects) == 0 {
-			t.Fatalf("%s must enable opencodeBrain with at least one project entry", agenticSDLCBrainValuesFile)
+		if !parsed.OpenCodeSandbox.Enabled || len(parsed.OpenCodeSandbox.Projects) == 0 {
+			t.Fatalf("%s must enable opencodeSandbox with at least one project entry", agenticSDLCSandboxValuesFile)
 		}
-		if parsed.OpenCodeBrain.SandboxPort < 1024 || parsed.OpenCodeBrain.SandboxPort > 65535 {
-			t.Fatalf("%s sandboxPort = %d; want 1024..65535", agenticSDLCBrainValuesFile, parsed.OpenCodeBrain.SandboxPort)
+		if parsed.OpenCodeSandbox.SandboxPort < 1024 || parsed.OpenCodeSandbox.SandboxPort > 65535 {
+			t.Fatalf("%s sandboxPort = %d; want 1024..65535", agenticSDLCSandboxValuesFile, parsed.OpenCodeSandbox.SandboxPort)
 		}
 		tenantSet := make(map[string]bool, len(parsed.Tenants))
 		for _, tenant := range parsed.Tenants {
 			tenantSet[tenant] = true
 		}
-		for _, entry := range parsed.OpenCodeBrain.Projects {
+		for _, entry := range parsed.OpenCodeSandbox.Projects {
 			if !tenantSet[entry.Tenant] {
-				t.Fatalf("%s project %q references tenant %q not in tenants %v", agenticSDLCBrainValuesFile, entry.Name, entry.Tenant, parsed.Tenants)
+				t.Fatalf("%s project %q references tenant %q not in tenants %v", agenticSDLCSandboxValuesFile, entry.Name, entry.Tenant, parsed.Tenants)
 			}
 			if entry.Project == "" || entry.Name == "" {
-				t.Fatalf("%s project entry missing name or project: %+v", agenticSDLCBrainValuesFile, entry)
+				t.Fatalf("%s project entry missing name or project: %+v", agenticSDLCSandboxValuesFile, entry)
 			}
 		}
 
@@ -991,7 +991,7 @@ func TestAgenticSDLCHermeticLifecycleEndToEnd(t *testing.T) {
 	}
 }
 
-// TestAgenticSDLCSandboxServeAndPipelineAdmission verifies Option 2 Brain/Hands
+// TestAgenticSDLCSandboxServeAndPipelineAdmission verifies Option 2 sandbox mode
 // end-to-end:
 //  1. Starts a real `kodema sandbox serve` HTTP MCP server jailed to a temp
 //     workspace and exercises write_file, edit_file, read_file, glob, grep,

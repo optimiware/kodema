@@ -336,14 +336,14 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	opencodeURL := flags.String("opencode-url", envOr("KODEMA_OPENCODE_URL", ""), "opencode serve HTTP URL")
 	opencodePassword := flags.String("opencode-password", "", "optional OpenCode server password for HTTP Basic Auth (or KODEMA_OPENCODE_PASSWORD / OPENCODE_PASSWORD; prefer --opencode-password-file)")
 	opencodePasswordFile := flags.String("opencode-password-file", envOr("KODEMA_OPENCODE_PASSWORD_FILE", ""), "file containing the OpenCode server password for HTTP Basic Auth (recommended over --opencode-password)")
-	opencodeMode := flags.String("mode", envOr("KODEMA_OPENCODE_MODE", string(opencode.OpenCodeExecutionModeWorktree)), "OpenCode execution mode (worktree|brain)")
+	opencodeMode := flags.String("mode", envOr("KODEMA_OPENCODE_MODE", string(opencode.OpenCodeExecutionModeWorktree)), "OpenCode execution mode (worktree|sandbox)")
 	llmProxyListen := flags.String("llm-proxy-listen", envOr("KODEMA_OPENCODE_LLM_PROXY_LISTEN", ""), "optional loopback listen address for the attributed LLM reverse proxy")
 	llmProxyAPIKey := flags.String("llm-proxy-api-key", "", "optional shared secret for inbound loopback LLM proxy requests (or KODEMA_OPENCODE_LLM_PROXY_API_KEY; auto-generated if empty)")
 	defaultPerTurnProxyRouting, perTurnProxyEnvErr := envBoolStrict("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", false)
 	perTurnProxyRouting := flags.Bool("per-turn-proxy-routing", defaultPerTurnProxyRouting, "route LLM proxy calls via explicit /turn/{exec}/{action}/llm/* paths for concurrent turns")
-	sandboxDefaultImage := flags.String("sandbox-default-image", envOr("KODEMA_OPENCODE_SANDBOX_DEFAULT_IMAGE", ""), "default stock toolchain image for Option 2 brain mode sandboxes")
+	sandboxDefaultImage := flags.String("sandbox-default-image", envOr("KODEMA_OPENCODE_SANDBOX_DEFAULT_IMAGE", ""), "default stock toolchain image for Option 2 sandbox mode")
 	sandboxCachesRaw := flags.String("sandbox-caches", envOr("KODEMA_OPENCODE_SANDBOX_CACHES", ""), "comma-separated default Kodema cache names mounted into ephemeral sandboxes")
-	sandboxPort := flags.Int("sandbox-port", opencode.DefaultOpenCodeSandboxPort, "container TCP port served by kodema sandbox serve in brain mode")
+	sandboxPort := flags.Int("sandbox-port", opencode.DefaultOpenCodeSandboxPort, "container TCP port served by kodema sandbox serve in sandbox mode")
 	sandboxMemory := flags.String("sandbox-memory", envOr("KODEMA_OPENCODE_SANDBOX_MEMORY", ""), "optional default memory limit for ephemeral sandboxes (e.g. 2Gi)")
 	sandboxCPU := flags.String("sandbox-cpu", envOr("KODEMA_OPENCODE_SANDBOX_CPU", ""), "optional default CPU limit for ephemeral sandboxes (e.g. 2)")
 	model := flags.String("model", envOr("KODEMA_OPENCODE_MODEL", ""), "optional default OpenCode model")
@@ -453,7 +453,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			execMode = opencode.OpenCodeExecutionModeWorktree
 		}
 		if !execMode.Valid() {
-			usage(stderr, fmt.Sprintf("opencode service --mode %q is unsupported (want worktree or brain)", execMode))
+			usage(stderr, fmt.Sprintf("opencode service --mode %q is unsupported (want worktree or sandbox)", execMode))
 			return 2
 		}
 		if execMode == opencode.OpenCodeExecutionModeWorktree {
@@ -463,7 +463,7 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			}
 		} else {
 			if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*opencodeURL) == "" {
-				usage(stderr, "opencode brain service requires --state-dir and --opencode-url")
+				usage(stderr, "opencode sandbox service requires --state-dir and --opencode-url")
 				return 2
 			}
 		}
@@ -479,27 +479,27 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 			}
 		}
 		defaultCaches := splitComma(*sandboxCachesRaw)
-		brainCfg := opencode.OpenCodeBrainConfig{
+		sandboxCfg := opencode.OpenCodeSandboxConfig{
 			DefaultSandboxImage:  strings.TrimSpace(*sandboxDefaultImage),
 			DefaultSandboxCaches: defaultCaches,
 			SandboxPort:          *sandboxPort,
 			DefaultSandboxMemory: strings.TrimSpace(*sandboxMemory),
 			DefaultSandboxCPU:    strings.TrimSpace(*sandboxCPU),
 		}
-		if execMode == opencode.OpenCodeExecutionModeBrain {
-			normalized, err := opencode.NormalizeBrainConfig(brainCfg)
+		if execMode == opencode.OpenCodeExecutionModeSandbox {
+			normalized, err := opencode.NormalizeSandboxConfig(sandboxCfg)
 			if err != nil {
 				usage(stderr, err.Error())
 				return 2
 			}
-			brainCfg = normalized
+			sandboxCfg = normalized
 		}
 		config := opencodeapp.OpenCodeConfig{
 			ServiceID:            id.PrincipalID(*service),
 			TenantID:             id.TenantID(*tenant),
 			ProjectID:            id.ProjectID(*project),
 			ExecutionMode:        execMode,
-			Brain:                brainCfg,
+			Sandbox:              sandboxCfg,
 			StateDirectory:       *stateDir,
 			BaseURL:              *baseURL,
 			CAFile:               strings.TrimSpace(*caFile),

@@ -27,7 +27,7 @@ You do not need Kubernetes or local app builds to deliver software with Kodema:
    - Do **not** write application code directly on the user's laptop or run local builds/tests to deliver features.
    - Instead, collaborate with the user to clarify requirements, store specs or plans in the project KV store (`kv_put` -> `kv:sha256:...`), create/manage tasks (`task_create`, `task_create_and_start`, `task_start`), apply pipelines (`pipeline_apply`), inspect executions and logs (`execution_inspect`, `execution_logs_read`), answer questions (`task_reply`), resolve review gates (`execution_request_resolve` with `pass | revise | fail`), and close tasks (`task_complete`).
    - All coding, testing, verification, review, and protected Git merges run inside isolated Kodema containers or project-scoped agentic services.
-5. **Graduate smoothly to 24/7 automation:** The exact same tasks, KV artifacts, and pipelines move seamlessly from interactive user-harness orchestration to an automated `kodsvc.` service account dispatcher, per-project OpenCode service (`kodema services --kind opencode --mode worktree` or `--mode brain` with `kodema sandbox serve`), and `service/merge-coordinator` (`kodema services --kind merge_coordinator`).
+5. **Graduate smoothly to 24/7 automation:** The exact same tasks, KV artifacts, and pipelines move seamlessly from interactive user-harness orchestration to an automated `kodsvc.` service account dispatcher, per-project OpenCode service (`kodema services --kind opencode --mode worktree` or `--mode sandbox` with `kodema sandbox serve`), and `service/merge-coordinator` (`kodema services --kind merge_coordinator`).
 
 ## Core model
 
@@ -80,4 +80,4 @@ Every project member and enabled project service account can read non-secret ope
 - `kodema://docs/git-rules` (`kodema docs git-rules`) — Git service, `admin/conf/git.conf`, Decision IDs, and disjoint rebase approval
 - `kodema://docs/workflows` (`kodema docs workflows`) — 3-way reviews (`pass|revise|fail`), multi-stage tasks, KV handoffs, and recovery
 - `kodema://docs/context` (`kodema docs context`) — shared company/project Git context repos and skills
-- `kodema://docs/agentic-services` (`kodema docs agentic-services`) — Option 1 OpenCode worktree service, Option 2 Brain/Hands split, attributed `kodsvc.` LLM proxy, and Helm NetworkPolicies
+- `kodema://docs/agentic-services` (`kodema docs agentic-services`) — Option 1 OpenCode worktree mode, Option 2 sandbox mode, attributed `kodsvc.` LLM proxy, and Helm NetworkPolicies

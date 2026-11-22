@@ -83,7 +83,7 @@ Start by orchestrating tasks and pipelines interactively from your user harness 
 - Your harness collaborates with you to write specs (`kv_put`), create tasks (`task_create`), run isolated implementation/verification pipelines (`task_create_and_start` / `task_start`), inspect logs (`execution_logs_read`), iterate on `revise` feedback, and close tasks (`task_complete`)—without touching your laptop's local build toolchain.
 - When ready for 24/7 hands-off delivery, attach the exact same pipelines to:
   - A `kodsvc.` service account dispatcher watching the project event stream,
-  - A per-project OpenCode service (`kodema services --kind opencode --mode worktree` or `--mode brain` with `kodema sandbox serve`; see `kodema://docs/agentic-services`), and
+  - A per-project OpenCode service (`kodema services --kind opencode --mode worktree` or `--mode sandbox` with `kodema sandbox serve`; see `kodema://docs/agentic-services`), and
   - A serialized merge coordinator (`kodema services --kind merge_coordinator`) that serializes pushes to `target_ref` and forwards `-o kodema.decision_id=<id>` (refusing with base-moved if `target_ref` advanced past `base`); for clean rebases onto a moved target ref, `kodema git serve` supports `option approve-rebase.<ref> = disjoint` with `-o kodema.approved_base=<sha> -o kodema.approved_candidate=<sha>` (optionally paired with `-o kodema.decision_id=<id>`) for pushing executions or custom rebase-aware merge services.
 
 ## 5. Delivery, artifacts, and promotion

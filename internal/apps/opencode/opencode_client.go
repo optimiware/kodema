@@ -436,7 +436,7 @@ func (c *HTTPOpenCodeClient) SendMessage(ctx context.Context, sessionID string, 
 	}
 
 	// Note: OpenCode v2 /api/session/{id}/prompt enforces additionalProperties: false
-	// and does not accept inline MCP server maps; Brain mode attaches/detaches
+	// and does not accept inline MCP server maps; sandbox mode attaches/detaches
 	// MCP servers dynamically via AttachMCPServer/DetachMCPServer.
 
 	// 2. Enqueue the prompt turn.
@@ -798,11 +798,11 @@ func (c *HTTPOpenCodeClient) AttachMCPServer(ctx context.Context, sessionID stri
 	c.mcpMu.Lock()
 	if owner, exists := c.mcpOwners[attKey]; exists && owner != sessionID {
 		c.mcpMu.Unlock()
-		return fmt.Errorf("opencode v2 MCP server %q is already attached to session %q in location %q; concurrent Brain-mode sandbox turns on a shared OpenCode v2 server require --max-concurrency 1", name, owner, dir)
+		return fmt.Errorf("opencode v2 MCP server %q is already attached to session %q in location %q; concurrent sandbox-mode turns on a shared OpenCode v2 server require --max-concurrency 1", name, owner, dir)
 	}
 	if owner, exists := c.mcpPending[attKey]; exists && owner != sessionID {
 		c.mcpMu.Unlock()
-		return fmt.Errorf("opencode v2 MCP server %q is already attached to session %q in location %q; concurrent Brain-mode sandbox turns on a shared OpenCode v2 server require --max-concurrency 1", name, owner, dir)
+		return fmt.Errorf("opencode v2 MCP server %q is already attached to session %q in location %q; concurrent sandbox-mode turns on a shared OpenCode v2 server require --max-concurrency 1", name, owner, dir)
 	}
 	c.mcpPending[attKey] = sessionID
 	c.mcpMu.Unlock()

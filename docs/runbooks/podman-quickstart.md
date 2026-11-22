@@ -584,7 +584,7 @@ editing application code directly on your laptop:
    completed work (`task_complete`).
 4. **Graduate to 24/7 automation:** Move the same pipelines unchanged onto
    always-on `kodsvc.` services (`kodema services --kind opencode --mode worktree`,
-   `kodema services --kind opencode --mode brain` with `kodema sandbox serve`,
+   `kodema services --kind opencode --mode sandbox` with `kodema sandbox serve`,
    and `kodema services --kind merge_coordinator`). See
    [llm-proxy-harnesses.md](llm-proxy-harnesses.md) and
    [examples/agentic-sdlc/README.md](../../examples/agentic-sdlc/README.md).

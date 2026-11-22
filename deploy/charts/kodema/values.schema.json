@@ -1331,8 +1331,8 @@
         }
       ]
     },
-    "opencodeBrain": {
-      "description": "Optional per-project OpenCode Brain NetworkPolicies (Option 2: Brain/Hands split). Off by default; enabling requires at least one complete project entry.",
+    "opencodeSandbox": {
+      "description": "Optional per-project OpenCode service <-> ephemeral sandbox NetworkPolicies (Option 2: sandbox mode). Off by default; enabling requires at least one complete project entry.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -1371,14 +1371,14 @@
                 "pattern": "^[a-z0-9]([a-z0-9-]{0,47}[a-z0-9])?$"
               },
               "project": {
-                "description": "Project id matched by kodema.dev/project labels on Brain and sandbox pods.",
+                "description": "Project id matched by kodema.dev/project labels on OpenCode service and sandbox pods.",
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 63,
                 "pattern": "^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$"
               },
               "namespace": {
-                "description": "Optional namespace hosting the Brain pod. Empty defaults to the Helm release namespace.",
+                "description": "Optional namespace hosting the OpenCode service pod. Empty defaults to the Helm release namespace.",
                 "type": "string",
                 "maxLength": 63,
                 "pattern": "^$|^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
@@ -1395,7 +1395,7 @@
       },
       "allOf": [
         {
-          "description": "Enabling opencodeBrain without at least one complete project entry is refused before any object renders.",
+          "description": "Enabling opencodeSandbox without at least one complete project entry is refused before any object renders.",
           "if": {
             "properties": {
               "enabled": {

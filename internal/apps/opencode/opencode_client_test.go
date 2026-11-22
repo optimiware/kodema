@@ -738,7 +738,7 @@ func TestHTTPOpenCodeClientAttachAndDetachMCPV2(t *testing.T) {
 		URL:       "http://10.0.0.5:8090/mcp",
 		Headers:   map[string]string{"Authorization": "Bearer tok-123"},
 		Enabled:   true,
-		Directory: "/srv/brain",
+		Directory: "/srv/opencode",
 	})
 	if err != nil {
 		t.Fatalf("AttachMCPServer: %v", err)
@@ -757,11 +757,11 @@ func TestHTTPOpenCodeClientAttachAndDetachMCPV2(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if putQuery != "/srv/brain" {
-		t.Fatalf("PUT location[directory] = %q; want /srv/brain", putQuery)
+	if putQuery != "/srv/opencode" {
+		t.Fatalf("PUT location[directory] = %q; want /srv/opencode", putQuery)
 	}
-	if firstDeleteQuery != "/srv/brain" {
-		t.Fatalf("DELETE location[directory] = %q; want /srv/brain", firstDeleteQuery)
+	if firstDeleteQuery != "/srv/opencode" {
+		t.Fatalf("DELETE location[directory] = %q; want /srv/opencode", firstDeleteQuery)
 	}
 	cfgObj, _ := putBody["config"].(map[string]any)
 	if cfgObj["type"] != "remote" || cfgObj["url"] != "http://10.0.0.5:8090/mcp" || cfgObj["disabled"] != false || cfgObj["oauth"] != false {
@@ -810,12 +810,12 @@ func TestHTTPOpenCodeClientMCPConcurrencyConflictAndDetachRetry(t *testing.T) {
 		t.Fatalf("NewHTTPOpenCodeClient: %v", err)
 	}
 
-	// Session A attaches "sandbox" in /srv/brain.
+	// Session A attaches "sandbox" in /srv/opencode.
 	err = cli.AttachMCPServer(context.Background(), "ses_A", OpenCodeMCPServerConfig{
 		Name:      "sandbox",
 		URL:       "http://10.0.0.1:8090/mcp",
 		Enabled:   true,
-		Directory: "/srv/brain",
+		Directory: "/srv/opencode",
 	})
 	if err != nil {
 		t.Fatalf("session A AttachMCPServer: %v", err)
@@ -827,7 +827,7 @@ func TestHTTPOpenCodeClientMCPConcurrencyConflictAndDetachRetry(t *testing.T) {
 		Name:      "sandbox",
 		URL:       "http://10.0.0.2:8090/mcp",
 		Enabled:   true,
-		Directory: "/srv/brain/",
+		Directory: "/srv/opencode/",
 	})
 	if err == nil || !strings.Contains(err.Error(), "--max-concurrency 1") {
 		t.Fatalf("session B AttachMCPServer err = %v; want conflict error mentioning --max-concurrency 1", err)
@@ -858,19 +858,19 @@ func TestHTTPOpenCodeClientMCPConcurrencyConflictAndDetachRetry(t *testing.T) {
 		Name:      "sandbox",
 		URL:       "http://10.0.0.2:8090/mcp",
 		Enabled:   true,
-		Directory: "/srv/brain",
+		Directory: "/srv/opencode",
 	}); err == nil {
 		t.Fatal("session B unexpectedly attached while session A detach had failed")
 	}
 
-	// Session A retries detach: must still send location[directory]=/srv/brain and succeed.
+	// Session A retries detach: must still send location[directory]=/srv/opencode and succeed.
 	if err := cli.DetachMCPServer(context.Background(), "ses_A", "sandbox"); err != nil {
 		t.Fatalf("retry DetachMCPServer: %v", err)
 	}
 
 	mu.Lock()
-	if !reflect.DeepEqual(deleteQueries, []string{"/srv/brain", "/srv/brain"}) {
-		t.Fatalf("DELETE location[directory] queries = %v; want [/srv/brain /srv/brain]", deleteQueries)
+	if !reflect.DeepEqual(deleteQueries, []string{"/srv/opencode", "/srv/opencode"}) {
+		t.Fatalf("DELETE location[directory] queries = %v; want [/srv/opencode /srv/opencode]", deleteQueries)
 	}
 	mu.Unlock()
 
@@ -879,7 +879,7 @@ func TestHTTPOpenCodeClientMCPConcurrencyConflictAndDetachRetry(t *testing.T) {
 		Name:      "sandbox",
 		URL:       "http://10.0.0.2:8090/mcp",
 		Enabled:   true,
-		Directory: "/srv/brain",
+		Directory: "/srv/opencode",
 	}); err != nil {
 		t.Fatalf("session B AttachMCPServer after session A detach: %v", err)
 	}

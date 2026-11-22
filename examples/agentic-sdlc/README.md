@@ -111,12 +111,12 @@ kodema services --kind opencode \
   `X-Kodema-Execution` and `X-Kodema-Action` headers, enforcing pipeline/task
   budgets and aborting sessions immediately on execution cancellation.
 
-## Pattern C: Option 2 Brain/Hands split (`--mode brain` + `kodema sandbox serve`)
+## Pattern C: Option 2 Sandbox mode (`--mode sandbox` + `kodema sandbox serve`)
 
-[`pattern-c-brain-polyglot.yaml`](pattern-c-brain-polyglot.yaml) separates LLM
-reasoning (**Brain**) from ephemeral toolchain execution (**Hands**):
+[`pattern-c-sandbox-polyglot.yaml`](pattern-c-sandbox-polyglot.yaml) separates LLM
+reasoning and session state (the OpenCode service) from ephemeral toolchain execution (sandboxes):
 
-- `plan` and `ai-review` omit `sandbox_image` and run directly in Brain with no
+- `plan` and `ai-review` omit `sandbox_image` and run directly in the OpenCode service with no
   sandbox container.
 - `implement-backend` launches an ephemeral Go sandbox using stock
   `docker.io/library/golang:1.24` with `sandbox_caches: go-mod,go-build`.
@@ -128,7 +128,7 @@ reasoning (**Brain**) from ephemeral toolchain execution (**Hands**):
 
 ```sh
 kodema services --kind opencode \
-  --mode brain \
+  --mode sandbox \
   --service opencode-shop \
   --tenant tenant-local \
   --project project-local \
@@ -147,14 +147,14 @@ kodema services --kind opencode \
   --sandbox-cpu 2
 ```
 
-- **Role requirement:** Unlike Option 1 worktree mode, Option 2 Brain mode's
+- **Role requirement:** Unlike Option 1 worktree mode, Option 2 sandbox mode's
   service account **requires the `engineer` role** so
   `KodemaExecutionSandboxManager` can start inline sandbox executions
   (`pipeline.start`), cancel them on teardown (`execution.cancel`), and manage
   ephemeral per-sandbox Bearer credentials (`secret.write` / `secret.delete`).
-- **Kubernetes isolation:** Apply [`opencode-brain-values.yaml`](opencode-brain-values.yaml)
+- **Kubernetes isolation:** Apply [`opencode-sandbox-values.yaml`](opencode-sandbox-values.yaml)
   with the Kodema Helm chart (`deploy/charts/kodema`) to render strict
-  tenant/project-scoped Brain and sandbox NetworkPolicies.
+  tenant/project-scoped OpenCode service and sandbox NetworkPolicies.
 
 ## Further reading
 

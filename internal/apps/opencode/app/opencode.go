@@ -25,7 +25,7 @@ type OpenCodeConfig struct {
 	TenantID             id.TenantID
 	ProjectID            id.ProjectID
 	ExecutionMode        opencode.OpenCodeExecutionMode
-	Brain                opencode.OpenCodeBrainConfig
+	Sandbox              opencode.OpenCodeSandboxConfig
 	StateDirectory       string
 	BaseURL              string
 	CAFile               string
@@ -56,7 +56,7 @@ type OpenCodeConfig struct {
 	OpenCode opencode.OpenCodeClient
 	// Worktrees overrides the default local Git worktree manager (worktree mode).
 	Worktrees opencode.OpenCodeWorktreeManager
-	// Sandboxes overrides the default KodemaExecutionSandboxManager (brain mode).
+	// Sandboxes overrides the default KodemaExecutionSandboxManager (sandbox mode).
 	Sandboxes opencode.OpenCodeSandboxManager
 	// Store overrides the default FileOpenCodeStateStore.
 	Store opencode.OpenCodeStateStore
@@ -71,7 +71,7 @@ type OpenCodeConfig struct {
 	Clock servicekit.Clock
 }
 
-// RunOpenCode composes and runs one strictly project-scoped OpenCode brain
+// RunOpenCode composes and runs one strictly project-scoped OpenCode
 // service until ctx is cancelled.
 func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 	if ctx == nil {
@@ -82,7 +82,7 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 		execMode = opencode.OpenCodeExecutionModeWorktree
 	}
 	if !execMode.Valid() {
-		return fmt.Errorf("opencode service execution mode %q is unsupported (want worktree or brain)", execMode)
+		return fmt.Errorf("opencode service execution mode %q is unsupported (want worktree or sandbox)", execMode)
 	}
 	if strings.TrimSpace(config.StateDirectory) == "" && config.Store == nil {
 		return fmt.Errorf("opencode service state directory is required")
@@ -144,7 +144,7 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 	var sandboxes opencode.OpenCodeSandboxManager
 	var sandboxRT http.RoundTripper
 
-	if execMode == opencode.OpenCodeExecutionModeBrain {
+	if execMode == opencode.OpenCodeExecutionModeSandbox {
 		sandboxes = config.Sandboxes
 		sandboxRT = config.RoundTripper
 		if sandboxes == nil {
@@ -194,9 +194,9 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 	}
 
 	effectiveMaxConc := config.MaxConcurrentTurns
-	if execMode == opencode.OpenCodeExecutionModeBrain && config.OpenCode == nil {
+	if execMode == opencode.OpenCodeExecutionModeSandbox && config.OpenCode == nil {
 		if effectiveMaxConc > 1 {
-			return fmt.Errorf("opencode brain mode with OpenCode v2 HTTP client requires --max-concurrency 1 because OpenCode v2 runtime MCP attachment (/api/experimental/mcp/{server}) is location-scoped (run separate OpenCode v2 server instances for parallel Brain-mode sandboxes)")
+			return fmt.Errorf("opencode sandbox mode with OpenCode v2 HTTP client requires --max-concurrency 1 because OpenCode v2 runtime MCP attachment (/api/experimental/mcp/{server}) is location-scoped (run separate OpenCode v2 server instances for parallel sandbox-mode turns)")
 		}
 		if effectiveMaxConc <= 0 {
 			effectiveMaxConc = 1
@@ -269,7 +269,7 @@ func RunOpenCode(ctx context.Context, config OpenCodeConfig) error {
 		TenantID:            config.TenantID,
 		ProjectID:           config.ProjectID,
 		ExecutionMode:       execMode,
-		Brain:               config.Brain,
+		Sandbox:             config.Sandbox,
 		Handler:             handler,
 		Stream:              stream,
 		Events:              events,

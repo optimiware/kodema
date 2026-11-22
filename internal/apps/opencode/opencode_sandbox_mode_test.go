@@ -40,38 +40,38 @@ func (f testAPIHandlerFunc) Invoke(ctx context.Context, inv api.Invocation) (api
 	return f(ctx, inv)
 }
 
-func TestBrainOpenCodeConfigDisablesLocalTools(t *testing.T) {
-	raw, err := GenerateBrainOpenCodeConfig(OpenCodeBrainConfig{}, "http://127.0.0.1:4100", "ocproxy.localkey123456")
+func TestSandboxOpenCodeConfigDisablesLocalTools(t *testing.T) {
+	raw, err := GenerateSandboxOpenCodeConfig(OpenCodeSandboxConfig{}, "http://127.0.0.1:4100", "ocproxy.localkey123456")
 	if err != nil {
-		t.Fatalf("GenerateBrainOpenCodeConfig: %v", err)
+		t.Fatalf("GenerateSandboxOpenCodeConfig: %v", err)
 	}
-	if err := ValidateBrainOpenCodeConfig(raw); err != nil {
-		t.Fatalf("ValidateBrainOpenCodeConfig rejected valid generated config: %v", err)
+	if err := ValidateSandboxOpenCodeConfig(raw); err != nil {
+		t.Fatalf("ValidateSandboxOpenCodeConfig rejected valid generated config: %v", err)
 	}
 	if !strings.Contains(string(raw), `"bash": false`) || !strings.Contains(string(raw), `"write": false`) {
-		t.Fatalf("generated brain config missing disabled local tools:\n%s", string(raw))
+		t.Fatalf("generated sandbox config missing disabled local tools:\n%s", string(raw))
 	}
 
-	// Enabling bash must be rejected by ValidateBrainOpenCodeConfig.
+	// Enabling bash must be rejected by ValidateSandboxOpenCodeConfig.
 	bad := strings.Replace(string(raw), `"bash": false`, `"bash": true`, 1)
-	if err := ValidateBrainOpenCodeConfig([]byte(bad)); err == nil {
-		t.Fatal("ValidateBrainOpenCodeConfig accepted config with bash enabled")
+	if err := ValidateSandboxOpenCodeConfig([]byte(bad)); err == nil {
+		t.Fatal("ValidateSandboxOpenCodeConfig accepted config with bash enabled")
 	}
 	// Allowing bash in permission map must also be rejected.
 	badPerm := strings.Replace(string(raw), `"bash": "deny"`, `"bash": "allow"`, 1)
-	if err := ValidateBrainOpenCodeConfig([]byte(badPerm)); err == nil {
-		t.Fatal("ValidateBrainOpenCodeConfig accepted config with bash permission=allow")
+	if err := ValidateSandboxOpenCodeConfig([]byte(badPerm)); err == nil {
+		t.Fatal("ValidateSandboxOpenCodeConfig accepted config with bash permission=allow")
 	}
 	// Omitting permission map entirely must be rejected.
-	if err := ValidateBrainOpenCodeConfig([]byte(`{"tools":{"bash":false,"write":false,"edit":false,"read":false,"glob":false,"grep":false}}`)); err == nil {
-		t.Fatal("ValidateBrainOpenCodeConfig accepted config missing permission map")
+	if err := ValidateSandboxOpenCodeConfig([]byte(`{"tools":{"bash":false,"write":false,"edit":false,"read":false,"glob":false,"grep":false}}`)); err == nil {
+		t.Fatal("ValidateSandboxOpenCodeConfig accepted config missing permission map")
 	}
-	if err := ValidateBrainOpenCodeConfig([]byte(`{"tools":{}}`)); err == nil {
-		t.Fatal("ValidateBrainOpenCodeConfig accepted empty tools map")
+	if err := ValidateSandboxOpenCodeConfig([]byte(`{"tools":{}}`)); err == nil {
+		t.Fatal("ValidateSandboxOpenCodeConfig accepted empty tools map")
 	}
 }
 
-func TestHTTPOpenCodeClientBrainMCPAttachDetachAndSendMessage(t *testing.T) {
+func TestHTTPOpenCodeClientSandboxMCPAttachDetachAndSendMessage(t *testing.T) {
 	var mu sync.Mutex
 	var attachedPayload map[string]any
 	var patchPayload map[string]any
@@ -130,7 +130,7 @@ func TestHTTPOpenCodeClientBrainMCPAttachDetachAndSendMessage(t *testing.T) {
 		Mode:            OpenCodeModeImplement,
 		ExecutionID:     "exec-1",
 		ActionID:        "act-1",
-		DisabledTools:   DefaultBrainDisabledLocalTools,
+		DisabledTools:   DefaultSandboxDisabledLocalTools,
 		MCPServers:      map[string]OpenCodeMCPServerConfig{"sandbox": mcpCfg},
 		ProxyPathPrefix: "/turn/exec-1/act-1",
 	})
@@ -811,7 +811,7 @@ func TestCommitAndPushViaSandboxMCPPreservesPushStderrAndValidatesSHA(t *testing
 
 // realLocalSandboxManager spawns real in-process `sandbox.Server` instances
 // backed by real temporary workspaces (and optional real Git repositories) so
-// Brain-mode tests exercise authentic HTTP JSON-RPC `/mcp` with real tokens.
+// Sandbox-mode tests exercise authentic HTTP JSON-RPC `/mcp` with real tokens.
 type realLocalSandboxManager struct {
 	t            *testing.T
 	gitBareRepos map[string]string // repo name -> bare git repo path
@@ -962,10 +962,10 @@ func runGitCmd(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// fakeBrainOpenCodeClient implements both OpenCodeClient and OpenCodeMCPClient
+// fakeSandboxOpenCodeClient implements both OpenCodeClient and OpenCodeMCPClient
 // so tests can inspect MCP attachment/detachment, disabled local tools, and
 // make real MCP calls into the attached `kodema sandbox serve` instance!
-type fakeBrainOpenCodeClient struct {
+type fakeSandboxOpenCodeClient struct {
 	mu           sync.Mutex
 	sessionSeq   int
 	attached     map[string]OpenCodeMCPServerConfig // sessionID -> cfg
@@ -975,27 +975,27 @@ type fakeBrainOpenCodeClient struct {
 	onSend       func(ctx context.Context, sessionID string, req OpenCodeMessageRequest, mcp OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error)
 }
 
-func newFakeBrainOpenCodeClient() *fakeBrainOpenCodeClient {
-	return &fakeBrainOpenCodeClient{attached: make(map[string]OpenCodeMCPServerConfig)}
+func newFakeSandboxOpenCodeClient() *fakeSandboxOpenCodeClient {
+	return &fakeSandboxOpenCodeClient{attached: make(map[string]OpenCodeMCPServerConfig)}
 }
 
-func (f *fakeBrainOpenCodeClient) Health(context.Context) error { return nil }
+func (f *fakeSandboxOpenCodeClient) Health(context.Context) error { return nil }
 
-func (f *fakeBrainOpenCodeClient) CreateSession(_ context.Context, _ string, _ string) (OpenCodeSession, error) {
+func (f *fakeSandboxOpenCodeClient) CreateSession(_ context.Context, _ string, _ string) (OpenCodeSession, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sessionSeq++
-	return OpenCodeSession{ID: fmt.Sprintf("brain-sess-%d", f.sessionSeq)}, nil
+	return OpenCodeSession{ID: fmt.Sprintf("sandbox-sess-%d", f.sessionSeq)}, nil
 }
 
-func (f *fakeBrainOpenCodeClient) AttachMCPServer(_ context.Context, sessionID string, cfg OpenCodeMCPServerConfig) error {
+func (f *fakeSandboxOpenCodeClient) AttachMCPServer(_ context.Context, sessionID string, cfg OpenCodeMCPServerConfig) error {
 	f.mu.Lock()
 	f.attached[sessionID] = cfg
 	f.mu.Unlock()
 	return nil
 }
 
-func (f *fakeBrainOpenCodeClient) DetachMCPServer(_ context.Context, sessionID string, serverName string) error {
+func (f *fakeSandboxOpenCodeClient) DetachMCPServer(_ context.Context, sessionID string, serverName string) error {
 	f.mu.Lock()
 	f.detached = append(f.detached, sessionID+"/"+serverName)
 	delete(f.attached, sessionID)
@@ -1003,7 +1003,7 @@ func (f *fakeBrainOpenCodeClient) DetachMCPServer(_ context.Context, sessionID s
 	return nil
 }
 
-func (f *fakeBrainOpenCodeClient) SendMessage(ctx context.Context, sessionID string, req OpenCodeMessageRequest) (OpenCodeMessageResponse, error) {
+func (f *fakeSandboxOpenCodeClient) SendMessage(ctx context.Context, sessionID string, req OpenCodeMessageRequest) (OpenCodeMessageResponse, error) {
 	f.mu.Lock()
 	f.disabledSeen = append(f.disabledSeen, append([]string(nil), req.DisabledTools...))
 	mcpCfg := f.attached[sessionID]
@@ -1104,14 +1104,14 @@ func TestResolveEndpointSplitLineAcrossPollsWithoutCursorAdvance(t *testing.T) {
 	}
 }
 
-func (f *fakeBrainOpenCodeClient) AbortSession(_ context.Context, sessionID string) error {
+func (f *fakeSandboxOpenCodeClient) AbortSession(_ context.Context, sessionID string) error {
 	f.mu.Lock()
 	f.abortCalls = append(f.abortCalls, sessionID)
 	f.mu.Unlock()
 	return nil
 }
 
-func makeBrainInboxFixture(execID, actionID, taskID, mode, repo, sandboxImage string, outputs []string, deadline time.Time) (api.InboxItem, api.ExecutionInspectResult) {
+func makeSandboxInboxFixture(execID, actionID, taskID, mode, repo, sandboxImage string, outputs []string, deadline time.Time) (api.InboxItem, api.ExecutionInspectResult) {
 	fields := []api.SubjectField{
 		{Name: OpenCodeFieldMode, Kind: "string", Value: mode},
 	}
@@ -1127,7 +1127,7 @@ func makeBrainInboxFixture(execID, actionID, taskID, mode, repo, sandboxImage st
 		TaskID:      taskID,
 		ExecutionID: execID,
 		ActionID:    actionID,
-		Assignment:  "service/opencode-brain",
+		Assignment:  "service/opencode-sandbox",
 		Version:     1,
 		At:          deadline,
 		Subject:     subj,
@@ -1147,7 +1147,7 @@ func makeBrainInboxFixture(execID, actionID, taskID, mode, repo, sandboxImage st
 			State:      "running",
 			Version:    1,
 			Deadline:   &deadline,
-			Assignment: "service/opencode-brain",
+			Assignment: "service/opencode-sandbox",
 			Subject:    subj,
 		}},
 		Cleanup: api.ExecutionCleanup{State: "none"},
@@ -1155,7 +1155,7 @@ func makeBrainInboxFixture(execID, actionID, taskID, mode, repo, sandboxImage st
 	return item, exec
 }
 
-type brainTestHandler struct {
+type sandboxTestHandler struct {
 	mu           sync.Mutex
 	inboxItems   []api.InboxItem
 	executions   map[string]api.ExecutionInspectResult
@@ -1163,15 +1163,15 @@ type brainTestHandler struct {
 	resolveCh    chan api.ExecutionRequestResolveRequest
 }
 
-func newBrainTestHandler() *brainTestHandler {
-	return &brainTestHandler{
+func newSandboxTestHandler() *sandboxTestHandler {
+	return &sandboxTestHandler{
 		executions:   make(map[string]api.ExecutionInspectResult),
 		resolveCalls: make(map[string]api.ExecutionRequestResolveRequest),
 		resolveCh:    make(chan api.ExecutionRequestResolveRequest, 16),
 	}
 }
 
-func (h *brainTestHandler) Invoke(_ context.Context, inv api.Invocation) (api.Result, error) {
+func (h *sandboxTestHandler) Invoke(_ context.Context, inv api.Invocation) (api.Result, error) {
 	codec := publicCodecs[inv.Operation]
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1242,7 +1242,7 @@ func (h *brainTestHandler) Invoke(_ context.Context, inv api.Invocation) (api.Re
 	}
 }
 
-func TestOpenCodeBrainModeConcurrentPolyglotRealSandboxes(t *testing.T) {
+func TestOpenCodeSandboxModeConcurrentPolyglotRealSandboxes(t *testing.T) {
 	// Set up two real bare git repositories for Task A (Go) and Task B (Node).
 	goBare := initBareGitRepo(t)
 	nodeBare := initBareGitRepo(t)
@@ -1262,7 +1262,7 @@ func TestOpenCodeBrainModeConcurrentPolyglotRealSandboxes(t *testing.T) {
 	clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
 	proxy, err := NewOpenCodeLLMProxy(OpenCodeLLMProxyConfig{
 		KodemaURL:   upstreamLLM.URL,
-		Credentials: staticTestCred("kodsvc.brain.tok"),
+		Credentials: staticTestCred("kodsvc.opencode.tok"),
 		Clock:       clock,
 	})
 	if err != nil {
@@ -1275,10 +1275,10 @@ func TestOpenCodeBrainModeConcurrentPolyglotRealSandboxes(t *testing.T) {
 	defer func() { _ = proxy.Close(context.Background()) }()
 
 	deadline := clock.Now().Add(5 * time.Minute)
-	itemGo, execGo := makeBrainInboxFixture("exec-go", "act-go", "task-go", "implement", "svc/go-api", "golang:1.24", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate, OpenCodeOutputSummaryKey, OpenCodeOutputSessionID}, deadline)
-	itemNode, execNode := makeBrainInboxFixture("exec-node", "act-node", "task-node", "implement", "svc/node-web", "node:22", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate, OpenCodeOutputSummaryKey, OpenCodeOutputSessionID}, deadline)
+	itemGo, execGo := makeSandboxInboxFixture("exec-go", "act-go", "task-go", "implement", "svc/go-api", "golang:1.24", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate, OpenCodeOutputSummaryKey, OpenCodeOutputSessionID}, deadline)
+	itemNode, execNode := makeSandboxInboxFixture("exec-node", "act-node", "task-node", "implement", "svc/node-web", "node:22", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate, OpenCodeOutputSummaryKey, OpenCodeOutputSessionID}, deadline)
 
-	handler := newBrainTestHandler()
+	handler := newSandboxTestHandler()
 	handler.inboxItems = []api.InboxItem{itemGo, itemNode}
 	handler.executions["exec-go"] = execGo
 	handler.executions["exec-node"] = execNode
@@ -1288,16 +1288,16 @@ func TestOpenCodeBrainModeConcurrentPolyglotRealSandboxes(t *testing.T) {
 		"svc/node-web": nodeBare,
 	})
 
-	// Barrier guarantees BOTH turns are executing concurrently inside the single Brain!
+	// Barrier guarantees BOTH turns are executing concurrently inside the single OpenCode service!
 	var arrived atomic.Int32
 	bothArrived := make(chan struct{})
 	var peerMu sync.Mutex
 	peerEndpoints := make(map[string]string) // taskID -> endpointURL
 	peerTokens := make(map[string]string)    // taskID -> token
 
-	brainClient := newFakeBrainOpenCodeClient()
-	brainClient.onSend = func(ctx context.Context, _ string, req OpenCodeMessageRequest, mcp OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
-		if len(req.DisabledTools) < len(DefaultBrainDisabledLocalTools) {
+	sandboxClient := newFakeSandboxOpenCodeClient()
+	sandboxClient.onSend = func(ctx context.Context, _ string, req OpenCodeMessageRequest, mcp OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
+		if len(req.DisabledTools) < len(DefaultSandboxDisabledLocalTools) {
 			return OpenCodeMessageResponse{}, fmt.Errorf("expected disabled local tools, got %v", req.DisabledTools)
 		}
 		if req.ProxyPathPrefix != fmt.Sprintf("/turn/%s/%s", req.ExecutionID, req.ActionID) {
@@ -1376,12 +1376,12 @@ func TestOpenCodeBrainModeConcurrentPolyglotRealSandboxes(t *testing.T) {
 	}
 
 	adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
-		ServiceID:           "opencode-brain",
+		ServiceID:           "opencode-sandbox",
 		TenantID:            "tenant-1",
 		ProjectID:           "project-1",
-		ExecutionMode:       OpenCodeExecutionModeBrain,
+		ExecutionMode:       OpenCodeExecutionModeSandbox,
 		Handler:             handler,
-		OpenCode:            brainClient,
+		OpenCode:            sandboxClient,
 		Store:               store,
 		Sandboxes:           sboxMgr,
 		Proxy:               proxy,
@@ -1459,7 +1459,7 @@ func TestOpenCodeBrainModeConcurrentPolyglotRealSandboxes(t *testing.T) {
 	llmMu.Unlock()
 }
 
-func TestOpenCodeBrainModeFaultContainmentSandboxOOMKill(t *testing.T) {
+func TestOpenCodeSandboxModeFaultContainmentSandboxOOMKill(t *testing.T) {
 	nodeBare := initBareGitRepo(t)
 	goBare := initBareGitRepo(t)
 
@@ -1485,7 +1485,7 @@ func TestOpenCodeBrainModeFaultContainmentSandboxOOMKill(t *testing.T) {
 	clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
 	proxy, err := NewOpenCodeLLMProxy(OpenCodeLLMProxyConfig{
 		KodemaURL:   upstreamLLM.URL,
-		Credentials: staticTestCred("kodsvc.brain.tok"),
+		Credentials: staticTestCred("kodsvc.opencode.tok"),
 		Clock:       clock,
 	})
 	if err != nil {
@@ -1498,10 +1498,10 @@ func TestOpenCodeBrainModeFaultContainmentSandboxOOMKill(t *testing.T) {
 	defer func() { _ = proxy.Close(context.Background()) }()
 
 	deadline := clock.Now().Add(5 * time.Minute)
-	itemA, execA := makeBrainInboxFixture("exec-a", "act-a", "task-a", "implement", "svc/a", "golang:1.24", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate}, deadline)
-	itemB, execB := makeBrainInboxFixture("exec-b", "act-b", "task-b", "implement", "svc/b", "node:22", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate}, deadline)
+	itemA, execA := makeSandboxInboxFixture("exec-a", "act-a", "task-a", "implement", "svc/a", "golang:1.24", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate}, deadline)
+	itemB, execB := makeSandboxInboxFixture("exec-b", "act-b", "task-b", "implement", "svc/b", "node:22", []string{OpenCodeOutputBranch, OpenCodeOutputCandidate}, deadline)
 
-	handler := newBrainTestHandler()
+	handler := newSandboxTestHandler()
 	handler.inboxItems = []api.InboxItem{itemA, itemB}
 	handler.executions["exec-a"] = execA
 	handler.executions["exec-b"] = execB
@@ -1517,8 +1517,8 @@ func TestOpenCodeBrainModeFaultContainmentSandboxOOMKill(t *testing.T) {
 	var taskASessionID, taskBSessionID string
 	var taskALLMCutOff atomic.Bool
 
-	brainClient := newFakeBrainOpenCodeClient()
-	brainClient.onSend = func(ctx context.Context, sessionID string, req OpenCodeMessageRequest, mcp OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
+	sandboxClient := newFakeSandboxOpenCodeClient()
+	sandboxClient.onSend = func(ctx context.Context, sessionID string, req OpenCodeMessageRequest, mcp OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
 		if req.TaskID == "task-a" {
 			taskASessionID = sessionID
 			close(taskAStarted)
@@ -1562,12 +1562,12 @@ func TestOpenCodeBrainModeFaultContainmentSandboxOOMKill(t *testing.T) {
 
 	store, _ := NewFileOpenCodeStateStore(t.TempDir())
 	adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
-		ServiceID:           "opencode-brain",
+		ServiceID:           "opencode-sandbox",
 		TenantID:            "tenant-1",
 		ProjectID:           "project-1",
-		ExecutionMode:       OpenCodeExecutionModeBrain,
+		ExecutionMode:       OpenCodeExecutionModeSandbox,
 		Handler:             handler,
-		OpenCode:            brainClient,
+		OpenCode:            sandboxClient,
 		Store:               store,
 		Sandboxes:           sboxMgr,
 		Proxy:               proxy,
@@ -1618,9 +1618,9 @@ func TestOpenCodeBrainModeFaultContainmentSandboxOOMKill(t *testing.T) {
 	}
 
 	// Verify ONLY Task A's session was aborted by the sandbox OOM kill (before adapter shutdown).
-	brainClient.mu.Lock()
-	aborts := append([]string(nil), brainClient.abortCalls...)
-	brainClient.mu.Unlock()
+	sandboxClient.mu.Lock()
+	aborts := append([]string(nil), sandboxClient.abortCalls...)
+	sandboxClient.mu.Unlock()
 	if len(aborts) != 1 || aborts[0] != taskASessionID {
 		t.Fatalf("AbortSession calls = %v; want only Task A session %q (not Task B %q)", aborts, taskASessionID, taskBSessionID)
 	}
@@ -1635,7 +1635,7 @@ func TestOpenCodeBrainModeFaultContainmentSandboxOOMKill(t *testing.T) {
 	}
 }
 
-func TestOpenCodeBrainModeFullCancellationAbortsSessionProxyAndSandbox(t *testing.T) {
+func TestOpenCodeSandboxModeFullCancellationAbortsSessionProxyAndSandbox(t *testing.T) {
 	stopUpstream := make(chan struct{})
 	upstreamLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -1652,7 +1652,7 @@ func TestOpenCodeBrainModeFullCancellationAbortsSessionProxyAndSandbox(t *testin
 	clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
 	proxy, err := NewOpenCodeLLMProxy(OpenCodeLLMProxyConfig{
 		KodemaURL:   upstreamLLM.URL,
-		Credentials: staticTestCred("kodsvc.brain.tok"),
+		Credentials: staticTestCred("kodsvc.opencode.tok"),
 		Clock:       clock,
 	})
 	if err != nil {
@@ -1665,8 +1665,8 @@ func TestOpenCodeBrainModeFullCancellationAbortsSessionProxyAndSandbox(t *testin
 	defer func() { _ = proxy.Close(context.Background()) }()
 
 	deadline := clock.Now().Add(5 * time.Minute)
-	item, ex := makeBrainInboxFixture("exec-cancel", "act-cancel", "task-cancel", "implement", "svc/app", "golang:1.24", []string{OpenCodeOutputBranch}, deadline)
-	handler := newBrainTestHandler()
+	item, ex := makeSandboxInboxFixture("exec-cancel", "act-cancel", "task-cancel", "implement", "svc/app", "golang:1.24", []string{OpenCodeOutputBranch}, deadline)
+	handler := newSandboxTestHandler()
 	handler.inboxItems = []api.InboxItem{item}
 	handler.executions["exec-cancel"] = ex
 
@@ -1675,8 +1675,8 @@ func TestOpenCodeBrainModeFullCancellationAbortsSessionProxyAndSandbox(t *testin
 
 	turnInFlight := make(chan struct{})
 	llmCutOff := make(chan struct{})
-	brainClient := newFakeBrainOpenCodeClient()
-	brainClient.onSend = func(ctx context.Context, _ string, req OpenCodeMessageRequest, _ OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
+	sandboxClient := newFakeSandboxOpenCodeClient()
+	sandboxClient.onSend = func(ctx context.Context, _ string, req OpenCodeMessageRequest, _ OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
 		close(turnInFlight)
 		go func() {
 			llmReq, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, proxyURL+req.ProxyPathPrefix+"/llm/openai/v1/chat/completions", strings.NewReader(`{}`))
@@ -1695,13 +1695,13 @@ func TestOpenCodeBrainModeFullCancellationAbortsSessionProxyAndSandbox(t *testin
 
 	store, _ := NewFileOpenCodeStateStore(t.TempDir())
 	adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
-		ServiceID:           "opencode-brain",
+		ServiceID:           "opencode-sandbox",
 		TenantID:            "tenant-1",
 		ProjectID:           "project-1",
-		ExecutionMode:       OpenCodeExecutionModeBrain,
+		ExecutionMode:       OpenCodeExecutionModeSandbox,
 		Handler:             handler,
 		Stream:              streamer,
-		OpenCode:            brainClient,
+		OpenCode:            sandboxClient,
 		Store:               store,
 		Sandboxes:           sboxMgr,
 		Proxy:               proxy,
@@ -1744,9 +1744,9 @@ func TestOpenCodeBrainModeFullCancellationAbortsSessionProxyAndSandbox(t *testin
 	}
 
 	// 2. AbortSession must have been called.
-	brainClient.mu.Lock()
-	aborts := len(brainClient.abortCalls)
-	brainClient.mu.Unlock()
+	sandboxClient.mu.Lock()
+	aborts := len(sandboxClient.abortCalls)
+	sandboxClient.mu.Unlock()
 	if aborts == 0 {
 		t.Fatal("AbortSession was not called on execution.cancelled")
 	}
@@ -1760,22 +1760,22 @@ func TestOpenCodeBrainModeFullCancellationAbortsSessionProxyAndSandbox(t *testin
 	}
 }
 
-func TestOpenCodeBrainModeNonCodingPlanSkipsSandbox(t *testing.T) {
+func TestOpenCodeSandboxModeNonCodingPlanSkipsSandbox(t *testing.T) {
 	clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
 	deadline := clock.Now().Add(5 * time.Minute)
-	item, ex := makeBrainInboxFixture("exec-plan", "act-plan", "task-plan", "plan", "", "", []string{OpenCodeOutputPlanKey, OpenCodeOutputSessionID}, deadline)
+	item, ex := makeSandboxInboxFixture("exec-plan", "act-plan", "task-plan", "plan", "", "", []string{OpenCodeOutputPlanKey, OpenCodeOutputSessionID}, deadline)
 
-	handler := newBrainTestHandler()
+	handler := newSandboxTestHandler()
 	handler.inboxItems = []api.InboxItem{item}
 	handler.executions["exec-plan"] = ex
 
 	sboxMgr := newRealLocalSandboxManager(t, nil)
-	brainClient := newFakeBrainOpenCodeClient()
-	brainClient.onSend = func(_ context.Context, _ string, req OpenCodeMessageRequest, _ OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
+	sandboxClient := newFakeSandboxOpenCodeClient()
+	sandboxClient.onSend = func(_ context.Context, _ string, req OpenCodeMessageRequest, _ OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
 		if len(req.MCPServers) != 0 {
 			return OpenCodeMessageResponse{}, fmt.Errorf("plan turn without sandbox_image attached unexpected MCP servers: %+v", req.MCPServers)
 		}
-		if len(req.DisabledTools) < len(DefaultBrainDisabledLocalTools) {
+		if len(req.DisabledTools) < len(DefaultSandboxDisabledLocalTools) {
 			return OpenCodeMessageResponse{}, fmt.Errorf("plan turn did not disable local tools: %v", req.DisabledTools)
 		}
 		return OpenCodeMessageResponse{Text: "## Plan\n1. Design\n2. Build"}, nil
@@ -1783,12 +1783,12 @@ func TestOpenCodeBrainModeNonCodingPlanSkipsSandbox(t *testing.T) {
 
 	store, _ := NewFileOpenCodeStateStore(t.TempDir())
 	adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
-		ServiceID:          "opencode-brain",
+		ServiceID:          "opencode-sandbox",
 		TenantID:           "tenant-1",
 		ProjectID:          "project-1",
-		ExecutionMode:      OpenCodeExecutionModeBrain,
+		ExecutionMode:      OpenCodeExecutionModeSandbox,
 		Handler:            handler,
-		OpenCode:           brainClient,
+		OpenCode:           sandboxClient,
 		Store:              store,
 		Sandboxes:          sboxMgr,
 		Clock:              clock,
@@ -1816,7 +1816,7 @@ func TestOpenCodeBrainModeNonCodingPlanSkipsSandbox(t *testing.T) {
 	}
 }
 
-func TestOpenCodeBrainModeDetachMCPServerRetryAndOrphanRecovery(t *testing.T) {
+func TestOpenCodeSandboxModeDetachMCPServerRetryAndOrphanRecovery(t *testing.T) {
 	cases := []struct {
 		name              string
 		failDeleteCount   int
@@ -1888,10 +1888,10 @@ func TestOpenCodeBrainModeDetachMCPServerRetryAndOrphanRecovery(t *testing.T) {
 
 			clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
 			deadline := clock.Now().Add(5 * time.Minute)
-			item1, ex1 := makeBrainInboxFixture("exec-mcp-1", "act-mcp-1", "task-mcp-1", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
-			item2, ex2 := makeBrainInboxFixture("exec-mcp-2", "act-mcp-2", "task-mcp-2", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
+			item1, ex1 := makeSandboxInboxFixture("exec-mcp-1", "act-mcp-1", "task-mcp-1", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
+			item2, ex2 := makeSandboxInboxFixture("exec-mcp-2", "act-mcp-2", "task-mcp-2", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
 
-			handler := newBrainTestHandler()
+			handler := newSandboxTestHandler()
 			handler.inboxItems = []api.InboxItem{item1}
 			handler.executions["exec-mcp-1"] = ex1
 			handler.executions["exec-mcp-2"] = ex2
@@ -1902,10 +1902,10 @@ func TestOpenCodeBrainModeDetachMCPServerRetryAndOrphanRecovery(t *testing.T) {
 				t.Fatalf("NewFileOpenCodeStateStore: %v", err)
 			}
 			adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
-				ServiceID:          "opencode-brain",
+				ServiceID:          "opencode-sandbox",
 				TenantID:           "tenant-1",
 				ProjectID:          "project-1",
-				ExecutionMode:      OpenCodeExecutionModeBrain,
+				ExecutionMode:      OpenCodeExecutionModeSandbox,
 				Handler:            handler,
 				OpenCode:           cli,
 				Store:              store,
@@ -2087,9 +2087,9 @@ func TestKodemaSandboxManagerReleaseCancelsInFlightMonitorWithoutSpuriousDeath(t
 	t.Run("OpenCodeAdapter joins lease.Done watcher goroutine before turn returns", func(t *testing.T) {
 		clock := &fixedClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
 		deadline := clock.Now().Add(5 * time.Minute)
-		item, ex := makeBrainInboxFixture("exec-wg-1", "act-wg-1", "task-wg-1", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
+		item, ex := makeSandboxInboxFixture("exec-wg-1", "act-wg-1", "task-wg-1", "plan", "", "golang:1.24", []string{OpenCodeOutputPlanKey}, deadline)
 
-		handler := newBrainTestHandler()
+		handler := newSandboxTestHandler()
 		handler.inboxItems = []api.InboxItem{item}
 		handler.executions["exec-wg-1"] = ex
 
@@ -2100,14 +2100,14 @@ func TestKodemaSandboxManagerReleaseCancelsInFlightMonitorWithoutSpuriousDeath(t
 		releaseAbort := make(chan struct{})
 		var abortCompleted atomic.Bool
 
-		brainClient := newFakeBrainOpenCodeClient()
-		brainClient.onSend = func(ctx context.Context, _ string, _ OpenCodeMessageRequest, _ OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
+		sandboxClient := newFakeSandboxOpenCodeClient()
+		sandboxClient.onSend = func(ctx context.Context, _ string, _ OpenCodeMessageRequest, _ OpenCodeMCPServerConfig) (OpenCodeMessageResponse, error) {
 			close(leaseDone)
 			<-ctx.Done()
 			return OpenCodeMessageResponse{}, ctx.Err()
 		}
 		wrappedClient := &blockingAbortOpenCodeClient{
-			fakeBrainOpenCodeClient: brainClient,
+			fakeSandboxOpenCodeClient: sandboxClient,
 			onAbort: func() {
 				select {
 				case <-abortStarted:
@@ -2124,10 +2124,10 @@ func TestKodemaSandboxManagerReleaseCancelsInFlightMonitorWithoutSpuriousDeath(t
 			t.Fatalf("NewFileOpenCodeStateStore: %v", err)
 		}
 		adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
-			ServiceID:          "opencode-brain",
+			ServiceID:          "opencode-sandbox",
 			TenantID:           "tenant-1",
 			ProjectID:          "project-1",
-			ExecutionMode:      OpenCodeExecutionModeBrain,
+			ExecutionMode:      OpenCodeExecutionModeSandbox,
 			Handler:            handler,
 			OpenCode:           wrappedClient,
 			Store:              store,
@@ -2195,7 +2195,7 @@ func (m *blockingLeaseDoneSandboxManager) Release(_ context.Context, _ OpenCodeS
 }
 
 type blockingAbortOpenCodeClient struct {
-	*fakeBrainOpenCodeClient
+	*fakeSandboxOpenCodeClient
 	onAbort func()
 }
 
@@ -2203,5 +2203,5 @@ func (c *blockingAbortOpenCodeClient) AbortSession(ctx context.Context, sessionI
 	if c.onAbort != nil {
 		c.onAbort()
 	}
-	return c.fakeBrainOpenCodeClient.AbortSession(ctx, sessionID)
+	return c.fakeSandboxOpenCodeClient.AbortSession(ctx, sessionID)
 }

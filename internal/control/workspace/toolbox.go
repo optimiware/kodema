@@ -130,12 +130,15 @@ func GitOrigin(gitURL string) (string, error) {
 
 // GitEnvironment returns the environment entries, as NAME=value, that give a
 // container action the installation's Git service: EnvGitURL and, with a
-// mounted toolbox, Git configuration scoped to that origin alone. The
-// credential helper is the toolbox and nothing else, restricted to the origin,
-// so the execution credential is offered to no other host and kept by no
-// other helper; caFile, when set, is the CA bundle
-// Git trusts for that origin only, so every other host keeps the image's
-// roots. An empty gitURL yields no entry.
+// mounted toolbox, Git configuration scoped to that origin alone plus
+// safe.directory for WorkspaceRoot. The credential helper is the toolbox and
+// nothing else, restricted to the origin, so the execution credential is
+// offered to no other host and kept by no other helper; safe.directory marks
+// the execution's dedicated mounted WorkspaceRoot safe so non-root images on
+// Kubernetes PVCs (where /workspace is owned by UID 0) match Podman without
+// touching $HOME/.gitconfig; caFile, when set, is the CA bundle Git trusts for
+// that origin only, so every other host keeps the image's roots. An empty
+// gitURL yields no entry.
 func GitEnvironment(gitURL, caFile string, toolbox bool) ([]string, error) {
 	if gitURL == "" {
 		return nil, nil
@@ -157,6 +160,11 @@ func GitEnvironment(gitURL, caFile string, toolbox bool) ([]string, error) {
 		// Git runs a helper that starts with an absolute path through the
 		// shell, with the operation appended.
 		{helper, ToolboxPath + " --trusted-origin '" + origin + "' git credential"},
+		// /workspace is the execution's dedicated mounted workspace root. On
+		// Kubernetes PVCs it is owned by UID 0 while non-root images run under
+		// a different UID; marking WorkspaceRoot safe keeps Kubernetes behavior
+		// consistent with Podman without writing to $HOME/.gitconfig.
+		{"safe.directory", WorkspaceRoot},
 	}
 	if caFile != "" {
 		settings = append(settings, [2]string{"http." + origin + ".sslCAInfo", caFile})
