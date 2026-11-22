@@ -6,27 +6,31 @@ Source: [architecture](../../KODEMA.md#1-product-and-architecture), [implementat
 
 Kodema uses a **two-sided (hourglass) architecture** joined at a narrow public contract (`api/` and `client/`), with a **hexagonal Control Plane** on the inside and isolated **Apps & Workloads** on the outside:
 
-```text
-          CONTROL PLANE (Hexagonal / Ports & Adapters)
-          ┌──────────────────────────────────────────────┐
-          │  Transports: REST, MCP (transport/)          │
-          │       ↓                                      │
-          │  Control: pure capabilities (control/)       │
-          │       ↓                          ↑           │
-          │  Engine (engine/)          Adapters          │
-          │  (pure state machine)      (adapter/)        │
-          │  Composed by: server/                        │
-          └──────────────────────┬───────────────────────┘
-                                 │
-              ════════════ api / client ════════════   ← public contract waist
-                                 │
-          ┌──────────────────────┴───────────────────────┐
-          │         APPS & WORKLOADS (apps/)             │
-          │  (zero server imports; sibling-isolated)     │
-          │                                              │
-          │  cli · git · agent · opencode · merge ·      │
-          │  email · sandbox · up + external workloads   │
-          └──────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph AW["Apps & Workloads — zero server imports, sibling-isolated"]
+        direction LR
+        Apps["First-Party Apps (apps/)<br/>cli · git · agent · opencode · merge · email · sandbox · up"]
+        Workloads["External Workloads & Services<br/>containers · harnesses · recipes · UIs"]
+    end
+
+    Waist(["Public Contract — api/ · client/<br/>REST · SSE · MCP · NATS · materialized workload files"])
+
+    subgraph CP["Control Plane — Hexagonal (composed by server/)"]
+        direction TB
+        Transport["Transports (transport/)<br/>REST · SSE · MCP"]
+        Control["Control (control/)<br/>pure domain capabilities"]
+        Engine["Engine (engine/)<br/>pure ordered state machine"]
+        Adapter["Adapters (adapter/)<br/>PostgreSQL · NATS · Podman · Kubernetes · KMS · OCI"]
+        Transport --> Control
+        Control --> Engine
+        Control -. ports .-> Adapter
+        Engine -. ports .-> Adapter
+    end
+
+    Apps --> Waist
+    Workloads --> Waist
+    Waist --> Transport
 ```
 
 - **Execution Engine (`internal/engine`):** executes admitted ordered work. Pure, deterministic, stdlib-only state machine with zero knowledge of tasks, roles, Git, HTTP, SQL, NATS, identity, or agents. Task snapshot bytes reach preparation as opaque data; the Engine never interprets their fields.

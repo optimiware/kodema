@@ -14,28 +14,31 @@ Kodema is an Apache-2.0, API-first, multi-tenant software factory, deployable st
 
 Kodema has a **two-sided (hourglass) architecture** separated by a narrow public contract (`api/` and `client/`), with a **hexagonal Control Plane** on the inside and **Apps & Workloads** on the outside:
 
-```text
-          CONTROL PLANE (Hexagonal / Ports & Adapters)
-          ┌──────────────────────────────────────────────┐
-          │  Transports: REST, MCP                       │
-          │       ↓                                      │
-          │  Control: authz, verify, tasks, inbox, KV,   │
-          │           secrets, tokens, triggers ...      │
-          │       ↓                          ↑           │
-          │  Engine (pure)               Adapters        │
-          │  (ordered lifecycle,     (PG, NATS, Podman,  │
-          │   deadlines, recovery)    K8s, KMS, OCI)     │
-          └──────────────────────┬───────────────────────┘
-                                 │
-              ════════════ api / client ════════════   ← public contract waist
-                                 │
-          ┌──────────────────────┴───────────────────────┐
-          │            APPS & WORKLOADS                  │
-          │  (zero server imports; public contracts only)│
-          │                                              │
-          │  cli · git serve · agent · services ·        │
-          │  sandbox · up + external containers & tools  │
-          └──────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph AW["Apps & Workloads — zero server imports"]
+        direction LR
+        Apps["First-Party Apps (apps/)<br/>cli · git · agent · opencode · merge · email · sandbox · up"]
+        Workloads["External Workloads & Services<br/>containers · harnesses · recipes · UIs"]
+    end
+
+    Waist(["Public Contract — api/ · client/<br/>REST · SSE · MCP · NATS · materialized workload files"])
+
+    subgraph CP["Control Plane — Hexagonal (composed by server/)"]
+        direction TB
+        Transport["Transports (transport/)<br/>REST · SSE · MCP"]
+        Control["Control (control/)<br/>authz · verify · tasks · inbox · KV · secrets · tokens · triggers"]
+        Engine["Engine (engine/)<br/>pure ordered lifecycle · deadlines · recovery"]
+        Adapter["Adapters (adapter/)<br/>PostgreSQL · NATS · Podman · Kubernetes · KMS · OCI"]
+        Transport --> Control
+        Control --> Engine
+        Control -. ports .-> Adapter
+        Engine -. ports .-> Adapter
+    end
+
+    Apps --> Waist
+    Workloads --> Waist
+    Waist --> Transport
 ```
 
 | Part | Responsibilities |
