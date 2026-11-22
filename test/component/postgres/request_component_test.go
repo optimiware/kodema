@@ -15,24 +15,24 @@ import (
 	"testing"
 	"time"
 
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	executionstore "github.com/optimiware/kodema/internal/adapter/store/units/execution"
+	"github.com/optimiware/kodema/internal/adapter/store/units/execution/snapshotdoc"
+	"github.com/optimiware/kodema/internal/adapter/store/units/readers"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	"github.com/optimiware/kodema/internal/shell/request"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	executionstore "github.com/optimiware/kodema/internal/shell/store/units/execution"
-	"github.com/optimiware/kodema/internal/shell/store/units/execution/snapshotdoc"
-	"github.com/optimiware/kodema/internal/shell/store/units/readers"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 
@@ -303,7 +303,7 @@ func TestRequestResolveVersusCancelOnPostgreSQL(t *testing.T) {
 func TestOutputSubmissionVersusCancelOnPostgreSQL(t *testing.T) {
 	env := newRequestRaceEnv(t)
 	ctx := context.Background()
-	submitted := kernel.Outputs{id.OutputKey("result"): "ok"}
+	submitted := engine.Outputs{id.OutputKey("result"): "ok"}
 
 	// Deterministic outputs winner, then a cancel that must lose.
 	env.reset(t)
@@ -347,7 +347,7 @@ func TestOutputSubmissionVersusCancelOnPostgreSQL(t *testing.T) {
 		"content_sha256": pgtest.ContentSHA256(t, outputsContent),
 		"result": pgtest.GoldenJSONOf(execution.TransitionResult{
 			ExecutionVersion: 2, ActionVersion: 2,
-			NextExecution: kernel.ExecutionRunning, NextAction: kernel.ActionRunning,
+			NextExecution: engine.ExecutionRunning, NextAction: engine.ActionRunning,
 		}),
 		"completed_at": env.now, "execution_id": string(executionID),
 		"snapshot_sha256": pgtest.NullValue, "created_at": env.now,
@@ -366,8 +366,8 @@ func TestOutputSubmissionVersusCancelOnPostgreSQL(t *testing.T) {
 	if _, err := settleStore.Transition(ctx, execution.TransitionUnit{
 		Owner: env.scope, ExecutionID: executionID, ExpectedExecutionVersion: 2, ExpectedActionVersion: 2,
 		Commit: flow.Commit{ExecutionID: executionID, ExpectedExecutionVersion: 2,
-			NextExecutionState: kernel.ExecutionSucceeded, ActionID: actionID,
-			ExpectedActionVersion: 2, NextActionState: kernel.ActionSucceeded, NextCurrentAction: &minusOne,
+			NextExecutionState: engine.ExecutionSucceeded, ActionID: actionID,
+			ExpectedActionVersion: 2, NextActionState: engine.ActionSucceeded, NextCurrentAction: &minusOne,
 			Output: flow.OutputChange{Action: flow.OutputPromote, Values: submitted}, At: time.Now()},
 	}); err != nil {
 		t.Fatalf("settle outputs: %v%s", err, pgtest.CauseText(err))
@@ -433,7 +433,7 @@ func cancelCommand(actor authorize.Principal, scope tenancy.Scope, executionID i
 	}
 }
 
-func outputsCommand(actor authorize.Principal, scope tenancy.Scope, executionID id.ExecutionID, actionID id.ActionID, callerKey string, outputs kernel.Outputs) execution.OutputsCommand {
+func outputsCommand(actor authorize.Principal, scope tenancy.Scope, executionID id.ExecutionID, actionID id.ActionID, callerKey string, outputs engine.Outputs) execution.OutputsCommand {
 	return execution.OutputsCommand{
 		Actor: actor, Scope: scope, ExecutionID: executionID, ActionID: actionID,
 		ExpectedExecutionVersion: 1, Outputs: outputs, CallerKey: callerKey,
@@ -460,7 +460,7 @@ func raceResolveAndCancel(ctx context.Context, env *requestRaceEnv, executionID 
 	return resolveErr, cancelErr
 }
 
-func raceOutputsAndCancel(ctx context.Context, env *requestRaceEnv, executionID id.ExecutionID, actionID id.ActionID, submitted kernel.Outputs) (outputsErr, cancelErr error) {
+func raceOutputsAndCancel(ctx context.Context, env *requestRaceEnv, executionID id.ExecutionID, actionID id.ActionID, submitted engine.Outputs) (outputsErr, cancelErr error) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -521,7 +521,7 @@ func requireResolveWinner(t *testing.T, ctx context.Context, env *requestRaceEnv
 
 // requireOutputsWinner proves the staged outputs, receipt, audit and event are
 // durable and the cancel loser left no state or rows behind.
-func requireOutputsWinner(t *testing.T, ctx context.Context, env *requestRaceEnv, executionID id.ExecutionID, actionID id.ActionID, submitted kernel.Outputs) {
+func requireOutputsWinner(t *testing.T, ctx context.Context, env *requestRaceEnv, executionID id.ExecutionID, actionID id.ActionID, submitted engine.Outputs) {
 	t.Helper()
 	executionRow := scopedRow(t, ctx, env.runtime, env.scope, 2,
 		`SELECT state, version FROM executions WHERE id = $1`, string(executionID))
@@ -594,7 +594,7 @@ func requireCancelledRows(t *testing.T, ctx context.Context, env *requestRaceEnv
 		"content_sha256": pgtest.ContentSHA256(t, cancelCommand(env.actor, env.scope, executionID, "cancel-1", `{"cancel":2}`).Content),
 		"result": pgtest.GoldenJSONOf(execution.TransitionResult{
 			ExecutionVersion: 2, ActionVersion: 2,
-			NextExecution: kernel.ExecutionCancelled, NextAction: kernel.ActionCancelled,
+			NextExecution: engine.ExecutionCancelled, NextAction: engine.ActionCancelled,
 		}),
 		"completed_at": env.now, "execution_id": string(executionID),
 		"snapshot_sha256": pgtest.NullValue, "created_at": env.now,
@@ -672,14 +672,14 @@ func TestExecutionSettlementPersistsOutputsAndFailureOnPostgreSQL(t *testing.T) 
 		executionID, actionID := seedRunningContainer(ctx, t, env.shard, env.scope)
 		seeded := readSeededTimes(t, ctx, env.shard, env.scope, executionID)
 		store := executionstore.New(storepg.New(env.runtime), storepg.New(env.runtime))
-		staged := kernel.Outputs{id.OutputKey("result"): "staged"}
-		settled := kernel.Outputs{id.OutputKey("result"): "settled"}
+		staged := engine.Outputs{id.OutputKey("result"): "staged"}
+		settled := engine.Outputs{id.OutputKey("result"): "settled"}
 		settleObserver := env.shard.ObserveUnit(t, "execution", "settlement.pass")
 		stage, err := store.Transition(ctx, execution.TransitionUnit{
 			Owner: env.scope, ExecutionID: executionID, ExpectedExecutionVersion: 1, ExpectedActionVersion: 1,
 			Commit: flow.Commit{ExecutionID: executionID, ExpectedExecutionVersion: 1,
-				NextExecutionState: kernel.ExecutionRunning, ActionID: actionID,
-				ExpectedActionVersion: 1, NextActionState: kernel.ActionRunning,
+				NextExecutionState: engine.ExecutionRunning, ActionID: actionID,
+				ExpectedActionVersion: 1, NextActionState: engine.ActionRunning,
 				Output: flow.OutputChange{Action: flow.OutputStage, Values: staged}, At: pgtest.FixtureTime},
 		})
 		if err != nil {
@@ -690,8 +690,8 @@ func TestExecutionSettlementPersistsOutputsAndFailureOnPostgreSQL(t *testing.T) 
 			Owner: env.scope, ExecutionID: executionID,
 			ExpectedExecutionVersion: stage.ExecutionVersion, ExpectedActionVersion: stage.ActionVersion,
 			Commit: flow.Commit{ExecutionID: executionID,
-				ExpectedExecutionVersion: stage.ExecutionVersion, NextExecutionState: kernel.ExecutionSucceeded,
-				ActionID: actionID, ExpectedActionVersion: stage.ActionVersion, NextActionState: kernel.ActionSucceeded,
+				ExpectedExecutionVersion: stage.ExecutionVersion, NextExecutionState: engine.ExecutionSucceeded,
+				ActionID: actionID, ExpectedActionVersion: stage.ActionVersion, NextActionState: engine.ActionSucceeded,
 				NextCurrentAction: &minusOne,
 				Output:            flow.OutputChange{Action: flow.OutputPromote, Values: settled}, At: pgtest.FixtureTime},
 		}); err != nil {
@@ -740,8 +740,8 @@ func TestExecutionSettlementPersistsOutputsAndFailureOnPostgreSQL(t *testing.T) 
 		if _, err := store.Transition(ctx, execution.TransitionUnit{
 			Owner: env.scope, ExecutionID: executionID, ExpectedExecutionVersion: 1, ExpectedActionVersion: 1,
 			Commit: flow.Commit{ExecutionID: executionID, ExpectedExecutionVersion: 1,
-				NextExecutionState: kernel.ExecutionRunning, ActionID: actionID,
-				ExpectedActionVersion: 1, NextActionState: kernel.ActionRunning,
+				NextExecutionState: engine.ExecutionRunning, ActionID: actionID,
+				ExpectedActionVersion: 1, NextActionState: engine.ActionRunning,
 				Output: flow.OutputChange{Action: flow.OutputNone}, At: pgtest.FixtureTime},
 		}); err != nil {
 			t.Fatalf("plain transition: %v%s", err, pgtest.CauseText(err))
@@ -779,11 +779,11 @@ func TestExecutionSettlementPersistsOutputsAndFailureOnPostgreSQL(t *testing.T) 
 		if _, err := store.Transition(ctx, execution.TransitionUnit{
 			Owner: env.scope, ExecutionID: executionID, ExpectedExecutionVersion: 1, ExpectedActionVersion: 1,
 			Commit: flow.Commit{ExecutionID: executionID, ExpectedExecutionVersion: 1,
-				NextExecutionState: kernel.ExecutionFailed, ActionID: actionID,
-				ExpectedActionVersion: 1, NextActionState: kernel.ActionFailed,
+				NextExecutionState: engine.ExecutionFailed, ActionID: actionID,
+				ExpectedActionVersion: 1, NextActionState: engine.ActionFailed,
 				NextCurrentAction: &minusOne,
 				Output:            flow.OutputChange{Action: flow.OutputDiscard},
-				Failure:           &kernel.Failure{Kind: kernel.FailureRuntime, Reason: "workload_exited", Detail: "exit status 2"},
+				Failure:           &engine.Failure{Kind: engine.FailureRuntime, Reason: "workload_exited", Detail: "exit status 2"},
 				At:                pgtest.FixtureTime},
 		}); err != nil {
 			t.Fatalf("failed settlement: %v%s", err, pgtest.CauseText(err))
@@ -793,11 +793,11 @@ func TestExecutionSettlementPersistsOutputsAndFailureOnPostgreSQL(t *testing.T) 
 		if executionRow[0] != "failed" || executionRow[1] != "2" {
 			t.Fatalf("failed execution = %v; want failed/2", executionRow[:2])
 		}
-		var failure kernel.Failure
+		var failure engine.Failure
 		if err := json.Unmarshal([]byte(executionRow[2]), &failure); err != nil {
 			t.Fatalf("decode failure %q: %v", executionRow[2], err)
 		}
-		if failure.Kind != kernel.FailureRuntime || failure.Reason != "workload_exited" || failure.Detail != "exit status 2" {
+		if failure.Kind != engine.FailureRuntime || failure.Reason != "workload_exited" || failure.Detail != "exit status 2" {
 			t.Fatalf("persisted failure = %+v; want runtime/workload_exited/exit status 2", failure)
 		}
 		env.shard.RequireGoldenRow(t, ctx, env.runtime, env.scope, "executions", map[string]any{"id": string(executionID)}, map[string]any{
@@ -893,7 +893,7 @@ func seedPendingRequestExecution(t *testing.T, env *requestRaceEnv, executionID 
 		Owner: env.scope, ExecutionID: executionID, ExpectedExecutionVersion: 1,
 		Commit: flow.Commit{
 			ExecutionID: executionID, ExpectedExecutionVersion: 1,
-			NextExecutionState: kernel.ExecutionRunning,
+			NextExecutionState: engine.ExecutionRunning,
 			Output:             flow.OutputChange{Action: flow.OutputNone},
 			At:                 pgtest.FixtureTime,
 		},
@@ -943,7 +943,7 @@ func TestRequestActivationPersistsExactRowsOnPostgreSQL(t *testing.T) {
 		Owner: env.scope, ExecutionID: executionID, ActionID: actionID,
 		ExpectedExecutionVersion: 2, ExpectedActionVersion: 1,
 		Commit: flow.Commit{ExecutionID: executionID, ExpectedExecutionVersion: 2,
-			NextExecutionState: kernel.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone},
+			NextExecutionState: engine.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone},
 			At: pgtest.FixtureTime},
 		Subject: subject, Assignment: request.Assignment{Kind: request.AssignmentRole, Role: tenancy.RoleEngineer},
 		Timeout: 37 * time.Minute, Deadline: deadline, At: pgtest.FixtureTime,
@@ -1074,7 +1074,7 @@ func TestRequestActivationPersistsExactRowsOnPostgreSQL(t *testing.T) {
 		Owner: env.scope, ExecutionID: secondID, ActionID: secondActionID,
 		ExpectedExecutionVersion: 2, ExpectedActionVersion: 1,
 		Commit: flow.Commit{ExecutionID: secondID, ExpectedExecutionVersion: 2,
-			NextExecutionState: kernel.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone},
+			NextExecutionState: engine.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone},
 			At: pgtest.FixtureTime},
 		Subject: subject, Assignment: request.Assignment{Kind: request.AssignmentRole, Role: tenancy.RoleEngineer},
 		Timeout: 37 * time.Minute, Deadline: deadline, At: pgtest.FixtureTime,
@@ -1114,7 +1114,7 @@ func TestCredentialInstallPersistsExactNonceAndExpiryOnPostgreSQL(t *testing.T) 
 		Owner: env.scope, ExecutionID: executionID, ExpectedExecutionVersion: 1,
 		Commit: flow.Commit{
 			ExecutionID: executionID, ExpectedExecutionVersion: 1,
-			NextExecutionState: kernel.ExecutionRunning,
+			NextExecutionState: engine.ExecutionRunning,
 			Output:             flow.OutputChange{Action: flow.OutputNone},
 			At:                 pgtest.FixtureTime,
 		},
@@ -1276,8 +1276,8 @@ func TestObservedResolveFailOnPostgreSQL(t *testing.T) {
 		"yaml_sha256": seededRequestYAMLSHA(), "snapshot": pgtest.GoldenJSONOf(rawJSON(runningRequestDocument(t))),
 		"token_nonce": pgtest.NullValue, "token_expires_at": pgtest.NullValue,
 		"workspace_id": "workspace-request",
-		"failure": pgtest.GoldenJSONOf(kernel.Failure{
-			Kind: kernel.FailureRuntime, Reason: "answer_rejected",
+		"failure": pgtest.GoldenJSONOf(engine.Failure{
+			Kind: engine.FailureRuntime, Reason: "answer_rejected",
 			Detail: "request action was answered with a failing decision",
 		}),
 		"created_at": seeded.created,
@@ -1377,7 +1377,7 @@ func TestObservedResolvePassNonLastOnPostgreSQL(t *testing.T) {
 	if _, err := store.Transition(ctx, execution.TransitionUnit{
 		Owner: env.scope, ExecutionID: executionID, ExpectedExecutionVersion: 1,
 		Commit: flow.Commit{ExecutionID: executionID, ExpectedExecutionVersion: 1,
-			NextExecutionState: kernel.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone}, At: pgtest.FixtureTime},
+			NextExecutionState: engine.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone}, At: pgtest.FixtureTime},
 	}); err != nil {
 		t.Fatalf("running transition: %v%s", err, pgtest.CauseText(err))
 	}
@@ -1387,7 +1387,7 @@ func TestObservedResolvePassNonLastOnPostgreSQL(t *testing.T) {
 		Owner: env.scope, ExecutionID: executionID, ActionID: actionID,
 		ExpectedExecutionVersion: 2, ExpectedActionVersion: 1,
 		Commit: flow.Commit{ExecutionID: executionID, ExpectedExecutionVersion: 2,
-			NextExecutionState: kernel.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone}, At: pgtest.FixtureTime},
+			NextExecutionState: engine.ExecutionRunning, Output: flow.OutputChange{Action: flow.OutputNone}, At: pgtest.FixtureTime},
 		Subject: subject, Assignment: request.Assignment{Kind: request.AssignmentRole, Role: tenancy.RoleEngineer},
 		Timeout: time.Hour, Deadline: deadline, At: pgtest.FixtureTime,
 	}); err != nil {

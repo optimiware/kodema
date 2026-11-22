@@ -17,12 +17,12 @@ import (
 	"testing"
 	"time"
 
+	executionstore "github.com/optimiware/kodema/internal/adapter/store/units/execution"
+	"github.com/optimiware/kodema/internal/adapter/store/units/execution/snapshotdoc"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/flow"
+	kernelengine "github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	executionstore "github.com/optimiware/kodema/internal/shell/store/units/execution"
-	"github.com/optimiware/kodema/internal/shell/store/units/execution/snapshotdoc"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 
@@ -78,22 +78,22 @@ func (r *prepareCancellationRuntime) Start(_ context.Context, request kernelengi
 	return kernelengine.StartResult{Outcome: kernelengine.StartAccepted, WorkloadID: request.Identity.WorkloadID}, nil
 }
 
-func (r *prepareCancellationRuntime) Observe(context.Context, kernelengine.ObserveRequest) (kernel.Observation, error) {
+func (r *prepareCancellationRuntime) Observe(context.Context, kernelengine.ObserveRequest) (engine.Observation, error) {
 	r.mu.Lock()
 	r.observes++
 	r.mu.Unlock()
-	return kernel.AbsentObservation(), nil
+	return engine.AbsentObservation(), nil
 }
 
 func (r *prepareCancellationRuntime) Logs(context.Context, kernelengine.LogsRequest) (kernelengine.LogBatch, error) {
 	return kernelengine.LogBatch{}, nil
 }
 
-func (r *prepareCancellationRuntime) Stop(context.Context, kernelengine.StopRequest) (kernel.StopEvidence, error) {
+func (r *prepareCancellationRuntime) Stop(context.Context, kernelengine.StopRequest) (engine.StopEvidence, error) {
 	r.mu.Lock()
 	r.stops++
 	r.mu.Unlock()
-	return kernel.PendingStop("stop unconfirmed: no workload pods observed"), nil
+	return engine.PendingStop("stop unconfirmed: no workload pods observed"), nil
 }
 
 func (r *prepareCancellationRuntime) Remove(_ context.Context, request kernelengine.RemoveRequest) (kernelengine.Removal, error) {
@@ -160,14 +160,14 @@ type prepareWitnessCrashState struct {
 	err     error
 }
 
-func (s *prepareWitnessCrashState) Commit(ctx context.Context, commit flow.Commit) (kernel.Execution, error) {
+func (s *prepareWitnessCrashState) Commit(ctx context.Context, commit flow.Commit) (engine.Execution, error) {
 	updated, err := s.State.Commit(ctx, commit)
 	if err != nil {
 		return updated, err
 	}
 	witness := commit.Launch == nil && commit.Failure == nil &&
 		commit.Observation != nil &&
-		commit.Observation.Kind == kernel.ObservationNeverStarted &&
+		commit.Observation.Kind == engine.ObservationNeverStarted &&
 		commit.Observation.Proof != ""
 	s.mu.Lock()
 	armed := s.armed && witness
@@ -233,17 +233,17 @@ func TestPrepareCancellationProofPersistsOnPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fresh Load: %v%s", err, pgtest.CauseText(err))
 	}
-	if persisted.State != kernel.ExecutionCancelled {
+	if persisted.State != engine.ExecutionCancelled {
 		t.Fatalf("persisted state = %q, want cancelled", persisted.State)
 	}
 	if persisted.Failure != nil {
 		t.Fatalf("persisted cancellation gained a failure: %+v", persisted.Failure)
 	}
 	action := persisted.Actions[0]
-	if action.State != kernel.ActionCancelled {
+	if action.State != engine.ActionCancelled {
 		t.Fatalf("persisted action state = %q, want cancelled", action.State)
 	}
-	if action.Container == nil || action.Container.Launch.State != kernel.LaunchIssued {
+	if action.Container == nil || action.Container.Launch.State != engine.LaunchIssued {
 		t.Fatalf("persisted launch = %+v, want the issued attempt preserved", action.Container)
 	}
 	if !action.Container.Observation.ProofOfNonexecution() {
@@ -252,7 +252,7 @@ func TestPrepareCancellationProofPersistsOnPostgreSQL(t *testing.T) {
 	if action.Stop.IsConfirmed() {
 		t.Fatal("the persisted witness fabricated confirmed stop evidence")
 	}
-	if persisted.Cleanup.State != kernel.CleanupPending {
+	if persisted.Cleanup.State != engine.CleanupPending {
 		t.Fatalf("persisted cleanup = %+v, want pending before the fresh engine runs", persisted.Cleanup)
 	}
 	if workspace.isReleased(workspaceID) {
@@ -270,11 +270,11 @@ func TestPrepareCancellationProofPersistsOnPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fresh Reconcile: %v%s", err, pgtest.CauseText(err))
 	}
-	if completed.State != kernel.ExecutionCancelled || completed.Failure != nil {
+	if completed.State != engine.ExecutionCancelled || completed.Failure != nil {
 		t.Fatalf("fresh terminal outcome = %q/%+v, want the preserved cancellation",
 			completed.State, completed.Failure)
 	}
-	if completed.Cleanup.State != kernel.CleanupComplete {
+	if completed.Cleanup.State != engine.CleanupComplete {
 		t.Fatalf("fresh cleanup = %+v, want complete", completed.Cleanup)
 	}
 	if completed.Cleanup.WorkloadID != action.Container.WorkloadID {

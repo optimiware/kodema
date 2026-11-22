@@ -18,7 +18,7 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/app"
+	app "github.com/optimiware/kodema/internal/server"
 )
 
 // modelsConfigFile renders one valid trusted model-gateway file for the

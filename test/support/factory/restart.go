@@ -28,25 +28,25 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	natsbroker "github.com/optimiware/kodema/internal/adapter/integration/nats"
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	identitystore "github.com/optimiware/kodema/internal/adapter/store/units/identity"
+	"github.com/optimiware/kodema/internal/adapter/store/units/readers"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	kernelengine "github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/app/bridges"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	natsbroker "github.com/optimiware/kodema/internal/shell/integration/nats"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	identitystore "github.com/optimiware/kodema/internal/shell/store/units/identity"
-	"github.com/optimiware/kodema/internal/shell/store/units/readers"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/server"
+	"github.com/optimiware/kodema/internal/server/bridges"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
+	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 )
 
 // controllerRestartTimeout bounds rebuilding one controller. It covers adapter
@@ -70,7 +70,7 @@ func (h *Harness) RestartController() {
 		h.T.Fatalf("factory: rebuild controller adapters: %v\ncomposition log:\n%s",
 			err, SanitizeDiagnostic(h.logs.String()))
 	}
-	composed, err := app.New(ctx, config)
+	composed, err := server.New(ctx, config)
 	if err != nil {
 		discard()
 		h.T.Fatalf("factory: restart app.New: %v\ncomposition log:\n%s",
@@ -93,7 +93,7 @@ func (h *Harness) RestartController() {
 // forwarder was created; a restarted controller re-binds the same address: the
 // workload's KODEMA_URL and the forwarder target name that port, and every
 // workload started before the restart still dials it.
-func (h *Harness) serveController(composed *app.App) error {
+func (h *Harness) serveController(composed *server.App) error {
 	listener := h.infra.rawListener
 	if listener == nil || h.infra.listenerRetired {
 		rebound, err := net.Listen("tcp", h.infra.listenAddr)
@@ -186,7 +186,7 @@ func (h *Harness) closePools() {
 // caller invokes if it does not construct the App. Every call creates new
 // connections and adapters, so a restarted controller cannot inherit in-memory
 // state from its predecessor.
-func (h *Harness) buildControllerConfig(ctx context.Context) (app.Config, func(), error) {
+func (h *Harness) buildControllerConfig(ctx context.Context) (server.Config, func(), error) {
 	infra := &h.infra
 	// Fresh role-separated pools: the durable data is shared, the connections
 	// and the transaction identity are not.
@@ -210,9 +210,9 @@ func (h *Harness) buildControllerConfig(ctx context.Context) (app.Config, func()
 		}
 		h.infra.dbs = nil
 	}
-	fail := func(err error) (app.Config, func(), error) {
+	fail := func(err error) (server.Config, func(), error) {
 		discard()
-		return app.Config{}, nil, err
+		return server.Config{}, nil, err
 	}
 
 	executor := storepg.New(runtimeDB)
@@ -261,8 +261,8 @@ func (h *Harness) buildControllerConfig(ctx context.Context) (app.Config, func()
 	var (
 		runtimeAdapter    kernelengine.Runtime
 		workspaceAdapter  kernelengine.Workspace
-		volumeProvisioner app.VolumeProvisioner
-		claimProvisioner  app.ClaimProvisioner
+		volumeProvisioner server.VolumeProvisioner
+		claimProvisioner  server.ClaimProvisioner
 	)
 	switch infra.variant {
 	case runtimeVariantPodman:
@@ -347,8 +347,8 @@ func (h *Harness) buildControllerConfig(ctx context.Context) (app.Config, func()
 	if imageResolver == nil {
 		imageResolver = DigestResolver{}
 	}
-	config := app.Config{
-		Profile: app.ProfileTest,
+	config := server.Config{
+		Profile: server.ProfileTest,
 		Installation: installation.Config{
 			Environment: installation.EnvironmentTest,
 			State:       installation.StatePostgres,
@@ -369,9 +369,9 @@ func (h *Harness) buildControllerConfig(ctx context.Context) (app.Config, func()
 		Models:               infra.opts.composeModelsConfig(h.Scope),
 		ToolProxy:            infra.opts.composeToolsConfig(h.Scope),
 		WorkspacePVC:         infra.pvc,
-		Dev: &app.DevelopmentConfig{
+		Dev: &server.DevelopmentConfig{
 			Tokens: infra.tokens,
-			Bootstrap: &app.Bootstrap{
+			Bootstrap: &server.Bootstrap{
 				TenantID:       id.TenantID(TenantID),
 				TenantName:     "I04 Tenant",
 				ProjectID:      id.ProjectID(ProjectID),
@@ -380,7 +380,7 @@ func (h *Harness) buildControllerConfig(ctx context.Context) (app.Config, func()
 				AdminRoles:     []string{string(tenancy.RoleAdmin)},
 			},
 		},
-		Adapters: &app.Adapters{
+		Adapters: &server.Adapters{
 			Store:              executor,
 			Scanner:            executor,
 			Controller:         controller,

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 )
 
 // migrateEnv is one complete, explicit `kodema migrate` environment. The

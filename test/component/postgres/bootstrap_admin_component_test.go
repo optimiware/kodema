@@ -30,17 +30,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
+	"github.com/optimiware/kodema/internal/server"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 
@@ -127,14 +127,14 @@ func writeBootstrapComponentToken(t *testing.T) string {
 func newBootstrapComponent(
 	t *testing.T,
 	executor store.Executor,
-	ids app.BootstrapAdminIDs,
+	ids server.BootstrapAdminIDs,
 	verifier identity.OIDCVerifier,
 	cipher secret.EnvelopeCipher,
-	clock app.Clock,
-	config app.BootstrapAdminConfig,
-) *app.BootstrapAdmin {
+	clock server.Clock,
+	config server.BootstrapAdminConfig,
+) *server.BootstrapAdmin {
 	t.Helper()
-	bootstrap, err := app.NewBootstrapAdmin(config, app.BootstrapAdminDependencies{
+	bootstrap, err := server.NewBootstrapAdmin(config, server.BootstrapAdminDependencies{
 		Executor: executor,
 		IDs:      ids,
 		Cipher:   cipher,
@@ -202,7 +202,7 @@ func TestBootstrapAdminAtomicityOnPostgres(t *testing.T) {
 	}
 	rollback := newBootstrapComponent(t, scoped, rollbackIDs,
 		bootstrapComponentVerifier{principal: rollbackPrincipal}, cipher, clock,
-		app.BootstrapAdminConfig{
+		server.BootstrapAdminConfig{
 			InstallationID: installationID,
 			TenantID:       id.TenantID(rollbackTenant),
 			TenantName:     "Bootstrap Rollback",
@@ -239,7 +239,7 @@ func TestBootstrapAdminAtomicityOnPostgres(t *testing.T) {
 	}
 	success := newBootstrapComponent(t, scoped, successIDs,
 		bootstrapComponentVerifier{principal: successPrincipal}, cipher, clock,
-		app.BootstrapAdminConfig{
+		server.BootstrapAdminConfig{
 			InstallationID: installationID,
 			TenantID:       id.TenantID(successTenant),
 			TenantName:     "Bootstrap Success",
@@ -339,8 +339,8 @@ func TestBootstrapAdminAtomicityOnPostgres(t *testing.T) {
 		t.Fatalf("audit actor = %q; want %q", actor, successPrincipal.ID)
 	}
 	if operation := bootstrapComponentString(t, ctx, shard,
-		`SELECT operation FROM audit WHERE id = $1`, "event-bootstrap-audit-ok"); operation != app.BootstrapAdminOperation {
-		t.Fatalf("audit operation = %q; want %q", operation, app.BootstrapAdminOperation)
+		`SELECT operation FROM audit WHERE id = $1`, "event-bootstrap-audit-ok"); operation != server.BootstrapAdminOperation {
+		t.Fatalf("audit operation = %q; want %q", operation, server.BootstrapAdminOperation)
 	}
 
 	if eventType := bootstrapComponentString(t, ctx, shard,
@@ -377,7 +377,7 @@ func TestBootstrapAdminAtomicityOnPostgres(t *testing.T) {
 	}
 	second := newBootstrapComponent(t, scoped, secondIDs,
 		bootstrapComponentVerifier{principal: secondPrincipal}, cipher, clock,
-		app.BootstrapAdminConfig{
+		server.BootstrapAdminConfig{
 			InstallationID: installationID,
 			TenantID:       id.TenantID(successTenant),
 			TenantName:     "Bootstrap Second",

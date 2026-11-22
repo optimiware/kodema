@@ -20,18 +20,19 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/kit/sandbox"
+	"github.com/optimiware/kodema/internal/apps/merge"
+	"github.com/optimiware/kodema/internal/apps/opencode"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	kernelengine "github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/userland/sandbox"
-	"github.com/optimiware/kodema/internal/userland/services"
+	shellapp "github.com/optimiware/kodema/internal/server"
 )
 
 // requiredAgenticSDLCPipelines is the exact manifest of pipeline YAMLs shipped
@@ -127,15 +128,15 @@ func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 		decoded := decodeExample(t, "agentic-sdlc/pattern-b-worktree-sdlc.yaml")
 		assertKinds(t, "agentic-sdlc/pattern-b-worktree-sdlc.yaml", decoded, "request", "request", "container", "request", "request")
 		planSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-b-worktree-sdlc.yaml", decoded.Actions[0])
-		if planSubj.Mode != services.OpenCodeModePlan {
+		if planSubj.Mode != opencode.OpenCodeModePlan {
 			t.Fatalf("plan mode = %q; want plan", planSubj.Mode)
 		}
 		implSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-b-worktree-sdlc.yaml", decoded.Actions[1])
-		if implSubj.Mode != services.OpenCodeModeImplement || implSubj.PlanKey == "" {
+		if implSubj.Mode != opencode.OpenCodeModeImplement || implSubj.PlanKey == "" {
 			t.Fatalf("implement subject = %+v; want mode=implement with plan_key", implSubj)
 		}
 		aiRevSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-b-worktree-sdlc.yaml", decoded.Actions[3])
-		if aiRevSubj.Mode != services.OpenCodeModeAIReview {
+		if aiRevSubj.Mode != opencode.OpenCodeModeAIReview {
 			t.Fatalf("ai-review mode = %q; want ai_review", aiRevSubj.Mode)
 		}
 	})
@@ -145,7 +146,7 @@ func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 		assertKinds(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded, "request", "request", "request", "request", "request")
 
 		planSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded.Actions[0])
-		if planSubj.Mode != services.OpenCodeModePlan || planSubj.SandboxImage != "" {
+		if planSubj.Mode != opencode.OpenCodeModePlan || planSubj.SandboxImage != "" {
 			t.Fatalf("brain plan turn must be sandbox-free (mode=plan, sandbox_image empty); got %+v", planSubj)
 		}
 
@@ -160,7 +161,7 @@ func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 		}
 
 		aiRevSubj := validateOpenCodeActionContract(t, "agentic-sdlc/pattern-c-brain-polyglot.yaml", decoded.Actions[3])
-		if aiRevSubj.Mode != services.OpenCodeModeAIReview || aiRevSubj.SandboxImage != "" {
+		if aiRevSubj.Mode != opencode.OpenCodeModeAIReview || aiRevSubj.SandboxImage != "" {
 			t.Fatalf("brain ai-review turn must be sandbox-free; got %+v", aiRevSubj)
 		}
 	})
@@ -211,7 +212,7 @@ func TestAgenticSDLCExamplePipelinesValidate(t *testing.T) {
 	})
 }
 
-func validateOpenCodeActionContract(t *testing.T, rel string, action definition.Action) services.OpenCodeSubject {
+func validateOpenCodeActionContract(t *testing.T, rel string, action definition.Action) opencode.OpenCodeSubject {
 	t.Helper()
 	if action.Request == nil {
 		t.Fatalf("%s action %q is not a request action", rel, action.Name)
@@ -241,7 +242,7 @@ func validateOpenCodeActionContract(t *testing.T, rel string, action definition.
 			Value: v,
 		})
 	}
-	parsed, err := services.ParseOpenCodeSubject(resolved)
+	parsed, err := opencode.ParseOpenCodeSubject(resolved)
 	if err != nil {
 		t.Fatalf("%s action %q subject failed ParseOpenCodeSubject: %v", rel, action.Name, err)
 	}
@@ -272,7 +273,7 @@ func validateMergeActionContract(t *testing.T, rel string, action definition.Act
 			Value: v,
 		})
 	}
-	parsed, err := services.ParseMergeSubject(resolved)
+	parsed, err := merge.ParseMergeSubject(resolved)
 	if err != nil {
 		t.Fatalf("%s action %q subject failed ParseMergeSubject: %v", rel, action.Name, err)
 	}
@@ -283,14 +284,14 @@ func validateMergeActionContract(t *testing.T, rel string, action definition.Act
 	for i, k := range action.Request.Outputs {
 		outputs[i] = string(k)
 	}
-	if err := services.ValidateMergeOutputs(outputs); err != nil {
+	if err := merge.ValidateMergeOutputs(outputs); err != nil {
 		t.Fatalf("%s action %q outputs %v failed ValidateMergeOutputs: %v", rel, action.Name, outputs, err)
 	}
 }
 
 // sdlcHermeticRuntime is a minimal in-process Kernel Runtime/Workspace that
 // simulates container actions settling outputs over the real public API so
-// multi-stage SDLC pipelines execute hermetically with zero external services.
+// multi-stage SDLC pipelines execute hermetically with zero external opencode.
 type sdlcHermeticRuntime struct {
 	mu      sync.Mutex
 	started map[id.WorkloadID]bool
@@ -337,22 +338,22 @@ func (r *sdlcHermeticRuntime) Start(_ context.Context, req kernelengine.StartReq
 	return kernelengine.StartResult{Outcome: kernelengine.StartAccepted, WorkloadID: req.Identity.WorkloadID, Detail: "started"}, nil
 }
 
-func (r *sdlcHermeticRuntime) Observe(_ context.Context, req kernelengine.ObserveRequest) (kernel.Observation, error) {
+func (r *sdlcHermeticRuntime) Observe(_ context.Context, req kernelengine.ObserveRequest) (engine.Observation, error) {
 	r.mu.Lock()
 	wasStarted := r.started[req.Identity.WorkloadID]
 	r.mu.Unlock()
 	if !wasStarted {
-		return kernel.AbsentObservation(), nil
+		return engine.AbsentObservation(), nil
 	}
-	return kernel.ExitedObservation(0, kernel.ConfirmedStop("exited 0")), nil
+	return engine.ExitedObservation(0, engine.ConfirmedStop("exited 0")), nil
 }
 
 func (r *sdlcHermeticRuntime) Logs(context.Context, kernelengine.LogsRequest) (kernelengine.LogBatch, error) {
 	return kernelengine.LogBatch{}, nil
 }
 
-func (r *sdlcHermeticRuntime) Stop(context.Context, kernelengine.StopRequest) (kernel.StopEvidence, error) {
-	return kernel.ConfirmedStop("stopped"), nil
+func (r *sdlcHermeticRuntime) Stop(context.Context, kernelengine.StopRequest) (engine.StopEvidence, error) {
+	return engine.ConfirmedStop("stopped"), nil
 }
 
 func (r *sdlcHermeticRuntime) Remove(context.Context, kernelengine.RemoveRequest) (kernelengine.Removal, error) {
@@ -1099,12 +1100,12 @@ func TestAgenticSDLCSandboxServeAndPipelineAdmission(t *testing.T) {
 	// through Kodema's real pipeline admission parser.
 	sandboxCases := []struct {
 		name      string
-		req       services.OpenCodeSandboxRequest
+		req       opencode.OpenCodeSandboxRequest
 		secretRef string
 	}{
 		{
 			name: "golang-1.24",
-			req: services.OpenCodeSandboxRequest{
+			req: opencode.OpenCodeSandboxRequest{
 				TenantID:    "tenant-a",
 				ProjectID:   "shop",
 				TaskID:      "task-polyglot-1",
@@ -1124,7 +1125,7 @@ func TestAgenticSDLCSandboxServeAndPipelineAdmission(t *testing.T) {
 		},
 		{
 			name: "node-22",
-			req: services.OpenCodeSandboxRequest{
+			req: opencode.OpenCodeSandboxRequest{
 				TenantID:    "tenant-a",
 				ProjectID:   "shop",
 				TaskID:      "task-polyglot-1",
@@ -1145,7 +1146,7 @@ func TestAgenticSDLCSandboxServeAndPipelineAdmission(t *testing.T) {
 	}
 	for _, tc := range sandboxCases {
 		t.Run("admit-"+tc.name, func(t *testing.T) {
-			yamlBytes, err := services.BuildSandboxPipelineYAML(tc.req, tc.secretRef)
+			yamlBytes, err := opencode.BuildSandboxPipelineYAML(tc.req, tc.secretRef)
 			if err != nil {
 				t.Fatalf("BuildSandboxPipelineYAML(%s): %v", tc.name, err)
 			}

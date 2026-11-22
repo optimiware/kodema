@@ -22,7 +22,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/optimiware/kodema/api"
-	shelloidc "github.com/optimiware/kodema/internal/shell/integration/oidc"
+	shelloidc "github.com/optimiware/kodema/internal/adapter/integration/oidc"
 	identityfixture "github.com/optimiware/kodema/test/support/boundaries/identity"
 	"github.com/optimiware/kodema/test/support/factory"
 )

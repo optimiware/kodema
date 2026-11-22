@@ -16,17 +16,17 @@ import (
 func TestRequiredAdapterContractFiles(t *testing.T) {
 	root := filepath.Join("..", "..", "..")
 	required := []string{
-		"internal/shell/store/adapter_contract.go",
-		"internal/shell/runtime/adapter_contract.go",
-		"internal/shell/workspace/adapter_contract.go",
-		"internal/shell/log/adapter_contract.go",
-		"internal/shell/secret/adapter_contract.go",
-		"internal/shell/event/adapter_contract.go",
-		"internal/shell/token/adapter_contract.go",
-		"internal/shell/identity/adapter_contract.go",
-		"internal/shell/authorize/adapter_contract.go",
-		"internal/shell/pipeline/adapter_contract.go",
-		"internal/shell/integration/nats/adapter_contract.go",
+		"internal/control/store/adapter_contract.go",
+		"internal/adapter/runtime/adapter_contract.go",
+		"internal/control/workspace/adapter_contract.go",
+		"internal/control/log/adapter_contract.go",
+		"internal/control/secret/adapter_contract.go",
+		"internal/control/event/adapter_contract.go",
+		"internal/control/token/adapter_contract.go",
+		"internal/control/identity/adapter_contract.go",
+		"internal/control/authorize/adapter_contract.go",
+		"internal/control/pipeline/adapter_contract.go",
+		"internal/adapter/integration/nats/adapter_contract.go",
 		"internal/installation/types.go",
 		"internal/installation/ports.go",
 		"internal/installation/adapter_contract.go",
@@ -56,32 +56,32 @@ func TestProductImportGraphAcyclic(t *testing.T) {
 }
 
 // TestProductImportGraphStoreSeamRules proves the layer rules: a capability
-// may consume the neutral internal/shell/store seam, but never a concrete
-// store/postgres or store/memory adapter, and transport packages may import
-// sibling transport packages.
+// may consume the neutral internal/control/store seam, but never a concrete
+// adapter store/postgres or store/memory package, and transport packages may
+// import sibling transport packages.
 func TestProductImportGraphStoreSeamRules(t *testing.T) {
 	const module = "example.com/fixture"
 	root := t.TempDir()
 	writeFixtureFile(t, root, "go.mod", "module "+module+"\n\ngo 1.27.2\n")
-	writeFixtureFile(t, root, "internal/shell/store/executor.go", "package store\n")
-	writeFixtureFile(t, root, "internal/shell/store/postgres/postgres.go", "package postgres\n")
-	writeFixtureFile(t, root, "internal/shell/store/memory/memory.go", "package memory\n")
-	writeFixtureFile(t, root, "internal/shell/secret/secret.go", `package secret
+	writeFixtureFile(t, root, "internal/control/store/executor.go", "package store\n")
+	writeFixtureFile(t, root, "internal/adapter/store/postgres/postgres.go", "package postgres\n")
+	writeFixtureFile(t, root, "internal/adapter/store/memory/memory.go", "package memory\n")
+	writeFixtureFile(t, root, "internal/control/secret/secret.go", `package secret
 
-import _ "`+module+`/internal/shell/store"
+import _ "`+module+`/internal/control/store"
 `)
-	writeFixtureFile(t, root, "internal/shell/leaky/leaky.go", `package leaky
+	writeFixtureFile(t, root, "internal/control/leaky/leaky.go", `package leaky
 
 import (
-	_ "`+module+`/internal/shell/store/postgres"
-	_ "`+module+`/internal/shell/store/memory"
+	_ "`+module+`/internal/adapter/store/postgres"
+	_ "`+module+`/internal/adapter/store/memory"
 )
 `)
-	writeFixtureFile(t, root, "internal/shell/transport/httpapi/httpapi.go", `package httpapi
+	writeFixtureFile(t, root, "internal/transport/httpapi/httpapi.go", `package httpapi
 
-import _ "`+module+`/internal/shell/transport/mcp"
+import _ "`+module+`/internal/transport/mcp"
 `)
-	writeFixtureFile(t, root, "internal/shell/transport/mcp/mcp.go", "package mcp\n")
+	writeFixtureFile(t, root, "internal/transport/mcp/mcp.go", "package mcp\n")
 
 	_, imports := collectProductImports(t, root, module)
 	violations := productImportViolations(imports)
@@ -91,14 +91,14 @@ import _ "`+module+`/internal/shell/transport/mcp"
 	}
 	joined := strings.Join(violations, "\n")
 	for _, want := range []string{
-		"internal/shell/leaky imports adapter/transport/composition package internal/shell/store/postgres",
-		"internal/shell/leaky imports adapter/transport/composition package internal/shell/store/memory",
+		"internal/control/leaky imports adapter/transport/composition package internal/adapter/store/postgres",
+		"internal/control/leaky imports adapter/transport/composition package internal/adapter/store/memory",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("violations do not contain %q:\n%s", want, joined)
 		}
 	}
-	if strings.Contains(joined, "internal/shell/secret") {
+	if strings.Contains(joined, "internal/control/secret") {
 		t.Errorf("capability import of the neutral store seam was refused:\n%s", joined)
 	}
 	if strings.Contains(joined, "transport/httpapi") {
@@ -113,22 +113,22 @@ func TestProductStdlibImportAllowlist(t *testing.T) {
 	const module = "example.com/fixture"
 	root := t.TempDir()
 	writeFixtureFile(t, root, "go.mod", "module "+module+"\n\ngo 1.27.2\n")
-	writeFixtureFile(t, root, "internal/shell/gateway/gateway.go", `package gateway
+	writeFixtureFile(t, root, "internal/control/gateway/gateway.go", `package gateway
 
 import _ "net/http"
 `)
-	writeFixtureFile(t, root, "internal/shell/gateway/gateway_test.go", `package gateway
+	writeFixtureFile(t, root, "internal/control/gateway/gateway_test.go", `package gateway
 
 import _ "net/http/httptest"
 `)
-	writeFixtureFile(t, root, "internal/shell/mcpproxy/mcpproxy.go", `package mcpproxy
+	writeFixtureFile(t, root, "internal/control/mcpproxy/mcpproxy.go", `package mcpproxy
 
 import _ "net/http"
 `)
-	writeFixtureFile(t, root, "internal/shell/store/executor.go", "package store\n")
+	writeFixtureFile(t, root, "internal/control/store/executor.go", "package store\n")
 
-	violations := stdlibImportViolations(collectShellStdlibImports(t, root, module))
-	if len(violations) != 1 || !strings.Contains(violations[0], "internal/shell/mcpproxy") {
+	violations := stdlibImportViolations(collectControlStdlibImports(t, root, module))
+	if len(violations) != 1 || !strings.Contains(violations[0], "internal/control/mcpproxy") {
 		t.Fatalf("stdlib violations = %v, want only the mcpproxy net/http import", violations)
 	}
 }
@@ -136,7 +136,7 @@ import _ "net/http"
 func TestProductStdlibImportsInRepository(t *testing.T) {
 	root := filepath.Join("..", "..", "..")
 	module := readModulePath(t, root)
-	if violations := stdlibImportViolations(collectShellStdlibImports(t, root, module)); len(violations) > 0 {
+	if violations := stdlibImportViolations(collectControlStdlibImports(t, root, module)); len(violations) > 0 {
 		t.Errorf("capability stdlib violations: %v", violations)
 	}
 }
@@ -144,39 +144,39 @@ func TestProductStdlibImportsInRepository(t *testing.T) {
 // TestProductImportGraphIgnoresExternalTestPackages proves a `<package>_test`
 // file importing its own product package is not recorded as a product
 // self-edge, which would be reported as
-// `product import cycle: [internal/shell/identity internal/shell/identity]`.
+// `product import cycle: [internal/control/identity internal/control/identity]`.
 // The product graph is built only from non-test production files, while real
 // production imports are still collected.
 func TestProductImportGraphIgnoresExternalTestPackages(t *testing.T) {
 	const module = "example.com/fixture"
 	root := t.TempDir()
 	writeFixtureFile(t, root, "go.mod", "module "+module+"\n\ngo 1.27.2\n")
-	writeFixtureFile(t, root, "internal/shell/identity/adapter_contract.go", "package identity\n")
-	writeFixtureFile(t, root, "internal/shell/identity/external_test.go", `package identity_test
+	writeFixtureFile(t, root, "internal/control/identity/adapter_contract.go", "package identity\n")
+	writeFixtureFile(t, root, "internal/control/identity/external_test.go", `package identity_test
 
 import (
 	"testing"
 
-	_ "`+module+`/internal/shell/identity"
+	_ "`+module+`/internal/control/identity"
 )
 
 func TestSelfImport(t *testing.T) {}
 `)
-	writeFixtureFile(t, root, "internal/shell/pipeline/adapter_contract.go", `package pipeline
+	writeFixtureFile(t, root, "internal/control/pipeline/adapter_contract.go", `package pipeline
 
-import _ "`+module+`/internal/shell/identity"
+import _ "`+module+`/internal/control/identity"
 `)
 
 	graph, imports := collectProductImports(t, root, module)
 
-	if got := graph["internal/shell/identity"]; len(got) != 0 {
+	if got := graph["internal/control/identity"]; len(got) != 0 {
 		t.Fatalf("external test package self-import recorded in product graph: %v", got)
 	}
-	if got := imports["internal/shell/identity"]; len(got) != 0 {
+	if got := imports["internal/control/identity"]; len(got) != 0 {
 		t.Fatalf("external test package self-import recorded in product imports: %v", got)
 	}
-	if got := graph["internal/shell/pipeline"]; len(got) != 1 || got[0] != "internal/shell/identity" {
-		t.Fatalf("production import of internal/shell/identity not recorded: got %v", got)
+	if got := graph["internal/control/pipeline"]; len(got) != 1 || got[0] != "internal/control/identity" {
+		t.Fatalf("production import of internal/control/identity not recorded: got %v", got)
 	}
 	if cycle := findCycle(graph); cycle != nil {
 		t.Fatalf("external test package produced product import cycle: %v", cycle)
@@ -215,7 +215,10 @@ func collectProductImports(t *testing.T, root, module string) (map[string][]stri
 	graph := make(map[string][]string)
 	imports := make(map[string][]string)
 	roots := []string{
-		filepath.Join(root, "internal", "shell"),
+		filepath.Join(root, "internal", "control"),
+		filepath.Join(root, "internal", "adapter"),
+		filepath.Join(root, "internal", "transport"),
+		filepath.Join(root, "internal", "server"),
 		filepath.Join(root, "internal", "installation"),
 	}
 	for _, base := range roots {
@@ -308,13 +311,13 @@ func productImportViolations(imports map[string][]string) []string {
 	return violations
 }
 
-// collectShellStdlibImports records the standard-library imports of every Go
-// file under internal/shell, including tests because the gateway allowlist
+// collectControlStdlibImports records the standard-library imports of every Go
+// file under internal/control, including tests because the gateway allowlist
 // applies to its test files too.
-func collectShellStdlibImports(t *testing.T, root, module string) map[string][]string {
+func collectControlStdlibImports(t *testing.T, root, module string) map[string][]string {
 	t.Helper()
 	imports := make(map[string][]string)
-	base := filepath.Join(root, "internal", "shell")
+	base := filepath.Join(root, "internal", "control")
 	err := filepath.WalkDir(base, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -378,7 +381,7 @@ func stdlibImportViolations(imports map[string][]string) []string {
 			if imported != "net/http" && !strings.HasPrefix(imported, "net/http/") {
 				continue
 			}
-			if dir == "internal/shell/gateway" {
+			if dir == "internal/control/gateway" {
 				continue
 			}
 			violations = append(violations, fmt.Sprintf("capability %s imports standard library %s", dir, imported))
@@ -398,53 +401,20 @@ func isInstallation(path string) bool {
 	return path == "internal/installation" || strings.HasPrefix(path, "internal/installation/")
 }
 
-func isStoreSeam(path string) bool {
-	return path == "internal/shell/store"
-}
-
 func isCapability(path string) bool {
-	if !strings.HasPrefix(path, "internal/shell/") {
-		return false
-	}
-	rest := strings.TrimPrefix(path, "internal/shell/")
-	switch {
-	case rest == "store":
-		// The SQL-free commit-unit seam is neutral: capabilities consume it.
-		return true
-	case strings.HasPrefix(rest, "store/"):
-		return false
-	case rest == "runtime" || strings.HasPrefix(rest, "runtime/"):
-		return false
-	case rest == "integration" || strings.HasPrefix(rest, "integration/"):
-		return false
-	case rest == "transport" || strings.HasPrefix(rest, "transport/"):
-		return false
-	case rest == "app" || strings.HasPrefix(rest, "app/"):
-		return false
-	default:
-		return true
-	}
+	return path == "internal/control" || strings.HasPrefix(path, "internal/control/")
 }
 
 func isAdapter(path string) bool {
-	if !strings.HasPrefix(path, "internal/shell/") {
-		return false
-	}
-	rest := strings.TrimPrefix(path, "internal/shell/")
-	if isStoreSeam(path) {
-		return false
-	}
-	return strings.HasPrefix(rest, "store/") ||
-		rest == "runtime" || strings.HasPrefix(rest, "runtime/") ||
-		rest == "integration" || strings.HasPrefix(rest, "integration/")
+	return path == "internal/adapter" || strings.HasPrefix(path, "internal/adapter/")
 }
 
 func isTransport(path string) bool {
-	return path == "internal/shell/transport" || strings.HasPrefix(path, "internal/shell/transport/")
+	return path == "internal/transport" || strings.HasPrefix(path, "internal/transport/")
 }
 
 func isComposition(path string) bool {
-	return path == "internal/shell/app" || strings.HasPrefix(path, "internal/shell/app/") ||
+	return path == "internal/server" || strings.HasPrefix(path, "internal/server/") ||
 		path == "cmd" || strings.HasPrefix(path, "cmd/")
 }
 

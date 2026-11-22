@@ -11,9 +11,9 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 )
 
 func TestAssignableServiceRolesDropsAdminAndUnknownValues(t *testing.T) {

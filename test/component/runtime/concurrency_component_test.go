@@ -5,10 +5,10 @@ package runtimeconformance
 import (
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/runtime/podman"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
@@ -66,7 +66,7 @@ func TestRuntimeIdentityNamespaces(t *testing.T) {
 	// complete effect identity differ between runs too.
 	firstIdentity := testIdentityInScope(first, "exec-c1", "action-c1", workloadBase, "idem-c1")
 	secondIdentity := testIdentityInScope(second, "exec-c1", "action-c1", workloadBase, "idem-c1")
-	for _, identity := range []engine.EffectIdentity{firstIdentity, secondIdentity} {
+	for _, identity := range []reconcile.EffectIdentity{firstIdentity, secondIdentity} {
 		if _, err := id.ParseExecutionID(string(identity.ExecutionID)); err != nil {
 			t.Fatalf("run-scoped execution id %q is invalid: %v", identity.ExecutionID, err)
 		}
@@ -115,28 +115,28 @@ func TestRuntimeConcurrentTwinIsolation(t *testing.T) {
 
 	firstIdentity := testIdentityInScope(firstScope, "exec-twin", "action-twin", "workload-twin", "idem-twin")
 	secondIdentity := testIdentityInScope(secondScope, "exec-twin", "action-twin", "workload-twin", "idem-twin")
-	launch := func(fixture *podmanFixture, identity engine.EffectIdentity) {
+	launch := func(fixture *podmanFixture, identity reconcile.EffectIdentity) {
 		t.Helper()
 		request := fixture.request(identity, []string{`echo alive > /workspace/alive`}, nil, nil, "tok-abc")
 		if _, err := fixture.adapter.Prepare(ctx, request); err != nil {
 			t.Fatalf("Prepare %q: %v", identity.WorkloadID, err)
 		}
-		start, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+		start, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
 		if err != nil {
 			t.Fatalf("Start %q: %v", identity.WorkloadID, err)
 		}
-		if start.Outcome != engine.StartAccepted {
+		if start.Outcome != reconcile.StartAccepted {
 			t.Fatalf("start outcome for %q = %q; want accepted", identity.WorkloadID, start.Outcome)
 		}
 		waitForPodmanObservation(t, ctx, fixture.adapter,
-			engine.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
+			reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 	}
 	launch(firstTwin, firstIdentity)
 	launch(secondTwin, secondIdentity)
 
 	// Positive observations before cleanup: each run owns one container and its
 	// own retained workspace bytes, while the twin is still alive.
-	assertOwned := func(fixture *podmanFixture, identity engine.EffectIdentity, want string) {
+	assertOwned := func(fixture *podmanFixture, identity reconcile.EffectIdentity, want string) {
 		t.Helper()
 		name, err := podman.ContainerName(identity.WorkloadID)
 		if err != nil {
@@ -154,7 +154,7 @@ func TestRuntimeConcurrentTwinIsolation(t *testing.T) {
 	assertOwned(secondTwin, secondIdentity, "alive\n")
 
 	// Close the first run exactly as the suite does at test end.
-	if removal, err := firstTwin.adapter.Remove(ctx, engine.RemoveRequest{Identity: firstIdentity, WorkspaceID: firstTwin.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := firstTwin.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: firstIdentity, WorkspaceID: firstTwin.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("first twin Remove = %+v, %v; want removed", removal, err)
 	}
 	if err := firstTwin.adapter.Release(ctx, firstTwin.workspaceID); err != nil {
@@ -177,7 +177,7 @@ func TestRuntimeConcurrentTwinIsolation(t *testing.T) {
 	assertOwned(secondTwin, secondIdentity, "alive\n")
 
 	// Clean the surviving twin so the run-scoped sweeps have nothing left.
-	if removal, err := secondTwin.adapter.Remove(ctx, engine.RemoveRequest{Identity: secondIdentity, WorkspaceID: secondTwin.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := secondTwin.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: secondIdentity, WorkspaceID: secondTwin.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("second twin Remove = %+v, %v; want removed", removal, err)
 	}
 	if err := secondTwin.adapter.Release(ctx, secondTwin.workspaceID); err != nil {

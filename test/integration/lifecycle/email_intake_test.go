@@ -27,8 +27,8 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/services"
-	servicesapp "github.com/optimiware/kodema/internal/userland/services/app"
+	"github.com/optimiware/kodema/internal/apps/email"
+	emailapp "github.com/optimiware/kodema/internal/apps/email/app"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 
@@ -128,15 +128,15 @@ func TestEmailIntakeServedCreateAndStart(t *testing.T) {
 	}}})
 	applied := applyPipeline(t, harness, "email-diagnostic", document)
 
-	config := servicesapp.EmailIntakeConfig{
+	config := emailapp.EmailIntakeConfig{
 		TenantID:   harness.TenantID,
 		ProjectID:  harness.ProjectID,
 		PipelineID: applied.PipelineID,
 	}
-	runIntake := func(handler api.Handler, message string) (services.EmailIntakeResult, error) {
+	runIntake := func(handler api.Handler, message string) (email.EmailIntakeResult, error) {
 		config.Handler = handler
 		config.Message = strings.NewReader(message)
-		return servicesapp.RunEmailIntake(ctx, config)
+		return emailapp.RunEmailIntake(ctx, config)
 	}
 	// The canonical Message-ID is the token without its conventional bracket
 	// pair; the wire spelling below keeps the brackets the sender uses.
@@ -236,7 +236,7 @@ func TestEmailIntakeServedCreateAndStart(t *testing.T) {
 	// receipt, and no second task is created.
 	changed, err := runIntake(handler, emailIntakeMessage("<"+messageID+">", "Printer queue diagnostic",
 		"A different body under the same message identity.\r\n"))
-	if !errors.Is(err, services.ErrEmailContentChanged) {
+	if !errors.Is(err, email.ErrEmailContentChanged) {
 		t.Fatalf("changed content error = %v; want ErrEmailContentChanged", err)
 	}
 	if changed.TaskID != "" || changed.ExecutionID != "" {

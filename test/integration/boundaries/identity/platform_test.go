@@ -8,12 +8,12 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/platform"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/platform"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 )
 

@@ -16,11 +16,11 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 
@@ -140,12 +140,12 @@ func runCAWorkload(
 	ctx context.Context,
 	fx *fixture,
 	adapter *runtimekube.Adapter,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	workspaceID id.WorkspaceID,
 	script string,
-) (kernel.Observation, []byte, []byte) {
+) (engine.Observation, []byte, []byte) {
 	t.Helper()
-	request := engine.PrepareRequest{
+	request := reconcile.PrepareRequest{
 		Identity:    identity,
 		WorkspaceID: workspaceID,
 		ActionName:  "https",
@@ -158,16 +158,16 @@ func runCAWorkload(
 	if _, err := adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare %s: %v", identity.WorkloadID, err)
 	}
-	start, err := adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: workspaceID})
+	start, err := adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Start %s: %v", identity.WorkloadID, err)
 	}
-	if start.Outcome != engine.StartAccepted {
+	if start.Outcome != reconcile.StartAccepted {
 		t.Fatalf("start outcome = %q; want accepted (%s)", start.Outcome, start.Detail)
 	}
-	observation := waitForObservation(t, ctx, adapter, engine.ObserveRequest{
+	observation := waitForObservation(t, ctx, adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 	stdout, stderr := readAllLogs(t, ctx, adapter, identity, 1<<20)
 	return observation, stdout, stderr
 }

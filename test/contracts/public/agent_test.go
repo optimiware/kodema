@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/agent"
-	"github.com/optimiware/kodema/internal/userland/session"
-	"github.com/optimiware/kodema/internal/userland/skill"
+	"github.com/optimiware/kodema/internal/apps/agent"
+	"github.com/optimiware/kodema/internal/apps/kit/session"
+	"github.com/optimiware/kodema/internal/apps/kit/skill"
 )
 
 // TestCheckpointReferenceFormat pins the versioned durable checkpoint reference

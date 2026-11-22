@@ -21,11 +21,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/control/identity"
 	"github.com/optimiware/kodema/internal/fault"
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
+	shellapp "github.com/optimiware/kodema/internal/server"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 )
 
 // selfSigned writes a certificate and key pair (also usable as a CA bundle).

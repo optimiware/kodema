@@ -35,8 +35,9 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
+	mergeapp "github.com/optimiware/kodema/internal/apps/merge"
 	"github.com/optimiware/kodema/internal/id"
-	serviceadapter "github.com/optimiware/kodema/internal/userland/services"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 
@@ -68,15 +69,15 @@ func applyMergePipeline(t *testing.T, harness *factory.Harness, name, assignment
 		Name:    "merge",
 		Request: assignment,
 		Subject: map[string]any{
-			serviceadapter.MergeFieldRepository: mergeAdapterRepository,
-			serviceadapter.MergeFieldRef:        mergeAdapterWorkRef,
-			serviceadapter.MergeFieldBase:       "base-1111111",
-			serviceadapter.MergeFieldCandidate:  "candidate-2222222",
+			mergeapp.MergeFieldRepository: mergeAdapterRepository,
+			mergeapp.MergeFieldRef:        mergeAdapterWorkRef,
+			mergeapp.MergeFieldBase:       "base-1111111",
+			mergeapp.MergeFieldCandidate:  "candidate-2222222",
 		},
 		Outputs: []string{
-			serviceadapter.MergeOutputBase,
-			serviceadapter.MergeOutputCandidate,
-			serviceadapter.MergeOutputResult,
+			mergeapp.MergeOutputBase,
+			mergeapp.MergeOutputCandidate,
+			mergeapp.MergeOutputResult,
 		},
 		Timeout: responderRequestTimeout,
 	}}})
@@ -97,29 +98,29 @@ func applyMergePipeline(t *testing.T, harness *factory.Harness, name, assignment
 // execution and settles applied observations that echo the exact revisions.
 type integrationMergeEffects struct {
 	mu         sync.Mutex
-	executed   []serviceadapter.MergeOperation
-	observed   []serviceadapter.MergeOperation
+	executed   []mergeapp.MergeOperation
+	observed   []mergeapp.MergeOperation
 	executeErr error
-	observe    func(serviceadapter.MergeOperation) (serviceadapter.MergeObservation, error)
+	observe    func(mergeapp.MergeOperation) (mergeapp.MergeObservation, error)
 }
 
-func (effects *integrationMergeEffects) Execute(_ context.Context, operation serviceadapter.MergeOperation) (serviceadapter.MergeObservation, error) {
+func (effects *integrationMergeEffects) Execute(_ context.Context, operation mergeapp.MergeOperation) (mergeapp.MergeObservation, error) {
 	effects.mu.Lock()
 	effects.executed = append(effects.executed, operation)
 	executeErr := effects.executeErr
 	effects.mu.Unlock()
 	if executeErr != nil {
-		return serviceadapter.MergeObservation{State: serviceadapter.EffectUncertain, Base: operation.Base}, executeErr
+		return mergeapp.MergeObservation{State: mergeapp.EffectUncertain, Base: operation.Base}, executeErr
 	}
-	return serviceadapter.MergeObservation{
-		State:     serviceadapter.EffectApplied,
+	return mergeapp.MergeObservation{
+		State:     mergeapp.EffectApplied,
 		Base:      operation.Base,
 		Candidate: operation.Candidate,
 		Output:    mergeAdapterOutput,
 	}, nil
 }
 
-func (effects *integrationMergeEffects) Observe(_ context.Context, operation serviceadapter.MergeOperation) (serviceadapter.MergeObservation, error) {
+func (effects *integrationMergeEffects) Observe(_ context.Context, operation mergeapp.MergeOperation) (mergeapp.MergeObservation, error) {
 	effects.mu.Lock()
 	effects.observed = append(effects.observed, operation)
 	observe := effects.observe
@@ -127,7 +128,7 @@ func (effects *integrationMergeEffects) Observe(_ context.Context, operation ser
 	if observe != nil {
 		return observe(operation)
 	}
-	return serviceadapter.MergeObservation{State: serviceadapter.EffectNotStarted}, nil
+	return mergeapp.MergeObservation{State: mergeapp.EffectNotStarted}, nil
 }
 
 func (effects *integrationMergeEffects) executeCount() int {
@@ -136,10 +137,10 @@ func (effects *integrationMergeEffects) executeCount() int {
 	return len(effects.executed)
 }
 
-func (effects *integrationMergeEffects) executions() []serviceadapter.MergeOperation {
+func (effects *integrationMergeEffects) executions() []mergeapp.MergeOperation {
 	effects.mu.Lock()
 	defer effects.mu.Unlock()
-	return append([]serviceadapter.MergeOperation(nil), effects.executed...)
+	return append([]mergeapp.MergeOperation(nil), effects.executed...)
 }
 
 // integrationOperationIDs returns deterministic, valid operation identities.
@@ -156,13 +157,13 @@ func integrationOperationIDs(prefix string) func() (id.OperationID, error) {
 
 // newIntegrationCoordinator opens one durable file store over directory and
 // returns the serializing coordinator.
-func newIntegrationCoordinator(t *testing.T, directory string, effects serviceadapter.MergeEffects) *serviceadapter.Coordinator {
+func newIntegrationCoordinator(t *testing.T, directory string, effects mergeapp.MergeEffects) *mergeapp.Coordinator {
 	t.Helper()
-	store, err := serviceadapter.NewFileCoordinationStore(directory)
+	store, err := mergeapp.NewFileCoordinationStore(directory)
 	if err != nil {
 		t.Fatalf("NewFileCoordinationStore: %v", err)
 	}
-	coordinator, err := serviceadapter.NewCoordinator(serviceadapter.CoordinatorConfig{
+	coordinator, err := mergeapp.NewCoordinator(mergeapp.CoordinatorConfig{
 		TenantID:       id.TenantID(factory.TenantID),
 		Owner:          "merge-adapter-integration",
 		Lease:          time.Minute,
@@ -179,10 +180,9 @@ func newIntegrationCoordinator(t *testing.T, directory string, effects servicead
 
 // newIntegrationMergeAdapter builds the merge adapter over one injected public
 // handler, hint source and durable coordinator.
-func newIntegrationMergeAdapter(t *testing.T, access serviceAccess, handler api.Handler, events serviceadapter.EventSource, coordinator serviceadapter.MergeRunner) *serviceadapter.Adapter {
+func newIntegrationMergeAdapter(t *testing.T, access serviceAccess, handler api.Handler, events servicekit.EventSource, coordinator mergeapp.MergeRunner) *mergeapp.Adapter {
 	t.Helper()
-	adapter, err := serviceadapter.NewAdapter(serviceadapter.AdapterConfig{
-		Kind:      serviceadapter.KindMergeCoordinator,
+	adapter, err := mergeapp.NewAdapter(mergeapp.AdapterConfig{
 		ServiceID: id.PrincipalID(access.id),
 		TenantID:  id.TenantID(factory.TenantID),
 		ProjectID: id.ProjectID(factory.ProjectID),
@@ -192,7 +192,7 @@ func newIntegrationMergeAdapter(t *testing.T, access serviceAccess, handler api.
 		Merges:    coordinator,
 	})
 	if err != nil {
-		t.Fatalf("services.NewAdapter: %v", err)
+		t.Fatalf("merge.NewAdapter: %v", err)
 	}
 	return adapter
 }
@@ -212,9 +212,9 @@ func assertMergeAnswer(t *testing.T, execution api.ExecutionInspectResult, servi
 		t.Fatalf("merge answer has no answered_at: %+v", action)
 	}
 	want := map[string]string{
-		serviceadapter.MergeOutputBase:      "base-1111111",
-		serviceadapter.MergeOutputCandidate: "candidate-2222222",
-		serviceadapter.MergeOutputResult:    mergeAdapterOutput,
+		mergeapp.MergeOutputBase:      "base-1111111",
+		mergeapp.MergeOutputCandidate: "candidate-2222222",
+		mergeapp.MergeOutputResult:    mergeAdapterOutput,
 	}
 	if !reflect.DeepEqual(action.Outputs, want) {
 		t.Fatalf("recorded outputs = %v; want the observed work-ref result %v", action.Outputs, want)
@@ -247,7 +247,7 @@ func TestMergeAdapterStartupResolvesObservedWorkRef(t *testing.T) {
 	if item.At.IsZero() || !item.At.After(time.Now()) {
 		t.Fatalf("merge inbox item has no future deadline: %+v", item)
 	}
-	if !reflect.DeepEqual(item.Outputs, []string{serviceadapter.MergeOutputBase, serviceadapter.MergeOutputCandidate, serviceadapter.MergeOutputResult}) {
+	if !reflect.DeepEqual(item.Outputs, []string{mergeapp.MergeOutputBase, mergeapp.MergeOutputCandidate, mergeapp.MergeOutputResult}) {
 		t.Fatalf("declared outputs = %v", item.Outputs)
 	}
 
@@ -274,14 +274,14 @@ func TestMergeAdapterStartupResolvesObservedWorkRef(t *testing.T) {
 		t.Fatalf("merge effects = %d; want exactly one", effects.executeCount())
 	}
 	executions := effects.executions()
-	if executions[0].Key != (serviceadapter.MergeKey{Repository: mergeAdapterRepository, Ref: mergeAdapterWorkRef}) ||
+	if executions[0].Key != (mergeapp.MergeKey{Repository: mergeAdapterRepository, Ref: mergeAdapterWorkRef}) ||
 		executions[0].Base != "base-1111111" || executions[0].Candidate != "candidate-2222222" {
 		t.Fatalf("effect operation = %+v; want the exact subject mapping", executions[0])
 	}
-	if scans := handler.count(serviceadapter.OperationInbox); scans < 1 {
+	if scans := handler.count(servicekit.OperationInbox); scans < 1 {
 		t.Fatalf("inbox scans = %d; the startup scan did not run", scans)
 	}
-	if inspections := handler.count(serviceadapter.OperationInspect); inspections < 1 {
+	if inspections := handler.count(servicekit.OperationInspect); inspections < 1 {
 		t.Fatalf("inspections = %d; the current request was not revalidated", inspections)
 	}
 	if resolves := handler.resolveAttempts(); resolves != 1 {
@@ -358,7 +358,7 @@ func TestMergeAdapterLostResolveResponseConverges(t *testing.T) {
 	if resolves := restartedHandler.resolveAttempts(); resolves != 0 {
 		t.Fatalf("restarted resolve submissions = %d; want none for the committed answer", resolves)
 	}
-	if updates := restartedHandler.count(serviceadapter.OperationInspect); updates < 1 {
+	if updates := restartedHandler.count(servicekit.OperationInspect); updates < 1 {
 		t.Fatalf("restarted inspections = %d; the pending assignment was not converged", updates)
 	}
 	pending, err = restartedCoordinator.Pending(ctx)

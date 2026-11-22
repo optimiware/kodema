@@ -13,7 +13,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
-	"github.com/optimiware/kodema/internal/shell/pipeline"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 )
 
 // Document is the e2e-authored inline pipeline document. It mirrors the

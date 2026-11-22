@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/session"
+	"github.com/optimiware/kodema/internal/apps/kit/session"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 

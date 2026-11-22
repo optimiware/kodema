@@ -10,10 +10,10 @@ import (
 	"strings"
 	"unicode"
 
+	authapp "github.com/optimiware/kodema/internal/apps/auth"
+	"github.com/optimiware/kodema/internal/apps/kit/principal"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	authapp "github.com/optimiware/kodema/internal/userland/app/auth"
-	"github.com/optimiware/kodema/internal/userland/principal"
 )
 
 // runAuthPrincipalIDEntry runs `kodema auth principal-id`.

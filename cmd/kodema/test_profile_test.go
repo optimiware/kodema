@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/installation"
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
-	"github.com/optimiware/kodema/internal/shell/secret"
+	shellapp "github.com/optimiware/kodema/internal/server"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
+	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
 )
 
 // testProfileFixture is one complete `kodema serve --profile test`

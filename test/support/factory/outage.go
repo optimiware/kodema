@@ -11,7 +11,7 @@ import (
 	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

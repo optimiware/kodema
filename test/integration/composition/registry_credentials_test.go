@@ -27,8 +27,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/integration/registry"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
+	"github.com/optimiware/kodema/internal/adapter/integration/registry"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 )
 
 const (

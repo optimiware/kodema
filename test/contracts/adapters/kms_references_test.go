@@ -16,10 +16,10 @@ import (
 	"context"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/secret"
 )
 
 // kmsReferenceVector is one accepted or refused reference.

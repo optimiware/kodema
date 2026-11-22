@@ -27,11 +27,11 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/cli"
+	"github.com/optimiware/kodema/internal/apps/cli/sessionlock"
+	"github.com/optimiware/kodema/internal/apps/cli/userlandfs"
+	"github.com/optimiware/kodema/internal/apps/up"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/app/drivers/sessionlock"
-	"github.com/optimiware/kodema/internal/shell/app/drivers/userlandfs"
-	"github.com/optimiware/kodema/internal/userland/cli"
-	"github.com/optimiware/kodema/internal/userland/up"
 )
 
 // defaultSessionLockTimeout bounds one acquisition of the cross-process session

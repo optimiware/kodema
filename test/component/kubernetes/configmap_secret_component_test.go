@@ -9,11 +9,11 @@ import (
 	"errors"
 	"testing"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/control/workspace"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
-	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
 // TestConfigMapAndSecretRoundTrip proves the real API accepts the driver's
@@ -121,13 +121,13 @@ func TestCredentialRefreshReplacesOnlyTheSecret(t *testing.T) {
 		identity, workspaceID, "build", "",
 		testContainer([]string{`sleep 8`}, nil), nil, "tok-before",
 	))
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationRunning)
+	}, engine.ObservationRunning)
 	jobBefore := oneJob(t, ctx, fx.Client, identity)
 	podBefore := waitForPod(t, ctx, fx.Client, identity)
 
-	refresh, err := fx.Adapter.RefreshCredential(ctx, engine.CredentialRequest{
+	refresh, err := fx.Adapter.RefreshCredential(ctx, reconcile.CredentialRequest{
 		Identity:   identity,
 		Credential: "tok-after",
 	})
@@ -159,9 +159,9 @@ func TestCredentialRefreshReplacesOnlyTheSecret(t *testing.T) {
 	if string(data["API_KEY"]) != "" {
 		t.Fatalf("unexpected declared secret appeared: %v", data)
 	}
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 }
 
 // TestTaskSpecMaterializedInRealPod proves that kubelet projects the immutable
@@ -199,9 +199,9 @@ func TestTaskSpecMaterializedInRealPod(t *testing.T) {
 	req.TaskFiles = taskFiles
 	startPrepared(t, ctx, fx, req)
 
-	obs := waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	obs := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 	if code, ok := obs.ExitStatus(); !ok || code != 0 {
 		stdout, _ := readAllLogs(t, ctx, fx.Adapter, identity, 1<<20)
 		t.Fatalf("pod exit = %d/%v (want 0/true); logs:\n%s", code, ok, stdout)

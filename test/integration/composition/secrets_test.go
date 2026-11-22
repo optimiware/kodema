@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/workspace"
+	"github.com/optimiware/kodema/internal/server"
 )
 
 // TestCompositionNeverRendersCredentialsOrSecretValues scans the captured logs,
@@ -178,7 +178,7 @@ func TestProjectSecretMaterializationAndPolicyInvariants(t *testing.T) {
 }`), 0o600); err != nil {
 			t.Fatalf("write secret-rules.json: %v", err)
 		}
-		rules, err := app.LoadSecretRulesFile(rulesPath, app.ProfileTest)
+		rules, err := server.LoadSecretRulesFile(rulesPath, server.ProfileTest)
 		if err != nil {
 			t.Fatalf("LoadSecretRulesFile: %v", err)
 		}
@@ -468,7 +468,7 @@ func TestProjectSecretMaterializationAndPolicyInvariants(t *testing.T) {
 }`), 0o600); err != nil {
 			t.Fatalf("write secret-rules.json: %v", err)
 		}
-		if rules, err := app.LoadSecretRulesFile(rulesPath, app.ProfileProduction); err == nil || rules != nil {
+		if rules, err := server.LoadSecretRulesFile(rulesPath, server.ProfileProduction); err == nil || rules != nil {
 			t.Fatalf("LoadSecretRulesFile(ProfileProduction) accepted allow_all: %+v", rules)
 		} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
 			t.Fatalf("LoadSecretRulesFile(ProfileProduction) error = %v; want InvalidInput", err)

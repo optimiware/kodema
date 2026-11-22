@@ -10,12 +10,12 @@ import (
 
 	natsgo "github.com/nats-io/nats.go"
 
+	broker "github.com/optimiware/kodema/internal/adapter/integration/nats"
+	"github.com/optimiware/kodema/internal/control/log"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	broker "github.com/optimiware/kodema/internal/shell/integration/nats"
-	"github.com/optimiware/kodema/internal/shell/log"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
 	support "github.com/optimiware/kodema/test/support/infrastructure/messaging"
 )
 

@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/runtime/kube"
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

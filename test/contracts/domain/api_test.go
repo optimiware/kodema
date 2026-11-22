@@ -85,25 +85,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/inbox"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/service"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/tenancy/admin"
+	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/control/trigger"
+	"github.com/optimiware/kodema/internal/control/verify"
+	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/inbox"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/request"
-	"github.com/optimiware/kodema/internal/shell/resource"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/service"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/tenancy/admin"
-	"github.com/optimiware/kodema/internal/shell/token"
-	"github.com/optimiware/kodema/internal/shell/trigger"
-	"github.com/optimiware/kodema/internal/shell/verify"
 )
 
 // TestFaultClassification pins the one public error vocabulary every
@@ -428,7 +428,7 @@ func TestStateVocabularies(t *testing.T) {
 
 	// Execution and action states are Kernel vocabulary; Shell must reuse it
 	// rather than invent a second state machine.
-	if !kernel.ExecutionRunning.Valid() || !kernel.ActionPending.Valid() {
+	if !engine.ExecutionRunning.Valid() || !engine.ActionPending.Valid() {
 		t.Fatal("kernel state vocabulary is not valid")
 	}
 }

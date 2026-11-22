@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/pipeline"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 )
 
 // The fixtures below mirror the chart's rendered tenant namespace, LimitRange,

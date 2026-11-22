@@ -7,14 +7,14 @@ import (
 	"testing"
 	"time"
 
+	executionstore "github.com/optimiware/kodema/internal/adapter/store/units/execution"
+	"github.com/optimiware/kodema/internal/adapter/store/units/execution/snapshotdoc"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/task"
+	kernel "github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	executionstore "github.com/optimiware/kodema/internal/shell/store/units/execution"
-	"github.com/optimiware/kodema/internal/shell/store/units/execution/snapshotdoc"
-	"github.com/optimiware/kodema/internal/shell/task"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

@@ -15,7 +15,7 @@ import (
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	kubesupport "github.com/optimiware/kodema/test/support/infrastructure/kubernetes"
 )
 

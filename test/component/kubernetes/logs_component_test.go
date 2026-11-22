@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 )
 
 // TestPodLogPaginationOverTheCombinedLog proves the real pod log endpoint, with
@@ -29,9 +29,9 @@ func TestPodLogPaginationOverTheCombinedLog(t *testing.T) {
 			`printf 'abcdefghij' >&2`,
 		}, nil), nil, "tok-k5",
 	))
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 	pod := onePod(t, ctx, fx.Client, identity)
 
 	// Read the whole combined log once. The cluster may interleave stdout and

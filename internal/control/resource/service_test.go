@@ -1,0 +1,375 @@
+package resource_test
+
+import (
+	"context"
+	"reflect"
+	"slices"
+	"testing"
+
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/service"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/fault"
+)
+
+type replayBindingApply struct {
+	commits     int
+	replays     int
+	stored      resource.BindingResult
+	key         receipt.Key
+	contentHash string
+}
+
+func (fake *replayBindingApply) Apply(_ context.Context, unit resource.BindingUnit) (resource.BindingResult, error) {
+	if fake.commits == 0 {
+		fake.commits++
+		fake.stored = resource.BindingResult{Version: unit.Binding.Version}
+		fake.key = unit.Receipt.Key
+		fake.contentHash = unit.Receipt.ContentHash
+		return fake.stored, nil
+	}
+	if unit.Receipt.Key != fake.key || unit.Receipt.ContentHash != fake.contentHash {
+		return resource.BindingResult{}, fault.New(fault.ChangedIdempotencyContent, "changed idempotency content")
+	}
+	result := fake.stored
+	result.Replayed = true
+	fake.replays++
+	return result, nil
+}
+
+type versionedBindingStore struct {
+	current uint64
+	commits int
+}
+
+func (fake *versionedBindingStore) Apply(_ context.Context, unit resource.BindingUnit) (resource.BindingResult, error) {
+	if unit.ExpectedVersion != fake.current {
+		return resource.BindingResult{}, fault.New(fault.VersionConflict, "stale binding version")
+	}
+	fake.current = unit.Binding.Version
+	fake.commits++
+	return resource.BindingResult{Version: unit.Binding.Version}, nil
+}
+
+func TestBindingRegistrationDoesNotTrustStaleActorRoles(t *testing.T) {
+	ports := &fakeBindingPorts{}
+	var captured resource.BindingUnit
+	ports.apply = func(_ context.Context, unit resource.BindingUnit) (resource.BindingResult, error) {
+		captured = unit
+		return resource.BindingResult{Version: unit.Binding.Version}, nil
+	}
+	service := newBindingService(t, ports)
+	command := validRegisterCommand()
+	command.Actor.Roles = nil
+	if _, err := service.RegisterBinding(context.Background(), command); err != nil {
+		t.Fatalf("RegisterBinding: %v", err)
+	}
+	read := requireBindingAuthority(t, captured.Authority, "resource.binding.register", authorize.CheckMembership, command.Scope, command.Actor.ID)
+	if !containsRole(read.Required.HumanRoles, tenancy.RoleAdmin) {
+		t.Fatalf("authority grant = %v; want the registry Admin grant, not a stale actor role snapshot", read.Required.HumanRoles)
+	}
+}
+
+func TestInjectedBindingFailureLeavesNoCommit(t *testing.T) {
+	ports := &fakeBindingPorts{}
+	calls := 0
+	committed := false
+	ports.apply = func(context.Context, resource.BindingUnit) (resource.BindingResult, error) {
+		calls++
+		return resource.BindingResult{}, fault.New(fault.DependencyUnavailable, "store unavailable")
+	}
+	service := newBindingService(t, ports)
+	result, err := service.RegisterBinding(context.Background(), validRegisterCommand())
+	requireFaultClass(t, err, fault.DependencyUnavailable)
+	if calls != 1 {
+		t.Fatalf("Apply calls = %d; want 1 attempted unit", calls)
+	}
+	if committed {
+		t.Fatal("a failed port call reported a committed binding")
+	}
+	if result != (resource.BindingResult{}) {
+		t.Fatalf("result = %+v; want zero result on refusal", result)
+	}
+}
+
+func TestBindingCrashBeforeEffectThenRetryCommitsOnce(t *testing.T) {
+	ports := &fakeBindingPorts{}
+	calls := 0
+	committed := 0
+	ports.apply = func(_ context.Context, unit resource.BindingUnit) (resource.BindingResult, error) {
+		calls++
+		if calls == 1 {
+			return resource.BindingResult{}, fault.New(fault.DependencyUnavailable, "commit did not start")
+		}
+		committed++
+		return resource.BindingResult{Version: unit.Binding.Version}, nil
+	}
+	service := newBindingService(t, ports)
+	command := validRegisterCommand()
+	if _, err := service.RegisterBinding(context.Background(), command); err == nil {
+		t.Fatal("first attempt unexpectedly succeeded")
+	}
+	if committed != 0 {
+		t.Fatalf("commits after failed attempt = %d; want 0", committed)
+	}
+	if _, err := service.RegisterBinding(context.Background(), command); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if committed != 1 {
+		t.Fatalf("commits after retry = %d; want exactly 1", committed)
+	}
+}
+
+func TestBindingReplayReturnsOriginalResult(t *testing.T) {
+	fake := &replayBindingApply{}
+	ports := &fakeBindingPorts{apply: fake.Apply}
+	service := newBindingService(t, ports)
+	command := validRegisterCommand()
+	first, err := service.RegisterBinding(context.Background(), command)
+	if err != nil {
+		t.Fatalf("first RegisterBinding: %v", err)
+	}
+	if first.Replayed {
+		t.Fatal("first commit reported a replay")
+	}
+	second, err := service.RegisterBinding(context.Background(), command)
+	if err != nil {
+		t.Fatalf("replayed RegisterBinding: %v", err)
+	}
+	if !second.Replayed {
+		t.Fatal("identical retry did not report a replay")
+	}
+	if second.Version != first.Version {
+		t.Fatalf("replay version = %d; want original %d", second.Version, first.Version)
+	}
+	if fake.commits != 1 || fake.replays != 1 {
+		t.Fatalf("commits/replays = %d/%d; want 1/1", fake.commits, fake.replays)
+	}
+}
+
+func TestBindingChangedReceiptContentIsRefused(t *testing.T) {
+	fake := &replayBindingApply{}
+	ports := &fakeBindingPorts{apply: fake.Apply}
+	service := newBindingService(t, ports)
+	first := validRegisterCommand()
+	if _, err := service.RegisterBinding(context.Background(), first); err != nil {
+		t.Fatalf("first RegisterBinding: %v", err)
+	}
+	changed := first
+	changed.Content = receiptContent(`{"resource":"other"}`)
+	_, err := service.RegisterBinding(context.Background(), changed)
+	requireFaultClass(t, err, fault.ChangedIdempotencyContent)
+	if fake.commits != 1 || fake.replays != 0 {
+		t.Fatalf("commits/replays = %d/%d; want 1/0", fake.commits, fake.replays)
+	}
+}
+
+func TestBindingStaleVersionPropagatesConflict(t *testing.T) {
+	fake := &versionedBindingStore{}
+	ports := &fakeBindingPorts{apply: fake.Apply}
+	bindingService := newBindingService(t, ports)
+
+	register := validRegisterCommand()
+	if _, err := bindingService.RegisterBinding(context.Background(), register); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	update := resource.UpdateBindingCommand{
+		Actor:            bindingActor("tenant-a", "project-a", "principal-admin"),
+		Scope:            projectScope("tenant-a", "project-a"),
+		BindingID:        "binding-a",
+		ResourceID:       "resource-a",
+		EnforcingService: service.ServiceID("git-service"),
+		TrustedOrigins:   []string{"https://git.example.com/shop"},
+		Operations:       []resource.Operation{resource.OperationGitRefUpdate},
+		ReportableEvents: []string{"git.ref.updated"},
+		ExpectedVersion:  1,
+		CallerKey:        "caller-update",
+		Content:          receiptContent(`{"environment":"staging"}`),
+	}
+	if _, err := bindingService.UpdateBinding(context.Background(), update); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := bindingService.UpdateBinding(context.Background(), update); err == nil {
+		t.Fatal("stale update unexpectedly succeeded")
+	} else {
+		requireFaultClass(t, err, fault.VersionConflict)
+	}
+	if fake.commits != 2 {
+		t.Fatalf("commits = %d; want 2 after the stale attempt", fake.commits)
+	}
+}
+
+func TestBindingRegistrationDefensiveCopies(t *testing.T) {
+	ports := &fakeBindingPorts{}
+	var captured resource.BindingUnit
+	ports.apply = func(_ context.Context, unit resource.BindingUnit) (resource.BindingResult, error) {
+		captured = unit
+		return resource.BindingResult{Version: unit.Binding.Version}, nil
+	}
+	service := newBindingService(t, ports)
+	command := validRegisterCommand()
+	if _, err := service.RegisterBinding(context.Background(), command); err != nil {
+		t.Fatalf("RegisterBinding: %v", err)
+	}
+	command.Metadata["environment"] = "mutated"
+	command.TrustedOrigins[0] = "https://evil.example.com"
+	command.Operations[0] = resource.Operation("mutated")
+	command.ReportableEvents[0] = "mutated"
+	if captured.Binding.Metadata["environment"] != "production" {
+		t.Fatal("committed metadata aliases caller-owned map")
+	}
+	if !reflect.DeepEqual(captured.Binding.TrustedOrigins, []string{"https://git.example.com/shop"}) {
+		t.Fatalf("committed origins = %v; want an independent copy", captured.Binding.TrustedOrigins)
+	}
+	if !reflect.DeepEqual(captured.Binding.Operations, []resource.Operation{resource.OperationGitRefUpdate}) {
+		t.Fatalf("committed operations = %v; want an independent copy", captured.Binding.Operations)
+	}
+	if !reflect.DeepEqual(captured.Binding.ReportableEvents, []string{"git.ref.updated"}) {
+		t.Fatalf("committed reportable events = %v; want an independent copy", captured.Binding.ReportableEvents)
+	}
+}
+
+func containsRole(roles []tenancy.Role, want tenancy.Role) bool {
+	return slices.Contains(roles, want)
+}
+
+// TestBindingReadAdmitsRolelessServiceAndAllHumanRoles proves ReadBinding and
+// QueryBindings admit enabled roleless services (AnyEnabledService: true) and
+// every human project role while still refusing execution principals and
+// service writes.
+func TestBindingReadAdmitsRolelessServiceAndAllHumanRoles(t *testing.T) {
+	scope := projectScope("tenant-a", "project-a")
+	stored := resource.Binding{
+		ID:               "binding-a",
+		ResourceID:       "resource-a",
+		Scope:            scope,
+		EnforcingService: service.ServiceID("git-service"),
+		TrustedOrigins:   []string{"https://git.example.com/shop"},
+		Operations:       []resource.Operation{resource.OperationGitRefUpdate},
+		ReportableEvents: []string{"git.ref.updated"},
+		Version:          1,
+	}
+	ports := &fakeBindingPorts{
+		read: func(_ context.Context, _ resource.BindingReadRequest) (resource.Binding, error) {
+			return stored, nil
+		},
+		query: func(_ context.Context, _ resource.BindingQuery) (resource.BindingPage, error) {
+			return resource.BindingPage{Bindings: []resource.Binding{stored}}, nil
+		},
+	}
+	svc := newBindingService(t, ports)
+
+	rolelessService := authorize.Principal{
+		ID:      "svc-roleless",
+		Kind:    identity.KindService,
+		Scope:   scope,
+		Enabled: true,
+		Version: 1,
+	}
+	if _, err := svc.ReadBinding(context.Background(), resource.ReadBindingCommand{
+		Actor:     rolelessService,
+		Scope:     scope,
+		BindingID: stored.ID,
+	}); err != nil {
+		t.Fatalf("ReadBinding for roleless service: %v", err)
+	}
+	if _, err := svc.QueryBindings(context.Background(), resource.QueryBindingsCommand{
+		Actor: rolelessService,
+		Scope: scope,
+		Limit: 10,
+	}); err != nil {
+		t.Fatalf("QueryBindings for roleless service: %v", err)
+	}
+
+	// Mutations remain Admin-only and refuse services.
+	register := validRegisterCommand()
+	register.Actor = rolelessService
+	_, err := svc.RegisterBinding(context.Background(), register)
+	requireFaultClass(t, err, fault.Forbidden)
+
+	// Execution principals still cannot read bindings.
+	execActor := authorize.Principal{
+		ID:          "exec-principal",
+		Kind:        identity.KindExecution,
+		Scope:       scope,
+		Enabled:     true,
+		Version:     1,
+		ExecutionID: "exec-1",
+	}
+	_, err = svc.ReadBinding(context.Background(), resource.ReadBindingCommand{
+		Actor:     execActor,
+		Scope:     scope,
+		BindingID: stored.ID,
+	})
+	requireFaultClass(t, err, fault.Forbidden)
+}
+
+func TestBindingReadAndQueryEnforceActorGrant(t *testing.T) {
+	scope := projectScope("tenant-a", "project-a")
+	stored := resource.Binding{
+		ID:               "binding-a",
+		ResourceID:       "resource-a",
+		Scope:            scope,
+		EnforcingService: service.ServiceID("git-service"),
+		TrustedOrigins:   []string{"https://git.example.com/shop"},
+		Operations:       []resource.Operation{resource.OperationGitRefUpdate},
+		ReportableEvents: []string{"git.ref.updated"},
+		Version:          1,
+	}
+	deniedActors := []struct {
+		name  string
+		actor authorize.Principal
+	}{
+		{
+			name:  "roleless human",
+			actor: authorize.Principal{ID: "human-none", Kind: identity.KindHuman, Scope: scope, Enabled: true, Version: 1},
+		},
+		{
+			name:  "disabled human viewer",
+			actor: authorize.Principal{ID: "human-disabled", Kind: identity.KindHuman, Scope: scope, Roles: []tenancy.Role{tenancy.RoleViewer}, Enabled: false, Version: 1},
+		},
+		{
+			name:  "disabled service",
+			actor: authorize.Principal{ID: "svc-disabled", Kind: identity.KindService, Scope: scope, Enabled: false, Version: 1},
+		},
+	}
+	for _, tc := range deniedActors {
+		t.Run(tc.name, func(t *testing.T) {
+			readCalls, queryCalls := 0, 0
+			ports := &fakeBindingPorts{
+				read: func(context.Context, resource.BindingReadRequest) (resource.Binding, error) {
+					readCalls++
+					return stored, nil
+				},
+				query: func(context.Context, resource.BindingQuery) (resource.BindingPage, error) {
+					queryCalls++
+					return resource.BindingPage{Bindings: []resource.Binding{stored}}, nil
+				},
+			}
+			svc := newBindingService(t, ports)
+
+			_, err := svc.ReadBinding(context.Background(), resource.ReadBindingCommand{
+				Actor:     tc.actor,
+				Scope:     scope,
+				BindingID: stored.ID,
+			})
+			requireFaultClass(t, err, fault.Forbidden)
+			if readCalls != 0 {
+				t.Fatalf("ReadBinding port calls = %d; want 0", readCalls)
+			}
+
+			_, err = svc.QueryBindings(context.Background(), resource.QueryBindingsCommand{
+				Actor: tc.actor,
+				Scope: scope,
+				Limit: 10,
+			})
+			requireFaultClass(t, err, fault.Forbidden)
+			if queryCalls != 0 {
+				t.Fatalf("QueryBindings port calls = %d; want 0", queryCalls)
+			}
+		})
+	}
+}

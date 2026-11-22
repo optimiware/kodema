@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/userland/cli"
+	"github.com/optimiware/kodema/internal/apps/cli"
 )
 
 // TestVersionNeedsNoConfiguration proves `kodema version` and `kodema

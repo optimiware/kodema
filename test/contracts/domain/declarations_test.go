@@ -35,12 +35,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
 var (
@@ -62,31 +62,31 @@ var (
 // runningExecution is a running execution with one running container action and
 // one pending successor: the cancellation must stop the workload and cancel the
 // pending action in the same commit.
-func runningExecution() kernel.Execution {
-	return kernel.Execution{
+func runningExecution() engine.Execution {
+	return engine.Execution{
 		ID:            cancelExecution,
 		Version:       7,
-		State:         kernel.ExecutionRunning,
+		State:         engine.ExecutionRunning,
 		WorkspaceID:   cancelWorkspace,
 		CurrentAction: 0,
-		Actions: []kernel.Action{
+		Actions: []engine.Action{
 			{
 				ID:      cancelContainer,
 				Index:   0,
 				Kind:    definition.ActionKindContainer,
-				State:   kernel.ActionRunning,
+				State:   engine.ActionRunning,
 				Version: 4,
-				Container: &kernel.ContainerAction{
+				Container: &engine.ContainerAction{
 					WorkloadID:  cancelWorkload,
 					WorkspaceID: cancelWorkspace,
-					Launch:      kernel.LaunchIntent{WorkloadID: cancelWorkload, State: kernel.LaunchIssued},
+					Launch:      engine.LaunchIntent{WorkloadID: cancelWorkload, State: engine.LaunchIssued},
 				},
 			},
 			{
 				ID:      cancelPendingAction,
 				Index:   1,
 				Kind:    definition.ActionKindContainer,
-				State:   kernel.ActionPending,
+				State:   engine.ActionPending,
 				Version: 1,
 			},
 		},
@@ -95,21 +95,21 @@ func runningExecution() kernel.Execution {
 
 // queuedExecution is an admitted execution that never started: cancelling it
 // must cancel the pending request action and never emit a stop intent.
-func queuedExecution() kernel.Execution {
-	return kernel.Execution{
+func queuedExecution() engine.Execution {
+	return engine.Execution{
 		ID:            cancelExecution,
 		Version:       2,
-		State:         kernel.ExecutionQueued,
+		State:         engine.ExecutionQueued,
 		WorkspaceID:   cancelWorkspace,
 		CurrentAction: -1,
-		Actions: []kernel.Action{
+		Actions: []engine.Action{
 			{
 				ID:      cancelPendingAction,
 				Index:   0,
 				Kind:    definition.ActionKindRequest,
-				State:   kernel.ActionPending,
+				State:   engine.ActionPending,
 				Version: 1,
-				Request: &kernel.RequestAction{},
+				Request: &engine.RequestAction{},
 			},
 		},
 	}
@@ -117,21 +117,21 @@ func queuedExecution() kernel.Execution {
 
 // terminalCancelledExecution is an already terminal predecessor: its row is
 // PRESERVED, not rewritten, so a task unit carries no commit for it.
-func terminalCancelledExecution() kernel.Execution {
-	return kernel.Execution{
+func terminalCancelledExecution() engine.Execution {
+	return engine.Execution{
 		ID:            cancelExecution,
 		Version:       9,
-		State:         kernel.ExecutionCancelled,
+		State:         engine.ExecutionCancelled,
 		WorkspaceID:   cancelWorkspace,
 		CurrentAction: -1,
-		Actions: []kernel.Action{
+		Actions: []engine.Action{
 			{
 				ID:      cancelContainer,
 				Index:   0,
 				Kind:    definition.ActionKindContainer,
-				State:   kernel.ActionCancelled,
+				State:   engine.ActionCancelled,
 				Version: 5,
-				Container: &kernel.ContainerAction{
+				Container: &engine.ContainerAction{
 					WorkloadID:  cancelWorkload,
 					WorkspaceID: cancelWorkspace,
 				},
@@ -143,7 +143,7 @@ func terminalCancelledExecution() kernel.Execution {
 // cancelCommitFor derives the Kernel cancel commit for one non-terminal
 // aggregate. Using the real reducer keeps the vector faithful to the Kernel
 // cancel path instead of hand-building a lookalike payload.
-func cancelCommitFor(t *testing.T, pre kernel.Execution) *flow.Commit {
+func cancelCommitFor(t *testing.T, pre engine.Execution) *flow.Commit {
 	t.Helper()
 	next, commit, err := flow.Reduce(pre, flow.CancelFact{
 		ExecutionID: pre.ID,
@@ -156,8 +156,8 @@ func cancelCommitFor(t *testing.T, pre kernel.Execution) *flow.Commit {
 	if commit == nil {
 		t.Fatalf("flow.Reduce(cancel) returned no commit for %q in state %q", pre.ID, pre.State)
 	}
-	if next.State != kernel.ExecutionCancelled {
-		t.Fatalf("reduced state = %q; want %q", next.State, kernel.ExecutionCancelled)
+	if next.State != engine.ExecutionCancelled {
+		t.Fatalf("reduced state = %q; want %q", next.State, engine.ExecutionCancelled)
 	}
 	return commit
 }
@@ -210,7 +210,7 @@ func TestTaskPortsDeclareExecutionAggregateReader(t *testing.T) {
 	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
 	scopeType := reflect.TypeOf(tenancy.Scope{})
 	executionIDType := reflect.TypeOf(id.ExecutionID(""))
-	executionType := reflect.TypeOf(kernel.Execution{})
+	executionType := reflect.TypeOf(engine.Execution{})
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
 	signature := method.Type
 	if signature.NumIn() != 3 {
@@ -228,26 +228,26 @@ func TestTaskPortsDeclareExecutionAggregateReader(t *testing.T) {
 	}
 
 	// The declaration belongs to the contract-owned file, not an adapter file.
-	data, err := os.ReadFile(filepath.Join(repoRoot(t), "internal", "shell", "task", "ports.go"))
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "internal", "control", "task", "ports.go"))
 	if err != nil {
-		t.Fatalf("internal/shell/task/ports.go is missing or unreadable: %v", err)
+		t.Fatalf("internal/control/task/ports.go is missing or unreadable: %v", err)
 	}
 	text := string(data)
-	for _, needle := range []string{"type ExecutionAggregateReader interface", "Load(", "tenancy.Scope", "kernel.Execution"} {
+	for _, needle := range []string{"type ExecutionAggregateReader interface", "Load(", "tenancy.Scope", "engine.Execution"} {
 		if !strings.Contains(text, needle) {
-			t.Errorf("internal/shell/task/ports.go does not name %q", needle)
+			t.Errorf("internal/control/task/ports.go does not name %q", needle)
 		}
 	}
 }
 
 // TestValidateCancellationCommitIsDeclaredInContractFile pins where the pure
-// rule lives: an `internal/shell/task/contract_*.go` file. A validator hidden
+// rule lives: an `internal/control/task/contract_*.go` file. A validator hidden
 // in an adapter file would not be a pinned contract declaration.
 func TestValidateCancellationCommitIsDeclaredInContractFile(t *testing.T) {
-	dir := filepath.Join(repoRoot(t), "internal", "shell", "task")
+	dir := filepath.Join(repoRoot(t), "internal", "control", "task")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("internal/shell/task is missing or unreadable: %v", err)
+		t.Fatalf("internal/control/task is missing or unreadable: %v", err)
 	}
 	declared := false
 	for _, entry := range entries {
@@ -267,6 +267,6 @@ func TestValidateCancellationCommitIsDeclaredInContractFile(t *testing.T) {
 		}
 	}
 	if !declared {
-		t.Error("no internal/shell/task/contract_*.go declares func ValidateCancellationCommit(")
+		t.Error("no internal/control/task/contract_*.go declares func ValidateCancellationCommit(")
 	}
 }

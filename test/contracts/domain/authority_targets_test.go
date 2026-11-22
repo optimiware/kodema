@@ -42,9 +42,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
 // TestAuthorityReadDeclaresMembershipTargets pins the exact declaration shape.

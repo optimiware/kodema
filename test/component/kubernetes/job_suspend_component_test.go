@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 
@@ -101,9 +101,9 @@ func TestJobSuspensionPreservesUIDAndAcceptsTerminalJobs(t *testing.T) {
 			identity, workspaceID, "build", "",
 			testContainer([]string{`exit 0`}, nil), nil, "tok-complete",
 		))
-		waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+		waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 			Identity: identity, WorkspaceID: workspaceID,
-		}, kernel.ObservationExited)
+		}, engine.ObservationExited)
 		settled := waitForJobSettled(t, ctx, fx.Client, identity)
 		if settled.Status.Succeeded != 1 {
 			t.Fatalf("completed Job status = %+v; want succeeded 1", settled.Status)
@@ -117,9 +117,9 @@ func TestJobSuspensionPreservesUIDAndAcceptsTerminalJobs(t *testing.T) {
 			identity, workspaceID, "build", "",
 			testContainer([]string{`exit 7`}, nil), nil, "tok-failed",
 		))
-		waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+		waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 			Identity: identity, WorkspaceID: workspaceID,
-		}, kernel.ObservationExited)
+		}, engine.ObservationExited)
 		settled := waitForJobSettled(t, ctx, fx.Client, identity)
 		if settled.Status.Failed != 1 {
 			t.Fatalf("failed Job status = %+v; want failed 1", settled.Status)
@@ -234,7 +234,7 @@ func requireNoReplacementPod(
 	t *testing.T,
 	ctx context.Context,
 	fx *fixture,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	originalName, originalUID string,
 ) {
 	t.Helper()

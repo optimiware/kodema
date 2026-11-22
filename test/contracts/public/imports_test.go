@@ -11,14 +11,14 @@ import (
 	"testing"
 )
 
-// declarationRoots are the public and Userland declaration directories.
+// declarationRoots are the public and Apps declaration directories.
 var declarationRoots = []string{
 	"api",
 	"client",
-	"internal/userland",
+	"internal/apps",
 }
 
-// publicDeclarationFile reports whether a path is a public or Userland
+// publicDeclarationFile reports whether a path is a public or Apps
 // declaration file.
 func publicDeclarationFile(rel string) bool {
 	rel = filepath.ToSlash(rel)
@@ -29,7 +29,7 @@ func publicDeclarationFile(rel string) bool {
 	if rel == "client/types.go" || rel == "client/ports.go" {
 		return true
 	}
-	if strings.HasPrefix(rel, "internal/userland/") {
+	if strings.HasPrefix(rel, "internal/apps/") {
 		return name == "types.go" || name == "ports.go" ||
 			name == "adapter_contract.go" || strings.HasPrefix(name, "contract_") && strings.HasSuffix(name, ".go")
 	}
@@ -166,9 +166,9 @@ func TestPublicAndUserlandDependencyRules(t *testing.T) {
 				continue
 			}
 
-			// client and internal/userland may use the standard library, public
+			// client and internal/apps may use the standard library, public
 			// schema and neutral values, and their own adapters. They never
-			// import Kernel, Shell or repository test code.
+			// import Control Plane, Engine, or repository test code.
 			if !isModuleImport(module, imported) {
 				if !isStandardLibrary(imported) {
 					t.Errorf("%s imports external module %q; public declarations are stdlib only", file.rel, imported)
@@ -178,11 +178,14 @@ func TestPublicAndUserlandDependencyRules(t *testing.T) {
 			switch {
 			case imported == module+"/api", imported == module+"/internal/id", imported == module+"/internal/fault":
 			case imported == module+"/client", strings.HasPrefix(imported, module+"/client/"):
-			case strings.HasPrefix(imported, module+"/internal/userland/"):
-			case imported == module+"/internal/kernel" || strings.HasPrefix(imported, module+"/internal/kernel/"):
-				t.Errorf("%s imports Kernel package %q; Userland never imports Kernel", file.rel, imported)
-			case imported == module+"/internal/shell" || strings.HasPrefix(imported, module+"/internal/shell/"):
-				t.Errorf("%s imports Shell package %q; Userland never imports Shell", file.rel, imported)
+			case strings.HasPrefix(imported, module+"/internal/apps/"):
+			case imported == module+"/internal/engine" || strings.HasPrefix(imported, module+"/internal/engine/"):
+				t.Errorf("%s imports Engine package %q; Apps never import Engine", file.rel, imported)
+			case imported == module+"/internal/control" || strings.HasPrefix(imported, module+"/internal/control/"),
+				imported == module+"/internal/adapter" || strings.HasPrefix(imported, module+"/internal/adapter/"),
+				imported == module+"/internal/transport" || strings.HasPrefix(imported, module+"/internal/transport/"),
+				imported == module+"/internal/server" || strings.HasPrefix(imported, module+"/internal/server/"):
+				t.Errorf("%s imports Control Plane package %q; Apps never import Control Plane internals", file.rel, imported)
 			case strings.HasPrefix(imported, module+"/test/"), strings.HasPrefix(imported, module+"/cmd/"):
 				t.Errorf("%s imports %q; product declarations never depend on tests or composition", file.rel, imported)
 			default:

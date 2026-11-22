@@ -25,11 +25,11 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 
@@ -96,7 +96,7 @@ func TestPendingJobStopConfirmsAfterSuspension(t *testing.T) {
 		t.Fatal("live Job has no metadata.uid")
 	}
 
-	pending, err := fx.Adapter.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	pending, err := fx.Adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestPendingJobStopConfirmsAfterSuspension(t *testing.T) {
 		t.Fatalf("confirmed stop observed spec.suspend = %v; want true", jobConfirmed.Spec.Suspend)
 	}
 
-	removal, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
+	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Remove after confirmed stop: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestSuspendedStopConvergesAfterPodDisappears(t *testing.T) {
 	waitForWorkloadContainerRunning(t, ctx, fx, identity, marker)
 	jobBefore := oneJob(t, ctx, fx.Client, identity)
 
-	pending, err := fx.Adapter.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	pending, err := fx.Adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestSuspendedStopConvergesAfterPodDisappears(t *testing.T) {
 	// Wait for the false-confirmation window: the Job reports active 0 while
 	// the workload container still runs.
 	waitForActiveZeroWhileRunning(t, ctx, fx, identity)
-	stillPending, err := fx.Adapter.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	stillPending, err := fx.Adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Stop while active is zero but the container runs: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestSuspendedStopConvergesAfterPodDisappears(t *testing.T) {
 		t.Fatalf("confirmed stop left the Job deleting: %v", jobConfirmed.DeletionTimestamp)
 	}
 
-	removal, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
+	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestSuspendedStopRecoveryUsesSurvivingJob(t *testing.T) {
 	// A restarted process has no in-process preparation state and no PATCH
 	// answer; it must confirm from the surviving Job.
 	recovered := newFixtureAdapter(t, fx)
-	evidence, err := recovered.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	evidence, err := recovered.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("recovered Stop: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestSuspendedStopRecoveryUsesSurvivingJob(t *testing.T) {
 		t.Fatalf("recovered Stop observed spec.suspend = %v; want true", jobAfter.Spec.Suspend)
 	}
 
-	removal, err := recovered.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
+	removal, err := recovered.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("recovered Remove: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestRemoveRefusesWhileWorkloadPodLive(t *testing.T) {
 		t.Fatalf("WorkspaceClaimName: %v", err)
 	}
 
-	removal, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
+	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
@@ -397,7 +397,7 @@ func uncordonNode(t *testing.T, ctx context.Context, fx *fixture, node string) {
 
 // waitForUnscheduledPod blocks until one workload pod is Pending with no node
 // assigned: it never reached a container runtime.
-func waitForUnscheduledPod(t *testing.T, ctx context.Context, fx *fixture, identity engine.EffectIdentity) runtimekube.Pod {
+func waitForUnscheduledPod(t *testing.T, ctx context.Context, fx *fixture, identity reconcile.EffectIdentity) runtimekube.Pod {
 	t.Helper()
 	var last runtimekube.Pod
 	var lastDetail string
@@ -438,7 +438,7 @@ func waitForUnscheduledPod(t *testing.T, ctx context.Context, fx *fixture, ident
 
 // waitForActiveZeroWhileRunning blocks until the suspended Job reports active 0
 // and a nonzero terminating count while the workload container still runs.
-func waitForActiveZeroWhileRunning(t *testing.T, ctx context.Context, fx *fixture, identity engine.EffectIdentity) {
+func waitForActiveZeroWhileRunning(t *testing.T, ctx context.Context, fx *fixture, identity reconcile.EffectIdentity) {
 	t.Helper()
 	var lastJob runtimekube.Job
 	var lastState string
@@ -488,7 +488,7 @@ func waitForActiveZeroWhileRunning(t *testing.T, ctx context.Context, fx *fixtur
 }
 
 // waitForNoWorkloadPods blocks until the workload selector returns no pod.
-func waitForNoWorkloadPods(t *testing.T, ctx context.Context, fx *fixture, identity engine.EffectIdentity) {
+func waitForNoWorkloadPods(t *testing.T, ctx context.Context, fx *fixture, identity reconcile.EffectIdentity) {
 	t.Helper()
 	var last int
 	probe := func(ctx context.Context) error {
@@ -514,11 +514,11 @@ func waitForNoWorkloadPods(t *testing.T, ctx context.Context, fx *fixture, ident
 
 // waitForStopConfirmed retries the production Stop until it reports affirmative
 // confirmation.
-func waitForStopConfirmed(t *testing.T, ctx context.Context, fx *fixture, identity engine.EffectIdentity, workspaceID id.WorkspaceID) kernel.StopEvidence {
+func waitForStopConfirmed(t *testing.T, ctx context.Context, fx *fixture, identity reconcile.EffectIdentity, workspaceID id.WorkspaceID) engine.StopEvidence {
 	t.Helper()
-	var last kernel.StopEvidence
+	var last engine.StopEvidence
 	probe := func(ctx context.Context) error {
-		evidence, err := fx.Adapter.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+		evidence, err := fx.Adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 		if err != nil {
 			return err
 		}

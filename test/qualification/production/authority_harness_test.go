@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 )
 
 // startAuthorityTLSServer starts one TLS fixture server with the test PKI. The

@@ -33,13 +33,13 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	kubesupport "github.com/optimiware/kodema/test/support/infrastructure/kubernetes"
 )
@@ -246,8 +246,8 @@ spec:
 }
 
 // testIdentity builds one persisted effect identity.
-func testIdentity(execution, action, workload, key string) engine.EffectIdentity {
-	return engine.EffectIdentity{
+func testIdentity(execution, action, workload, key string) reconcile.EffectIdentity {
+	return reconcile.EffectIdentity{
 		ExecutionID:    id.ExecutionID(execution),
 		ActionID:       id.ActionID(action),
 		WorkloadID:     id.WorkloadID(workload),
@@ -263,15 +263,15 @@ func testContainer(commands []string, env []definition.EnvVar) definition.Contai
 // prepareRequest builds one complete preparation with inputs, an earlier
 // output, a task snapshot, one declared secret and the execution credential.
 func prepareRequest(
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	workspaceID id.WorkspaceID,
 	actionName id.ActionName,
 	taskID id.TaskID,
 	container definition.Container,
-	secrets []engine.SecretValue,
+	secrets []reconcile.SecretValue,
 	credential string,
-) engine.PrepareRequest {
-	return engine.PrepareRequest{
+) reconcile.PrepareRequest {
+	return reconcile.PrepareRequest{
 		Identity:    identity,
 		WorkspaceID: workspaceID,
 		ActionName:  actionName,
@@ -281,7 +281,7 @@ func prepareRequest(
 		Inputs: map[id.InputKey]string{
 			"input-a": "line1\nline2\n",
 		},
-		Outputs: map[id.ActionName]kernel.Outputs{
+		Outputs: map[id.ActionName]engine.Outputs{
 			"earlier": {"out-a": "earlier-output"},
 		},
 		Task:       []byte(`{"id":"task-1"}`),
@@ -290,19 +290,19 @@ func prepareRequest(
 }
 
 // startPrepared prepares and starts one workload, requiring an accepted start.
-func startPrepared(t *testing.T, ctx context.Context, fx *fixture, request engine.PrepareRequest) {
+func startPrepared(t *testing.T, ctx context.Context, fx *fixture, request reconcile.PrepareRequest) {
 	t.Helper()
 	if _, err := fx.Adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	start, err := fx.Adapter.Start(ctx, engine.StartRequest{
+	start, err := fx.Adapter.Start(ctx, reconcile.StartRequest{
 		Identity:    request.Identity,
 		WorkspaceID: request.WorkspaceID,
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if start.Outcome != engine.StartAccepted {
+	if start.Outcome != reconcile.StartAccepted {
 		t.Fatalf("start outcome = %q; want accepted (%s)", start.Outcome, start.Detail)
 	}
 }
@@ -313,11 +313,11 @@ func waitForObservation(
 	t *testing.T,
 	ctx context.Context,
 	adapter *runtimekube.Adapter,
-	request engine.ObserveRequest,
-	want kernel.ObservationKind,
-) kernel.Observation {
+	request reconcile.ObserveRequest,
+	want engine.ObservationKind,
+) engine.Observation {
 	t.Helper()
-	var last kernel.Observation
+	var last engine.Observation
 	probe := func(ctx context.Context) error {
 		observation, err := adapter.Observe(ctx, request)
 		if err != nil {
@@ -341,7 +341,7 @@ func waitForObservation(
 }
 
 // onePod returns the single pod carrying the workload label.
-func onePod(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity engine.EffectIdentity) runtimekube.Pod {
+func onePod(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Pod {
 	t.Helper()
 	pods, err := client.ListPods(ctx, testNamespace, map[string]string{
 		runtimekube.LabelWorkload: string(identity.WorkloadID),
@@ -358,7 +358,7 @@ func onePod(t *testing.T, ctx context.Context, client *driverkube.Cluster, ident
 // waitForPod blocks until exactly one workload pod is observable. Observe can
 // report Running from the Job alone (the pod is not scheduled yet), so a test
 // that needs the pod must wait for it instead of assuming it exists.
-func waitForPod(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity engine.EffectIdentity) runtimekube.Pod {
+func waitForPod(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Pod {
 	t.Helper()
 	var last runtimekube.Pod
 	probe := func(ctx context.Context) error {
@@ -386,7 +386,7 @@ func waitForPod(t *testing.T, ctx context.Context, client *driverkube.Cluster, i
 // waitForJobSettled blocks until the single workload Job reports a terminal
 // status. The Job controller updates the Job asynchronously after the pod
 // terminates, so a test must not read the Job status once and assume it settled.
-func waitForJobSettled(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity engine.EffectIdentity) runtimekube.Job {
+func waitForJobSettled(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Job {
 	t.Helper()
 	var last runtimekube.Job
 	probe := func(ctx context.Context) error {
@@ -416,7 +416,7 @@ func waitForJobSettled(t *testing.T, ctx context.Context, client *driverkube.Clu
 }
 
 // oneJob returns the single Job carrying the workload label.
-func oneJob(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity engine.EffectIdentity) runtimekube.Job {
+func oneJob(t *testing.T, ctx context.Context, client *driverkube.Cluster, identity reconcile.EffectIdentity) runtimekube.Job {
 	t.Helper()
 	jobs, err := client.ListJobs(ctx, testNamespace, map[string]string{
 		runtimekube.LabelWorkload: string(identity.WorkloadID),
@@ -550,13 +550,13 @@ func readAllLogs(
 	t *testing.T,
 	ctx context.Context,
 	adapter *runtimekube.Adapter,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	limit int,
 ) (stdout, stderr []byte) {
 	t.Helper()
 	var offset int64
 	for page := 0; page < 10000; page++ {
-		batch, err := adapter.Logs(ctx, engine.LogsRequest{
+		batch, err := adapter.Logs(ctx, reconcile.LogsRequest{
 			Identity:    identity,
 			AfterOffset: offset,
 			Limit:       limit,
@@ -566,9 +566,9 @@ func readAllLogs(
 		}
 		for _, chunk := range batch.Chunks {
 			switch chunk.Stream {
-			case engine.LogStdout:
+			case reconcile.LogStdout:
 				stdout = append(stdout, chunk.Data...)
-			case engine.LogStderr:
+			case reconcile.LogStderr:
 				stderr = append(stderr, chunk.Data...)
 			}
 		}
@@ -615,9 +615,9 @@ func runReader(t *testing.T, ctx context.Context, fx *fixture, workspaceID id.Wo
 		identity, workspaceID, id.ActionName("read"), "",
 		testContainer(commands, nil), nil, "tok-reader-"+name,
 	))
-	observation := waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 	if code, ok := observation.ExitStatus(); !ok || code != 0 {
 		t.Fatalf("reader %q exit = %d/%v; want 0/true", name, code, ok)
 	}

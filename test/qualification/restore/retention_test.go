@@ -19,8 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/apps/kit/session"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/userland/session"
 )
 
 // TestRetentionBoundaries pins the frozen lifetimes and their exact boundary.

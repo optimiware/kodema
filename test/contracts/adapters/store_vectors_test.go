@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/store"
+	"github.com/optimiware/kodema/internal/control/store"
 )
 
 // The store conformance vectors are executable: each one carries seed state,

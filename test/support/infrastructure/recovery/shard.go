@@ -27,9 +27,9 @@ import (
 	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
-	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
-	recovery "github.com/optimiware/kodema/internal/shell/app/drivers/recovery"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
+	recovery "github.com/optimiware/kodema/internal/server/drivers/recovery"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 	"github.com/optimiware/kodema/test/support/infrastructure/runtime"

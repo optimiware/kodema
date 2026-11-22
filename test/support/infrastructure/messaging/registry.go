@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/shell/integration/registry"
+	"github.com/optimiware/kodema/internal/adapter/integration/registry"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 

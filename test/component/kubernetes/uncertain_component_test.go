@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 
@@ -34,8 +34,8 @@ func TestCancelledStartLeavesNoJobAndRetryReusesOne(t *testing.T) {
 
 	cancelled, cancelStart := context.WithCancel(ctx)
 	cancelStart()
-	start, err := fx.Adapter.Start(cancelled, engine.StartRequest{Identity: identity, WorkspaceID: workspaceID})
-	if start.Outcome != engine.StartUnknown {
+	start, err := fx.Adapter.Start(cancelled, reconcile.StartRequest{Identity: identity, WorkspaceID: workspaceID})
+	if start.Outcome != reconcile.StartUnknown {
 		t.Fatalf("cancelled start outcome = %q; want unknown", start.Outcome)
 	}
 	requireFaultClass(t, err, fault.DependencyUnavailable)
@@ -49,24 +49,24 @@ func TestCancelledStartLeavesNoJobAndRetryReusesOne(t *testing.T) {
 		t.Fatalf("cancelled start created %d Job(s); want 0", len(jobs))
 	}
 
-	accepted, err := fx.Adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: workspaceID})
+	accepted, err := fx.Adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("retry Start: %v", err)
 	}
-	if accepted.Outcome != engine.StartAccepted {
+	if accepted.Outcome != reconcile.StartAccepted {
 		t.Fatalf("retry start outcome = %q; want accepted", accepted.Outcome)
 	}
-	reused, err := fx.Adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: workspaceID})
+	reused, err := fx.Adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("second retry Start: %v", err)
 	}
-	if reused.Outcome != engine.StartAccepted {
+	if reused.Outcome != reconcile.StartAccepted {
 		t.Fatalf("second retry outcome = %q; want accepted", reused.Outcome)
 	}
 	oneJob(t, ctx, fx.Client, identity)
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 }
 
 // TestStopWithoutTerminationEvidenceStaysPending proves suspending the Job is an
@@ -91,7 +91,7 @@ func TestStopWithoutTerminationEvidenceStaysPending(t *testing.T) {
 		t.Fatal("live Job has no metadata.uid")
 	}
 
-	evidence, err := fx.Adapter.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	evidence, err := fx.Adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -109,14 +109,14 @@ func TestStopWithoutTerminationEvidenceStaysPending(t *testing.T) {
 		t.Fatalf("Job spec.suspend = %v after Stop; want true", jobAfterStop.Spec.Suspend)
 	}
 
-	observation, err := fx.Adapter.Observe(ctx, engine.ObserveRequest{Identity: identity, WorkspaceID: workspaceID})
+	observation, err := fx.Adapter.Observe(ctx, reconcile.ObserveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Observe after Stop: %v", err)
 	}
 	if observation.ProofOfNonexecution() {
 		t.Fatalf("observation = %+v; suspension is never proof the command never ran", observation)
 	}
-	if observation.Kind == kernel.ObservationNeverStarted {
+	if observation.Kind == engine.ObservationNeverStarted {
 		t.Fatalf("observation = %+v; a suspended Job is not a never-started proof", observation)
 	}
 
@@ -158,9 +158,9 @@ func TestSlowStopRetainsLogsAndReleasesResources(t *testing.T) {
 			`sleep 25`,
 		}, nil), nil, "tok-k13",
 	))
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationRunning)
+	}, engine.ObservationRunning)
 	// Observe can report Running from the Job alone while the pod is still
 	// Pending (scheduling, image pull). A log read of a container that has not
 	// started is correctly rejected and retried by the adapter, so this test
@@ -181,7 +181,7 @@ func TestSlowStopRetainsLogsAndReleasesResources(t *testing.T) {
 
 	// The requested deletion is acknowledged, not confirmed: the workload
 	// ignores SIGTERM and keeps running until its own bounded timer expires.
-	pending, err := fx.Adapter.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	pending, err := fx.Adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -219,9 +219,9 @@ func TestSlowStopRetainsLogsAndReleasesResources(t *testing.T) {
 	// Cleanup must converge on its own after the container exits. Removing
 	// before then retains the workspace instead of deleting a live writer's
 	// resources; the loop below is the Kernel's bounded retry behavior.
-	var lastRemoval engine.Removal
+	var lastRemoval reconcile.Removal
 	probe := func(ctx context.Context) error {
-		removal, err := fx.Adapter.Remove(ctx, engine.RemoveRequest{
+		removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{
 			Identity: identity, WorkspaceID: workspaceID,
 		})
 		if err != nil {
@@ -256,9 +256,9 @@ func TestDeletedJobIsNotAnAbsentWorkload(t *testing.T) {
 		identity, workspaceID, "build", "",
 		testContainer([]string{`trap '' TERM`, `sleep 20`}, nil), nil, "tok-k12",
 	))
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationRunning)
+	}, engine.ObservationRunning)
 	waitForPod(t, ctx, fx.Client, identity)
 	job := oneJob(t, ctx, fx.Client, identity)
 	t.Cleanup(func() {
@@ -275,7 +275,7 @@ func TestDeletedJobIsNotAnAbsentWorkload(t *testing.T) {
 	if err := fx.Client.DeleteJob(ctx, testNamespace, job.Name); err != nil {
 		t.Fatalf("DeleteJob: %v", err)
 	}
-	observation, err := fx.Adapter.Observe(ctx, engine.ObserveRequest{Identity: identity, WorkspaceID: workspaceID})
+	observation, err := fx.Adapter.Observe(ctx, reconcile.ObserveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Observe after external deletion: %v", err)
 	}
@@ -301,7 +301,7 @@ func waitForWorkloadContainerRunning(
 	t *testing.T,
 	ctx context.Context,
 	fx *fixture,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	marker string,
 ) {
 	t.Helper()
@@ -357,12 +357,12 @@ func waitForWorkloadContainerRunning(
 func readWorkloadLogs(
 	ctx context.Context,
 	adapter *runtimekube.Adapter,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	limit int,
 ) (stdout, stderr []byte, err error) {
 	var offset int64
 	for page := 0; page < 10000; page++ {
-		batch, err := adapter.Logs(ctx, engine.LogsRequest{
+		batch, err := adapter.Logs(ctx, reconcile.LogsRequest{
 			Identity:    identity,
 			AfterOffset: offset,
 			Limit:       limit,
@@ -372,9 +372,9 @@ func readWorkloadLogs(
 		}
 		for _, chunk := range batch.Chunks {
 			switch chunk.Stream {
-			case engine.LogStdout:
+			case reconcile.LogStdout:
 				stdout = append(stdout, chunk.Data...)
-			case engine.LogStderr:
+			case reconcile.LogStderr:
 				stderr = append(stderr, chunk.Data...)
 			}
 		}
@@ -406,7 +406,7 @@ func workloadPodDiagnostic(
 	t *testing.T,
 	ctx context.Context,
 	fx *fixture,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 ) string {
 	t.Helper()
 	pods, err := fx.Client.ListPods(ctx, testNamespace, map[string]string{

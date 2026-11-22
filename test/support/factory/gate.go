@@ -14,7 +14,7 @@ import (
 	"context"
 	"sync"
 
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 )
 
 // StopGate gates exactly one composition Libpod StopContainer call per Arm.

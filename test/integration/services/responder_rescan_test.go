@@ -33,9 +33,8 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	serviceadapter "github.com/optimiware/kodema/internal/apps/kit/servicekit"
 	"github.com/optimiware/kodema/internal/id"
-	serviceadapter "github.com/optimiware/kodema/internal/userland/services"
-	servicesapp "github.com/optimiware/kodema/internal/userland/services/app"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 
@@ -79,7 +78,7 @@ func TestResponderStartupFindsOldRequestWithoutNotification(t *testing.T) {
 	handler := newResponderHandler(harness, access.token)
 	runErr := make(chan error, 1)
 	go func() {
-		runErr <- servicesapp.Run(ctx, servicesapp.Config{
+		runErr <- serviceadapter.Run(ctx, serviceadapter.Config{
 			Kind:      serviceadapter.KindResponder,
 			ServiceID: id.PrincipalID(access.id),
 			TenantID:  id.TenantID(factory.TenantID),
@@ -88,7 +87,7 @@ func TestResponderStartupFindsOldRequestWithoutNotification(t *testing.T) {
 			// Explicitly labelled fault injection: the notification drain
 			// fails before it can report a single hint.
 			Events: faultNotificationSource{},
-			Clock:  servicesapp.SystemClock{},
+			Clock:  serviceadapter.SystemClock{},
 		})
 	}()
 

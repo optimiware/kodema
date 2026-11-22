@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/userland/cli"
+	"github.com/optimiware/kodema/internal/apps/cli"
 )
 
 // TestKodemaRunsAgainstTheComposedApp drives one parameterized kodema command

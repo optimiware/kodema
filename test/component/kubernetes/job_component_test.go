@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 
@@ -40,9 +40,9 @@ func TestJobCompletesWithPodEvidence(t *testing.T) {
 		testContainer(commands, nil), nil, "tok-k1",
 	))
 
-	observation := waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 	code, ok := observation.ExitStatus()
 	if !ok || code != 0 {
 		t.Fatalf("exit status = %d/%v; want 0/true (%+v)", code, ok, observation)
@@ -97,9 +97,9 @@ func TestJobFailureIsObservedNotReplayed(t *testing.T) {
 		testContainer([]string{`exit 7`}, nil), nil, "tok-k2",
 	))
 
-	observation := waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationExited)
+	}, engine.ObservationExited)
 	code, ok := observation.ExitStatus()
 	if !ok || code != 7 {
 		t.Fatalf("exit status = %d/%v; want 7/true (%+v)", code, ok, observation)
@@ -167,9 +167,9 @@ func TestFreshAdapterAdoptsRunningJob(t *testing.T) {
 	// Pending (image pull or scheduling), so the pod itself must reach Running
 	// before the identity snapshot is taken.
 	podBefore := waitForPodRunning(t, ctx, fx, fx.Client, identity)
-	waitForObservation(t, ctx, fx.Adapter, engine.ObserveRequest{
+	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationRunning)
+	}, engine.ObservationRunning)
 	jobBefore := oneJob(t, ctx, fx.Client, identity)
 	jobUIDBefore := objectUID(t, ctx, fx, "job", jobBefore.Name)
 	podUIDBefore := objectUID(t, ctx, fx, "pod", podBefore.Name)
@@ -205,9 +205,9 @@ func TestFreshAdapterAdoptsRunningJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build fresh Kubernetes adapter: %v", err)
 	}
-	waitForObservation(t, ctx, fresh, engine.ObserveRequest{
+	waitForObservation(t, ctx, fresh, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
-	}, kernel.ObservationRunning)
+	}, engine.ObservationRunning)
 
 	jobAfter := oneJob(t, ctx, client, identity)
 	if jobAfter.Name != jobBefore.Name {
@@ -233,13 +233,13 @@ func TestFreshAdapterAdoptsRunningJob(t *testing.T) {
 	// A restarted controller may retry the same Start. The durable Job must be
 	// adopted: Start is accepted with the existing stable Job, and no second Job
 	// or replacement Pod appears.
-	start, err := fresh.Start(ctx, engine.StartRequest{
+	start, err := fresh.Start(ctx, reconcile.StartRequest{
 		Identity: identity, WorkspaceID: workspaceID,
 	})
 	if err != nil {
 		t.Fatalf("fresh Start on the adopted workload: %v", err)
 	}
-	if start.Outcome != engine.StartAccepted {
+	if start.Outcome != reconcile.StartAccepted {
 		t.Fatalf("fresh Start outcome = %q; want accepted (%s)", start.Outcome, start.Detail)
 	}
 	if !strings.Contains(start.Detail, "reused existing stable Job") {
@@ -269,7 +269,7 @@ func waitForPodRunning(
 	ctx context.Context,
 	fx *fixture,
 	client *driverkube.Cluster,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 ) runtimekube.Pod {
 	t.Helper()
 	var last runtimekube.Pod
@@ -326,7 +326,7 @@ func podStatusDiagnostic(
 	ctx context.Context,
 	fx *fixture,
 	client *driverkube.Cluster,
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	last runtimekube.Pod,
 ) string {
 	t.Helper()

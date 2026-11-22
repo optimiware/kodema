@@ -11,7 +11,7 @@ import (
 
 func writeUnitSource(t *testing.T, root, pkgDir, pkg, source string) {
 	t.Helper()
-	dir := filepath.Join(root, "internal", "shell", pkgDir)
+	dir := filepath.Join(root, "internal", "control", pkgDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -25,11 +25,11 @@ func TestUnitTypesAreQualifiedByPackageAndSkipTestsAndNonStructs(t *testing.T) {
 	root := t.TempDir()
 	writeUnitSource(t, root, "alpha", "alpha", "type CreateUnit struct{}\ntype NotAStructUnit int\ntype helper struct{}\n")
 	writeUnitSource(t, root, "beta", "beta", "type CreateUnit struct{}\n")
-	if err := os.WriteFile(filepath.Join(root, "internal", "shell", "alpha", "x_test.go"),
+	if err := os.WriteFile(filepath.Join(root, "internal", "control", "alpha", "x_test.go"),
 		[]byte("package alpha\n\ntype fakeUnit struct{}\n"), 0o644); err != nil {
 		t.Fatalf("write test file: %v", err)
 	}
-	got, err := unitTypes(filepath.Join(root, "internal", "shell"))
+	got, err := unitTypes(filepath.Join(root, "internal", "control"))
 	if err != nil {
 		t.Fatalf("unitTypes: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestCoverageGateReadsSourceAndRefusesAnEmptyRegistry(t *testing.T) {
 // product tree: the qualified *Unit types parsed from internal/shell must equal
 // the mapped keys plus the exempt ones, so a new unit type cannot slip in.
 func TestUnitTypeStatesMatchProductSource(t *testing.T) {
-	parsed, err := unitTypes(filepath.Join("..", "..", "..", "..", "internal", "shell"))
+	parsed, err := unitTypes(filepath.Join("..", "..", "..", "..", "internal", "control"))
 	if err != nil {
 		t.Fatalf("unitTypes: %v", err)
 	}

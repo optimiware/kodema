@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/userland/git"
+	"github.com/optimiware/kodema/internal/apps/git"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 	recoveryfix "github.com/optimiware/kodema/test/support/boundaries/recovery"
 )

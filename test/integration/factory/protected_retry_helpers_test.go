@@ -35,7 +35,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/internal/userland/git"
+	"github.com/optimiware/kodema/internal/apps/git"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 

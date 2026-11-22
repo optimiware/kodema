@@ -8,19 +8,14 @@ import (
 	"testing"
 )
 
-// TestUserlandAppImportGraphIsPublicOnly proves that the Git, agent and
-// service app packages use only neutral packages, the public API/client
-// contracts and other Userland packages. Even when linked into the same
-// `kodema` binary as the Shell composition, they never import Shell, Kernel or
-// installation code.
-func TestUserlandAppImportGraphIsPublicOnly(t *testing.T) {
+// TestAppsImportGraphIsPublicOnly proves that every first-party app package
+// under internal/apps uses only neutral packages, the public API/client
+// contracts and shared apps/kit helpers. Even when linked into the same
+// `kodema` binary as the Control Plane composition, they never import engine,
+// control, adapter, transport, server or installation code.
+func TestAppsImportGraphIsPublicOnly(t *testing.T) {
 	root := repositoryRoot(t)
-	command := exec.Command("go", "list", "-deps",
-		"./internal/userland/app/auth",
-		"./internal/userland/git/app",
-		"./internal/userland/agent/app",
-		"./internal/userland/services/app",
-	)
+	command := exec.Command("go", "list", "-deps", "./internal/apps/...")
 	command.Dir = root
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
@@ -28,8 +23,11 @@ func TestUserlandAppImportGraphIsPublicOnly(t *testing.T) {
 		t.Fatalf("go list -deps: %v\n%s", err, output)
 	}
 	forbidden := []string{
-		"github.com/optimiware/kodema/internal/shell",
-		"github.com/optimiware/kodema/internal/kernel",
+		"github.com/optimiware/kodema/internal/engine",
+		"github.com/optimiware/kodema/internal/control",
+		"github.com/optimiware/kodema/internal/adapter",
+		"github.com/optimiware/kodema/internal/transport",
+		"github.com/optimiware/kodema/internal/server",
 		"github.com/optimiware/kodema/internal/installation",
 	}
 	found := make(map[string]bool)
@@ -41,16 +39,16 @@ func TestUserlandAppImportGraphIsPublicOnly(t *testing.T) {
 		found[line] = true
 		for _, prefix := range forbidden {
 			if line == prefix || strings.HasPrefix(line, prefix+"/") {
-				t.Errorf("userland app import graph contains forbidden package %q", line)
+				t.Errorf("apps import graph contains forbidden package %q", line)
 			}
 		}
 	}
 	for _, expected := range []string{
-		"github.com/optimiware/kodema/internal/userland/app/auth",
-		"github.com/optimiware/kodema/internal/userland/git/app",
-		"github.com/optimiware/kodema/internal/userland/agent/app",
-		"github.com/optimiware/kodema/internal/userland/services/app",
 		"github.com/optimiware/kodema/client",
+		"github.com/optimiware/kodema/internal/apps/auth",
+		"github.com/optimiware/kodema/internal/apps/git",
+		"github.com/optimiware/kodema/internal/apps/agent",
+		"github.com/optimiware/kodema/internal/apps/cli",
 	} {
 		if !found[expected] {
 			t.Errorf("go list did not report expected package %q", expected)
@@ -76,7 +74,7 @@ func TestKodemaProductDoesNotImportTestSupport(t *testing.T) {
 		if line == "github.com/optimiware/kodema/test" || strings.HasPrefix(line, "github.com/optimiware/kodema/test/") {
 			t.Errorf("kodema imports test package %q", line)
 		}
-		if line == "github.com/optimiware/kodema/internal/shell/app/drivers/podman" {
+		if line == "github.com/optimiware/kodema/internal/server/drivers/podman" {
 			found = true
 		}
 	}

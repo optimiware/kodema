@@ -11,10 +11,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/runtime/podman"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
@@ -34,12 +34,12 @@ func TestPodmanRuntimeWorkspacePersistenceAndCredentialRefresh(t *testing.T) {
 	if _, err := fixture.adapter.Prepare(ctx, firstRequest); err != nil {
 		t.Fatalf("first Prepare: %v", err)
 	}
-	if _, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: first, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: first, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, fixture.adapter,
-		engine.ObserveRequest{Identity: first, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
-	if removal, err := fixture.adapter.Remove(ctx, engine.RemoveRequest{Identity: first, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+		reconcile.ObserveRequest{Identity: first, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
+	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: first, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("first Remove = %+v, %v; want removed", removal, err)
 	}
 	if !runtimesupport.VolumeExists(ctx, fixture.volumeName) {
@@ -54,18 +54,18 @@ func TestPodmanRuntimeWorkspacePersistenceAndCredentialRefresh(t *testing.T) {
 	if _, err := fixture.adapter.Prepare(ctx, secondRequest); err != nil {
 		t.Fatalf("second Prepare: %v", err)
 	}
-	if _, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: second, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: second, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("second Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, fixture.adapter,
-		engine.ObserveRequest{Identity: second, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
+		reconcile.ObserveRequest{Identity: second, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 	if got := string(readVolume(t, ctx, fixture, "readback")); got != "persisted\n" {
 		t.Fatalf("workspace data after container recreation = %q; want persisted", got)
 	}
 	if got := strings.TrimSpace(string(readVolume(t, ctx, fixture, "launch-count"))); got != "first\nsecond" {
 		t.Fatalf("launch count = %q; want first then second", got)
 	}
-	if removal, err := fixture.adapter.Remove(ctx, engine.RemoveRequest{Identity: second, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: second, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("second Remove = %+v, %v; want removed", removal, err)
 	}
 
@@ -82,11 +82,11 @@ func TestPodmanRuntimeWorkspacePersistenceAndCredentialRefresh(t *testing.T) {
 	if _, err := fixture.adapter.Prepare(ctx, thirdRequest); err != nil {
 		t.Fatalf("third Prepare: %v", err)
 	}
-	if _, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: third, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: third, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("third Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, fixture.adapter,
-		engine.ObserveRequest{Identity: third, WorkspaceID: fixture.workspaceID}, kernel.ObservationRunning)
+		reconcile.ObserveRequest{Identity: third, WorkspaceID: fixture.workspaceID}, engine.ObservationRunning)
 	waitForVolumeContent(t, ctx, fixture, "token-seen", "tok-abc")
 	name, err := podman.ContainerName(third.WorkloadID)
 	if err != nil {
@@ -96,7 +96,7 @@ func TestPodmanRuntimeWorkspacePersistenceAndCredentialRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inspect before refresh: %v", err)
 	}
-	if _, err := fixture.adapter.RefreshCredential(ctx, engine.CredentialRequest{Identity: third, Credential: "tok-new"}); err != nil {
+	if _, err := fixture.adapter.RefreshCredential(ctx, reconcile.CredentialRequest{Identity: third, Credential: "tok-new"}); err != nil {
 		t.Fatalf("RefreshCredential: %v", err)
 	}
 	waitForVolumeContent(t, ctx, fixture, "token-seen", "tok-new")
@@ -118,10 +118,10 @@ func TestPodmanRuntimeWorkspacePersistenceAndCredentialRefresh(t *testing.T) {
 	if before.ID != after.ID || after.Status != podman.ContainerStatusRunning {
 		t.Fatalf("credential refresh restarted the container: before %+v after %+v", before, after)
 	}
-	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, engine.StopRequest{Identity: third, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: third, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
-	if removal, err := fixture.adapter.Remove(ctx, engine.RemoveRequest{Identity: third, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: third, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("third Remove = %+v, %v; want removed", removal, err)
 	}
 	if err := fixture.adapter.Release(ctx, fixture.workspaceID); err != nil {
@@ -149,8 +149,8 @@ func TestPodmanRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 	if _, err := adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	start, err := adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
-	if err == nil || start.Outcome != engine.StartUnknown {
+	start, err := adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	if err == nil || start.Outcome != reconcile.StartUnknown {
 		t.Fatalf("lost start = %q/%v; want unknown", start.Outcome, err)
 	}
 	if wrapper.startCalls() != 1 {
@@ -158,11 +158,11 @@ func TestPodmanRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 	}
 
 	recovered := newPodmanAdapterOnly(t, fixture)
-	recoveredStart, err := recovered.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	recoveredStart, err := recovered.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
 	if err != nil {
 		t.Fatalf("recovered Start: %v", err)
 	}
-	if recoveredStart.Outcome != engine.StartAccepted {
+	if recoveredStart.Outcome != reconcile.StartAccepted {
 		t.Fatalf("recovered start outcome = %q; want accepted", recoveredStart.Outcome)
 	}
 	if wrapper.startCalls() != 1 {
@@ -175,9 +175,9 @@ func TestPodmanRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 		t.Fatalf("workload launched %d times; want 1", got)
 	}
 	waitForPodmanObservation(t, ctx, recovered,
-		engine.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
-	recoveredStart, err = recovered.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
-	if err != nil || recoveredStart.Outcome != engine.StartAccepted {
+		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
+	recoveredStart, err = recovered.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	if err != nil || recoveredStart.Outcome != reconcile.StartAccepted {
 		t.Fatalf("start after exit = %q/%v; want accepted", recoveredStart.Outcome, err)
 	}
 	if got := strings.Count(string(readVolume(t, ctx, fixture, "launch-count")), "launched"); got != 1 {
@@ -192,7 +192,7 @@ func TestPodmanRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 	if _, err := goneAdapter.Prepare(ctx, goneRequest); err != nil {
 		t.Fatalf("gone Prepare: %v", err)
 	}
-	if start, err := goneAdapter.Start(ctx, engine.StartRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID}); err == nil || start.Outcome != engine.StartUnknown {
+	if start, err := goneAdapter.Start(ctx, reconcile.StartRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID}); err == nil || start.Outcome != reconcile.StartUnknown {
 		t.Fatalf("gone lost start = %q/%v; want unknown", start.Outcome, err)
 	}
 	goneName, err := podman.ContainerName(goneIdentity.WorkloadID)
@@ -203,27 +203,27 @@ func TestPodmanRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 		t.Fatalf("remove attempted container: %v", err)
 	}
 	createdBefore := goneWrapper.createCalls()
-	retry, err := goneAdapter.Start(ctx, engine.StartRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID})
-	if err == nil || retry.Outcome != engine.StartUnknown {
+	retry, err := goneAdapter.Start(ctx, reconcile.StartRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID})
+	if err == nil || retry.Outcome != reconcile.StartUnknown {
 		t.Fatalf("start of a gone attempted container = %q/%v; want unknown", retry.Outcome, err)
 	}
 	if goneWrapper.createCalls() != createdBefore {
 		t.Fatalf("a gone attempted container was recreated: %d -> %d", createdBefore, goneWrapper.createCalls())
 	}
-	if _, err := goneAdapter.Remove(ctx, engine.RemoveRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := goneAdapter.Remove(ctx, reconcile.RemoveRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("gone Remove: %v", err)
 	}
-	observation, err := goneAdapter.Observe(ctx, engine.ObserveRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID})
+	observation, err := goneAdapter.Observe(ctx, reconcile.ObserveRequest{Identity: goneIdentity, WorkspaceID: fixture.workspaceID})
 	if err != nil {
 		t.Fatalf("gone Observe: %v", err)
 	}
-	if observation.Kind != kernel.ObservationAbsent {
+	if observation.Kind != engine.ObservationAbsent {
 		t.Fatalf("removed observation = %+v; want absent", observation)
 	}
-	if evidence := waitForPodmanStop(t, ctx, recovered, engine.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := waitForPodmanStop(t, ctx, recovered, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
-	if removal, err := recovered.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := recovered.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("Remove = %+v, %v; want removed", removal, err)
 	}
 	if err := recovered.Release(ctx, fixture.workspaceID); err != nil {
@@ -251,27 +251,27 @@ func TestPodmanRuntimeUncertainStartAndStop(t *testing.T) {
 		t.Fatalf("Prepare: %v", err)
 	}
 	type startOutcome struct {
-		result engine.StartResult
+		result reconcile.StartResult
 		err    error
 	}
 	started := make(chan startOutcome, 1)
 	go func() {
-		result, err := startAdapter.Start(ctx, engine.StartRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID})
+		result, err := startAdapter.Start(ctx, reconcile.StartRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID})
 		started <- startOutcome{result: result, err: err}
 	}()
 	<-gated.startEntered
 	fixture.service.Kill()
 	close(gated.startRelease)
 	outcome := <-started
-	if outcome.err == nil || outcome.result.Outcome != engine.StartUnknown {
+	if outcome.err == nil || outcome.result.Outcome != reconcile.StartUnknown {
 		t.Fatalf("interrupted start = %q/%v; want unknown", outcome.result.Outcome, outcome.err)
 	}
 	fixture.service.Restart(t)
-	observation, err := startAdapter.Observe(ctx, engine.ObserveRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID})
+	observation, err := startAdapter.Observe(ctx, reconcile.ObserveRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID})
 	if err != nil {
 		t.Fatalf("Observe after restart: %v", err)
 	}
-	if observation.Kind == kernel.ObservationNeverStarted || observation.ProofOfNonexecution() {
+	if observation.Kind == engine.ObservationNeverStarted || observation.ProofOfNonexecution() {
 		t.Fatalf("ambiguous start collapsed into never-started: %+v", observation)
 	}
 	// Clean the ambiguous created container; it may never have started. The
@@ -280,7 +280,7 @@ func TestPodmanRuntimeUncertainStartAndStop(t *testing.T) {
 	if err := runtimesupport.RemoveRunContainersInWorkspace(ctx, string(fixture.workspaceID)); err != nil {
 		t.Fatalf("remove ambiguous container: %v", err)
 	}
-	if removal, err := startAdapter.Remove(ctx, engine.RemoveRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := startAdapter.Remove(ctx, reconcile.RemoveRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("clean ambiguous workload = %+v, %v; want removed", removal, err)
 	}
 
@@ -289,21 +289,21 @@ func TestPodmanRuntimeUncertainStartAndStop(t *testing.T) {
 	if _, err := fixture.adapter.Prepare(ctx, stopRequest); err != nil {
 		t.Fatalf("stop Prepare: %v", err)
 	}
-	if _, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("stop Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, fixture.adapter,
-		engine.ObserveRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}, kernel.ObservationRunning)
+		reconcile.ObserveRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}, engine.ObservationRunning)
 
 	stopGate := newGatedLibpod(fixture.libpod)
 	_, _, stopAdapter := newPodmanAdapter(t, fixture, stopGate)
 	type stopOutcome struct {
-		evidence kernel.StopEvidence
+		evidence engine.StopEvidence
 		err      error
 	}
 	stopped := make(chan stopOutcome, 1)
 	go func() {
-		evidence, err := stopAdapter.Stop(ctx, engine.StopRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID})
+		evidence, err := stopAdapter.Stop(ctx, reconcile.StopRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID})
 		stopped <- stopOutcome{evidence: evidence, err: err}
 	}()
 	<-stopGate.stopEntered
@@ -315,7 +315,7 @@ func TestPodmanRuntimeUncertainStartAndStop(t *testing.T) {
 		t.Fatalf("interrupted stop confirmed termination: %+v", pending.evidence)
 	}
 	fixture.service.Restart(t)
-	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, engine.StopRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
 		t.Fatalf("recovered stop evidence = %+v; want confirmed", evidence)
 	}
 	stopName, err := podman.ContainerName(stopIdentity.WorkloadID)
@@ -329,7 +329,7 @@ func TestPodmanRuntimeUncertainStartAndStop(t *testing.T) {
 	if state.Status != podman.ContainerStatusExited || !state.WholeStopped {
 		t.Fatalf("confirmed stop state = %+v; want exited with whole-container evidence", state)
 	}
-	if removal, err := fixture.adapter.Remove(ctx, engine.RemoveRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: stopIdentity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("Remove = %+v, %v; want removed", removal, err)
 	}
 	if err := fixture.adapter.Release(ctx, fixture.workspaceID); err != nil {
@@ -353,12 +353,12 @@ func TestPodmanRuntimeCleanupAndWorkspaceExclusivity(t *testing.T) {
 	if _, err := fixture.adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	if _, err := fixture.adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, fixture.adapter,
-		engine.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
-	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, engine.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
+	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
 	// A second controller sees the labelled container as the owner and cannot
@@ -369,7 +369,7 @@ func TestPodmanRuntimeCleanupAndWorkspaceExclusivity(t *testing.T) {
 	} else {
 		assertFaultClass(t, err, fault.Forbidden)
 	}
-	if removal, err := fixture.adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
+	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("Remove = %+v, %v; want removed", removal, err)
 	}
 	if names := podmanContainerNames(t, ctx, fixture.workspaceID); len(names) != 0 {
@@ -401,15 +401,15 @@ func TestPodmanRuntimeRemovalFailureStaysPending(t *testing.T) {
 	if _, err := adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	if _, err := adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil {
+	if _, err := adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	waitForPodmanObservation(t, ctx, adapter,
-		engine.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, kernel.ObservationExited)
-	if evidence := waitForPodmanStop(t, ctx, adapter, engine.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
+	if evidence := waitForPodmanStop(t, ctx, adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
-	removal, err := adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	removal, err := adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
@@ -420,11 +420,11 @@ func TestPodmanRuntimeRemovalFailureStaysPending(t *testing.T) {
 	if !strings.Contains(removal.Detail, name) {
 		t.Fatalf("removal detail does not name the retained container: %q", removal.Detail)
 	}
-	if _, err := adapter.Start(ctx, engine.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err == nil {
+	if _, err := adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err == nil {
 		t.Fatal("a fenced identity was started again")
 	}
 	failing.clearFailures()
-	removal, err = adapter.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	removal, err = adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
 	if err != nil || !removal.Removed {
 		t.Fatalf("retried Remove = %+v, %v; want removed", removal, err)
 	}

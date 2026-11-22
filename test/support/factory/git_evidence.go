@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/git"
+	"github.com/optimiware/kodema/internal/apps/git"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

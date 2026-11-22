@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
 	"github.com/optimiware/kodema/internal/id"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
 )
 
 // holdFinalizer is the test-owned finalizer the workspace component test places

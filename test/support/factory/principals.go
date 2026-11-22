@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/server"
 )
 
 // Role-limited human fixture principals.
@@ -57,8 +57,8 @@ func newLimitedPrincipal(t *testing.T, principalID string, role tenancy.Role, ex
 // DevToken renders the principal as an explicit development authenticator
 // token. Roles are exactly the limited role so the grant stage can never rely on
 // another role held by the same human.
-func (principal LimitedPrincipal) DevToken() app.DevToken {
-	return app.DevToken{
+func (principal LimitedPrincipal) DevToken() server.DevToken {
+	return server.DevToken{
 		Credential: principal.Token,
 		Principal: identity.Principal{
 			ID:      principal.ID,

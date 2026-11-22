@@ -333,15 +333,15 @@ func TestFactoryStartupPhaseWiring(t *testing.T) {
 		t.Fatalf("phase runner parent = %s; want the test context t.Context()", got)
 	}
 
-	// app.New must receive the application callback's parameter.
+	// server.New must receive the application callback's parameter.
 	apps := factoryCalls(startFunction.Body, func(call *ast.CallExpr) bool {
-		return factorySelectorCall(call, "app", "New")
+		return factorySelectorCall(call, "server", "New")
 	})
 	if len(apps) != 1 {
-		t.Fatalf("start() calls app.New %d times; want exactly 1", len(apps))
+		t.Fatalf("start() calls server.New %d times; want exactly 1", len(apps))
 	}
 	if got, want := factoryExpressionName(apps[0].Args[0]), callbacks["phaseApplication"]; got != want {
-		t.Fatalf("app.New context = %s; want the application phase parameter %s", got, want)
+		t.Fatalf("server.New context = %s; want the application phase parameter %s", got, want)
 	}
 
 	// newKubernetesRuntime must receive the infrastructure callback's parameter.

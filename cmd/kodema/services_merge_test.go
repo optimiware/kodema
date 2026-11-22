@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	servicesapp "github.com/optimiware/kodema/internal/userland/services/app"
+	mergeapp "github.com/optimiware/kodema/internal/apps/merge/app"
 )
 
 // TestServicesMergeCoordinatorRequiresStateAndGitURL pins the merge-coordinator
@@ -84,10 +84,10 @@ func TestServicesMergeCoordinatorForwardsCAFile(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("KODEMA_CA_FILE", tc.envCAFile)
-			var captured servicesapp.MergeConfig
+			var captured mergeapp.MergeConfig
 			called := false
 			orig := runMergeCoordinator
-			runMergeCoordinator = func(_ context.Context, cfg servicesapp.MergeConfig) error {
+			runMergeCoordinator = func(_ context.Context, cfg mergeapp.MergeConfig) error {
 				called = true
 				captured = cfg
 				return nil

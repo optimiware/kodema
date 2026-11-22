@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/git"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/userland/git"
 )
 
 // Fixture identities. The tokens are opaque fixture values; the contract

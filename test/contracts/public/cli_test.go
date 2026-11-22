@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/client"
-	"github.com/optimiware/kodema/internal/userland/cli"
+	"github.com/optimiware/kodema/internal/apps/cli"
 )
 
 // TestCLIConfigInputs pins the kodema configuration inputs: a trusted server

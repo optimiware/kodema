@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/git"
+	"github.com/optimiware/kodema/internal/apps/git"
 	recoveryfix "github.com/optimiware/kodema/test/support/boundaries/recovery"
 )
 

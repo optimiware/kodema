@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
 )
 
 func readVector(t *testing.T, name string) []byte {
@@ -47,7 +47,7 @@ func TestObservationVectors(t *testing.T) {
 		t.Fatalf("observation vectors = %d, want 6", len(entries))
 	}
 
-	observations := make([]kernel.Observation, len(entries))
+	observations := make([]engine.Observation, len(entries))
 	for index, entry := range entries {
 		if err := json.Unmarshal(entry, &observations[index]); err != nil {
 			t.Fatalf("decode observation %d: %v", index, err)
@@ -55,19 +55,19 @@ func TestObservationVectors(t *testing.T) {
 	}
 
 	unknown := observations[0]
-	if unknown.Kind != kernel.ObservationUnknown || unknown.ProofOfNonexecution() || unknown.StopConfirmed() {
+	if unknown.Kind != engine.ObservationUnknown || unknown.ProofOfNonexecution() || unknown.StopConfirmed() {
 		t.Fatalf("unknown vector = %+v", unknown)
 	}
 	absent := observations[1]
-	if absent.Kind != kernel.ObservationAbsent || absent.ProofOfNonexecution() || absent.StopConfirmed() {
+	if absent.Kind != engine.ObservationAbsent || absent.ProofOfNonexecution() || absent.StopConfirmed() {
 		t.Fatalf("absent vector = %+v", absent)
 	}
 	neverStarted := observations[2]
-	if neverStarted.Kind != kernel.ObservationNeverStarted || !neverStarted.ProofOfNonexecution() || neverStarted.StopConfirmed() {
+	if neverStarted.Kind != engine.ObservationNeverStarted || !neverStarted.ProofOfNonexecution() || neverStarted.StopConfirmed() {
 		t.Fatalf("never-started vector = %+v", neverStarted)
 	}
 	running := observations[3]
-	if running.Kind != kernel.ObservationRunning || running.ProofOfNonexecution() || running.StopConfirmed() {
+	if running.Kind != engine.ObservationRunning || running.ProofOfNonexecution() || running.StopConfirmed() {
 		t.Fatalf("running vector = %+v", running)
 	}
 	exited := observations[4]
@@ -96,7 +96,7 @@ func TestObservationVectors(t *testing.T) {
 
 func TestOutputVectors(t *testing.T) {
 	raw := readVector(t, "outputs.json")
-	var outputs []kernel.Outputs
+	var outputs []engine.Outputs
 	if err := json.Unmarshal(raw, &outputs); err != nil {
 		t.Fatalf("decode outputs: %v", err)
 	}
@@ -175,18 +175,18 @@ func TestCommitVectorCarriesOneAtomicTransition(t *testing.T) {
 	if commit.ExecutionID != "exec-0001" || commit.ExpectedExecutionVersion != 7 {
 		t.Fatalf("commit execution identity/version = %+v", commit)
 	}
-	if commit.NextExecutionState != kernel.ExecutionRunning {
+	if commit.NextExecutionState != engine.ExecutionRunning {
 		t.Fatalf("commit next execution state = %q", commit.NextExecutionState)
 	}
 	if commit.ActionID != "act-0002" || commit.ExpectedActionVersion != 1 {
 		t.Fatalf("commit action identity/version = %+v", commit)
 	}
-	if commit.NextActionState != kernel.ActionRunning {
+	if commit.NextActionState != engine.ActionRunning {
 		t.Fatalf("commit next action state = %q", commit.NextActionState)
 	}
 	wantCancellations := []flow.ActionUpdate{
-		{ActionID: "act-0003", ExpectedVersion: 1, NextState: kernel.ActionCancelled},
-		{ActionID: "act-0004", ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+		{ActionID: "act-0003", ExpectedVersion: 1, NextState: engine.ActionCancelled},
+		{ActionID: "act-0004", ExpectedVersion: 1, NextState: engine.ActionCancelled},
 	}
 	if len(commit.PendingCancellations) != len(wantCancellations) {
 		t.Fatalf("commit pending cancellations = %+v, want %d updates", commit.PendingCancellations, len(wantCancellations))
@@ -231,7 +231,7 @@ func TestCommitVectorCarriesOneAtomicTransition(t *testing.T) {
 	if commit.CleanupUpdate == nil {
 		t.Fatal("commit cleanup progress missing")
 	}
-	if commit.CleanupUpdate.State != kernel.CleanupPending || commit.CleanupUpdate.WorkloadID != "wl-0001" ||
+	if commit.CleanupUpdate.State != engine.CleanupPending || commit.CleanupUpdate.WorkloadID != "wl-0001" ||
 		commit.CleanupUpdate.WorkspaceID != "ws-0001" || commit.CleanupUpdate.Attempts != 2 ||
 		commit.CleanupUpdate.LastError != "runtime unavailable" {
 		t.Fatalf("commit cleanup progress = %+v", commit.CleanupUpdate)
@@ -239,7 +239,7 @@ func TestCommitVectorCarriesOneAtomicTransition(t *testing.T) {
 	if commit.Answer == nil {
 		t.Fatal("commit answer missing")
 	}
-	if commit.Answer.Decision != kernel.DecisionPass || !commit.Answer.DownstreamEligible() {
+	if commit.Answer.Decision != engine.DecisionPass || !commit.Answer.DownstreamEligible() {
 		t.Fatalf("commit answer = %+v", commit.Answer)
 	}
 	if commit.Answer.Outputs["decision"] != "approved" {
@@ -251,7 +251,7 @@ func TestCommitVectorCarriesOneAtomicTransition(t *testing.T) {
 	if string(commit.Answer.Provenance) != "signature" {
 		t.Fatalf("commit answer provenance = %q", commit.Answer.Provenance)
 	}
-	if commit.Observation == nil || commit.Observation.Kind != kernel.ObservationExited {
+	if commit.Observation == nil || commit.Observation.Kind != engine.ObservationExited {
 		t.Fatalf("commit observation = %+v", commit.Observation)
 	}
 	if code, ok := commit.Observation.ExitStatus(); !ok || code != 0 {
@@ -260,11 +260,11 @@ func TestCommitVectorCarriesOneAtomicTransition(t *testing.T) {
 	if !commit.Observation.StopConfirmed() {
 		t.Fatal("commit observation lost confirmed stop evidence")
 	}
-	if commit.Launch == nil || commit.Launch.WorkloadID != "wl-0001" || commit.Launch.State != kernel.LaunchIssued ||
+	if commit.Launch == nil || commit.Launch.WorkloadID != "wl-0001" || commit.Launch.State != engine.LaunchIssued ||
 		commit.Launch.IdempotencyKey != "start-wl-0001" {
 		t.Fatalf("commit launch intent = %+v", commit.Launch)
 	}
-	if commit.Failure == nil || commit.Failure.Kind != kernel.FailureTimeout ||
+	if commit.Failure == nil || commit.Failure.Kind != engine.FailureTimeout ||
 		commit.Failure.Reason != "deadline_expired" || commit.Failure.Detail == "" {
 		t.Fatalf("commit failure = %+v", commit.Failure)
 	}
@@ -277,9 +277,9 @@ func TestCommitVectorCarriesOneAtomicTransition(t *testing.T) {
 }
 
 func TestLaunchIntentRetiringJSONRoundTrip(t *testing.T) {
-	intent := kernel.LaunchIntent{
+	intent := engine.LaunchIntent{
 		WorkloadID:     "wl-1",
-		State:          kernel.LaunchRetiring,
+		State:          engine.LaunchRetiring,
 		IdempotencyKey: "k",
 	}
 	const want = `{"workload_id":"wl-1","state":"retiring","idempotency_key":"k"}`
@@ -290,7 +290,7 @@ func TestLaunchIntentRetiringJSONRoundTrip(t *testing.T) {
 	if string(encoded) != want {
 		t.Fatalf("encoded launch intent = %s, want %s", encoded, want)
 	}
-	var decoded kernel.LaunchIntent
+	var decoded engine.LaunchIntent
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("decode launch intent: %v", err)
 	}
@@ -308,25 +308,25 @@ func TestCleanupVectors(t *testing.T) {
 	if len(entries) != 3 {
 		t.Fatalf("cleanup vectors = %d, want 3", len(entries))
 	}
-	cleanups := make([]kernel.Cleanup, len(entries))
+	cleanups := make([]engine.Cleanup, len(entries))
 	for index, entry := range entries {
 		if err := json.Unmarshal(entry, &cleanups[index]); err != nil {
 			t.Fatalf("decode cleanup %d: %v", index, err)
 		}
 	}
 
-	if cleanups[0].State != kernel.CleanupNone || cleanups[0].IsPending() {
+	if cleanups[0].State != engine.CleanupNone || cleanups[0].IsPending() {
 		t.Fatalf("cleanup-none vector = %+v", cleanups[0])
 	}
 	pending := cleanups[1]
-	if pending.State != kernel.CleanupPending || !pending.IsPending() {
+	if pending.State != engine.CleanupPending || !pending.IsPending() {
 		t.Fatalf("cleanup-pending vector = %+v", pending)
 	}
 	if pending.WorkloadID != "wl-0001" || pending.WorkspaceID != "ws-0001" || pending.Attempts != 2 || pending.LastError == "" {
 		t.Fatalf("pending cleanup is not attributable: %+v", pending)
 	}
 	complete := cleanups[2]
-	if complete.State != kernel.CleanupComplete || complete.IsPending() {
+	if complete.State != engine.CleanupComplete || complete.IsPending() {
 		t.Fatalf("cleanup-complete vector = %+v", complete)
 	}
 

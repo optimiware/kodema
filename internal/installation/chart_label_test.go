@@ -40,7 +40,7 @@ var tenantLabelTokenPattern = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9._-]*/[A-
 // adapter it is supposed to satisfy.
 func adapterTenantLabel(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(repoRoot(t), "internal", "shell", "runtime", "kube", "api.go")
+	path := filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "kube", "api.go")
 	body, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read adapter label source %s: %v", path, err)

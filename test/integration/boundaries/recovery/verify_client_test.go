@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 )
 
 // fixedResultTransport answers every invocation with one fixed public result.

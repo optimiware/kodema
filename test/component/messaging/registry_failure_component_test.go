@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/registry"
+	"github.com/optimiware/kodema/internal/control/pipeline"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/integration/registry"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
 	support "github.com/optimiware/kodema/test/support/infrastructure/messaging"
 )
 

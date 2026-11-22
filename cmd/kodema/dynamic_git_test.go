@@ -14,10 +14,10 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/git"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
+	actorapp "github.com/optimiware/kodema/internal/apps/git/app/actors"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/userland/git"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
-	actorapp "github.com/optimiware/kodema/internal/userland/git/app/actors"
 )
 
 func TestMain(m *testing.M) {

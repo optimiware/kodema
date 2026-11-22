@@ -23,22 +23,22 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/identity"
+	shelllog "github.com/optimiware/kodema/internal/control/log"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/shell/app"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	shelllog "github.com/optimiware/kodema/internal/shell/log"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
-	runtimepodman "github.com/optimiware/kodema/internal/shell/runtime/podman"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/server"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 	kubesupport "github.com/optimiware/kodema/test/support/infrastructure/kubernetes"
 	"github.com/optimiware/kodema/test/support/infrastructure/messaging"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
@@ -342,7 +342,7 @@ func WithOIDC() Option {
 type Harness struct {
 	T *testing.T
 
-	App         *app.App
+	App         *server.App
 	Listener    net.Listener
 	BaseURL     string
 	WorkloadURL string
@@ -443,11 +443,11 @@ type fixtureInfrastructure struct {
 	nat     *messaging.NATS
 	keyfile keys.Provider
 	logSink shelllog.RetainedSink
-	tokens  []app.DevToken
-	devAuth *app.DevAuthenticator
+	tokens  []server.DevToken
+	devAuth *server.DevAuthenticator
 	socket  string
 	kube    *kubernetesRuntime
-	pvc     *app.WorkspacePVC
+	pvc     *server.WorkspacePVC
 	runtime installation.RuntimeAdapter
 	// listenAddr is the public edge address. The listener itself is created by
 	// start and re-created by a restart on the same address, because the
@@ -505,8 +505,8 @@ func start(t *testing.T, variant runtimeVariant, options ...Option) *Harness {
 	t.Helper()
 
 	opts := Options{
-		DefaultActionTimeout: app.DefaultActionTimeout,
-		LoopInterval:         app.DefaultLoopInterval,
+		DefaultActionTimeout: server.DefaultActionTimeout,
+		LoopInterval:         server.DefaultLoopInterval,
 	}
 	for _, option := range options {
 		opts.apply(option)
@@ -596,7 +596,7 @@ func start(t *testing.T, variant runtimeVariant, options ...Option) *Harness {
 	operator := newLimitedPrincipal(t, OperatorPrincipal, tenancy.RoleOperator, expiresAt)
 	engineer := newLimitedPrincipal(t, EngineerPrincipal, tenancy.RoleEngineer, expiresAt)
 	admission := newLimitedPrincipal(t, AdmissionPrincipal, tenancy.RoleEngineer, expiresAt)
-	tokens := []app.DevToken{
+	tokens := []server.DevToken{
 		{
 			Credential: adminToken,
 			Principal: identity.Principal{
@@ -695,12 +695,12 @@ func start(t *testing.T, variant runtimeVariant, options ...Option) *Harness {
 
 	installationRuntime := installation.RuntimePodman
 	var kubeRuntime *kubernetesRuntime
-	workspacePVC := (*app.WorkspacePVC)(nil)
+	workspacePVC := (*server.WorkspacePVC)(nil)
 	podmanSocket := ""
 	runtimeRoot := filepath.Join(dataDir, "runtime")
 	if variant == runtimeVariantKubernetes {
 		installationRuntime = installation.RuntimeKubernetes
-		workspacePVC = &app.WorkspacePVC{
+		workspacePVC = &server.WorkspacePVC{
 			Namespace:    KubernetesNamespace,
 			TenantID:     id.TenantID(TenantID),
 			StorageClass: KubernetesStorageClass,
@@ -739,7 +739,7 @@ func start(t *testing.T, variant runtimeVariant, options ...Option) *Harness {
 		t.Fatalf("factory: infrastructure phase: %v", err)
 	}
 
-	devAuthenticator, err := app.NewDevAuthenticator(clock, tokens)
+	devAuthenticator, err := server.NewDevAuthenticator(clock, tokens)
 	if err != nil {
 		forwarder.Close()
 		_ = apiListener.Close()
@@ -815,7 +815,7 @@ func start(t *testing.T, variant runtimeVariant, options ...Option) *Harness {
 		if err != nil {
 			return err
 		}
-		composed, err := app.New(applicationCtx, config)
+		composed, err := server.New(applicationCtx, config)
 		if err != nil {
 			discard()
 			return err
@@ -1256,12 +1256,12 @@ func (h *Harness) Containers(ctx context.Context, key, value string) ([]string, 
 // Libpod seam and the composition's fresh-only VolumeProvisioner.
 type labelledLibpod struct {
 	runtimepodman.Libpod
-	provisioner app.VolumeProvisioner
+	provisioner server.VolumeProvisioner
 	fixture     FixtureScope
 }
 
 var _ runtimepodman.Libpod = labelledLibpod{}
-var _ app.VolumeProvisioner = labelledLibpod{}
+var _ server.VolumeProvisioner = labelledLibpod{}
 
 // CreateContainer adds the fixture and process cleanup labels without changing
 // the product identity labels or any other field.
@@ -1288,7 +1288,7 @@ func mergeLabels(base, added map[string]string) map[string]string {
 // session expiry comes from the explicit development authenticator and every
 // other principal kind from the store-backed reader.
 type composedValidity struct {
-	dev   *app.DevAuthenticator
+	dev   *server.DevAuthenticator
 	store event.CredentialValidity
 }
 

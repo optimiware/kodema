@@ -11,14 +11,14 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	natsbroker "github.com/optimiware/kodema/internal/adapter/integration/nats"
+	shelllog "github.com/optimiware/kodema/internal/control/log"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
+	kernelengine "github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	natsbroker "github.com/optimiware/kodema/internal/shell/integration/nats"
-	shelllog "github.com/optimiware/kodema/internal/shell/log"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
 	messaging "github.com/optimiware/kodema/test/support/infrastructure/messaging"
 )
 

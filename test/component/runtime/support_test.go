@@ -16,15 +16,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/adapter/runtime/process"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	podmandriver "github.com/optimiware/kodema/internal/shell/app/drivers/podman"
-	processdriver "github.com/optimiware/kodema/internal/shell/app/drivers/process"
-	"github.com/optimiware/kodema/internal/shell/runtime/podman"
-	"github.com/optimiware/kodema/internal/shell/runtime/process"
+	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
+	processdriver "github.com/optimiware/kodema/internal/server/drivers/process"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
@@ -49,7 +49,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func testIdentity(execution, action, workload, key string) engine.EffectIdentity {
+func testIdentity(execution, action, workload, key string) reconcile.EffectIdentity {
 	return testIdentityInScope(runtimesupport.RunScope(), execution, action, workload, key)
 }
 
@@ -57,8 +57,8 @@ func testIdentity(execution, action, workload, key string) engine.EffectIdentity
 // is called once per fixture so retries and reconstructed controllers inside
 // the run derive exactly the same execution, action, workload and idempotency
 // values.
-func testIdentityInScope(scope runtimesupport.Scope, execution, action, workload, key string) engine.EffectIdentity {
-	return engine.EffectIdentity{
+func testIdentityInScope(scope runtimesupport.Scope, execution, action, workload, key string) reconcile.EffectIdentity {
+	return reconcile.EffectIdentity{
 		ExecutionID:    id.ExecutionID(scope.ID(execution)),
 		ActionID:       id.ActionID(scope.ID(action)),
 		WorkloadID:     id.WorkloadID(scope.ID(workload)),
@@ -76,15 +76,15 @@ func testContainer(image string, commands []string, env []definition.EnvVar, sec
 }
 
 func testPrepareRequest(
-	identity engine.EffectIdentity,
+	identity reconcile.EffectIdentity,
 	workspaceID id.WorkspaceID,
 	actionName id.ActionName,
 	taskID id.TaskID,
 	container definition.Container,
-	secrets []engine.SecretValue,
+	secrets []reconcile.SecretValue,
 	credential string,
-) engine.PrepareRequest {
-	return engine.PrepareRequest{
+) reconcile.PrepareRequest {
+	return reconcile.PrepareRequest{
 		Identity:    identity,
 		WorkspaceID: workspaceID,
 		ActionName:  actionName,
@@ -94,7 +94,7 @@ func testPrepareRequest(
 		Inputs: map[id.InputKey]string{
 			"input-a": "line1\nline2\n",
 		},
-		Outputs: map[id.ActionName]kernel.Outputs{
+		Outputs: map[id.ActionName]engine.Outputs{
 			"earlier": {"out-a": "earlier-output"},
 		},
 		Task:       []byte(`{"id":"task-1"}`),
@@ -158,9 +158,9 @@ func waitForContent(t *testing.T, ctx context.Context, path, want string) {
 // waitForProcessStop retries the stop barrier until the adapter affirms
 // whole-group termination. A signal acknowledgment alone is not confirmation,
 // so the barrier is observed, not assumed.
-func waitForProcessStop(t *testing.T, ctx context.Context, adapter *process.Adapter, request engine.StopRequest) kernel.StopEvidence {
+func waitForProcessStop(t *testing.T, ctx context.Context, adapter *process.Adapter, request reconcile.StopRequest) engine.StopEvidence {
 	t.Helper()
-	var last kernel.StopEvidence
+	var last engine.StopEvidence
 	probe := func(ctx context.Context) error {
 		evidence, err := adapter.Stop(ctx, request)
 		last = evidence
@@ -179,9 +179,9 @@ func waitForProcessStop(t *testing.T, ctx context.Context, adapter *process.Adap
 }
 
 // waitForProcessObservation waits for the adapter to report the wanted kind.
-func waitForProcessObservation(t *testing.T, ctx context.Context, adapter *process.Adapter, request engine.ObserveRequest, want kernel.ObservationKind) kernel.Observation {
+func waitForProcessObservation(t *testing.T, ctx context.Context, adapter *process.Adapter, request reconcile.ObserveRequest, want engine.ObservationKind) engine.Observation {
 	t.Helper()
-	var last kernel.Observation
+	var last engine.Observation
 	probe := func(ctx context.Context) error {
 		observation, err := adapter.Observe(ctx, request)
 		if err != nil {
@@ -202,9 +202,9 @@ func waitForProcessObservation(t *testing.T, ctx context.Context, adapter *proce
 // waitForPodmanStop retries the stop barrier until the adapter affirms
 // whole-container termination. A stop acknowledgment alone is not
 // confirmation.
-func waitForPodmanStop(t *testing.T, ctx context.Context, adapter *podman.Adapter, request engine.StopRequest) kernel.StopEvidence {
+func waitForPodmanStop(t *testing.T, ctx context.Context, adapter *podman.Adapter, request reconcile.StopRequest) engine.StopEvidence {
 	t.Helper()
-	var last kernel.StopEvidence
+	var last engine.StopEvidence
 	probe := func(ctx context.Context) error {
 		evidence, err := adapter.Stop(ctx, request)
 		last = evidence
@@ -234,9 +234,9 @@ func podmanContainerNames(t *testing.T, ctx context.Context, workspaceID id.Work
 
 // waitForPodmanObservation waits for the Podman adapter to report the wanted
 // kind.
-func waitForPodmanObservation(t *testing.T, ctx context.Context, adapter *podman.Adapter, request engine.ObserveRequest, want kernel.ObservationKind) kernel.Observation {
+func waitForPodmanObservation(t *testing.T, ctx context.Context, adapter *podman.Adapter, request reconcile.ObserveRequest, want engine.ObservationKind) engine.Observation {
 	t.Helper()
-	var last kernel.Observation
+	var last engine.Observation
 	probe := func(ctx context.Context) error {
 		observation, err := adapter.Observe(ctx, request)
 		if err != nil {
@@ -419,12 +419,12 @@ func newPodmanAdapter(t *testing.T, f *podmanFixture, wrapper podman.Libpod) (*p
 	return libpod, files, adapter
 }
 
-func (f *podmanFixture) request(identity engine.EffectIdentity, commands []string, env []definition.EnvVar, secrets []engine.SecretValue, credential string) engine.PrepareRequest {
+func (f *podmanFixture) request(identity reconcile.EffectIdentity, commands []string, env []definition.EnvVar, secrets []reconcile.SecretValue, credential string) reconcile.PrepareRequest {
 	return testPrepareRequest(identity, f.workspaceID, "build", "task-1",
 		testContainer(f.image.Reference, commands, env, secretNames(secrets)), secrets, credential)
 }
 
-func secretNames(secrets []engine.SecretValue) []id.SecretName {
+func secretNames(secrets []reconcile.SecretValue) []id.SecretName {
 	names := make([]id.SecretName, 0, len(secrets))
 	for _, secret := range secrets {
 		names = append(names, secret.Name)

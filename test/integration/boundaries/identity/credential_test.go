@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/cli"
+	"github.com/optimiware/kodema/internal/apps/cli/userlandfs"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/app/drivers/userlandfs"
-	"github.com/optimiware/kodema/internal/userland/cli"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 )
 

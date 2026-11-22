@@ -18,7 +18,7 @@ import (
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/installation"
-	recovery "github.com/optimiware/kodema/internal/shell/app/drivers/recovery"
+	recovery "github.com/optimiware/kodema/internal/server/drivers/recovery"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	recoverysupport "github.com/optimiware/kodema/test/support/infrastructure/recovery"
 	"github.com/optimiware/kodema/test/support/infrastructure/runtime"

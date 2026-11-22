@@ -9,15 +9,15 @@ import (
 	"os"
 	"strings"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/internal/id"
-	shellapp "github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/app/bridges"
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/store/postgres"
+	shellapp "github.com/optimiware/kodema/internal/server"
+	"github.com/optimiware/kodema/internal/server/bridges"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 )
 
 // bootstrapAdminRunner is the one-shot bootstrap surface the entrypoint runs.

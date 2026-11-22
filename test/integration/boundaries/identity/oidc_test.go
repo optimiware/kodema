@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
+	shelloidc "github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	shellidentity "github.com/optimiware/kodema/internal/control/identity"
 	"github.com/optimiware/kodema/internal/fault"
-	shellidentity "github.com/optimiware/kodema/internal/shell/identity"
-	shelloidc "github.com/optimiware/kodema/internal/shell/integration/oidc"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 )
 

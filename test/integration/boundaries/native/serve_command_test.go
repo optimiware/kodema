@@ -31,10 +31,10 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	shelloidc "github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 	"github.com/optimiware/kodema/internal/id"
-	shelloidc "github.com/optimiware/kodema/internal/shell/integration/oidc"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 	nativefix "github.com/optimiware/kodema/test/support/boundaries/native"
 )

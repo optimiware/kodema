@@ -11,9 +11,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/optimiware/kodema/internal/shell/gateway"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/gateway"
+	"github.com/optimiware/kodema/internal/control/store"
 )
 
 // ModelUsageRows returns the committed model_usage rows of the fixture project.

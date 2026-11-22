@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	shelloidc "github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	"github.com/optimiware/kodema/internal/fault"
-	shelloidc "github.com/optimiware/kodema/internal/shell/integration/oidc"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 )
 

@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/control/log"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/workspace"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/log"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
 // TestWorkspacePathRules proves preparation is confined to the immutable
@@ -91,7 +91,7 @@ func TestWorkspaceMaterializationValidation(t *testing.T) {
 			{Path: "/kodema/inputs/source", Data: []byte("input"), Mode: 0o444},
 			{Path: "/kodema/task.json", Data: []byte(`{"id":"task-1"}`), Mode: 0o444},
 		},
-		Secrets: []engine.SecretValue{
+		Secrets: []reconcile.SecretValue{
 			{Name: id.SecretName("DB_PASSWORD"), Value: "secret-value"},
 		},
 		Credential: "kodex.exec-1.mac",
@@ -131,10 +131,10 @@ func TestWorkspaceMaterializationValidation(t *testing.T) {
 			m.Credential = ""
 		}},
 		{"duplicate secret name", func(m *workspace.Materialization) {
-			m.Secrets = append(m.Secrets, engine.SecretValue{Name: id.SecretName("DB_PASSWORD"), Value: "other"})
+			m.Secrets = append(m.Secrets, reconcile.SecretValue{Name: id.SecretName("DB_PASSWORD"), Value: "other"})
 		}},
 		{"reserved secret name", func(m *workspace.Materialization) {
-			m.Secrets = append(m.Secrets, engine.SecretValue{Name: id.SecretName(id.SecretTokenName), Value: "x"})
+			m.Secrets = append(m.Secrets, reconcile.SecretValue{Name: id.SecretName(id.SecretTokenName), Value: "x"})
 		}},
 		{"task file without task", func(m *workspace.Materialization) {
 			m.Task = nil
@@ -150,7 +150,7 @@ func TestWorkspaceMaterializationValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate := valid
 			candidate.Files = append([]workspace.File(nil), valid.Files...)
-			candidate.Secrets = append([]engine.SecretValue(nil), valid.Secrets...)
+			candidate.Secrets = append([]reconcile.SecretValue(nil), valid.Secrets...)
 			tc.mutate(&candidate)
 			if err := candidate.Validate(); err == nil {
 				t.Fatalf("materialization %q accepted; want refusal", tc.name)

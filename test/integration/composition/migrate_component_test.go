@@ -24,10 +24,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
 	"github.com/optimiware/kodema/internal/fault"
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/app/migrate"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
+	"github.com/optimiware/kodema/internal/server/migrate"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	pgtest "github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )

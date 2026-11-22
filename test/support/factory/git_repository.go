@@ -24,9 +24,9 @@ import (
 	"testing"
 	"time"
 
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
+	"github.com/optimiware/kodema/internal/apps/git/app/native"
 	"github.com/optimiware/kodema/internal/id"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
-	"github.com/optimiware/kodema/internal/userland/git/app/native"
 )
 
 const (

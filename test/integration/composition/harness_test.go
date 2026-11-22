@@ -18,19 +18,19 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/adapter/store/memory"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/engine"
+	kernelengine "github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/kernel"
-	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/app"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/store/memory"
-	"github.com/optimiware/kodema/internal/shell/task"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
+	"github.com/optimiware/kodema/internal/server"
 )
 
 // Fixture identities and credentials. The token values are deliberately
@@ -151,29 +151,29 @@ func (runtime *fakeRuntime) Start(_ context.Context, request kernelengine.StartR
 	}
 }
 
-func (runtime *fakeRuntime) Observe(_ context.Context, request kernelengine.ObserveRequest) (kernel.Observation, error) {
+func (runtime *fakeRuntime) Observe(_ context.Context, request kernelengine.ObserveRequest) (engine.Observation, error) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	runtime.observed++
 	if runtime.mode == modeComplete {
-		return kernel.ExitedObservation(0, kernel.ConfirmedStop("process exited 0")), nil
+		return engine.ExitedObservation(0, engine.ConfirmedStop("process exited 0")), nil
 	}
 	if runtime.running[request.Identity.WorkloadID] {
-		return kernel.RunningObservation(), nil
+		return engine.RunningObservation(), nil
 	}
-	return kernel.ExitedObservation(0, kernel.ConfirmedStop("process exited after stop")), nil
+	return engine.ExitedObservation(0, engine.ConfirmedStop("process exited after stop")), nil
 }
 
 func (runtime *fakeRuntime) Logs(context.Context, kernelengine.LogsRequest) (kernelengine.LogBatch, error) {
 	return kernelengine.LogBatch{}, nil
 }
 
-func (runtime *fakeRuntime) Stop(_ context.Context, request kernelengine.StopRequest) (kernel.StopEvidence, error) {
+func (runtime *fakeRuntime) Stop(_ context.Context, request kernelengine.StopRequest) (engine.StopEvidence, error) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	runtime.stopped = append(runtime.stopped, request.Identity.WorkloadID)
 	runtime.running[request.Identity.WorkloadID] = false
-	return kernel.ConfirmedStop("stopped"), nil
+	return engine.ConfirmedStop("stopped"), nil
 }
 
 func (runtime *fakeRuntime) Remove(_ context.Context, request kernelengine.RemoveRequest) (kernelengine.Removal, error) {
@@ -449,7 +449,7 @@ func (probe *settlementProbe) Scan(ctx context.Context, scan store.ControllerSca
 	if err != nil {
 		return page, err
 	}
-	if scan.Table != "executions" || scan.Equals["state"] != string(kernel.ExecutionSucceeded) {
+	if scan.Table != "executions" || scan.Equals["state"] != string(engine.ExecutionSucceeded) {
 		return page, nil
 	}
 	probe.mu.Lock()
@@ -503,7 +503,7 @@ type harness struct {
 	clock      *fakeClock
 	store      *memory.Store
 	logs       *safeBuffer
-	config     app.Config
+	config     server.Config
 	publisher  *fakePublisher
 	settlement *settlementProbe
 	started    []*runningEnv
@@ -519,8 +519,8 @@ func newHarness(t *testing.T) *harness {
 	allRoles := []tenancy.Role{
 		tenancy.RoleAdmin, tenancy.RoleEngineer, tenancy.RoleReviewer, tenancy.RoleOperator,
 	}
-	config := app.Config{
-		Profile: app.ProfileDevelopment,
+	config := server.Config{
+		Profile: server.ProfileDevelopment,
 		Installation: installation.Config{
 			Environment: installation.EnvironmentDevelopment,
 			State:       installation.StateMemory,
@@ -536,8 +536,8 @@ func newHarness(t *testing.T) *harness {
 		Logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{
 			Level: slog.LevelDebug,
 		})),
-		Dev: &app.DevelopmentConfig{
-			Tokens: []app.DevToken{
+		Dev: &server.DevelopmentConfig{
+			Tokens: []server.DevToken{
 				{
 					Credential: adminToken,
 					Principal: identity.Principal{
@@ -647,7 +647,7 @@ func newHarness(t *testing.T) *harness {
 					ExpiresAt: clock.Now().Add(-time.Hour),
 				},
 			},
-			Bootstrap: &app.Bootstrap{
+			Bootstrap: &server.Bootstrap{
 				TenantID:       tenantID,
 				TenantName:     "Tenant One",
 				ProjectID:      projectID,
@@ -656,7 +656,7 @@ func newHarness(t *testing.T) *harness {
 				AdminRoles:     []string{string(tenancy.RoleAdmin)},
 			},
 		},
-		Adapters: &app.Adapters{
+		Adapters: &server.Adapters{
 			Store:      store,
 			Scanner:    settlement,
 			Controller: settlement,
@@ -673,7 +673,7 @@ func (harness *harness) start(runtime kernelengine.Runtime) *runningEnv {
 	harness.t.Helper()
 	config := harness.config
 	config.Adapters.Runtime = runtime
-	composed, err := app.New(context.Background(), config)
+	composed, err := server.New(context.Background(), config)
 	if err != nil {
 		harness.t.Fatalf("app.New: %v", err)
 	}
@@ -706,7 +706,7 @@ func (harness *harness) start(runtime kernelengine.Runtime) *runningEnv {
 // runningEnv is one served composition.
 type runningEnv struct {
 	harness  *harness
-	app      *app.App
+	app      *server.App
 	listener net.Listener
 	baseURL  string
 	cancel   context.CancelFunc
@@ -953,7 +953,7 @@ func (environment *runningEnv) mcpRaw(method string, params any, token string) (
 	if err != nil {
 		return api.MCPResponse{}, err
 	}
-	request, err := http.NewRequest(http.MethodPost, environment.baseURL+app.DefaultMCPPath, bytes.NewReader(encoded))
+	request, err := http.NewRequest(http.MethodPost, environment.baseURL+server.DefaultMCPPath, bytes.NewReader(encoded))
 	if err != nil {
 		return api.MCPResponse{}, err
 	}

@@ -15,12 +15,12 @@ import (
 
 	natsgo "github.com/nats-io/nats.go"
 
+	broker "github.com/optimiware/kodema/internal/adapter/integration/nats"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
 	"github.com/optimiware/kodema/internal/id"
-	natsdriver "github.com/optimiware/kodema/internal/shell/app/drivers/nats"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	broker "github.com/optimiware/kodema/internal/shell/integration/nats"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
+	natsdriver "github.com/optimiware/kodema/internal/server/drivers/nats"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 	support "github.com/optimiware/kodema/test/support/infrastructure/messaging"
 )

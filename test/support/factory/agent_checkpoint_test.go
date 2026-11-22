@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/userland/session"
+	"github.com/optimiware/kodema/internal/apps/kit/session"
 )
 
 // agentCheckpointTestRecord builds one valid session record for the service

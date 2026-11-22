@@ -13,8 +13,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/secret"
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	"github.com/optimiware/kodema/internal/control/secret"
 )
 
 func keyfileEnv(path string, overrides map[string]string) productionEnv {

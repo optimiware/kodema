@@ -12,10 +12,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/keys"
+	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/integration/keys"
-	"github.com/optimiware/kodema/internal/shell/secret"
 	support "github.com/optimiware/kodema/test/support/infrastructure/messaging"
 )
 

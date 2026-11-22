@@ -33,18 +33,18 @@ package domaincontract
 import (
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/task"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/task"
 )
 
 type validatorCase struct {
 	name            string
 	expectedVersion uint64
 	taskCurrent     id.ExecutionID
-	pre             kernel.Execution
+	pre             engine.Execution
 	commit          *flow.Commit
 	wantClass       fault.Class // empty means accepted
 }
@@ -110,14 +110,14 @@ func validatorCases(t *testing.T) []validatorCase {
 			name:            "no predecessor requires no commit",
 			expectedVersion: 0,
 			taskCurrent:     "",
-			pre:             kernel.Execution{},
+			pre:             engine.Execution{},
 			commit:          nil,
 		},
 		{
 			name:            "no predecessor with a commit is refused",
 			expectedVersion: 0,
 			taskCurrent:     "",
-			pre:             kernel.Execution{},
+			pre:             engine.Execution{},
 			commit:          runningCommit,
 			wantClass:       fault.InvalidInput,
 		},

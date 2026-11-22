@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 )
 
 // UnitObserver snapshots every declared table before and after one unit runs

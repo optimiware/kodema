@@ -7,8 +7,8 @@ import (
 	"io"
 	"strings"
 
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	"github.com/optimiware/kodema/internal/id"
-	gitapp "github.com/optimiware/kodema/internal/userland/git/app"
 )
 
 // provisionTenant is the injectable provisioning entrypoint. Tests replace it

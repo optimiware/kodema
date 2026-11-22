@@ -10,14 +10,14 @@ import (
 	"testing"
 	"time"
 
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	identityunits "github.com/optimiware/kodema/internal/adapter/store/units/identity"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	tenancyadmin "github.com/optimiware/kodema/internal/control/tenancy/admin"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	identityunits "github.com/optimiware/kodema/internal/shell/store/units/identity"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	tenancyadmin "github.com/optimiware/kodema/internal/shell/tenancy/admin"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

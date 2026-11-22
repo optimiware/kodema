@@ -225,90 +225,90 @@ func TestImportsNeutralAndAPIAreStandardLibraryOnly(t *testing.T) {
 	assertFindings(t, res, "api/dto.go", "internal/id/id.go")
 }
 
-func TestImportsKernelRejectsShellUserlandAndInfrastructure(t *testing.T) {
-	root := fixturePath(t, "imports/kernel-forbidden")
+func TestImportsEngineRejectsControlAppsAndInfrastructure(t *testing.T) {
+	root := fixturePath(t, "imports/engine-forbidden")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/kernel/flow/flow.go")
+	assertFindings(t, res, "internal/engine/flow/flow.go")
 }
 
-func TestImportsKernelDependencyCycle(t *testing.T) {
-	root := fixturePath(t, "imports/kernel-cycle")
+func TestImportsEngineDependencyCycle(t *testing.T) {
+	root := fixturePath(t, "imports/engine-cycle")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/kernel/", "cycle")
+	assertFindings(t, res, "internal/engine/", "cycle")
 }
 
-func TestImportsShellCapabilityRejectsStoreAndUserland(t *testing.T) {
-	root := fixturePath(t, "imports/shell-forbidden")
+func TestImportsControlRejectsAdapterAndApps(t *testing.T) {
+	root := fixturePath(t, "imports/control-forbidden")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/shell/request/request.go", "internal/shell/tenancy/tenancy.go")
+	assertFindings(t, res, "internal/control/request/request.go", "internal/control/tenancy/tenancy.go")
 }
 
-func TestImportsShellCapabilityAllowsRecordedExternalDependency(t *testing.T) {
-	assertClean(t, runCheck(t, fixturePath(t, "imports/shell-approved-external"), "imports"))
+func TestImportsControlAllowsRecordedExternalDependency(t *testing.T) {
+	assertClean(t, runCheck(t, fixturePath(t, "imports/control-approved-external"), "imports"))
 }
 
-func TestImportsRecordedExternalDependencyRejectedOutsideCapabilityLayers(t *testing.T) {
+func TestImportsRecordedExternalDependencyRejectedOutsideControlLayer(t *testing.T) {
 	res := runCheck(t, fixturePath(t, "imports/allowlist-scope"), "imports")
-	assertFindings(t, res, "api/dto.go", "internal/id/id.go", "internal/kernel/flow/flow.go",
+	assertFindings(t, res, "api/dto.go", "internal/id/id.go", "internal/engine/flow/flow.go",
 		`forbidden external import "go.yaml.in/yaml/v3"`)
 	if got := len(strings.Split(strings.TrimRight(res.stdout, "\n"), "\n")); got != 3 {
 		t.Errorf("finding count = %d, want 3:\n%s", got, res.stdout)
 	}
 }
 
-func TestImportsShellCapabilityRejectsUnapprovedExternalDependency(t *testing.T) {
-	res := runCheck(t, fixturePath(t, "imports/shell-unapproved-external"), "imports")
-	assertFindings(t, res, "internal/shell/pipeline/other.go",
-		`forbidden external import "github.com/example/external" from shell capability package`)
+func TestImportsControlRejectsUnapprovedExternalDependency(t *testing.T) {
+	res := runCheck(t, fixturePath(t, "imports/control-unapproved-external"), "imports")
+	assertFindings(t, res, "internal/control/pipeline/other.go",
+		`forbidden external import "github.com/example/external" from control package`)
 }
 
-func TestImportsShellTransportRejectsSQL(t *testing.T) {
-	root := fixturePath(t, "imports/shell-transport-sql")
+func TestImportsTransportRejectsSQL(t *testing.T) {
+	root := fixturePath(t, "imports/transport-sql")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/shell/transport/httpapi/httpapi.go")
+	assertFindings(t, res, "internal/transport/httpapi/httpapi.go")
 }
 
-func TestImportsCapabilityAcceptsNeutralStoreSeam(t *testing.T) {
-	assertClean(t, runCheck(t, fixturePath(t, "imports/capability-imports-clean"), "imports"))
+func TestImportsControlAcceptsControlStoreSeam(t *testing.T) {
+	assertClean(t, runCheck(t, fixturePath(t, "imports/control-imports-clean"), "imports"))
 }
 
-func TestImportsCapabilityRejectsConcreteStoreAdapters(t *testing.T) {
-	root := fixturePath(t, "imports/capability-imports-forbidden")
+func TestImportsControlRejectsConcreteStoreAdapters(t *testing.T) {
+	root := fixturePath(t, "imports/control-imports-forbidden")
 	res := runCheck(t, root, "imports")
 	assertFindings(t, res,
-		"internal/shell/secret/secret.go",
-		"internal/shell/tenancy/tenancy.go",
-		"internal/shell/store/postgres",
-		"internal/shell/store/memory",
+		"internal/control/secret/secret.go",
+		"internal/control/tenancy/tenancy.go",
+		"internal/adapter/store/postgres",
+		"internal/adapter/store/memory",
 	)
 }
 
 func TestImportsGatewayStdlibAllowlist(t *testing.T) {
-	root := fixturePath(t, "imports/capability-imports-forbidden")
+	root := fixturePath(t, "imports/control-imports-forbidden")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/shell/mcpproxy/mcpproxy.go", `"net/http"`)
-	if strings.Contains(res.stdout, "internal/shell/gateway/gateway.go") {
+	assertFindings(t, res, "internal/control/mcpproxy/mcpproxy.go", `"net/http"`)
+	if strings.Contains(res.stdout, "internal/control/gateway/gateway.go") {
 		t.Errorf("gateway allowlisted net/http import was reported:\n%s", res.stdout)
 	}
-	if strings.Contains(res.stdout, "internal/shell/gateway/gateway_test.go") {
+	if strings.Contains(res.stdout, "internal/control/gateway/gateway_test.go") {
 		t.Errorf("gateway allowlisted test net/http import was reported:\n%s", res.stdout)
 	}
 }
 
-func TestImportsNeutralAPIAndKernelRejectStoreSeam(t *testing.T) {
-	root := fixturePath(t, "imports/capability-imports-forbidden")
+func TestImportsNeutralAPIAndEngineRejectControlStoreSeam(t *testing.T) {
+	root := fixturePath(t, "imports/control-imports-forbidden")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "api/dto.go", "internal/id/id.go", "internal/kernel/flow/flow.go")
+	assertFindings(t, res, "api/dto.go", "internal/id/id.go", "internal/engine/flow/flow.go")
 }
 
-func TestImportsKernelTestFileStillCannotImportShell(t *testing.T) {
-	root := fixturePath(t, "imports/capability-imports-forbidden")
+func TestImportsEngineTestFileStillCannotImportControl(t *testing.T) {
+	root := fixturePath(t, "imports/control-imports-forbidden")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/kernel/flow/flow_test.go")
+	assertFindings(t, res, "internal/engine/flow/flow_test.go")
 }
 
 func TestImportsTransportMayImportSiblingTransport(t *testing.T) {
-	assertClean(t, runCheck(t, fixturePath(t, "imports/capability-imports-clean"), "imports"))
+	assertClean(t, runCheck(t, fixturePath(t, "imports/control-imports-clean"), "imports"))
 }
 
 // TestInstallationURLImportExceptionIsExact pins the single standard-library
@@ -328,10 +328,10 @@ func TestInstallationURLImportExceptionIsExact(t *testing.T) {
 		"internal/installation/sub/url.go",
 		"internal/installation/exec.go",
 		"internal/installation/tls.go",
-		"internal/kernel/flow/url.go",
+		"internal/engine/flow/url.go",
 		"internal/id/url.go",
 		"internal/installation-evil/url.go",
-		"internal/shell/secret/url.go",
+		"internal/control/secret/url.go",
 		`forbidden standard-library import "net/netip"`,
 	)
 	if strings.Contains(res.stdout, "internal/installation/url.go") {
@@ -345,36 +345,137 @@ func TestInstallationURLImportExceptionIsExact(t *testing.T) {
 	}
 }
 
-func TestImportsUserlandRejectsKernelAndShellInternals(t *testing.T) {
-	root := fixturePath(t, "imports/userland-forbidden")
+func TestImportsAppsAndClientRejectControlPlaneInternals(t *testing.T) {
+	root := fixturePath(t, "imports/apps-forbidden")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/userland/cli/cli.go", "client/client.go")
+	assertFindings(t, res,
+		"internal/apps/cli/cli.go",
+		"client/client.go",
+		"kodema/internal/engine/flow",
+		"kodema/internal/control/identity",
+		"kodema/internal/adapter/store/postgres",
+		"kodema/internal/transport/httpapi",
+		"kodema/internal/server",
+		"kodema/internal/installation",
+		"kodema/internal/apps/cli",
+		"kodema/internal/apps/kit/principal",
+	)
+	if got := len(strings.Split(strings.TrimRight(res.stdout, "\n"), "\n")); got != 9 {
+		t.Errorf("finding count = %d, want 9:\n%s", got, res.stdout)
+	}
 }
 
-func TestUserlandAppLayerImportsOnlyPublicContracts(t *testing.T) {
-	for _, path := range []string{"internal/userland/git/app/main.go", "internal/userland/agent/app/run.go", "internal/userland/services/app/run.go"} {
-		if got := classifyPath(path); got != layerUserlandApp {
-			t.Errorf("classifyPath(%q) = %s, want userland app", path, got)
+func TestImportsAppsSiblingIsolationAndKitBoundary(t *testing.T) {
+	root := fixturePath(t, "imports/apps-sibling-isolation")
+	res := runCheck(t, root, "imports")
+	assertFindings(t, res,
+		"internal/apps/git/app/run.go",
+		`forbidden sibling app import "kodema/internal/apps/cli" from app "git"`,
+		"internal/apps/kit/bad/bad.go",
+		`forbidden import "kodema/internal/apps/cli" from apps kit package`,
+	)
+	if strings.Contains(res.stdout, "internal/apps/git/git.go") {
+		t.Errorf("apps/git importing apps/kit was reported:\n%s", res.stdout)
+	}
+	if strings.Contains(res.stdout, "internal/apps/cli/cli.go") {
+		t.Errorf("apps/cli importing apps/kit was reported:\n%s", res.stdout)
+	}
+	if strings.Contains(res.stdout, `"kodema/internal/apps/git"`) {
+		t.Errorf("apps/git/app importing own apps/git package was reported:\n%s", res.stdout)
+	}
+	if got := len(strings.Split(strings.TrimRight(res.stdout, "\n"), "\n")); got != 2 {
+		t.Errorf("finding count = %d, want 2:\n%s", got, res.stdout)
+	}
+}
+
+func TestAppsLayerClassificationAndPolicy(t *testing.T) {
+	for _, path := range []string{
+		"internal/apps/cli/cli.go",
+		"internal/apps/git/app/run.go",
+		"internal/apps/agent/app/run.go",
+		"internal/apps/opencode/run.go",
+		"internal/apps/kit-evil/main.go",
+	} {
+		if got := classifyPath(path); got != layerApp {
+			t.Errorf("classifyPath(%q) = %s, want app", path, got)
 		}
+	}
+	for _, path := range []string{
+		"internal/apps/kit/principal/principal.go",
+		"internal/apps/kit/session/store.go",
+		"internal/apps/kit/skill/loader.go",
+	} {
+		if got := classifyPath(path); got != layerAppsKit {
+			t.Errorf("classifyPath(%q) = %s, want apps kit", path, got)
+		}
+	}
+	if got := classifyPath("client/http.go"); got != layerClient {
+		t.Errorf("client must be layerClient, got %s", got)
+	}
+	if got := classifyPath("internal/server/wire.go"); got != layerComposition {
+		t.Errorf("internal/server must be composition, got %s", got)
 	}
 	if got := classifyPath("cmd/kodema/main.go"); got != layerComposition {
 		t.Errorf("cmd must stay composition, got %s", got)
 	}
-	for _, imported := range []layer{layerNeutral, layerAPI, layerUserland, layerUserlandApp} {
-		if !productImportAllowed(layerUserlandApp, imported) {
-			t.Errorf("userland app must be able to import %s", imported)
+
+	for _, imported := range []layer{layerNeutral, layerAPI, layerClient, layerAppsKit, layerApp} {
+		if !productImportAllowed(layerApp, imported) {
+			t.Errorf("app must be able to import %s", imported)
 		}
 	}
-	for _, imported := range []layer{layerKernel, layerShellCapability, layerShellAdapter, layerShellTransport, layerComposition, layerInstallation, layerTooling} {
-		if productImportAllowed(layerUserlandApp, imported) {
-			t.Errorf("userland app must not import %s", imported)
+	for _, imported := range []layer{layerEngine, layerControl, layerAdapter, layerTransport, layerComposition, layerInstallation, layerTooling, layerTest} {
+		if productImportAllowed(layerApp, imported) {
+			t.Errorf("app must not import %s", imported)
+		}
+	}
+
+	for _, imported := range []layer{layerNeutral, layerAPI, layerClient, layerAppsKit} {
+		if !productImportAllowed(layerAppsKit, imported) {
+			t.Errorf("apps kit must be able to import %s", imported)
+		}
+	}
+	for _, imported := range []layer{layerApp, layerEngine, layerControl, layerAdapter, layerTransport, layerComposition, layerInstallation, layerTooling, layerTest} {
+		if productImportAllowed(layerAppsKit, imported) {
+			t.Errorf("apps kit must not import %s", imported)
+		}
+	}
+
+	for _, imported := range []layer{layerNeutral, layerAPI, layerClient} {
+		if !productImportAllowed(layerClient, imported) {
+			t.Errorf("client must be able to import %s", imported)
+		}
+	}
+	for _, imported := range []layer{layerAppsKit, layerApp, layerEngine, layerControl, layerAdapter, layerTransport, layerComposition, layerInstallation, layerTooling, layerTest} {
+		if productImportAllowed(layerClient, imported) {
+			t.Errorf("client must not import %s", imported)
+		}
+	}
+}
+
+func TestAppName(t *testing.T) {
+	cases := map[string]string{
+		"internal/apps/git":                    "git",
+		"internal/apps/git/git.go":             "git",
+		"internal/apps/git/app/native/exec.go": "git",
+		"internal/apps/cli/cli_test.go":        "cli",
+		"internal/apps/kit-evil/main.go":       "kit-evil",
+		"internal/apps/kit":                    "",
+		"internal/apps/kit/principal/p.go":     "",
+		"internal/apps":                        "",
+		"internal/apps/root.go":                "",
+		"internal/control/task/task.go":        "",
+	}
+	for path, want := range cases {
+		if got := appName(path); got != want {
+			t.Errorf("appName(%q) = %q, want %q", path, got, want)
 		}
 	}
 }
 
 func TestClassifyPathTestLayer(t *testing.T) {
 	paths := []string{
-		"test/contracts/kernel/consumer_test.go",
+		"test/contracts/engine/consumer_test.go",
 		"test/component/store/postgres_test.go",
 		"test/integration/flow_test.go",
 		"test/e2e/cli_test.go",
@@ -390,8 +491,8 @@ func TestClassifyPathTestLayer(t *testing.T) {
 
 func TestTestLayerImportPolicy(t *testing.T) {
 	productLayers := []layer{
-		layerNeutral, layerAPI, layerKernel, layerShellCapability, layerShellAdapter,
-		layerShellTransport, layerUserland, layerUserlandApp, layerComposition, layerInstallation, layerTooling,
+		layerNeutral, layerAPI, layerEngine, layerControl, layerAdapter,
+		layerTransport, layerClient, layerAppsKit, layerApp, layerComposition, layerInstallation, layerTooling,
 	}
 	for _, imported := range productLayers {
 		if !productImportAllowed(layerTest, imported) {
@@ -408,14 +509,32 @@ func TestTestLayerImportPolicy(t *testing.T) {
 	}
 }
 
-func TestClassifyPathStoreSeam(t *testing.T) {
+func TestClassifyPathTopLevelRings(t *testing.T) {
 	cases := map[string]layer{
-		"internal/shell/store":               layerShellCapability,
-		"internal/shell/store/executor.go":   layerShellCapability,
-		"internal/shell/store/postgres":      layerShellAdapter,
-		"internal/shell/store/postgres/x.go": layerShellAdapter,
-		"internal/shell/store/memory":        layerShellAdapter,
-		"internal/shell/store/memory/x.go":   layerShellAdapter,
+		"api/dto.go":                              layerAPI,
+		"client/http.go":                          layerClient,
+		"internal/id/id.go":                       layerNeutral,
+		"internal/fault/fault.go":                 layerNeutral,
+		"internal/docs/docs.go":                   layerNeutral,
+		"internal/engine/flow/flow.go":            layerEngine,
+		"internal/control/store":                  layerControl,
+		"internal/control/store/executor.go":      layerControl,
+		"internal/adapter/store/postgres":         layerAdapter,
+		"internal/adapter/store/postgres/x.go":    layerAdapter,
+		"internal/adapter/store/memory":           layerAdapter,
+		"internal/adapter/store/memory/x.go":      layerAdapter,
+		"internal/adapter/runtime/podman/x.go":    layerAdapter,
+		"internal/adapter/integration/nats/x.go":  layerAdapter,
+		"internal/transport/httpapi/httpapi.go":   layerTransport,
+		"internal/server/wire.go":                 layerComposition,
+		"cmd/kodema/main.go":                      layerComposition,
+		"internal/apps/kit/principal/p.go":        layerAppsKit,
+		"internal/apps/git/app/run.go":            layerApp,
+		"internal/installation/config.go":         layerInstallation,
+		"tools/check/main.go":                     layerTooling,
+		"internal/archtest/imports.go":            layerTooling,
+		"examples/minimal/main.go":                layerTest,
+		"test/contracts/adapters/imports_test.go": layerTest,
 	}
 	for path, want := range cases {
 		if got := classifyPath(path); got != want {
@@ -426,10 +545,10 @@ func TestClassifyPathStoreSeam(t *testing.T) {
 
 func TestClassifyPathKeepsTestFilesInTheirProductLayer(t *testing.T) {
 	cases := map[string]layer{
-		"internal/kernel/flow/flow_test.go":       layerKernel,
-		"internal/shell/secret/secret_test.go":    layerShellCapability,
-		"internal/shell/gateway/gateway_test.go":  layerShellCapability,
-		"test/contracts/adapters/imports_test.go": layerTest,
+		"internal/engine/flow/flow_test.go":        layerEngine,
+		"internal/control/secret/secret_test.go":   layerControl,
+		"internal/control/gateway/gateway_test.go": layerControl,
+		"test/contracts/adapters/imports_test.go":  layerTest,
 	}
 	for path, want := range cases {
 		if got := classifyPath(path); got != want {
@@ -445,7 +564,7 @@ func TestImportsTestConsumersMayImportProductLayers(t *testing.T) {
 func TestImportsProductLayersRejectTestImports(t *testing.T) {
 	root := fixturePath(t, "imports/test-import-forbidden")
 	res := runCheck(t, root, "imports")
-	assertFindings(t, res, "internal/kernel/flow/flow.go", `forbidden import "kodema/test/support/factory"`, "kernel package")
+	assertFindings(t, res, "internal/engine/flow/flow.go", `forbidden import "kodema/test/support/factory"`, "engine package")
 }
 
 func TestImportsAcceptsRealRepository(t *testing.T) {

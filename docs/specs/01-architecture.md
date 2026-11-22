@@ -10,7 +10,7 @@ Kodema uses a **two-sided (hourglass) architecture** joined at a narrow public c
 flowchart TB
     subgraph AW["Apps & Workloads — zero server imports, sibling-isolated"]
         direction LR
-        Apps["First-Party Apps (apps/)<br/>cli · git · agent · opencode · merge · email · sandbox · up"]
+        Apps["First-Party Apps (apps/)<br/>cli · git · agent · opencode · merge · email · up · auth"]
         Workloads["External Workloads & Services<br/>containers · harnesses · recipes · UIs"]
     end
 
@@ -38,22 +38,22 @@ flowchart TB
 - **Adapters & Transports (`internal/adapter`, `internal/transport`):** concrete PostgreSQL/memory persistence, Process/Podman/Kubernetes runtimes, NATS/KMS/OIDC/OCI integrations, and one shared operation router behind thin REST and MCP edges. Only Control Plane adapters access the factory database.
 - **Composition (`internal/server`, `cmd/kodema`):** one explicit Control Plane composition root and CLI dispatch entrypoint.
 - **Public Contract (`api`, `client`):** stdlib-only wire DTOs/schemas (`api`) and the public REST/SSE/NATS Go client (`client`).
-- **Apps & Workloads (`internal/apps`, plus external containers/services):** independent first-party programs (`cli`, `git`, `agent`, `opencode`, `merge`, `email`, `sandbox`, `up`) and third-party workloads/services. Even when linked into the single `kodema` binary, apps use `api`/`client` contracts only, never import Control Plane or Engine internals, and remain isolated from sibling apps (sharing only `api`, `client`, neutral primitives, and a minimal `internal/apps/kit` helper layer).
+- **Apps & Workloads (`internal/apps`, plus external containers/services):** independent first-party programs (`cli`, `git`, `agent`, `opencode`, `merge`, `email`, `up`, `auth`) and third-party workloads/services. Even when linked into the single `kodema` binary, apps use `api`/`client` contracts only, never import Control Plane or Engine internals, and remain isolated from sibling apps (sharing only `api`, `client`, neutral primitives, and a minimal `internal/apps/kit` helper layer).
 
-## 2. Target package layout and migration map
+## 2. Package layout
 
-The repository is transitioning from the earlier three-folder layout (`internal/kernel`, `internal/shell`, `internal/userland`) to the hexagonal + `apps/` tree below so `ls internal/` mirrors the enforced import boundaries directly instead of hiding ring classification inside `internal/archtest`.
+The repository mirrors the hexagonal Control Plane and `apps/` boundary directly under `internal/` so `ls internal/` reflects the enforced import rings:
 
-| Target ring | Target paths | Current paths (pre-move) | Responsibility |
-|---|---|---|---|
-| Neutral & contract | `api`, `client`, `internal/id`, `internal/fault`, `internal/docs` | *(unchanged)* | Public DTOs/schemas, Go client, typed IDs, error taxonomy, embedded docs |
-| Engine | `internal/engine/{definition,flow,script,reconcile,testkit}` | `internal/kernel/{definition,flow,script,engine,testkit}` | Pure definition validation, ordered reducer, fail-fast script rendering, deterministic reconciler, fakes |
-| Control | `internal/control/{tenancy,resource,identity,token,service,authorize,verify,pipeline,execution,request,task,inbox,kv,event,receipt,trigger,secret,workspace,log,gateway,mcpproxy}` | `internal/shell/<capability>` | Pure domain capabilities, authorization/verification, secret/workspace contracts, optional in-process gateways |
-| Adapter | `internal/adapter/store/{memory,postgres,units/*}`, `internal/adapter/runtime/{container,process,podman,kube}`, `internal/adapter/integration/{keys,nats,oidc,platform,registry}` | `internal/shell/store/*`, `internal/shell/runtime/*`, `internal/shell/integration/*` | Concrete persistence, container/process runtimes (with shared container-runtime core), infrastructure integrations |
-| Transport | `internal/transport/{ops,httpapi,mcp}` | `internal/shell/transport/{ops,httpapi,mcp}` | Single operation router and thin REST, SSE, and MCP edges |
-| Server | `internal/server` | `internal/shell/app` | Control Plane composition root and driver wiring |
-| Apps | `internal/apps/{cli,git,agent,opencode,merge,email,sandbox,up,auth}`, `internal/apps/kit/{principal,session,skill}` | `internal/userland/{cli,git,agent,services,sandbox,up,app/auth,principal,session,skill}` | Independent first-party programs speaking public contracts only; `services` split into sibling daemon apps |
-| Installation & examples | `internal/installation`, `deploy`, `examples` | *(unchanged)* | Config/preflight, Helm/OpenTofu, reference delivery recipes |
+| Ring | Paths | Responsibility |
+|---|---|---|
+| Neutral & contract | `api`, `client`, `internal/id`, `internal/fault`, `internal/docs` | Public DTOs/schemas, Go client, typed IDs, error taxonomy, embedded docs |
+| Engine | `internal/engine`, `internal/engine/{definition,flow,script,reconcile,testkit}` | Root execution types, pure definition validation, ordered reducer, fail-fast script rendering, deterministic reconciler, fakes |
+| Control | `internal/control/{tenancy,resource,identity,token,service,authorize,verify,pipeline,execution,request,task,inbox,kv,event,receipt,trigger,secret,workspace,log,store,gateway,mcpproxy}` | Pure domain capabilities, authorization/verification, store/secret/workspace contracts, optional in-process gateways |
+| Adapter | `internal/adapter/store/{memory,postgres,storetest,units/*}`, `internal/adapter/runtime/{internal/adapterutil,process,podman,kube}`, `internal/adapter/integration/{keys,nats,oidc,platform,registry}` | Concrete persistence and store fixtures, process/Podman/Kubernetes runtimes, infrastructure integrations |
+| Transport | `internal/transport/{ops,httpapi,mcp}` | Single operation router and thin REST, SSE, and MCP edges |
+| Server | `internal/server` (`bridges`, `drivers`, `migrate`, `ops`) | Control Plane composition root, bridges, driver wiring, migrations, operation registration |
+| Apps | `internal/apps/{cli,git,agent,opencode,merge,email,up,auth}`, `internal/apps/kit/{principal,session,skill,sandbox,servicekit}` | Independent first-party programs speaking public contracts only (`cli` owns its `sessionlock`/`userlandfs` subpackages), plus shared app helpers in `kit/` |
+| Installation & examples | `internal/installation`, `deploy`, `examples` | Config/preflight, Helm/OpenTofu, reference delivery recipes |
 
 `api` contains public DTOs/schemas only. `internal/installation` is configuration and preflight logic, not a product layer or alternate composition root.
 

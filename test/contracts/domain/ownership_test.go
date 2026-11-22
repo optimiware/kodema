@@ -15,13 +15,13 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/request"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	"github.com/optimiware/kodema/internal/shell/request"
 )
 
 // ownershipCase is one Shell path: its own event classes, the Kernel commit it
@@ -44,25 +44,25 @@ func ownershipCases() []ownershipCase {
 			name: "answer pass appends execution.succeeded and the request action.transition",
 			own:  []publishedEvent{{Type: event.TypeRequestResolved, SubjectID: string(projectionExecution)}},
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 8,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionSucceeded, 2),
-				actionPreImage(1, requestAction, definition.ActionKindRequest, kernel.ActionRunning, 3),
+				engine.ExecutionRunning, 8,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionSucceeded, 2),
+				actionPreImage(1, requestAction, definition.ActionKindRequest, engine.ActionRunning, 3),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 8,
-				NextExecutionState:       kernel.ExecutionSucceeded,
+				NextExecutionState:       engine.ExecutionSucceeded,
 				ActionID:                 requestAction,
 				ExpectedActionVersion:    3,
-				NextActionState:          kernel.ActionSucceeded,
+				NextActionState:          engine.ActionSucceeded,
 				NextCurrentAction:        intPointer(-1),
 				Output: flow.OutputChange{
 					Action: flow.OutputPromote,
-					Values: kernel.Outputs{"decision": "pass"},
+					Values: engine.Outputs{"decision": "pass"},
 				},
-				Answer: &kernel.Answer{
-					Decision: kernel.DecisionPass,
-					Outputs:  kernel.Outputs{"decision": "pass"},
+				Answer: &engine.Answer{
+					Decision: engine.DecisionPass,
+					Outputs:  engine.Outputs{"decision": "pass"},
 					Actor:    id.PrincipalID("principal-1"),
 					At:       projectionAt,
 				},
@@ -81,29 +81,29 @@ func ownershipCases() []ownershipCase {
 			name: "answer fail appends execution.failed and every action.transition",
 			own:  []publishedEvent{{Type: event.TypeRequestResolved, SubjectID: string(projectionExecution)}},
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 8,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionSucceeded, 2),
-				actionPreImage(1, requestAction, definition.ActionKindRequest, kernel.ActionRunning, 3),
-				actionPreImage(2, firstSuccessor, definition.ActionKindContainer, kernel.ActionPending, 1),
+				engine.ExecutionRunning, 8,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionSucceeded, 2),
+				actionPreImage(1, requestAction, definition.ActionKindRequest, engine.ActionRunning, 3),
+				actionPreImage(2, firstSuccessor, definition.ActionKindContainer, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 8,
-				NextExecutionState:       kernel.ExecutionFailed,
+				NextExecutionState:       engine.ExecutionFailed,
 				ActionID:                 requestAction,
 				ExpectedActionVersion:    3,
-				NextActionState:          kernel.ActionFailed,
+				NextActionState:          engine.ActionFailed,
 				PendingCancellations: []flow.ActionUpdate{
-					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				},
 				NextCurrentAction: intPointer(-1),
 				Output:            flow.OutputChange{Action: flow.OutputDiscard},
-				Answer: &kernel.Answer{
-					Decision: kernel.DecisionFail,
+				Answer: &engine.Answer{
+					Decision: engine.DecisionFail,
 					Actor:    id.PrincipalID("principal-1"),
 					At:       projectionAt,
 				},
-				Failure: &kernel.Failure{Kind: kernel.FailureRuntime, Reason: "answer_rejected"},
+				Failure: &engine.Failure{Kind: engine.FailureRuntime, Reason: "answer_rejected"},
 				At:      projectionAt,
 			},
 			owned: []event.OwnedEvent{{Type: event.TypeRequestResolved, SubjectID: string(projectionExecution)}},
@@ -120,25 +120,25 @@ func ownershipCases() []ownershipCase {
 			name: "operator cancel appends cleanup and every action.transition",
 			own:  []publishedEvent{{Type: event.TypeExecutionCancelled, SubjectID: string(projectionExecution)}},
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 5,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionRunning, 4),
-				actionPreImage(1, firstSuccessor, definition.ActionKindContainer, kernel.ActionPending, 1),
+				engine.ExecutionRunning, 5,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionRunning, 4),
+				actionPreImage(1, firstSuccessor, definition.ActionKindContainer, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 5,
-				NextExecutionState:       kernel.ExecutionCancelled,
+				NextExecutionState:       engine.ExecutionCancelled,
 				ActionID:                 containerAction,
 				ExpectedActionVersion:    4,
-				NextActionState:          kernel.ActionCancelled,
+				NextActionState:          engine.ActionCancelled,
 				PendingCancellations: []flow.ActionUpdate{
-					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: kernel.ActionCancelled},
+					{ActionID: firstSuccessor, ExpectedVersion: 1, NextState: engine.ActionCancelled},
 				},
 				NextCurrentAction:    intPointer(-1),
 				Output:               flow.OutputChange{Action: flow.OutputDiscard},
 				InvalidateCredential: true,
 				CleanupUpdate: &flow.CleanupUpdate{
-					State:       kernel.CleanupPending,
+					State:       engine.CleanupPending,
 					WorkspaceID: id.WorkspaceID("workspace-1"),
 				},
 				At: projectionAt,
@@ -158,17 +158,17 @@ func ownershipCases() []ownershipCase {
 			name: "request activation appends action.transition and excludes action.requested by type",
 			own:  []publishedEvent{{Type: event.TypeActionRequested, SubjectID: string(projectionExecution)}},
 			pre: executionPreImage(
-				kernel.ExecutionRunning, 4,
-				actionPreImage(0, containerAction, definition.ActionKindContainer, kernel.ActionSucceeded, 3),
-				actionPreImage(1, requestAction, definition.ActionKindRequest, kernel.ActionPending, 1),
+				engine.ExecutionRunning, 4,
+				actionPreImage(0, containerAction, definition.ActionKindContainer, engine.ActionSucceeded, 3),
+				actionPreImage(1, requestAction, definition.ActionKindRequest, engine.ActionPending, 1),
 			),
 			commit: flow.Commit{
 				ExecutionID:              projectionExecution,
 				ExpectedExecutionVersion: 4,
-				NextExecutionState:       kernel.ExecutionRunning,
+				NextExecutionState:       engine.ExecutionRunning,
 				ActionID:                 requestAction,
 				ExpectedActionVersion:    1,
-				NextActionState:          kernel.ActionRunning,
+				NextActionState:          engine.ActionRunning,
 				NextCurrentAction:        intPointer(1),
 				Output:                   flow.OutputChange{Action: flow.OutputNone},
 				InvalidateCredential:     true,

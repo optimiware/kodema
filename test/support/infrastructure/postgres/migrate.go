@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/store"
 )
 
 // ErrAppliedMigrationRewritten reports a ledger entry whose recorded checksum no

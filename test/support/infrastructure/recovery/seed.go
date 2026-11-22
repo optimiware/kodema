@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/installation"
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

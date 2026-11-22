@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	pgdriver "github.com/optimiware/kodema/internal/shell/app/drivers/postgres"
+	pgdriver "github.com/optimiware/kodema/internal/server/drivers/postgres"
 )
 
 // PgError returns the PostgreSQL server error carried by err, if any. The

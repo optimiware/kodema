@@ -248,7 +248,7 @@ func TestDeploymentDescriptorOutputsMatchCloudFacts(t *testing.T) {
 func TestProductionEntrySelectsEveryDeployedKeyAdapter(t *testing.T) {
 	root := repoRoot(t)
 	entry := readRepoFile(t, root, "cmd/kodema/production.go")
-	shell := readRepoFile(t, root, "internal/shell/app/production.go")
+	shell := readRepoFile(t, root, "internal/server/production.go")
 	constants := map[string]string{"scw-kms": "KeyScalewayKMS", "aws-kms": "KeyAWSKMS", "gcp-kms": "KeyGCPKMS"}
 
 	accepted := regexp.MustCompile(`(?m)^[ \t]*case ([^\n]*):\n[ \t]*return adapter, nil`).FindStringSubmatch(entry)

@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	"github.com/optimiware/kodema/internal/apps/kit/principal"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/shell/integration/oidc"
-	"github.com/optimiware/kodema/internal/userland/principal"
 )
 
 // TestUserlandPrincipalForOIDCMatchesShellOIDCDerivation pins that Userland's

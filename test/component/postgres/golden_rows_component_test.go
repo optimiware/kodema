@@ -9,22 +9,22 @@ import (
 	"testing"
 	"time"
 
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	executionstore "github.com/optimiware/kodema/internal/adapter/store/units/execution"
+	"github.com/optimiware/kodema/internal/adapter/store/units/execution/snapshotdoc"
+	"github.com/optimiware/kodema/internal/adapter/store/units/identity"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/execution"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/receipt"
+	"github.com/optimiware/kodema/internal/control/resource"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	tenancyadmin "github.com/optimiware/kodema/internal/control/tenancy/admin"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/definition"
+	"github.com/optimiware/kodema/internal/engine/flow"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/definition"
-	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/execution"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/receipt"
-	"github.com/optimiware/kodema/internal/shell/resource"
-	"github.com/optimiware/kodema/internal/shell/store"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
-	executionstore "github.com/optimiware/kodema/internal/shell/store/units/execution"
-	"github.com/optimiware/kodema/internal/shell/store/units/execution/snapshotdoc"
-	"github.com/optimiware/kodema/internal/shell/store/units/identity"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	tenancyadmin "github.com/optimiware/kodema/internal/shell/tenancy/admin"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 
@@ -140,7 +140,7 @@ func TestGoldenCleanupRowsOnPostgreSQL(t *testing.T) {
 	if _, err := store.Transition(ctx, execution.TransitionUnit{
 		Owner: scope, ExecutionID: "execution-cleanup", ExpectedExecutionVersion: 1,
 		Commit: flow.Commit{ExecutionID: "execution-cleanup", ExpectedExecutionVersion: 1,
-			NextExecutionState: kernel.ExecutionFailed,
+			NextExecutionState: engine.ExecutionFailed,
 			Output:             flow.OutputChange{Action: flow.OutputNone},
 			Cleanup:            &flow.CleanupIntent{WorkloadID: "workload-1", WorkspaceID: "ws-1", Reason: "failed"},
 			At:                 pgtest.FixtureTime},
@@ -159,9 +159,9 @@ func TestGoldenCleanupRowsOnPostgreSQL(t *testing.T) {
 	if _, err := store.Transition(ctx, execution.TransitionUnit{
 		Owner: scope, ExecutionID: "execution-cleanup", ExpectedExecutionVersion: 2,
 		Commit: flow.Commit{ExecutionID: "execution-cleanup", ExpectedExecutionVersion: 2,
-			NextExecutionState: kernel.ExecutionFailed,
+			NextExecutionState: engine.ExecutionFailed,
 			Output:             flow.OutputChange{Action: flow.OutputNone},
-			CleanupUpdate:      &flow.CleanupUpdate{State: kernel.CleanupPending, WorkloadID: "workload-1", WorkspaceID: "ws-1", Attempts: 2, LastError: "boom"},
+			CleanupUpdate:      &flow.CleanupUpdate{State: engine.CleanupPending, WorkloadID: "workload-1", WorkspaceID: "ws-1", Attempts: 2, LastError: "boom"},
 			At:                 retryAt},
 	}); err != nil {
 		t.Fatalf("cleanup retry: %v%s", err, pgtest.CauseText(err))
@@ -177,9 +177,9 @@ func TestGoldenCleanupRowsOnPostgreSQL(t *testing.T) {
 	if _, err := store.Transition(ctx, execution.TransitionUnit{
 		Owner: scope, ExecutionID: "execution-cleanup", ExpectedExecutionVersion: 3,
 		Commit: flow.Commit{ExecutionID: "execution-cleanup", ExpectedExecutionVersion: 3,
-			NextExecutionState: kernel.ExecutionFailed,
+			NextExecutionState: engine.ExecutionFailed,
 			Output:             flow.OutputChange{Action: flow.OutputNone},
-			CleanupUpdate:      &flow.CleanupUpdate{State: kernel.CleanupComplete, WorkloadID: "workload-1", WorkspaceID: "ws-1", Attempts: 3},
+			CleanupUpdate:      &flow.CleanupUpdate{State: engine.CleanupComplete, WorkloadID: "workload-1", WorkspaceID: "ws-1", Attempts: 3},
 			At:                 retryAt.Add(time.Minute)},
 	}); err != nil {
 		t.Fatalf("cleanup complete: %v%s", err, pgtest.CauseText(err))
@@ -235,10 +235,10 @@ func TestGoldenPreparationFailureProofAndCleanupRowsOnPostgreSQL(t *testing.T) {
 	}
 	actionID := snapshotdoc.DeriveActionID(started.ExecutionID, 0)
 
-	proof := kernel.NeverStarted("preparation failed before the start request was issued")
-	launch := kernel.LaunchIntent{
+	proof := engine.NeverStarted("preparation failed before the start request was issued")
+	launch := engine.LaunchIntent{
 		WorkloadID:     id.WorkloadID("workload-prep"),
-		State:          kernel.LaunchIssued,
+		State:          engine.LaunchIssued,
 		IdempotencyKey: "launch-key",
 	}
 	if _, err := store.Transition(ctx, execution.TransitionUnit{
@@ -247,16 +247,16 @@ func TestGoldenPreparationFailureProofAndCleanupRowsOnPostgreSQL(t *testing.T) {
 		Commit: flow.Commit{
 			ExecutionID:              "execution-prep",
 			ExpectedExecutionVersion: 1,
-			NextExecutionState:       kernel.ExecutionFailed,
+			NextExecutionState:       engine.ExecutionFailed,
 			ActionID:                 actionID,
 			ExpectedActionVersion:    1,
-			NextActionState:          kernel.ActionFailed,
+			NextActionState:          engine.ActionFailed,
 			Output:                   flow.OutputChange{Action: flow.OutputDiscard},
 			Launch:                   &launch,
 			Observation:              &proof,
-			Failure:                  &kernel.Failure{Kind: kernel.FailurePreparation, Reason: "preparation_failed"},
+			Failure:                  &engine.Failure{Kind: engine.FailurePreparation, Reason: "preparation_failed"},
 			CleanupUpdate: &flow.CleanupUpdate{
-				State:       kernel.CleanupPending,
+				State:       engine.CleanupPending,
 				WorkloadID:  launch.WorkloadID,
 				WorkspaceID: "workspace-execution-prep",
 			},
@@ -272,15 +272,15 @@ func TestGoldenPreparationFailureProofAndCleanupRowsOnPostgreSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v%s", err, pgtest.CauseText(err))
 	}
-	if loaded.Failure == nil || loaded.Failure.Kind != kernel.FailurePreparation {
+	if loaded.Failure == nil || loaded.Failure.Kind != engine.FailurePreparation {
 		t.Fatalf("loaded failure = %+v; want preparation", loaded.Failure)
 	}
 	if len(loaded.Actions) != 1 || loaded.Actions[0].Container == nil ||
 		!loaded.Actions[0].Container.Observation.ProofOfNonexecution() {
 		t.Fatalf("loaded action lost the never-started proof: %+v", loaded.Actions)
 	}
-	wantCleanup := kernel.Cleanup{
-		State:       kernel.CleanupPending,
+	wantCleanup := engine.Cleanup{
+		State:       engine.CleanupPending,
 		WorkloadID:  launch.WorkloadID,
 		WorkspaceID: "workspace-execution-prep",
 	}

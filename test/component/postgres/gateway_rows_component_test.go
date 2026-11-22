@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/shell/gateway"
-	storepg "github.com/optimiware/kodema/internal/shell/store/postgres"
+	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	"github.com/optimiware/kodema/internal/control/gateway"
 	"github.com/optimiware/kodema/test/support/infrastructure/postgres"
 )
 

@@ -3,22 +3,22 @@ package adaptercontract
 import (
 	"context"
 
+	"github.com/optimiware/kodema/internal/adapter/integration/nats"
+	"github.com/optimiware/kodema/internal/adapter/runtime"
+	"github.com/optimiware/kodema/internal/control/authorize"
+	"github.com/optimiware/kodema/internal/control/event"
+	"github.com/optimiware/kodema/internal/control/identity"
+	"github.com/optimiware/kodema/internal/control/log"
+	"github.com/optimiware/kodema/internal/control/pipeline"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/store"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/control/workspace"
+	"github.com/optimiware/kodema/internal/engine"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
-	"github.com/optimiware/kodema/internal/kernel"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	"github.com/optimiware/kodema/internal/shell/authorize"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/identity"
-	"github.com/optimiware/kodema/internal/shell/integration/nats"
-	"github.com/optimiware/kodema/internal/shell/log"
-	"github.com/optimiware/kodema/internal/shell/pipeline"
-	"github.com/optimiware/kodema/internal/shell/runtime"
-	"github.com/optimiware/kodema/internal/shell/secret"
-	"github.com/optimiware/kodema/internal/shell/store"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
-	"github.com/optimiware/kodema/internal/shell/token"
-	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
 // The fake adapters below are compile-only conformance consumers. They prove
@@ -120,29 +120,29 @@ func (fakeKeyProvider) Unwrap(context.Context, secret.UnwrapRequest) ([]byte, er
 
 type fakeRuntimeClient struct{}
 
-func (fakeRuntimeClient) Capabilities(context.Context) (engine.Capabilities, error) {
-	return engine.Capabilities{}, nil
+func (fakeRuntimeClient) Capabilities(context.Context) (reconcile.Capabilities, error) {
+	return reconcile.Capabilities{}, nil
 }
-func (fakeRuntimeClient) Prepare(context.Context, engine.PrepareRequest) (engine.Preparation, error) {
-	return engine.Preparation{}, nil
+func (fakeRuntimeClient) Prepare(context.Context, reconcile.PrepareRequest) (reconcile.Preparation, error) {
+	return reconcile.Preparation{}, nil
 }
-func (fakeRuntimeClient) Start(context.Context, engine.StartRequest) (engine.StartResult, error) {
-	return engine.StartResult{}, nil
+func (fakeRuntimeClient) Start(context.Context, reconcile.StartRequest) (reconcile.StartResult, error) {
+	return reconcile.StartResult{}, nil
 }
-func (fakeRuntimeClient) Observe(context.Context, engine.ObserveRequest) (kernel.Observation, error) {
-	return kernel.UnknownObservation(), nil
+func (fakeRuntimeClient) Observe(context.Context, reconcile.ObserveRequest) (engine.Observation, error) {
+	return engine.UnknownObservation(), nil
 }
-func (fakeRuntimeClient) Logs(context.Context, engine.LogsRequest) (engine.LogBatch, error) {
-	return engine.LogBatch{}, nil
+func (fakeRuntimeClient) Logs(context.Context, reconcile.LogsRequest) (reconcile.LogBatch, error) {
+	return reconcile.LogBatch{}, nil
 }
-func (fakeRuntimeClient) Stop(context.Context, engine.StopRequest) (kernel.StopEvidence, error) {
-	return kernel.PendingStop("pending"), nil
+func (fakeRuntimeClient) Stop(context.Context, reconcile.StopRequest) (engine.StopEvidence, error) {
+	return engine.PendingStop("pending"), nil
 }
-func (fakeRuntimeClient) Remove(context.Context, engine.RemoveRequest) (engine.Removal, error) {
-	return engine.Removal{}, nil
+func (fakeRuntimeClient) Remove(context.Context, reconcile.RemoveRequest) (reconcile.Removal, error) {
+	return reconcile.Removal{}, nil
 }
-func (fakeRuntimeClient) RefreshCredential(context.Context, engine.CredentialRequest) (engine.CredentialRefresh, error) {
-	return engine.CredentialRefresh{}, nil
+func (fakeRuntimeClient) RefreshCredential(context.Context, reconcile.CredentialRequest) (reconcile.CredentialRefresh, error) {
+	return reconcile.CredentialRefresh{}, nil
 }
 func (fakeRuntimeClient) Version(context.Context) (runtime.APIVersion, error) {
 	return runtime.APIVersion{}, nil
@@ -240,7 +240,7 @@ var (
 	_ secret.Resolver           = fakeSecretResolver{}
 	_ secret.KeyProvider        = fakeKeyProvider{}
 	_ runtime.Client            = fakeRuntimeClient{}
-	_ engine.Runtime            = (runtime.Client)(nil)
+	_ reconcile.Runtime         = (runtime.Client)(nil)
 	_ event.Publisher           = fakeEventPublisher{}
 	_ token.InvalidationPort    = fakeInvalidationSink{}
 	_ nats.Publisher            = fakeNATSPublisher{}

@@ -49,10 +49,10 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
+	"github.com/optimiware/kodema/internal/apps/agent"
+	agentapp "github.com/optimiware/kodema/internal/apps/agent/app"
+	"github.com/optimiware/kodema/internal/apps/kit/session"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/userland/agent"
-	agentapp "github.com/optimiware/kodema/internal/userland/agent/app"
-	"github.com/optimiware/kodema/internal/userland/session"
 )
 
 const (

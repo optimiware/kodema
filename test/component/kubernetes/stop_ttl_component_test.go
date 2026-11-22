@@ -26,10 +26,10 @@ import (
 	"testing"
 	"time"
 
+	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/kernel/engine"
-	driverkube "github.com/optimiware/kodema/internal/shell/app/drivers/kube"
-	runtimekube "github.com/optimiware/kodema/internal/shell/runtime/kube"
+	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
 )
 
@@ -92,7 +92,7 @@ func TestSuspensionClearsFinishedJobTTL(t *testing.T) {
 		t.Fatalf("workload Job is already deleting: %v", jobBefore.DeletionTimestamp)
 	}
 
-	evidence, err := shortLived.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	evidence, err := shortLived.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestSuspensionClearsFinishedJobTTL(t *testing.T) {
 	}
 	onePod(t, ctx, fx.Client, identity)
 
-	again, err := shortLived.Stop(ctx, engine.StopRequest{Identity: identity, WorkspaceID: workspaceID})
+	again, err := shortLived.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Stop after the TTL window: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestSuspensionClearsFinishedJobTTL(t *testing.T) {
 		t.Fatalf("stop evidence after the TTL window = %+v; want a still-confirmed stop", again)
 	}
 
-	removal, err := shortLived.Remove(ctx, engine.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
+	removal, err := shortLived.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
 	if err != nil {
 		t.Fatalf("Remove: %v", err)
 	}

@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
-	shellidentity "github.com/optimiware/kodema/internal/shell/identity"
-	shelloidc "github.com/optimiware/kodema/internal/shell/integration/oidc"
+	shelloidc "github.com/optimiware/kodema/internal/adapter/integration/oidc"
+	shellidentity "github.com/optimiware/kodema/internal/control/identity"
 )
 
 // Default fixture claim names and values.
