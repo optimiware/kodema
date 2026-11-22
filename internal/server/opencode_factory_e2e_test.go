@@ -17,8 +17,8 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
-	"github.com/optimiware/kodema/internal/apps/services"
-	servicesapp "github.com/optimiware/kodema/internal/apps/services/app"
+	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
+	"github.com/optimiware/kodema/internal/apps/opencode"
 	"github.com/optimiware/kodema/internal/control/identity"
 	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/control/tenancy"
@@ -503,7 +503,7 @@ actions:
 	// Start the OpenCode local attribution reverse proxy bridging OpenCode's
 	// Anthropic calls to real Kodema /llm/anthropic/* with kodsvc. + attribution headers!
 	ocCredSource := client.FileCredentialSource{Path: ocCredFile}
-	llmProxy, err := services.NewOpenCodeLLMProxy(services.OpenCodeLLMProxyConfig{
+	llmProxy, err := opencode.NewOpenCodeLLMProxy(opencode.OpenCodeLLMProxyConfig{
 		KodemaURL:    kodemaHTTP.URL,
 		Credentials:  ocCredSource,
 		RoundTripper: kodemaHTTP.Client().Transport,
@@ -603,15 +603,15 @@ actions:
 	// real HTTP transport + live SSE event stream!
 	ocTransport := newHTTPTransport(ocCredSource)
 	ocStateDir := filepath.Join(tmp, "opencode-state")
-	ocStore, err := services.NewFileOpenCodeStateStore(filepath.Join(ocStateDir, "opencode"))
+	ocStore, err := opencode.NewFileOpenCodeStateStore(filepath.Join(ocStateDir, "opencode"))
 	if err != nil {
 		t.Fatalf("NewFileOpenCodeStateStore: %v", err)
 	}
-	gitExec, err := servicesapp.NewOSGitExecutor(servicesapp.OSGitExecutorConfig{})
+	gitExec, err := servicekit.NewOSGitExecutor(servicekit.OSGitExecutorConfig{})
 	if err != nil {
 		t.Fatalf("NewOSGitExecutor: %v", err)
 	}
-	worktrees, err := services.NewGitOpenCodeWorktreeManager(services.GitOpenCodeWorktreeConfig{
+	worktrees, err := opencode.NewGitOpenCodeWorktreeManager(opencode.GitOpenCodeWorktreeConfig{
 		RemoteBaseURL:  "file://" + gitRoot,
 		StateDirectory: ocStateDir,
 		Executor:       gitExec,
@@ -619,14 +619,14 @@ actions:
 	if err != nil {
 		t.Fatalf("NewGitOpenCodeWorktreeManager: %v", err)
 	}
-	ocClient, err := services.NewHTTPOpenCodeClient(services.HTTPOpenCodeClientConfig{
+	ocClient, err := opencode.NewHTTPOpenCodeClient(opencode.HTTPOpenCodeClientConfig{
 		BaseURL:  opencodeServer.URL,
 		Password: opencodeServerPassword,
 	})
 	if err != nil {
 		t.Fatalf("NewHTTPOpenCodeClient: %v", err)
 	}
-	ocAdapter, err := services.NewOpenCodeAdapter(services.OpenCodeAdapterConfig{
+	ocAdapter, err := opencode.NewOpenCodeAdapter(opencode.OpenCodeAdapterConfig{
 		ServiceID:      opencodeServiceID,
 		TenantID:       tenantID,
 		ProjectID:      projectID,
@@ -636,7 +636,7 @@ actions:
 		Store:          ocStore,
 		Worktrees:      worktrees,
 		Proxy:          llmProxy,
-		Clock:          servicesapp.SystemClock{},
+		Clock:          servicekit.SystemClock{},
 		RescanInterval: 50 * time.Millisecond,
 	})
 	if err != nil {

@@ -39,7 +39,7 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/apps/cli"
-	"github.com/optimiware/kodema/internal/apps/services"
+	mergeapp "github.com/optimiware/kodema/internal/apps/merge"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -771,14 +771,14 @@ func TestTwoStageImplementAndIntegratePipelines(t *testing.T) {
 			Value: sampleValues[name],
 		})
 	}
-	if _, err := services.ParseMergeSubject(resolvedSubject); err != nil {
+	if _, err := mergeapp.ParseMergeSubject(resolvedSubject); err != nil {
 		t.Fatalf("integrate-stage.yaml merge subject is incompatible with ParseMergeSubject: %v", err)
 	}
 	mergeOutputs := make([]string, len(merge.Request.Outputs))
 	for i, k := range merge.Request.Outputs {
 		mergeOutputs[i] = string(k)
 	}
-	if err := services.ValidateMergeOutputs(mergeOutputs); err != nil {
+	if err := mergeapp.ValidateMergeOutputs(mergeOutputs); err != nil {
 		t.Fatalf("integrate-stage.yaml merge outputs %v are incompatible with ValidateMergeOutputs: %v", mergeOutputs, err)
 	}
 }
