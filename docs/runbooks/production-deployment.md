@@ -471,7 +471,7 @@ and the revision has not been written** (finish-plan D3: "the `scw-kms` grammar
 current implementation behaviour, not as a published frozen contract. The
 deferral is about publishing the revision, not about a missing parser:
 `parseScalewayKeyRef` is present and pins the shape
-([`scaleway_test.go`](../../internal/shell/integration/keys/scaleway_test.go)). Do not
+([`scaleway_test.go`](../../internal/adapter/integration/keys/scaleway_test.go)). Do not
 invent a second spelling such as `scw-kms:<key-id>` without a region; the
 current parser refuses it.
 
@@ -493,7 +493,7 @@ qualification run, not a routine install.
   data-loss decision, not a rotation procedure
   ([deploy/README.md](../../deploy/README.md)).
 - The key provider supports several configured versions (`Current`, `Versions`,
-  `Retained` in [`internal/shell/integration/keys/cloud.go`](../../internal/shell/integration/keys/cloud.go)),
+  `Retained` in [`internal/adapter/integration/keys/cloud.go`](../../internal/adapter/integration/keys/cloud.go)),
   but `loadProductionKeys` loads only the current version from
   `kek-v<version>.blob`. There is no shipped re-wrap or multi-version rotation
   command. A future rotation needs a new blob plus both versions configured; do
@@ -579,7 +579,7 @@ creates a Secret value. `scripts/bootstrap-secrets` creates the live set:
 **The administrator credential is a setup credential, not a runtime credential.**
 The chart never mounts `kodema-database-admin`; only the one-shot
 `scripts/deploy <cloud> migrate` pod reads it as `KODEMA_ADMIN_DATABASE_URL`.
-[`internal/shell/app/migrate/migrate.go`](../../internal/shell/app/migrate/migrate.go)
+[`internal/server/migrate/migrate.go`](../../internal/server/migrate/migrate.go)
 records why the setup administrator must be removed or disabled after the
 installation completes: it keeps `ADMIN` and `SET` on `kodema_owner` and can
 assume that role at will. Treat the Secret as the highest-value credential in
@@ -846,7 +846,7 @@ the new state.
 | `GET /metrics` (HTTPS) | 200 with `kodema_publication_backlog`, `kodema_consumer_lag` and `kodema_pending_cleanup` (gauges sampled from durable state, capped at 500) and `kodema_refused_pushes_total`, `kodema_refused_reports_total` and `kodema_dependency_errors_total` (in-process counters, reset on restart); 503 with a fixed body if a sample fails | PostgreSQL |
 
 The readiness budget is 4 seconds total; the chart's probe timeout is 10 seconds
-(minimum 5) ([`internal/shell/app/readiness.go`](../../internal/shell/app/readiness.go)).
+(minimum 5) ([`internal/server/readiness.go`](../../internal/server/readiness.go)).
 A PostgreSQL, NATS or KMS outage makes the pod not ready but does
 not restart it. There is no built-in dashboard, scrape configuration or alert
 rule; alert on the signals below using your platform's probe, metrics, log and

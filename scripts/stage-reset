@@ -40,8 +40,8 @@ readonly NATS_SERVER='tls://nats.kodema-system.svc.cluster.local:4222'
 
 # The five roles the migration ledger creates: 0001 (owner and runtime) and
 # 0009 (controller, publisher, auth), per
-# internal/shell/app/migrate/migrate.go (bootstrap = 0001, 0009) and
-# internal/shell/store/postgres/migrations.go. The setup administrator is not
+# internal/server/migrate/migrate.go (bootstrap = 0001, 0009) and
+# internal/adapter/store/postgres/migrations.go. The setup administrator is not
 # in this list and must survive.
 readonly ROLES=(
   kodema_owner
