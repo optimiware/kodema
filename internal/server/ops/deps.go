@@ -291,9 +291,9 @@ type RepositoryProvisionResult struct {
 // Userland and coordinates only provisioning and the corresponding resource
 // binding.
 type RepositoryProvisioner interface {
-	DefaultServiceID() string
-	DefaultTrustedOrigins() []string
-	CloneURL(repository string) string
+	DefaultServiceID(tenantID id.TenantID) string
+	DefaultTrustedOrigins(tenantID id.TenantID) []string
+	CloneURL(tenantID id.TenantID, repository string) string
 	ProvisionRepository(context.Context, RepositoryProvisionRequest) (RepositoryProvisionResult, error)
 }
 

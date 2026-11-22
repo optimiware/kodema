@@ -121,6 +121,629 @@
               "type": "string"
             }
           }
+        },
+        "secretRules": {
+          "type": "object",
+          "description": "Workload secret-name allow-list rendered into KODEMA_SECRET_RULES_FILE. Production stays fail-closed by default and refuses allowAll: true. existingConfigMap and inline rules are mutually exclusive.",
+          "additionalProperties": false,
+          "properties": {
+            "existingConfigMap": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "allowAllInTest": {
+              "type": "boolean"
+            },
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenantID"
+                ],
+                "properties": {
+                  "tenantID": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 49,
+                    "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                  },
+                  "projectID": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "pattern": "^$|^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "names": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+                      "not": {
+                        "const": "KODEMA_TOKEN"
+                      }
+                    }
+                  },
+                  "allowAll": {
+                    "type": "boolean"
+                  }
+                },
+                "allOf": [
+                  {
+                    "description": "A rule cannot combine allowAll: true with explicit secret names.",
+                    "if": {
+                      "required": [
+                        "allowAll"
+                      ],
+                      "properties": {
+                        "allowAll": {
+                          "const": true
+                        }
+                      }
+                    },
+                    "then": {
+                      "not": {
+                        "required": [
+                          "names"
+                        ],
+                        "properties": {
+                          "names": {
+                            "minItems": 1
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "description": "A rule without allowAll: true must list at least one secret name.",
+                    "if": {
+                      "not": {
+                        "required": [
+                          "allowAll"
+                        ],
+                        "properties": {
+                          "allowAll": {
+                            "const": true
+                          }
+                        }
+                      }
+                    },
+                    "then": {
+                      "required": [
+                        "names"
+                      ],
+                      "properties": {
+                        "names": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "allOf": [
+            {
+              "description": "existingConfigMap cannot be combined with inline rules.",
+              "if": {
+                "required": [
+                  "existingConfigMap"
+                ],
+                "properties": {
+                  "existingConfigMap": {
+                    "minLength": 1
+                  }
+                }
+              },
+              "then": {
+                "not": {
+                  "required": [
+                    "rules"
+                  ],
+                  "properties": {
+                    "rules": {
+                      "minItems": 1
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "models": {
+          "type": "object",
+          "description": "Streaming LLM proxy and configured model gateway rendered into KODEMA_MODELS_FILE. Never carries raw API keys; secretName references Kodema's encrypted DB secrets.",
+          "additionalProperties": false,
+          "properties": {
+            "existingConfigMap": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "defaultProviders": {
+              "type": "boolean"
+            },
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenantID",
+                  "name",
+                  "secretName"
+                ],
+                "properties": {
+                  "tenantID": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 49,
+                    "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                  },
+                  "projectID": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "pattern": "^$|^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z]([a-z0-9]|-[a-z0-9])*$"
+                  },
+                  "baseURL": {
+                    "type": "string",
+                    "pattern": "^$|^https?://[^\\s@?#]+$",
+                    "not": {
+                      "pattern": "://[^/@]*:[^@]*@"
+                    }
+                  },
+                  "endpoint": {
+                    "type": "string",
+                    "pattern": "^$|^https?://[^\\s@?#]+$",
+                    "not": {
+                      "pattern": "://[^/@]*:[^@]*@"
+                    }
+                  },
+                  "secretName": {
+                    "type": "string",
+                    "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+                    "not": {
+                      "const": "KODEMA_TOKEN"
+                    }
+                  },
+                  "authHeader": {
+                    "type": "string",
+                    "enum": [
+                      "",
+                      "Authorization",
+                      "x-api-key"
+                    ]
+                  },
+                  "anthropicVersion": {
+                    "type": "string",
+                    "pattern": "^[^\\r\\n\\x00]*$"
+                  },
+                  "maxRequestBytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 16777216
+                  },
+                  "timeout": {
+                    "type": "string",
+                    "pattern": "^$|^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$"
+                  }
+                },
+                "allOf": [
+                  {
+                    "description": "A provider must declare baseURL or endpoint.",
+                    "if": {
+                      "not": {
+                        "required": [
+                          "baseURL"
+                        ],
+                        "properties": {
+                          "baseURL": {
+                            "minLength": 1
+                          }
+                        }
+                      }
+                    },
+                    "then": {
+                      "required": [
+                        "endpoint"
+                      ],
+                      "properties": {
+                        "endpoint": {
+                          "minLength": 1
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenantID",
+                  "projectID",
+                  "model",
+                  "upstreamModel",
+                  "endpoint",
+                  "secretName",
+                  "maxRequestBytes",
+                  "maxResponseBytes",
+                  "maxCompletionTokens",
+                  "timeout"
+                ],
+                "properties": {
+                  "tenantID": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 49,
+                    "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                  },
+                  "projectID": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "upstreamModel": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "endpoint": {
+                    "type": "string",
+                    "pattern": "^https?://[^\\s@?#]+$",
+                    "not": {
+                      "pattern": "://[^/@]*:[^@]*@"
+                    }
+                  },
+                  "secretName": {
+                    "type": "string",
+                    "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+                    "not": {
+                      "const": "KODEMA_TOKEN"
+                    }
+                  },
+                  "maxRequestBytes": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "maxResponseBytes": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "maxCompletionTokens": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "timeout": {
+                    "type": "string",
+                    "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$"
+                  },
+                  "recordContent": {
+                    "type": "boolean"
+                  },
+                  "contentRetention": {
+                    "type": "string",
+                    "pattern": "^$|^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$"
+                  },
+                  "inputUSDPerMillionTokens": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "outputUSDPerMillionTokens": {
+                    "type": "number",
+                    "minimum": 0
+                  }
+                }
+              }
+            },
+            "budgets": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "defaultExecution": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxTokens": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "maxCostUSD": {
+                      "type": "number",
+                      "minimum": 0
+                    }
+                  }
+                },
+                "defaultTask": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "maxTokens": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "maxCostUSD": {
+                      "type": "number",
+                      "minimum": 0
+                    }
+                  }
+                },
+                "pricing": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "model",
+                      "inputUSDPerMillionTokens",
+                      "outputUSDPerMillionTokens"
+                    ],
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "inputUSDPerMillionTokens": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "outputUSDPerMillionTokens": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "secretRules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenantID",
+                  "names"
+                ],
+                "properties": {
+                  "tenantID": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 49,
+                    "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+                  },
+                  "projectID": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "pattern": "^$|^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "names": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+                      "not": {
+                        "const": "KODEMA_TOKEN"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "allOf": [
+            {
+              "description": "existingConfigMap cannot be combined with inline defaultProviders, providers, models, budgets, or secretRules.",
+              "if": {
+                "required": [
+                  "existingConfigMap"
+                ],
+                "properties": {
+                  "existingConfigMap": {
+                    "minLength": 1
+                  }
+                }
+              },
+              "then": {
+                "allOf": [
+                  {
+                    "properties": {
+                      "defaultProviders": {
+                        "const": false
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "providers"
+                      ],
+                      "properties": {
+                        "providers": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "models"
+                      ],
+                      "properties": {
+                        "models": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "secretRules"
+                      ],
+                      "properties": {
+                        "secretRules": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "budgets": {
+                        "allOf": [
+                          {
+                            "not": {
+                              "required": [
+                                "defaultExecution"
+                              ]
+                            }
+                          },
+                          {
+                            "not": {
+                              "required": [
+                                "defaultTask"
+                              ]
+                            }
+                          },
+                          {
+                            "not": {
+                              "required": [
+                                "pricing"
+                              ],
+                              "properties": {
+                                "pricing": {
+                                  "minItems": 1
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "description": "budgets and secretRules require defaultProviders: true or at least one configured provider or model.",
+              "if": {
+                "allOf": [
+                  {
+                    "not": {
+                      "required": [
+                        "defaultProviders"
+                      ],
+                      "properties": {
+                        "defaultProviders": {
+                          "const": true
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "providers"
+                      ],
+                      "properties": {
+                        "providers": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "not": {
+                      "required": [
+                        "models"
+                      ],
+                      "properties": {
+                        "models": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "then": {
+                "allOf": [
+                  {
+                    "not": {
+                      "required": [
+                        "secretRules"
+                      ],
+                      "properties": {
+                        "secretRules": {
+                          "minItems": 1
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "budgets": {
+                        "allOf": [
+                          {
+                            "not": {
+                              "required": [
+                                "defaultExecution"
+                              ]
+                            }
+                          },
+                          {
+                            "not": {
+                              "required": [
+                                "defaultTask"
+                              ]
+                            }
+                          },
+                          {
+                            "not": {
+                              "required": [
+                                "pricing"
+                              ],
+                              "properties": {
+                                "pricing": {
+                                  "minItems": 1
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
         }
       }
     },
@@ -303,6 +926,31 @@
           "description": "Public API base URL the Git service calls. Empty uses config.publicURL.",
           "type": "string"
         },
+        "publicURL": {
+          "description": "Optional client-facing Git HTTP base URL for repository provisioning (supports {tenant}).",
+          "type": "string",
+          "pattern": "^$|^https?://[^\\s@?#]+$",
+          "not": {
+            "pattern": "://[^/@]*:[^@]*@"
+          }
+        },
+        "serviceID": {
+          "description": "Optional enforcing service ID for repository bindings created via repository.create (supports {tenant}).",
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^$|^([A-Za-z0-9_-]|\\{tenant\\})+$"
+        },
+        "trustedOrigins": {
+          "description": "Optional trusted origins for repository bindings created via repository.create (supports {tenant}).",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^https?://[^\\s@?#]+$",
+            "not": {
+              "pattern": "://[^/@]*:[^@]*@"
+            }
+          }
+        },
         "tlsProxyImage": {
           "description": "TLS-terminating proxy image pinned by digest (repository[:tag]@sha256:<64 hex>).",
           "type": "string",
@@ -324,7 +972,6 @@
             "additionalProperties": false,
             "required": [
               "tenant",
-              "repositories",
               "credential",
               "tls",
               "storage",
@@ -339,9 +986,8 @@
                 "pattern": "^[a-z0-9]([a-z0-9-]{0,39}[a-z0-9])?$"
               },
               "repositories": {
-                "description": "Repository name to registered resource id mappings, rendered as repeated git serve --resource flags.",
+                "description": "Optional static repository name to registered resource id mappings, rendered as repeated git serve --resource flags. Omit or leave empty for dynamic repository serving from admin/conf/git.conf.",
                 "type": "array",
-                "minItems": 1,
                 "items": {
                   "type": "object",
                   "additionalProperties": false,
@@ -367,6 +1013,27 @@
               },
               "credential": {
                 "description": "Service credential mounted read-only; never a value.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "existingSecret",
+                  "key"
+                ],
+                "properties": {
+                  "existingSecret": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 253,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  }
+                }
+              },
+              "provisionToken": {
+                "description": "Optional bearer token Secret for HTTP repository provisioning (`git serve --provision-token-file`), mounted read-only; never a value.",
                 "type": "object",
                 "additionalProperties": false,
                 "required": [
@@ -1056,6 +1723,67 @@
                 "properties": {
                   "iam.gke.io/gcp-service-account": {
                     "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "Production refuses wildcard allowAll: true workload secret rules and non-https LLM proxy/model gateway endpoints.",
+      "if": {
+        "properties": {
+          "environment": {
+            "const": "production"
+          }
+        },
+        "required": [
+          "environment"
+        ]
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "secretRules": {
+                "properties": {
+                  "rules": {
+                    "items": {
+                      "properties": {
+                        "allowAll": {
+                          "not": {
+                            "const": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "models": {
+                "properties": {
+                  "providers": {
+                    "items": {
+                      "properties": {
+                        "baseURL": {
+                          "pattern": "^$|^https://[^\\s@?#]+$"
+                        },
+                        "endpoint": {
+                          "pattern": "^$|^https://[^\\s@?#]+$"
+                        }
+                      }
+                    }
+                  },
+                  "models": {
+                    "items": {
+                      "properties": {
+                        "endpoint": {
+                          "pattern": "^https://[^\\s@?#]+$"
+                        }
+                      }
+                    }
                   }
                 }
               }

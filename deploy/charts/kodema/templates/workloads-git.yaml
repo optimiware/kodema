@@ -39,6 +39,26 @@ execution pods never mount it.
 {{- if not (and .Values.secrets .Values.secrets.tls .Values.secrets.tls.existingSecret) }}
 {{- fail "gitService.enabled requires secrets.tls.existingSecret: the API certificate is issued by the private installation CA and SSL_CERT_FILE must trust it" }}
 {{- end }}
+{{- if $git.publicURL }}
+{{- if not (and (kindIs "string" $git.publicURL) (regexMatch "^(?i)https?://[^[:space:]@?#]+$" $git.publicURL) (not (regexMatch "://[^/@]*:[^@]*@" $git.publicURL))) }}
+{{- fail (printf "gitService.publicURL %q must be an absolute http:// or https:// URL without userinfo, query or fragment" $git.publicURL) }}
+{{- end }}
+{{- end }}
+{{- if $git.serviceID }}
+{{- if not (and (kindIs "string" $git.serviceID) (le (len $git.serviceID) 128) (regexMatch "^([A-Za-z0-9_-]|\\{tenant\\})+$" $git.serviceID)) }}
+{{- fail (printf "gitService.serviceID %q must match ^([A-Za-z0-9_-]|{tenant})+$" $git.serviceID) }}
+{{- end }}
+{{- end }}
+{{- if $git.trustedOrigins }}
+{{- if not (kindIs "slice" $git.trustedOrigins) }}
+{{- fail "gitService.trustedOrigins must be an array of http(s) URLs" }}
+{{- end }}
+{{- range $origin := $git.trustedOrigins }}
+{{- if not (and (kindIs "string" $origin) (regexMatch "^(?i)https?://[^[:space:]@?#]+$" $origin) (not (regexMatch "://[^/@]*:[^@]*@" $origin))) }}
+{{- fail (printf "gitService.trustedOrigins entry %q must be an absolute http:// or https:// URL without userinfo, query or fragment" $origin) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if not $git.tenants }}
 {{- fail "gitService.enabled requires at least one complete tenants entry" }}
 {{- end }}
@@ -71,11 +91,27 @@ data:
 {{- fail (printf "gitService repeats tenant %q; one tenant must not get two Git services" $tenant) }}
 {{- end }}
 {{- $_ := set $seenTenants $tenant true }}
-{{- if not $entry.repositories }}
-{{- fail (printf "gitService tenant %q needs at least one repositories mapping" $tenant) }}
+{{- if and (hasKey $entry "repositories") (not (kindIs "invalid" $entry.repositories)) (not (kindIs "slice" $entry.repositories)) }}
+{{- fail (printf "gitService tenant %q repositories must be an array" $tenant) }}
 {{- end }}
 {{- if not $entry.clients }}
 {{- fail (printf "gitService tenant %q needs at least one declared clients source; an empty peer list would widen the policy or drop it" $tenant) }}
+{{- end }}
+{{- if and (hasKey $entry "provisionToken") (not (kindIs "invalid" $entry.provisionToken)) }}
+{{- if not (kindIs "map" $entry.provisionToken) }}
+{{- fail (printf "gitService tenant %q provisionToken must be an object with existingSecret and key" $tenant) }}
+{{- end }}
+{{- range $k, $_ := $entry.provisionToken }}
+{{- if not (has $k (list "existingSecret" "key")) }}
+{{- fail (printf "gitService tenant %q provisionToken contains unsupported property %q" $tenant $k) }}
+{{- end }}
+{{- end }}
+{{- if not (and (hasKey $entry.provisionToken "existingSecret") (kindIs "string" $entry.provisionToken.existingSecret) (ne $entry.provisionToken.existingSecret "")) }}
+{{- fail (printf "gitService tenant %q provisionToken.existingSecret must be a non-empty Secret name" $tenant) }}
+{{- end }}
+{{- if not (and (hasKey $entry.provisionToken "key") (kindIs "string" $entry.provisionToken.key) (ge (len $entry.provisionToken.key) 1) (le (len $entry.provisionToken.key) 253) (regexMatch "^[A-Za-z0-9._-]+$" $entry.provisionToken.key)) }}
+{{- fail (printf "gitService tenant %q provisionToken.key must match ^[A-Za-z0-9._-]+$" $tenant) }}
+{{- end }}
 {{- end }}
 {{- $seenRepositories := dict }}
 {{- range $repository := $entry.repositories }}
@@ -178,6 +214,9 @@ spec:
             - --journal-dir=/var/lib/kodema/git/journal
             - --base-url={{ $baseURL }}
             - --credential-file=/etc/kodema/git/credential
+            {{- if $entry.provisionToken }}
+            - --provision-token-file=/etc/kodema/git-provision/token
+            {{- end }}
             {{- range $repository := $entry.repositories }}
             - --resource={{ $repository.name }}={{ $repository.resource }}
             {{- end }}
@@ -222,6 +261,11 @@ spec:
             - name: credential
               mountPath: /etc/kodema/git
               readOnly: true
+            {{- if $entry.provisionToken }}
+            - name: provision-token
+              mountPath: /etc/kodema/git-provision
+              readOnly: true
+            {{- end }}
             - name: api-ca
               mountPath: /etc/kodema/api-ca
               readOnly: true
@@ -283,6 +327,14 @@ spec:
             items:
               - key: {{ $entry.credential.key | quote }}
                 path: credential
+        {{- if $entry.provisionToken }}
+        - name: provision-token
+          secret:
+            secretName: {{ $entry.provisionToken.existingSecret | quote }}
+            items:
+              - key: {{ $entry.provisionToken.key | quote }}
+                path: token
+        {{- end }}
         - name: api-ca
           secret:
             secretName: {{ $.Values.secrets.tls.existingSecret | quote }}
@@ -334,6 +386,20 @@ spec:
               {{ $key }}: {{ $value | quote }}
               {{- end }}
           {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+    {{- end }}
+    {{- if $entry.provisionToken }}
+    # Allow the control plane to call the HTTP repository provisioning API.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Release.Namespace | quote }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kodema
+              app.kubernetes.io/component: control-plane
       ports:
         - protocol: TCP
           port: {{ $port }}

@@ -4,6 +4,7 @@
 package kube_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube/logframe"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/fault"
 	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
@@ -645,12 +647,74 @@ func TestReadPodLogsRefusesUnboundedRequests(t *testing.T) {
 		{Stream: runtimekube.LogStreamCombined, Limit: 0},
 		{Stream: runtimekube.LogStreamCombined, Limit: runtimekube.MaxLogBytes + 1},
 		{Stream: runtimekube.LogStreamCombined, Offset: -1, Limit: 10},
+		{Stream: runtimekube.LogStreamSplit, Limit: 0},
+		{Stream: runtimekube.LogStreamSplit, Offset: -1, Limit: 10},
+		{Stream: runtimekube.LogStreamSplit, StderrOffset: -1, Limit: 10},
 	} {
 		_, err := cluster.ReadPodLogs(context.Background(), testNamespace, "pod-1", request)
 		assertFaultClass(t, err, fault.InvalidInput)
 	}
 	if calls := api.callCount(); calls != 0 {
 		t.Fatalf("invalid log requests made %d API calls; want 0", calls)
+	}
+}
+
+// TestReadPodLogsSplitStreamDemuxesWithoutStreamQuery proves LogStreamSplit
+// sends only the portable `container=workload&follow=false` query (never
+// `?stream=`) and demultiplexes framed stdout/stderr with independent offsets
+// and truncation flags, falling back to stdout for unframed output.
+func TestReadPodLogsSplitStreamDemuxesWithoutStreamQuery(t *testing.T) {
+	var wire bytes.Buffer
+	w := logframe.NewWriter(&wire)
+	_, _ = w.WriteStream(logframe.StreamStdout, []byte("0123456789\n"))
+	_, _ = w.WriteStream(logframe.StreamStderr, []byte("abcdefghij\n"))
+
+	api := newAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != podLogPath("pod-1") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Query().Has("stream") {
+			http.Error(w, "split pod log streams are disabled", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write(wire.Bytes())
+	})
+	cluster := newClusterFor(t, api)
+
+	page, err := cluster.ReadPodLogs(context.Background(), testNamespace, "pod-1", runtimekube.PodLogRequest{
+		Stream:       runtimekube.LogStreamSplit,
+		Offset:       2,
+		StderrOffset: 4,
+		Limit:        5,
+	})
+	if err != nil {
+		t.Fatalf("ReadPodLogs split: %v", err)
+	}
+	call := api.lastCall(t)
+	if want := "container=workload&follow=false"; call.RawQuery != want {
+		t.Fatalf("log query = %q; want %q", call.RawQuery, want)
+	}
+	if string(page.Data) != "23456" || page.NextOffset != 7 || !page.Truncated {
+		t.Fatalf("stdout page = (%q, next=%d, trunc=%v); want (23456, 7, true)", page.Data, page.NextOffset, page.Truncated)
+	}
+	if string(page.StderrData) != "efghi" || page.StderrNextOffset != 9 || !page.StderrTruncated {
+		t.Fatalf("stderr page = (%q, next=%d, trunc=%v); want (efghi, 9, true)", page.StderrData, page.StderrNextOffset, page.StderrTruncated)
+	}
+
+	tail, err := cluster.ReadPodLogs(context.Background(), testNamespace, "pod-1", runtimekube.PodLogRequest{
+		Stream:       runtimekube.LogStreamSplit,
+		Offset:       7,
+		StderrOffset: 9,
+		Limit:        16,
+	})
+	if err != nil {
+		t.Fatalf("ReadPodLogs split tail: %v", err)
+	}
+	if string(tail.Data) != "789\n" || tail.NextOffset != 11 || tail.Truncated {
+		t.Fatalf("stdout tail = (%q, next=%d, trunc=%v); want (789\\n, 11, false)", tail.Data, tail.NextOffset, tail.Truncated)
+	}
+	if string(tail.StderrData) != "j\n" || tail.StderrNextOffset != 11 || tail.StderrTruncated {
+		t.Fatalf("stderr tail = (%q, next=%d, trunc=%v); want (j\\n, 11, false)", tail.StderrData, tail.StderrNextOffset, tail.StderrTruncated)
 	}
 }
 

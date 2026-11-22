@@ -1,11 +1,13 @@
-// Kubernetes-specific log behavior: combined-stream query semantics, high-half
-// cursor encoding with legacy split-stream cursor refusal, post-restart cursor
-// resume, cursor token overflow boundary before cluster calls, terminated-pod
-// log retention, and pod-log error classification sentinels.
+// Kubernetes-specific log behavior: split-stream demux query semantics over
+// the portable pod log endpoint, dual-stream cursor pagination and quiet-stream
+// preservation, unframed backward compatibility, post-restart cursor resume,
+// cursor token overflow boundary before cluster calls, terminated-pod log
+// retention, and pod-log error classification sentinels.
 //
 // Shared log invariants (redaction, split-page holdback, short-secret marker
-// expansion, limit/offset validation, fail-closed redaction) are verified in
-// TestKubeConformance, logs_differential_test.go, and container/logs_test.go.
+// expansion, limit/offset validation, fail-closed redaction, stdout/stderr
+// separation) are verified in TestKubeConformance, logs_differential_test.go,
+// and container/logs_test.go.
 package kube
 
 import (
@@ -17,15 +19,16 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime/container"
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube/logframe"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
 
-func TestLogsReadsOnlyTheCombinedStream(t *testing.T) {
+func TestLogsRequestsSplitStreamAndFallsBackForUnframedOutput(t *testing.T) {
 	fake, _, adapter, request := setupStarted(t)
 	pod := testRunningPod(request.Identity)
 	fake.addPod(pod)
-	fake.setPodLogs(pod.Name, LogStreamCombined, []byte("combined stdout and stderr\n"))
+	fake.setPodLogs(pod.Name, LogStreamCombined, []byte("unframed stdout output\n"))
 
 	batch, err := adapter.Logs(context.Background(), reconcile.LogsRequest{
 		Identity: request.Identity,
@@ -35,22 +38,39 @@ func TestLogsReadsOnlyTheCombinedStream(t *testing.T) {
 		t.Fatalf("Logs returned error: %v", err)
 	}
 	streams := fake.logStreamsSnapshot()
-	if len(streams) != 1 || streams[0] != LogStreamCombined {
-		t.Fatalf("requested log streams = %v; want only %q", streams, LogStreamCombined)
+	if len(streams) != 1 || streams[0] != LogStreamSplit {
+		t.Fatalf("requested log streams = %v; want only %q", streams, LogStreamSplit)
 	}
-	if len(batch.Chunks) != 1 || string(batch.Chunks[0].Data) != "combined stdout and stderr\n" {
-		t.Fatalf("chunks = %+v; want the combined log in one chunk", batch.Chunks)
+	if len(batch.Chunks) != 1 || batch.Chunks[0].Stream != reconcile.LogStdout || string(batch.Chunks[0].Data) != "unframed stdout output\n" {
+		t.Fatalf("chunks = %+v; want unframed log attributed to stdout", batch.Chunks)
 	}
 }
 
-func TestLogsCursorHighHalfAdvancesAndStderrHalfStaysZero(t *testing.T) {
+func TestLogsDualStreamPaginationAndQuietStreamPreservation(t *testing.T) {
 	fake, _, adapter, request := setupStarted(t)
 	pod := testRunningPod(request.Identity)
 	fake.addPod(pod)
-	fake.setPodLogs(pod.Name, LogStreamCombined, []byte(strings.Repeat("z", 40)))
+
+	var wire bytes.Buffer
+	w := logframe.NewWriter(&wire)
+	wantStdout := strings.Repeat("O", 40)
+	wantStderr := strings.Repeat("E", 12)
+	_, _ = w.WriteStream(logframe.StreamStdout, []byte(wantStdout[:20]))
+	_, _ = w.WriteStream(logframe.StreamStderr, []byte(wantStderr))
+	_, _ = w.WriteStream(logframe.StreamStdout, []byte(wantStdout[20:]))
+	fake.setPodLogs(pod.Name, LogStreamCombined, wire.Bytes())
 
 	cursor := int64(0)
-	for step, want := range []int64{16, 32, 40} {
+	var gotOut, gotErr []byte
+	steps := []struct {
+		wantOut int64
+		wantErr int64
+	}{
+		{16, 12},
+		{32, 12}, // stderr is quiet; its cursor stays preserved at 12
+		{40, 12},
+	}
+	for step, want := range steps {
 		batch, err := adapter.Logs(context.Background(), reconcile.LogsRequest{
 			Identity:    request.Identity,
 			AfterOffset: cursor,
@@ -59,11 +79,28 @@ func TestLogsCursorHighHalfAdvancesAndStderrHalfStaysZero(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step %d Logs returned error: %v", step, err)
 		}
+		for _, chunk := range batch.Chunks {
+			switch chunk.Stream {
+			case reconcile.LogStdout:
+				if chunk.Sequence != 1 {
+					t.Fatalf("step %d stdout sequence = %d; want 1", step, chunk.Sequence)
+				}
+				gotOut = append(gotOut, chunk.Data...)
+			case reconcile.LogStderr:
+				if chunk.Sequence != 2 {
+					t.Fatalf("step %d stderr sequence = %d; want 2", step, chunk.Sequence)
+				}
+				gotErr = append(gotErr, chunk.Data...)
+			}
+		}
 		stdoutPos, stderrPos := container.DecodeLogCursor(batch.NextOffset)
-		if stdoutPos != want || stderrPos != 0 {
-			t.Fatalf("step %d decoded cursor = (%d, %d); want (%d, 0)", step, stdoutPos, stderrPos, want)
+		if stdoutPos != want.wantOut || stderrPos != want.wantErr {
+			t.Fatalf("step %d decoded cursor = (%d, %d); want (%d, %d)", step, stdoutPos, stderrPos, want.wantOut, want.wantErr)
 		}
 		cursor = batch.NextOffset
+	}
+	if string(gotOut) != wantStdout || string(gotErr) != wantStderr {
+		t.Fatalf("got=(%q, %q); want=(%q, %q)", gotOut, gotErr, wantStdout, wantStderr)
 	}
 }
 
@@ -113,56 +150,44 @@ func TestLogsPaginationAcrossRestartIsExact(t *testing.T) {
 	}
 }
 
-func TestLogsRefusesLegacySplitStreamCursor(t *testing.T) {
-	fake, _, adapter := testSetup(t)
-	request := testPrepareRequest()
-	legacy := container.EncodeLogCursor(7, 5)
-
-	batch, err := adapter.Logs(context.Background(), reconcile.LogsRequest{
-		Identity:    request.Identity,
-		AfterOffset: legacy,
-		Limit:       1024,
-	})
-	if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
-		t.Fatalf("refusal class = (%v, %v) for %v; want %q", class, ok, err, fault.InvalidInput)
-	}
-	if len(batch.Chunks) != 0 {
-		t.Fatalf("refused cursor returned %d chunks", len(batch.Chunks))
-	}
-	for _, operation := range []string{"ListPods", "GetSecret", "ReadPodLogs"} {
-		if calls := fake.callCount(operation); calls != 0 {
-			t.Fatalf("refused cursor made %d %s calls; want 0", calls, operation)
-		}
-	}
-}
-
-func TestLogsAcceptsCombinedCursorAndRefusesOverflow(t *testing.T) {
+func TestLogsAcceptsDualStreamCursorAndRefusesOverflow(t *testing.T) {
 	fake, _, adapter, request := setupStarted(t)
 	pod := testRunningPod(request.Identity)
 	fake.addPod(pod)
-	fake.setPodLogs(pod.Name, LogStreamCombined, []byte("0123456789"))
+
+	var wire bytes.Buffer
+	w := logframe.NewWriter(&wire)
+	_, _ = w.WriteStream(logframe.StreamStdout, []byte("0123456789"))
+	_, _ = w.WriteStream(logframe.StreamStderr, []byte("abcdefghij"))
+	fake.setPodLogs(pod.Name, LogStreamCombined, wire.Bytes())
 
 	batch, err := adapter.Logs(context.Background(), reconcile.LogsRequest{
 		Identity:    request.Identity,
-		AfterOffset: container.EncodeLogCursor(3, 0),
+		AfterOffset: container.EncodeLogCursor(3, 5),
 		Limit:       4,
 	})
 	if err != nil {
 		t.Fatalf("Logs returned error: %v", err)
 	}
-	if len(batch.Chunks) != 1 || batch.Chunks[0].Offset != 3 || string(batch.Chunks[0].Data) != "3456" {
-		t.Fatalf("resumed chunks = %+v; want offset 3 data 3456", batch.Chunks)
+	if len(batch.Chunks) != 2 {
+		t.Fatalf("resumed chunks = %+v; want 2 (stdout and stderr)", batch.Chunks)
 	}
-	if want := container.EncodeLogCursor(7, 0); batch.NextOffset != want {
+	if batch.Chunks[0].Stream != reconcile.LogStdout || batch.Chunks[0].Offset != 3 || string(batch.Chunks[0].Data) != "3456" {
+		t.Fatalf("stdout chunk = %+v; want offset 3 data 3456", batch.Chunks[0])
+	}
+	if batch.Chunks[1].Stream != reconcile.LogStderr || batch.Chunks[1].Offset != 5 || string(batch.Chunks[1].Data) != "fghi" {
+		t.Fatalf("stderr chunk = %+v; want offset 5 data fghi", batch.Chunks[1])
+	}
+	if want := container.EncodeLogCursor(7, 9); batch.NextOffset != want {
 		t.Fatalf("NextOffset = %d; want %d", batch.NextOffset, want)
 	}
 
-	// 2^31-1 is accepted; 2^31 overflows into a negative token and is refused before ReadPodLogs.
-	accepted := container.EncodeLogCursor(container.MaxStdoutLogCursorPosition, 0)
+	// 2^31-1 stdout and 2^32-1 stderr are accepted; 2^31 stdout overflows into a negative token and is refused before ReadPodLogs.
+	accepted := container.EncodeLogCursor(container.MaxStdoutLogCursorPosition, container.MaxStderrLogCursorPosition)
 	if b, err := adapter.Logs(context.Background(), reconcile.LogsRequest{
 		Identity: request.Identity, AfterOffset: accepted, Limit: 16,
 	}); err != nil || b.NextOffset != accepted {
-		t.Fatalf("2^31-1 boundary Logs = (%+v, %v); want NextOffset=%d", b, err, accepted)
+		t.Fatalf("boundary Logs = (%+v, %v); want NextOffset=%d", b, err, accepted)
 	}
 
 	readsBefore := fake.callCount("ReadPodLogs")

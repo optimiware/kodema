@@ -568,15 +568,17 @@ func debugKubernetesExecution(t *testing.T, harness *factory.Harness, executionI
 			_, _ = fmt.Fprintf(&builder, "pod %s logs withheld: redaction values unavailable: %v\n", pod.Name, redactionErr)
 			continue
 		}
-		for _, stream := range []string{"stdout", "stderr"} {
-			page, err := harness.KubernetesClient.ReadPodLogs(ctx, harness.KubernetesNamespace, pod.Name,
-				runtimekube.PodLogRequest{Stream: stream, Limit: runtimekube.MaxLogBytes})
-			if err != nil {
-				_, _ = fmt.Fprintf(&builder, "pod %s %s logs: %v\n", pod.Name, stream, err)
-				continue
-			}
-			_, _ = fmt.Fprintf(&builder, "pod %s %s logs:\n%s\n", pod.Name, stream,
-				factory.SanitizeDiagnostic(string(page.Data), redactions...))
+		page, err := harness.KubernetesClient.ReadPodLogs(ctx, harness.KubernetesNamespace, pod.Name,
+			runtimekube.PodLogRequest{Stream: runtimekube.LogStreamSplit, Limit: runtimekube.MaxLogBytes})
+		if err != nil {
+			_, _ = fmt.Fprintf(&builder, "pod %s logs: %v\n", pod.Name, err)
+			continue
+		}
+		_, _ = fmt.Fprintf(&builder, "pod %s stdout logs:\n%s\n", pod.Name,
+			factory.SanitizeDiagnostic(string(page.Data), redactions...))
+		if len(page.StderrData) > 0 {
+			_, _ = fmt.Fprintf(&builder, "pod %s stderr logs:\n%s\n", pod.Name,
+				factory.SanitizeDiagnostic(string(page.StderrData), redactions...))
 		}
 	}
 	return builder.String()

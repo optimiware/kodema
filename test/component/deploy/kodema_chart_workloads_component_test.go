@@ -1030,17 +1030,49 @@ func TestKodemaChartWorkloadSchemaRefusals(t *testing.T) {
 			},
 		},
 		{
-			name: "git entry without repositories",
-			mutate: func(values workloadValues) {
-				entry := workloadMap(workloadList(workloadMap(values["gitService"])["tenants"])[0])
-				delete(entry, "repositories")
-			},
-		},
-		{
-			name: "git entry with empty repository list",
+			name: "git entry with non-array repositories",
 			mutate: func(values workloadValues) {
 				entry := workloadMap(workloadList(workloadMap(values["gitService"])["tenants"])[0])
 				entry["repositories"] = map[string]any{}
+			},
+		},
+		{
+			name: "git entry with provisionToken missing existingSecret",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["gitService"])["tenants"])[0])
+				entry["provisionToken"] = map[string]any{"key": "token"}
+			},
+		},
+		{
+			name: "git entry with provisionToken empty existingSecret",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["gitService"])["tenants"])[0])
+				entry["provisionToken"] = map[string]any{"existingSecret": "", "key": "token"}
+			},
+		},
+		{
+			name: "git entry with provisionToken invalid key",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["gitService"])["tenants"])[0])
+				entry["provisionToken"] = map[string]any{"existingSecret": "kodema-git-provision-tenant-a", "key": "../token"}
+			},
+		},
+		{
+			name: "git publicURL with userinfo",
+			mutate: func(values workloadValues) {
+				workloadMap(values["gitService"])["publicURL"] = "https://user:pass@git.example.test"
+			},
+		},
+		{
+			name: "git serviceID with invalid characters",
+			mutate: func(values workloadValues) {
+				workloadMap(values["gitService"])["serviceID"] = "git/bad"
+			},
+		},
+		{
+			name: "git trustedOrigins with non-http URL",
+			mutate: func(values workloadValues) {
+				workloadMap(values["gitService"])["trustedOrigins"] = []any{"ssh://git.example.test"}
 			},
 		},
 		{
@@ -1206,5 +1238,179 @@ func TestKodemaChartWorkloadSchemaRefusals(t *testing.T) {
 				t.Fatalf("helm accepted %s:\n%s", testCase.name, rendered)
 			}
 		})
+	}
+}
+
+// TestKodemaChartGitServiceDynamicRepositoriesAndProvisionToken proves:
+//   - gitService.tenants[].repositories is optional (omitted or empty [] renders
+//     cleanly with zero --resource flags for dynamic admin/conf/git.conf serving);
+//   - provisionToken wires --provision-token-file, Secret volume/mount, and
+//     control-plane NetworkPolicy ingress on StatefulSet/NetworkPolicy;
+//   - the control-plane Deployment wires KODEMA_GIT_ADMIN_URL,
+//     KODEMA_GIT_PROVISION_TOKEN_FILE, KODEMA_GIT_CA_FILE=/etc/kodema/tls/ca.crt,
+//     KODEMA_GIT_PUBLIC_URL, KODEMA_GIT_TRUSTED_ORIGINS, optional
+//     KODEMA_GIT_SERVICE_ID, and per-tenant read-only Secret volumes;
+//   - template guards still refuse malformed provisionToken with
+//     --skip-schema-validation.
+func TestKodemaChartGitServiceDynamicRepositoriesAndProvisionToken(t *testing.T) {
+	helm, charts := stagedCharts(t)
+	chart := filepath.Join(charts, "kodema")
+
+	// 1. Dynamic-only repositories (omitted on tenant-a, empty [] on tenant-b)
+	//    with single-tenant provisionToken.
+	values := cloneWorkloadValues(baseWorkloadValues())
+	workloadMap(values["services"])["enabled"] = false
+	tenants := workloadList(workloadMap(values["gitService"])["tenants"])
+	tenantA := workloadMap(tenants[0])
+	tenantB := workloadMap(tenants[1])
+	delete(tenantA, "repositories")
+	tenantB["repositories"] = []any{}
+	tenantA["provisionToken"] = map[string]any{
+		"existingSecret": "kodema-git-provision-tenant-a",
+		"key":            "provision.token",
+	}
+
+	rendered, err := renderWorkloadValues(t, helm, chart, values)
+	if err != nil {
+		t.Fatalf("helm template dynamic gitService with single provisionToken: %v\n%s", err, rendered)
+	}
+
+	// Neither tenant passes --resource=; only tenant-a passes --provision-token-file.
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		sts := renderedObjectNamed(t, rendered, "StatefulSet", "kodema-git-"+tenant)
+		git := workloadContainer(t, sts, "git")
+		args := containerArgs(t, git)
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "--resource=") {
+				t.Errorf("dynamic gitService %s unexpectedly passed %q", tenant, arg)
+			}
+		}
+		hasProvisionFlag := containsArg(args, "--provision-token-file=/etc/kodema/git-provision/token")
+		if tenant == "tenant-a" && !hasProvisionFlag {
+			t.Errorf("tenant-a missing --provision-token-file flag: %v", args)
+		}
+		if tenant == "tenant-b" && hasProvisionFlag {
+			t.Errorf("tenant-b unexpectedly passed --provision-token-file flag: %v", args)
+		}
+	}
+
+	// Verify tenant-a StatefulSet Secret volume, mount, and NetworkPolicy control-plane ingress.
+	stsA := renderedObjectNamed(t, rendered, "StatefulSet", "kodema-git-tenant-a")
+	provVolA := renderedVolume(t, stsA, "provision-token")
+	provSecretA := objectAtKey(t, provVolA, "secret")
+	if got := stringAtKey(t, provSecretA, "secretName"); got != "kodema-git-provision-tenant-a" {
+		t.Errorf("tenant-a provision-token secretName = %q", got)
+	}
+	provItemsA := sliceAtKey(t, provSecretA, "items")[0].(map[string]any)
+	if stringAtKey(t, provItemsA, "key") != "provision.token" || stringAtKey(t, provItemsA, "path") != "token" {
+		t.Errorf("tenant-a provision-token items = %v", provItemsA)
+	}
+	provMountA := findVolumeMount(t, workloadContainer(t, stsA, "git"), "provision-token")
+	if readOnly, _ := provMountA["readOnly"].(bool); !readOnly || stringAtKey(t, provMountA, "mountPath") != "/etc/kodema/git-provision" {
+		t.Errorf("tenant-a provision-token mount = %v", provMountA)
+	}
+
+	netpolA := renderedObjectNamed(t, rendered, "NetworkPolicy", "kodema-git-tenant-a")
+	ingressA := sliceAtKey(t, objectAtKey(t, netpolA, "spec"), "ingress")
+	if len(ingressA) != 2 {
+		t.Fatalf("tenant-a NetworkPolicy ingress count = %d, want 2 (client + control-plane)", len(ingressA))
+	}
+	cpRule := ingressA[1].(map[string]any)
+	cpPeer := sliceAtKey(t, cpRule, "from")[0].(map[string]any)
+	cpNS := objectAtKey(t, objectAtKey(t, cpPeer, "namespaceSelector"), "matchLabels")
+	cpPod := objectAtKey(t, objectAtKey(t, cpPeer, "podSelector"), "matchLabels")
+	if stringAtKey(t, cpNS, "kubernetes.io/metadata.name") != "kodema-system" ||
+		stringAtKey(t, cpPod, "app.kubernetes.io/name") != "kodema" ||
+		stringAtKey(t, cpPod, "app.kubernetes.io/component") != "control-plane" {
+		t.Errorf("tenant-a control-plane ingress peer = %v", cpPeer)
+	}
+	netpolB := renderedObjectNamed(t, rendered, "NetworkPolicy", "kodema-git-tenant-b")
+	if got := len(sliceAtKey(t, objectAtKey(t, netpolB, "spec"), "ingress")); got != 1 {
+		t.Errorf("tenant-b without provisionToken NetworkPolicy ingress count = %d, want 1", got)
+	}
+
+	// Verify control-plane Deployment default Git companion env vars and single tenant mount.
+	dep := renderedObjectNamed(t, rendered, "Deployment", "kodema")
+	wantDefaultURL := "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443"
+	for name, want := range map[string]string{
+		"KODEMA_GIT_ADMIN_URL":            wantDefaultURL,
+		"KODEMA_GIT_PROVISION_TOKEN_FILE": "/etc/kodema/git-provision/{tenant}/token",
+		"KODEMA_GIT_CA_FILE":              "/etc/kodema/tls/ca.crt",
+		"KODEMA_GIT_PUBLIC_URL":           wantDefaultURL,
+		"KODEMA_GIT_TRUSTED_ORIGINS":      wantDefaultURL,
+	} {
+		if got := stringAtKey(t, renderedEnvEntry(t, dep, name), "value"); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if hasEnvVar(t, dep, "KODEMA_GIT_SERVICE_ID") {
+		t.Error("KODEMA_GIT_SERVICE_ID should not render when gitService.serviceID is empty")
+	}
+	depMountA := findVolumeMount(t, workloadContainer(t, dep, "kodema"), "git-provision-tenant-a")
+	if readOnly, _ := depMountA["readOnly"].(bool); !readOnly || stringAtKey(t, depMountA, "mountPath") != "/etc/kodema/git-provision/tenant-a" {
+		t.Errorf("Deployment git-provision-tenant-a mount = %v", depMountA)
+	}
+
+	// 2. Multi-tenant provisionToken with custom publicURL, serviceID, and trustedOrigins.
+	tenantB["provisionToken"] = map[string]any{
+		"existingSecret": "kodema-git-provision-tenant-b",
+		"key":            "token",
+	}
+	workloadMap(values["gitService"])["publicURL"] = "https://git.example.test/{tenant}"
+	workloadMap(values["gitService"])["serviceID"] = "kodema-git-{tenant}"
+	workloadMap(values["gitService"])["trustedOrigins"] = []any{
+		"https://git.example.test/{tenant}",
+		"https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+	}
+	multiRendered, err := renderWorkloadValues(t, helm, chart, values)
+	if err != nil {
+		t.Fatalf("helm template multi-tenant provisionToken with custom URLs: %v\n%s", err, multiRendered)
+	}
+	multiDep := renderedObjectNamed(t, multiRendered, "Deployment", "kodema")
+	for name, want := range map[string]string{
+		"KODEMA_GIT_PUBLIC_URL":      "https://git.example.test/{tenant}",
+		"KODEMA_GIT_SERVICE_ID":      "kodema-git-{tenant}",
+		"KODEMA_GIT_TRUSTED_ORIGINS": "https://git.example.test/{tenant},https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+	} {
+		if got := stringAtKey(t, renderedEnvEntry(t, multiDep, name), "value"); got != want {
+			t.Errorf("multi-tenant %s = %q, want %q", name, got, want)
+		}
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		mount := findVolumeMount(t, workloadContainer(t, multiDep, "kodema"), "git-provision-"+tenant)
+		if readOnly, _ := mount["readOnly"].(bool); !readOnly || stringAtKey(t, mount, "mountPath") != "/etc/kodema/git-provision/"+tenant {
+			t.Errorf("multi-tenant Deployment mount for %s = %v", tenant, mount)
+		}
+		vol := renderedVolume(t, multiDep, "git-provision-"+tenant)
+		if got := stringAtKey(t, objectAtKey(t, vol, "secret"), "secretName"); got != "kodema-git-provision-"+tenant {
+			t.Errorf("multi-tenant Deployment volume for %s secretName = %q", tenant, got)
+		}
+	}
+
+	// 3. When trustedOrigins is omitted and publicURL differs from workloadGitURL,
+	//    KODEMA_GIT_TRUSTED_ORIGINS carries both deduplicated URLs.
+	delete(workloadMap(values["gitService"]), "trustedOrigins")
+	dedupRendered, err := renderWorkloadValues(t, helm, chart, values)
+	if err != nil {
+		t.Fatalf("helm template deduplicated trustedOrigins: %v\n%s", err, dedupRendered)
+	}
+	dedupDep := renderedObjectNamed(t, dedupRendered, "Deployment", "kodema")
+	wantDedup := "https://git.example.test/{tenant},https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443"
+	if got := stringAtKey(t, renderedEnvEntry(t, dedupDep, "KODEMA_GIT_TRUSTED_ORIGINS"), "value"); got != wantDedup {
+		t.Errorf("deduplicated KODEMA_GIT_TRUSTED_ORIGINS = %q, want %q", got, wantDedup)
+	}
+
+	// 4. Template guard still refuses invalid provisionToken with --skip-schema-validation.
+	bad := cloneWorkloadValues(values)
+	workloadMap(workloadList(workloadMap(bad["gitService"])["tenants"])[0])["provisionToken"] = map[string]any{
+		"existingSecret": "kodema-git-provision-tenant-a",
+		"key":            "../escape",
+	}
+	badOut, badErr := renderWorkloadValuesWithArgs(t, helm, chart, bad, "--skip-schema-validation")
+	if badErr == nil {
+		t.Fatalf("--skip-schema-validation accepted invalid provisionToken.key:\n%s", badOut)
+	}
+	if !strings.Contains(badOut, "provisionToken.key") {
+		t.Errorf("template refusal for invalid provisionToken.key does not mention provisionToken.key:\n%s", badOut)
 	}
 }

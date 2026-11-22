@@ -1,12 +1,14 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime"
 	"github.com/optimiware/kodema/internal/adapter/runtime/containertest"
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube/logframe"
 	"github.com/optimiware/kodema/internal/control/workspace"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
@@ -110,6 +112,7 @@ func (k *kubeConformanceFixture) InspectLaunched(t *testing.T, identity reconcil
 	out := containertest.LaunchedWorkload{
 		WorkingDir:      spec.WorkingDir,
 		Command:         append([]string(nil), spec.Command...),
+		FrameStreams:    spec.ToolboxImage != "",
 		Env:             envMap,
 		EnvList:         envList,
 		Labels:          job.Labels,
@@ -149,13 +152,22 @@ func (k *kubeConformanceFixture) SeedExited(t *testing.T, identity reconcile.Eff
 	k.fake.setPods([]Pod{testTerminatedPod(identity, phase, exitCode)})
 }
 
-func (k *kubeConformanceFixture) AppendLog(t *testing.T, identity reconcile.EffectIdentity, _ reconcile.LogStream, data []byte) {
+func (k *kubeConformanceFixture) AppendLog(t *testing.T, identity reconcile.EffectIdentity, stream reconcile.LogStream, data []byte) {
 	t.Helper()
 	pods := k.fake.podsSnapshot()
 	if len(pods) == 0 {
 		t.Fatal("AppendLog called with no pod seeded")
 	}
-	k.logs = append(k.logs, data...)
+	wireStream := logframe.StreamStdout
+	if stream == reconcile.LogStderr {
+		wireStream = logframe.StreamStderr
+	}
+	var buf bytes.Buffer
+	w := logframe.NewWriter(&buf)
+	if _, err := w.WriteStream(wireStream, data); err != nil {
+		t.Fatalf("logframe.WriteStream: %v", err)
+	}
+	k.logs = append(k.logs, buf.Bytes()...)
 	k.fake.setPodLogs(pods[0].Name, LogStreamCombined, k.logs)
 }
 

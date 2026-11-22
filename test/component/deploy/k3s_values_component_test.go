@@ -42,6 +42,9 @@ func TestK3sReferenceValuesRenderCleanly(t *testing.T) {
 		{"KODEMA_KEY_ADAPTER", "keyfile"},
 		{"KODEMA_KEY_REF", "keyfile:kek-v1"},
 		{"KODEMA_KEYFILE", "/etc/kodema/keyfile/kek-v1.key"},
+		{"KODEMA_TOOLBOX_IMAGE", "ghcr.io/optimiware/kodema/kodema:0.8.2"},
+		{"KODEMA_SECRET_RULES_FILE", "/etc/kodema/secret-rules/secret-rules.json"},
+		{"KODEMA_MODELS_FILE", "/etc/kodema/models/models.json"},
 		{"KODEMA_WORKSPACE_PVC_STORAGE_CLASS", ""},
 	} {
 		pattern := regexp.MustCompile(`(?ms)- name: ` + regexp.QuoteMeta(want.name) + `\s*\r?\n\s*value: "` + regexp.QuoteMeta(want.value) + `"`)
@@ -58,6 +61,20 @@ func TestK3sReferenceValuesRenderCleanly(t *testing.T) {
 
 	if count := renderedKindCount(rendered, "Deployment"); count < 2 {
 		t.Errorf("k3s stack rendered %d Deployments; expected kodema + oauthsonas", count)
+	}
+	_ = renderedObjectNamed(t, rendered, "ConfigMap", "kodema-secret-rules")
+	_ = renderedObjectNamed(t, rendered, "ConfigMap", "kodema-models")
+
+	// Passing an explicit image.digest still pins KODEMA_TOOLBOX_IMAGE by digest.
+	digest := "sha256:" + strings.Repeat("b", 64)
+	pinned, err := renderChartArgs(t, helm, "kodema", stack, "--namespace", "kodema-system", "-f", valuesFile,
+		"--set", "kodema.image.digest="+digest)
+	if err != nil {
+		t.Fatalf("helm template kodema-stack with digest override: %v\n%s", err, pinned)
+	}
+	pinnedDep := renderedObjectNamed(t, pinned, "Deployment", "kodema")
+	if got := stringAtKey(t, renderedEnvEntry(t, pinnedDep, "KODEMA_TOOLBOX_IMAGE"), "value"); got != "ghcr.io/optimiware/kodema/kodema@"+digest {
+		t.Errorf("k3s KODEMA_TOOLBOX_IMAGE with digest = %q, want ghcr.io/optimiware/kodema/kodema@%s", got, digest)
 	}
 }
 

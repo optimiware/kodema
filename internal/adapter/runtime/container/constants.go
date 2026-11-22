@@ -73,4 +73,10 @@ const (
 	LabelPreparation = "kodema.dev/preparation"
 	// LabelRetained marks a retained workspace resource.
 	LabelRetained = "kodema.dev/retained"
+	// LabelCacheKey carries the scoped cache key (32-char lowercase hex digest)
+	// on a persistent named cache volume or PersistentVolumeClaim.
+	LabelCacheKey = "kodema.dev/cache-key"
+	// LabelCache carries the informational cache slug when it is a valid label
+	// value.
+	LabelCache = "kodema.dev/cache"
 )

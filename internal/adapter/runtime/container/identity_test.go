@@ -68,11 +68,16 @@ func TestPinnedConstants(t *testing.T) {
 		"idempotency": LabelIdempotencyKey,
 		"preparation": LabelPreparation,
 		"retained":    LabelRetained,
+		"cache-key":   LabelCacheKey,
+		"cache":       LabelCache,
 	}
 	for name, key := range labels {
 		if !strings.HasPrefix(key, "kodema.dev/") {
 			t.Errorf("label %s = %q; want kodema.dev/ prefix", name, key)
 		}
+	}
+	if LabelCacheKey != "kodema.dev/cache-key" || LabelCache != "kodema.dev/cache" {
+		t.Errorf("cache labels = (%q, %q); want (kodema.dev/cache-key, kodema.dev/cache)", LabelCacheKey, LabelCache)
 	}
 	if RoleSandbox != "sandbox" {
 		t.Errorf("RoleSandbox = %q; want sandbox", RoleSandbox)
@@ -172,5 +177,53 @@ func TestStableDigestAndDescribeIdentity(t *testing.T) {
 	want := `workload "workload-1" (execution "exec-1" action "act-1")`
 	if desc != want {
 		t.Fatalf("DescribeIdentity = %q; want %q", desc, want)
+	}
+}
+
+func TestCacheResourceName(t *testing.T) {
+	validKey := "0123456789abcdef0123456789abcdef"
+	name, err := CacheResourceName(validKey)
+	if err != nil {
+		t.Fatalf("CacheResourceName(32-hex) = %v; want nil", err)
+	}
+	want := "kodema-cache-" + validKey
+	if name != want {
+		t.Fatalf("CacheResourceName = %q; want %q", name, want)
+	}
+	name2, err := CacheResourceName(validKey)
+	if err != nil || name2 != name {
+		t.Fatalf("CacheResourceName is not deterministic: %q vs %q (%v)", name, name2, err)
+	}
+
+	// Boundary valid lengths: 16 hex chars (minimum) and 50 hex chars (63-char total name).
+	if got, err := CacheResourceName(strings.Repeat("a", 16)); err != nil || got != "kodema-cache-"+strings.Repeat("a", 16) {
+		t.Fatalf("CacheResourceName(16-hex) = (%q, %v)", got, err)
+	}
+	if got, err := CacheResourceName(strings.Repeat("b", 50)); err != nil || len(got) != 63 {
+		t.Fatalf("CacheResourceName(50-hex) = (%q len=%d, %v); want len 63", got, len(got), err)
+	}
+
+	invalid := []struct {
+		name string
+		key  string
+	}{
+		{name: "empty", key: ""},
+		{name: "too short (15 hex)", key: strings.Repeat("a", 15)},
+		{name: "too long for 63-char name (51 hex)", key: strings.Repeat("a", 51)},
+		{name: "too long (65 hex)", key: strings.Repeat("a", 65)},
+		{name: "uppercase hex", key: strings.Repeat("A", 32)},
+		{name: "mixed-case hex", key: "0123456789ABCDEF0123456789abcdef"},
+		{name: "non-hex letter", key: strings.Repeat("g", 32)},
+		{name: "hyphen", key: "0123456789abcdef-0123456789abcde"},
+		{name: "whitespace", key: "0123456789abcdef 0123456789abcde"},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := CacheResourceName(tc.key)
+			if err == nil {
+				t.Fatalf("CacheResourceName(%q) = %q; want InvalidInput", tc.key, got)
+			}
+			assertFaultClass(t, err, fault.InvalidInput)
+		})
 	}
 }

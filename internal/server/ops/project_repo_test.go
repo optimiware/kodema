@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/control/identity"
 	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/id"
 	opsapp "github.com/optimiware/kodema/internal/server/ops"
 	"github.com/optimiware/kodema/internal/transport/ops"
 )
@@ -21,21 +23,29 @@ type fakeRepositoryProvisioner struct {
 	calls          []opsapp.RepositoryProvisionRequest
 	created        map[string]bool
 	failErr        error
+	omitCloneURL   bool
 }
 
-func (f *fakeRepositoryProvisioner) DefaultServiceID() string {
-	return f.serviceID
+func (f *fakeRepositoryProvisioner) DefaultServiceID(tenantID id.TenantID) string {
+	return strings.ReplaceAll(f.serviceID, "{tenant}", string(tenantID))
 }
 
-func (f *fakeRepositoryProvisioner) DefaultTrustedOrigins() []string {
-	return append([]string(nil), f.trustedOrigins...)
+func (f *fakeRepositoryProvisioner) DefaultTrustedOrigins(tenantID id.TenantID) []string {
+	if len(f.trustedOrigins) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(f.trustedOrigins))
+	for _, origin := range f.trustedOrigins {
+		out = append(out, strings.ReplaceAll(origin, "{tenant}", string(tenantID)))
+	}
+	return out
 }
 
-func (f *fakeRepositoryProvisioner) CloneURL(repository string) string {
+func (f *fakeRepositoryProvisioner) CloneURL(tenantID id.TenantID, repository string) string {
 	if f.publicGitURL == "" {
 		return ""
 	}
-	return f.publicGitURL + "/" + repository + ".git"
+	return strings.ReplaceAll(f.publicGitURL, "{tenant}", string(tenantID)) + "/" + repository + ".git"
 }
 
 func (f *fakeRepositoryProvisioner) ProvisionRepository(_ context.Context, req opsapp.RepositoryProvisionRequest) (opsapp.RepositoryProvisionResult, error) {
@@ -48,10 +58,14 @@ func (f *fakeRepositoryProvisioner) ProvisionRepository(_ context.Context, req o
 	}
 	wasCreated := !f.created[req.Repository]
 	f.created[req.Repository] = true
+	cloneURL := ""
+	if !f.omitCloneURL {
+		cloneURL = f.CloneURL(req.TenantID, req.Repository)
+	}
 	return opsapp.RepositoryProvisionResult{
 		Repository:    req.Repository,
 		DefaultBranch: req.DefaultBranch,
-		CloneURL:      f.CloneURL(req.Repository),
+		CloneURL:      cloneURL,
 		Created:       wasCreated,
 	}, nil
 }
@@ -674,5 +688,65 @@ func TestRepositoryCreateCompensatesBindingOnPermanentProvisionFailureAndRetries
 	decodeResult(t, retryRaw, &converged)
 	if converged.Name != "retry/repo" || converged.Version != 1 || !converged.Created {
 		t.Fatalf("converged = %+v; want retry/repo v1 created=true", converged)
+	}
+}
+
+// TestRepositoryCreateAndListPassTenantIDToProvisionerTemplates verifies that
+// repository.create and repository.list pass call.Scope.TenantID to
+// DefaultServiceID, DefaultTrustedOrigins, and CloneURL (including when
+// ProvisionRepository returns an empty CloneURL fallback).
+func TestRepositoryCreateAndListPassTenantIDToProvisionerTemplates(t *testing.T) {
+	provisioner := &fakeRepositoryProvisioner{
+		serviceID:      "kodema-git-{tenant}",
+		trustedOrigins: []string{"https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443"},
+		publicGitURL:   "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+		omitCloneURL:   true,
+	}
+	h := newHarnessWithProvisioner(t, provisioner)
+	if _, err := h.invokeKey(t, "token-admin", "tenant.create",
+		`{"tenant_id":"`+testTenant+`","name":"Tenant A"}`, "mt-tenant", nil); err != nil {
+		t.Fatalf("tenant.create: %v", err)
+	}
+	if _, err := h.invokeKey(t, "token-admin", "project.create",
+		`{"project_id":"`+testProject+`","name":"Project A"}`, "mt-proj", nil); err != nil {
+		t.Fatalf("project.create: %v", err)
+	}
+	wantServiceID := "kodema-git-" + testTenant
+	if _, err := h.invokeKey(t, testToken, "service.create",
+		`{"project_id":"`+testProject+`","service_id":"`+wantServiceID+`","roles":["viewer"]}`, "mt-svc", nil); err != nil {
+		t.Fatalf("service.create: %v", err)
+	}
+
+	createRaw, err := h.invokeKey(t, "token-admin", "repository.create",
+		`{"project_id":"`+testProject+`","name":"core/app"}`, "mt-repo-create", nil)
+	if err != nil {
+		t.Fatalf("repository.create: %v", err)
+	}
+	var created api.RepositoryCreateResult
+	decodeResult(t, createRaw, &created)
+	wantOrigin := "https://kodema-git-" + testTenant + ".kodema-system.svc.cluster.local:8443"
+	wantCloneURL := wantOrigin + "/core/app.git"
+	if created.EnforcingService != wantServiceID {
+		t.Fatalf("created.EnforcingService = %q; want %q", created.EnforcingService, wantServiceID)
+	}
+	if !reflect.DeepEqual(created.TrustedOrigins, []string{wantOrigin}) {
+		t.Fatalf("created.TrustedOrigins = %v; want [%s]", created.TrustedOrigins, wantOrigin)
+	}
+	if created.CloneURL != wantCloneURL {
+		t.Fatalf("created.CloneURL = %q; want %q", created.CloneURL, wantCloneURL)
+	}
+
+	listRaw, err := h.invoke(t, testToken, "repository.list", `{"project_id":"`+testProject+`"}`, nil)
+	if err != nil {
+		t.Fatalf("repository.list: %v", err)
+	}
+	var listed api.RepositoryListResult
+	decodeResult(t, listRaw, &listed)
+	if len(listed.Repositories) != 1 {
+		t.Fatalf("repository.list count = %d; want 1", len(listed.Repositories))
+	}
+	repo := listed.Repositories[0]
+	if repo.EnforcingService != wantServiceID || repo.CloneURL != wantCloneURL || !reflect.DeepEqual(repo.TrustedOrigins, []string{wantOrigin}) {
+		t.Fatalf("listed repo = %+v; want service=%q clone_url=%q origins=[%q]", repo, wantServiceID, wantCloneURL, wantOrigin)
 	}
 }

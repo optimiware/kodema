@@ -10,6 +10,7 @@ import (
 	"net/url"
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube/logframe"
 	"github.com/optimiware/kodema/internal/fault"
 )
 
@@ -133,9 +134,11 @@ func (wire podWire) pod(operation string) (runtimekube.Pod, error) {
 	}, nil
 }
 
-// ReadPodLogs reads one bounded page of the combined pod log. The offset is
-// applied by discarding exactly that many bytes, so the caller's continuation
-// cursor is one byte position in the interleaved stream.
+// ReadPodLogs reads one bounded page of the pod log from the portable
+// `?container=workload&follow=false` endpoint. When request.Stream is
+// LogStreamSplit, framed stdout/stderr records are demultiplexed in a single
+// streaming pass (unframed lines fall back verbatim to stdout). When
+// request.Stream is LogStreamCombined, raw bytes are paged directly by offset.
 func (c *Cluster) ReadPodLogs(
 	ctx context.Context,
 	namespace, pod string,
@@ -145,17 +148,17 @@ func (c *Cluster) ReadPodLogs(
 		return runtimekube.PodLogPage{}, fault.New(fault.InvalidInput,
 			"kubernetes log read limit is outside the bounded range")
 	}
-	if request.Offset < 0 {
+	if request.Offset < 0 || request.StderrOffset < 0 {
 		return runtimekube.PodLogPage{}, fault.New(fault.InvalidInput,
 			"kubernetes log read offset is negative")
 	}
-	// The log API can separate the two streams only behind the alpha
+	// The log API can separate the two streams natively only behind the alpha
 	// PodLogsQuerySplitStreams gate, which stock clusters leave off and which
-	// rejects the stream parameter otherwise. The one combined log is the
-	// portable read; the seam names it "combined".
-	if request.Stream != runtimekube.LogStreamCombined {
+	// rejects the stream parameter otherwise. Both LogStreamCombined and
+	// LogStreamSplit use the same portable endpoint with no `stream` query.
+	if request.Stream != runtimekube.LogStreamCombined && request.Stream != runtimekube.LogStreamSplit {
 		return runtimekube.PodLogPage{}, fault.New(fault.InvalidInput,
-			"kubernetes log read stream must be the combined log")
+			"kubernetes log read stream must be combined or split")
 	}
 	query := url.Values{}
 	query.Set("container", workloadContainerName)
@@ -171,6 +174,21 @@ func (c *Cluster) ReadPodLogs(
 	if response.StatusCode != http.StatusOK {
 		_, _ = io.CopyN(io.Discard, response.Body, errorDrainBytes)
 		return runtimekube.PodLogPage{}, podLogStatusError(response.StatusCode)
+	}
+
+	if request.Stream == runtimekube.LogStreamSplit {
+		demuxed, err := logframe.Demux(response.Body, request.Offset, request.StderrOffset, request.Limit)
+		if err != nil {
+			return runtimekube.PodLogPage{}, ambiguousRequest("read Pod logs", requestCtx, err)
+		}
+		return runtimekube.PodLogPage{
+			Data:             demuxed.Stdout,
+			NextOffset:       demuxed.StdoutNext,
+			Truncated:        demuxed.StdoutTruncated,
+			StderrData:       demuxed.Stderr,
+			StderrNextOffset: demuxed.StderrNext,
+			StderrTruncated:  demuxed.StderrTruncated,
+		}, nil
 	}
 
 	if request.Offset > 0 {

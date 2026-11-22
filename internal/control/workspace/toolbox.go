@@ -52,6 +52,11 @@ type Launch struct {
 	// Outputs reports that the action declares outputs, so its output
 	// directory is mounted writable.
 	Outputs bool
+	// FrameStreams wraps the toolbox shell invocation in `kodema _frame --` so
+	// runtimes whose container log endpoint merges stdout and stderr (such as
+	// Kubernetes) can demultiplex both streams cleanly. Ignored when Toolbox is
+	// false.
+	FrameStreams bool
 }
 
 // Entrypoint returns the entrypoint that runs the Kernel's script at
@@ -59,8 +64,10 @@ type Launch struct {
 // nothing else. With one, the shell appends ToolboxRoot to the image's own
 // PATH, never replacing it and never leading with an empty element, and runs
 // the script; when the action also declares outputs and the script exited
-// zero, the shell is replaced by `kodema output push`. The exit status is the
-// script's when it failed and the push's otherwise.
+// zero, the shell is replaced by `kodema output push`. When FrameStreams is
+// also set, the toolbox's stateless stream-framing wrapper runs the shell and
+// tags stdout/stderr lines while forwarding signals and preserving exit status.
+// The exit status is the script's when it failed and the push's otherwise.
 func Entrypoint(scriptPath string, launch Launch) []string {
 	if !launch.Toolbox {
 		return []string{script.ShellPath, scriptPath}
@@ -70,6 +77,9 @@ func Entrypoint(scriptPath string, launch Launch) []string {
 		command += script.ShellPath + " " + scriptPath + " && exec " + ToolboxPath + " output push"
 	} else {
 		command += "exec " + script.ShellPath + " " + scriptPath
+	}
+	if launch.FrameStreams {
+		return []string{ToolboxPath, "_frame", "--", script.ShellPath, "-c", command}
 	}
 	return []string{script.ShellPath, "-c", command}
 }

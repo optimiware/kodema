@@ -29,8 +29,10 @@ kodema:
   image:
     repository: ghcr.io/optimiware/kodema/kodema
     tag: "0.8.2"
-    # Set digest (sha256:<64 hex>) to enable the /kodema/bin/kodema workload
-    # toolbox initContainer (required for `kodema output push` in pipelines).
+    # In environment: "test", leaving digest empty falls back
+    # KODEMA_TOOLBOX_IMAGE to repository:tag so the /kodema/bin/kodema workload
+    # toolbox initContainer works out of the box. Set digest (sha256:<64 hex>)
+    # to pin both the control plane and toolbox by digest (required in production).
     digest: ""
     pullPolicy: IfNotPresent
   config:
@@ -48,6 +50,14 @@ kodema:
       accessMode: "ReadWriteOnce"
     workloadCA:
       secretName: "kodema-workload-ca"
+    # In environment: "test", config.secretRules defaults to allowAllInTest: true
+    # and generates an allow_all rule for every declared tenant in
+    # ConfigMap/kodema-secret-rules (set allowAllInTest: false to stay fail-closed).
+    # Enable the built-in openai, anthropic, and opencode LLM proxy providers
+    # (ConfigMap/kodema-models); provider API keys live in Kodema's encrypted DB
+    # secrets, never in Helm values.
+    models:
+      defaultProviders: true
     extraEnv:
       KODEMA_OIDC_ISSUER: "https://oauthsonas.kodema-system.svc.cluster.local:8443"
       KODEMA_OIDC_AUDIENCE: "https://kodema.kodema-system.svc.cluster.local:8443"

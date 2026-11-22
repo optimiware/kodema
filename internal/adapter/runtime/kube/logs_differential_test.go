@@ -4,6 +4,7 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math/rand"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime/container"
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube/logframe"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 )
 
@@ -73,8 +75,8 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 			if forwarded.Limit != limit {
 				t.Fatalf("fixture %d forwarded limit %d; want %d", fixtures, forwarded.Limit, limit)
 			}
-			if forwarded.Stream != LogStreamCombined {
-				t.Fatalf("fixture %d forwarded stream %q; want combined", fixtures, forwarded.Stream)
+			if forwarded.Stream != LogStreamSplit {
+				t.Fatalf("fixture %d forwarded stream %q; want split", fixtures, forwarded.Stream)
 			}
 
 			next, _ := container.DecodeLogCursor(batch.NextOffset)
@@ -182,6 +184,124 @@ func TestLogsPagedOutputMatchesFullLogReference(t *testing.T) {
 		t.Fatalf("differential corpus had %d fixtures; want at least 100000", fixtures)
 	}
 	t.Logf("differential corpus: %d fixtures", fixtures)
+}
+
+// TestLogsFramedDualStreamDifferentialRedaction proves that interleaving
+// stdout and stderr frames (including secrets split across stdout writes with
+// stderr frames in between) still redacts both streams identically to a
+// whole-stream reference scan with zero plaintext leaks across every page bound.
+func TestLogsFramedDualStreamDifferentialRedaction(t *testing.T) {
+	fake, _, adapter := testSetup(t)
+	identity := testIdentity()
+	pod := testRunningPod(identity)
+	fake.addPod(pod)
+	secretName := credentialSecretName(identity.WorkloadID)
+	ctx := context.Background()
+
+	rng := rand.New(rand.NewSource(20261122))
+	for iter := range 2000 {
+		limit := 1 + rng.Intn(32)
+		maxValue := min(limit, 6)
+		seen := make(map[string]bool)
+		values := make([]string, 0, 3)
+		possible := (1 << (maxValue + 1)) - 2
+		wantValues := min(1+rng.Intn(3), possible)
+		for len(values) < wantValues {
+			value := randomWord(rng, "ab", 1+rng.Intn(maxValue))
+			if seen[value] {
+				continue
+			}
+			seen[value] = true
+			values = append(values, value)
+		}
+
+		stdoutLog := []byte(randomWord(rng, "ab", rng.Intn(35)))
+		stderrLog := []byte(randomWord(rng, "ab", rng.Intn(35)))
+
+		// Interleave small partial writes (splitting secrets across stdout
+		// writes with stderr writes in between).
+		var wire bytes.Buffer
+		w := logframe.NewWriter(&wire)
+		outIdx, errIdx := 0, 0
+		for outIdx < len(stdoutLog) || errIdx < len(stderrLog) {
+			if outIdx < len(stdoutLog) {
+				step := 1 + rng.Intn(3)
+				end := min(outIdx+step, len(stdoutLog))
+				_, _ = w.WriteStream(logframe.StreamStdout, stdoutLog[outIdx:end])
+				outIdx = end
+			}
+			if errIdx < len(stderrLog) {
+				step := 1 + rng.Intn(3)
+				end := min(errIdx+step, len(stderrLog))
+				_, _ = w.WriteStream(logframe.StreamStderr, stderrLog[errIdx:end])
+				errIdx = end
+			}
+		}
+
+		secret := Secret{
+			Name:      secretName,
+			Namespace: testNamespace,
+			Data:      make(map[string][]byte, len(values)),
+		}
+		for index, value := range values {
+			secret.Data[fmt.Sprintf("V%d", index)] = []byte(value)
+		}
+		if _, err := fake.PutSecret(ctx, secret); err != nil {
+			t.Fatalf("iter %d PutSecret: %v", iter, err)
+		}
+		fake.setPodLogs(pod.Name, LogStreamCombined, wire.Bytes())
+		fake.resetCallLog()
+
+		cursor := int64(0)
+		var gotOut, gotErr []byte
+		for step := 0; ; step++ {
+			if step > len(stdoutLog)+len(stderrLog)+8 {
+				t.Fatalf("iter %d did not terminate", iter)
+			}
+			batch, err := adapter.Logs(ctx, reconcile.LogsRequest{
+				Identity:    identity,
+				AfterOffset: cursor,
+				Limit:       limit,
+			})
+			if err != nil {
+				t.Fatalf("iter %d Logs: %v", iter, err)
+			}
+			for _, chunk := range batch.Chunks {
+				if len(chunk.Data) > limit {
+					t.Fatalf("iter %d emitted %d bytes > limit %d", iter, len(chunk.Data), limit)
+				}
+				text := string(chunk.Data)
+				for _, value := range values {
+					if strings.Contains(text, value) {
+						t.Fatalf("iter %d leaked %q on %s in %q", iter, value, chunk.Stream, text)
+					}
+				}
+				switch chunk.Stream {
+				case reconcile.LogStdout:
+					gotOut = append(gotOut, chunk.Data...)
+				case reconcile.LogStderr:
+					gotErr = append(gotErr, chunk.Data...)
+				default:
+					t.Fatalf("iter %d unexpected stream %q", iter, chunk.Stream)
+				}
+			}
+			if batch.NextOffset == cursor {
+				break
+			}
+			cursor = batch.NextOffset
+		}
+
+		wantOut := referenceRedaction(stdoutLog, values, limit)
+		wantErr := referenceRedaction(stderrLog, values, limit)
+		if string(gotOut) != wantOut {
+			t.Fatalf("iter %d stdout = %q; reference = %q (values=%q raw=%q limit=%d)",
+				iter, gotOut, wantOut, values, stdoutLog, limit)
+		}
+		if string(gotErr) != wantErr {
+			t.Fatalf("iter %d stderr = %q; reference = %q (values=%q raw=%q limit=%d)",
+				iter, gotErr, wantErr, values, stderrLog, limit)
+		}
+	}
 }
 
 func randomWord(rng *rand.Rand, alphabet string, length int) string {

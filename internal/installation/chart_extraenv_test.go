@@ -127,6 +127,7 @@ func checkExtraEnvGuard(deployment, guard string) error {
 		{`regexMatch[ \t]+"\^\(SCW\|AWS\|GOOGLE\)_"`, "cloud credential refusal"},
 		{`regexMatch[ \t]+"\(\?i\)\(token\|secret\|password\|passwd\|credential\|private\|key\)"`, "credential-shaped name refusal"},
 		{`regexMatch[ \t]+"_FILE\$"`, "mounted file exception"},
+		{`regexMatch[ \t]+"_ENDPOINT\$"`, "public endpoint exception"},
 		{`regexMatch[ \t]+\$allowlist`, "allowlist enforcement"},
 		{`regexMatch[ \t]+":\/\/\[\^/@\]\*:\[\^@\]\*@"`, "URL userinfo refusal"},
 	} {
@@ -164,6 +165,7 @@ func TestExtraEnvSchemaAllowlistIsExact(t *testing.T) {
 		"SCW_SECRET_KEY",
 		"AWS_ACCESS_KEY_ID",
 		"KODEMA_OIDC_TOKEN",
+		"KODEMA_FAKE_TOKEN_ENDPOINT",
 		"KODEMA_SECRET_VALUE",
 		"KODEMA_PRIVATE_KEY",
 		"KODEMA_OIDC_ISSUER_EXTRA",

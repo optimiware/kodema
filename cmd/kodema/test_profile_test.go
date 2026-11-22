@@ -1121,4 +1121,26 @@ func TestBuildTestProfileKubernetesRuntime(t *testing.T) {
 			t.Fatalf("err = %v; want refusal naming KODEMA_RUNTIME", err)
 		}
 	})
+
+	t.Run("accepts tag-referenced KODEMA_TOOLBOX_IMAGE in kubernetes test profile", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		fixture.values["KODEMA_TOOLBOX_IMAGE"] = "ghcr.io/optimiware/kodema:v0.2.0-test"
+		if _, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube); err != nil {
+			t.Fatalf("buildTestProfileWithKube with tagged toolbox: %v", err)
+		}
+		// Multi-tenant path also accepts tag-referenced toolbox image.
+		delete(fixture.values, "KODEMA_TENANT")
+		fixture.values["KODEMA_TENANTS"] = `["tenant-a","tenant-b"]`
+		if _, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube); err != nil {
+			t.Fatalf("buildTestProfileWithKube multi-tenant with tagged toolbox: %v", err)
+		}
+	})
+
+	t.Run("refuses tagless KODEMA_TOOLBOX_IMAGE in kubernetes test profile", func(t *testing.T) {
+		fixture, kube := newKubeFixture(t)
+		fixture.values["KODEMA_TOOLBOX_IMAGE"] = "ghcr.io/optimiware/kodema"
+		if _, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube); err == nil {
+			t.Fatal("buildTestProfileWithKube accepted bare tagless toolbox image")
+		}
+	})
 }

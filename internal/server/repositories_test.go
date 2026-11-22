@@ -3,11 +3,14 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -44,6 +47,17 @@ func TestGitCompanionConfigValidate(t *testing.T) {
 		full.TrustedOrigins = []string{"https://127.0.0.1:8443", "https://kodema.example.com/"}
 		if err := full.validate(); err != nil {
 			t.Fatalf("full validate() = %v; want nil", err)
+		}
+
+		multiTenant := GitCompanionConfig{
+			AdminURL:       "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+			PublicGitURL:   "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+			ServiceID:      "kodema-git-{tenant}",
+			TrustedOrigins: []string{"https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443"},
+			TokenFile:      "/etc/kodema/git-provision/{tenant}/token",
+		}
+		if err := multiTenant.validate(); err != nil {
+			t.Fatalf("multiTenant validate() = %v; want nil", err)
 		}
 	})
 
@@ -145,6 +159,21 @@ func TestGitCompanionConfigValidate(t *testing.T) {
 		{
 			name:   "trusted origin with userinfo",
 			mutate: func(c *GitCompanionConfig) { c.TrustedOrigins = []string{"https://user@kodema.example.com"} },
+			want:   "trusted origin",
+		},
+		{
+			name:   "templated public git URL with query",
+			mutate: func(c *GitCompanionConfig) { c.PublicGitURL = "https://kodema-git-{tenant}.svc:8443?x=1" },
+			want:   "public git URL",
+		},
+		{
+			name:   "templated service ID with slash",
+			mutate: func(c *GitCompanionConfig) { c.ServiceID = "kodema-git/{tenant}" },
+			want:   "service ID",
+		},
+		{
+			name:   "templated non-https trusted origin",
+			mutate: func(c *GitCompanionConfig) { c.TrustedOrigins = []string{"http://kodema-git-{tenant}.svc:8443"} },
 			want:   "trusted origin",
 		},
 	}
@@ -325,5 +354,305 @@ func TestHTTPRepositoryProvisionerIgnoresEnvironmentProxies(t *testing.T) {
 	}
 	if got := companionHits.Load(); got != 1 {
 		t.Fatalf("companion received %d requests; want 1", got)
+	}
+}
+
+type repoRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f repoRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func TestHTTPRepositoryProvisionerTenantTemplateExpansionAndBackwardCompat(t *testing.T) {
+	t.Run("multi-tenant placeholders expand per tenant with deduplication and slice isolation", func(t *testing.T) {
+		p, err := newHTTPRepositoryProvisioner(Config{
+			GitCompanion: &GitCompanionConfig{
+				AdminURL:     "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+				PublicGitURL: "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443/",
+				ServiceID:    "kodema-git-{tenant}",
+				TrustedOrigins: []string{
+					"https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443/",
+					"https://kodema-git-tenant-a.kodema-system.svc.cluster.local:8443",
+					"https://kodema.example.com",
+				},
+				TokenFile: "/etc/kodema/git-provision/{tenant}/token",
+			},
+		})
+		if err != nil {
+			t.Fatalf("newHTTPRepositoryProvisioner: %v", err)
+		}
+		t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+		if got := p.DefaultServiceID("tenant-a"); got != "kodema-git-tenant-a" {
+			t.Fatalf("DefaultServiceID(tenant-a) = %q; want kodema-git-tenant-a", got)
+		}
+		if got := p.DefaultServiceID("tenant-b"); got != "kodema-git-tenant-b" {
+			t.Fatalf("DefaultServiceID(tenant-b) = %q; want kodema-git-tenant-b", got)
+		}
+		if got := p.DefaultServiceID(""); got != "kodema-git-{tenant}" {
+			t.Fatalf("DefaultServiceID(empty) = %q; want unexpanded template", got)
+		}
+
+		originsA := p.DefaultTrustedOrigins("tenant-a")
+		wantOriginsA := []string{
+			"https://kodema-git-tenant-a.kodema-system.svc.cluster.local:8443",
+			"https://kodema.example.com",
+		}
+		if !reflect.DeepEqual(originsA, wantOriginsA) {
+			t.Fatalf("DefaultTrustedOrigins(tenant-a) = %v; want %v (deduplicated)", originsA, wantOriginsA)
+		}
+		// Mutating returned slice must not affect subsequent calls.
+		originsA[0] = "https://mutated.invalid"
+
+		originsB := p.DefaultTrustedOrigins("tenant-b")
+		wantOriginsB := []string{
+			"https://kodema-git-tenant-b.kodema-system.svc.cluster.local:8443",
+			"https://kodema-git-tenant-a.kodema-system.svc.cluster.local:8443",
+			"https://kodema.example.com",
+		}
+		if !reflect.DeepEqual(originsB, wantOriginsB) {
+			t.Fatalf("DefaultTrustedOrigins(tenant-b) = %v; want %v", originsB, wantOriginsB)
+		}
+
+		if got := p.CloneURL("tenant-a", "team/repo"); got != "https://kodema-git-tenant-a.kodema-system.svc.cluster.local:8443/team/repo.git" {
+			t.Fatalf("CloneURL(tenant-a) = %q", got)
+		}
+		if got := p.CloneURL("tenant-b", "/team/repo.git"); got != "https://kodema-git-tenant-b.kodema-system.svc.cluster.local:8443/team/repo.git" {
+			t.Fatalf("CloneURL(tenant-b) = %q", got)
+		}
+	})
+
+	t.Run("single-tenant configs without placeholders preserve exact behavior", func(t *testing.T) {
+		p, err := newHTTPRepositoryProvisioner(Config{
+			GitCompanion: &GitCompanionConfig{
+				AdminURL:       "http://kodema-default-git:8081",
+				PublicGitURL:   "https://127.0.0.1:8443/git",
+				ServiceID:      "",
+				TrustedOrigins: []string{"https://127.0.0.1:8443"},
+				TokenFile:      "/run/secrets/git-provision-token",
+			},
+		})
+		if err != nil {
+			t.Fatalf("newHTTPRepositoryProvisioner: %v", err)
+		}
+		t.Cleanup(func() { _ = p.Close(context.Background()) })
+
+		if got := p.DefaultServiceID("tenant-a"); got != "git" {
+			t.Fatalf("DefaultServiceID = %q; want git", got)
+		}
+		if got := p.DefaultTrustedOrigins("tenant-a"); !reflect.DeepEqual(got, []string{"https://127.0.0.1:8443"}) {
+			t.Fatalf("DefaultTrustedOrigins = %v; want [https://127.0.0.1:8443]", got)
+		}
+		if got := p.CloneURL("tenant-a", "shop/web"); got != "https://127.0.0.1:8443/git/shop/web.git" {
+			t.Fatalf("CloneURL = %q; want https://127.0.0.1:8443/git/shop/web.git", got)
+		}
+	})
+}
+
+func TestHTTPRepositoryProvisionerMultiTenantTokenAndRouting(t *testing.T) {
+	tmp := t.TempDir()
+	for tenant, secret := range map[string]string{
+		"tenant-a": "provision-token-alpha",
+		"tenant-b": "provision-token-beta",
+	} {
+		dir := filepath.Join(tmp, "git-provision", tenant)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "token"), []byte(secret+"\n"), 0o600); err != nil {
+			t.Fatalf("write token for %s: %v", tenant, err)
+		}
+	}
+
+	type observedReq struct {
+		url  string
+		auth string
+	}
+	var (
+		mu       sync.Mutex
+		observed []observedReq
+	)
+	rt := repoRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		observed = append(observed, observedReq{
+			url:  r.URL.String(),
+			auth: r.Header.Get("Authorization"),
+		})
+		mu.Unlock()
+
+		var expectedAuth string
+		switch r.URL.Host {
+		case "kodema-git-tenant-a.kodema-system.svc.cluster.local:8443":
+			expectedAuth = "Bearer provision-token-alpha"
+		case "kodema-git-tenant-b.kodema-system.svc.cluster.local:8443":
+			expectedAuth = "Bearer provision-token-beta"
+		default:
+			t.Errorf("unexpected host %q", r.URL.Host)
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{}`)),
+			}, nil
+		}
+		if r.Header.Get("Authorization") != expectedAuth {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"code":"unauthenticated","message":"wrong token"}`)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"created":true}`)),
+		}, nil
+	})
+
+	p, err := newHTTPRepositoryProvisioner(Config{
+		GitCompanion: &GitCompanionConfig{
+			AdminURL:       "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+			PublicGitURL:   "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+			ServiceID:      "kodema-git-{tenant}",
+			TrustedOrigins: []string{"https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443"},
+			TokenFile:      filepath.Join(tmp, "git-provision", "{tenant}", "token"),
+			RoundTripper:   rt,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newHTTPRepositoryProvisioner: %v", err)
+	}
+
+	resA, err := p.ProvisionRepository(context.Background(), opsapp.RepositoryProvisionRequest{
+		TenantID:      id.TenantID("tenant-a"),
+		ProjectID:     id.ProjectID("proj-a"),
+		Repository:    "alpha/service",
+		ResourceID:    "git-alpha-service",
+		DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("ProvisionRepository(tenant-a): %v", err)
+	}
+	if resA.CloneURL != "https://kodema-git-tenant-a.kodema-system.svc.cluster.local:8443/alpha/service.git" {
+		t.Fatalf("resA.CloneURL = %q", resA.CloneURL)
+	}
+
+	resB, err := p.ProvisionRepository(context.Background(), opsapp.RepositoryProvisionRequest{
+		TenantID:      id.TenantID("tenant-b"),
+		ProjectID:     id.ProjectID("proj-b"),
+		Repository:    "beta/worker",
+		ResourceID:    "git-beta-worker",
+		DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("ProvisionRepository(tenant-b): %v", err)
+	}
+	if resB.CloneURL != "https://kodema-git-tenant-b.kodema-system.svc.cluster.local:8443/beta/worker.git" {
+		t.Fatalf("resB.CloneURL = %q", resB.CloneURL)
+	}
+
+	wantObserved := []observedReq{
+		{
+			url:  "https://kodema-git-tenant-a.kodema-system.svc.cluster.local:8443/_kodema/repositories",
+			auth: "Bearer provision-token-alpha",
+		},
+		{
+			url:  "https://kodema-git-tenant-b.kodema-system.svc.cluster.local:8443/_kodema/repositories",
+			auth: "Bearer provision-token-beta",
+		},
+	}
+	if !reflect.DeepEqual(observed, wantObserved) {
+		t.Fatalf("observed requests = %+v; want %+v", observed, wantObserved)
+	}
+}
+
+func TestHTTPRepositoryProvisionerRejectsInvalidTenantIDForTemplates(t *testing.T) {
+	tmp := t.TempDir()
+	// Create a file outside the tenant directory that path traversal would reach.
+	outsideDir := filepath.Join(tmp, "other")
+	if err := os.MkdirAll(outsideDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", outsideDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideDir, "token"), []byte("stolen-secret\n"), 0o600); err != nil {
+		t.Fatalf("write outside token: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmp, "git-provision"), 0o700); err != nil {
+		t.Fatalf("mkdir git-provision: %v", err)
+	}
+
+	var hits atomic.Int32
+	rt := repoRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hits.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"created":true}`)),
+		}, nil
+	})
+
+	p, err := newHTTPRepositoryProvisioner(Config{
+		GitCompanion: &GitCompanionConfig{
+			AdminURL:     "https://kodema-git.internal:8443",
+			TokenFile:    filepath.Join(tmp, "git-provision", "{tenant}", "token"),
+			RoundTripper: rt,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newHTTPRepositoryProvisioner: %v", err)
+	}
+
+	badTenants := []id.TenantID{
+		"",
+		"../other",
+		"../../other",
+		"tenant/a",
+		"tenant\\a",
+		"tenant.a",
+		"tenant a",
+	}
+	for _, bad := range badTenants {
+		_, err := p.ProvisionRepository(context.Background(), opsapp.RepositoryProvisionRequest{
+			TenantID:      bad,
+			ProjectID:     id.ProjectID("proj-a"),
+			Repository:    "shop/web",
+			ResourceID:    "git-shop-web",
+			DefaultBranch: "main",
+		})
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("ProvisionRepository(TenantID=%q) err = %v (class=%v); want InvalidInput", bad, err, class)
+		}
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("HTTP transport called %d times on invalid tenant IDs; want 0", got)
+	}
+
+	// Also verify invalid TenantID is rejected when only AdminURL contains {tenant}.
+	staticToken := filepath.Join(tmp, "static-token")
+	if err := os.WriteFile(staticToken, []byte("static-secret\n"), 0o600); err != nil {
+		t.Fatalf("write static token: %v", err)
+	}
+	pAdminOnly, err := newHTTPRepositoryProvisioner(Config{
+		GitCompanion: &GitCompanionConfig{
+			AdminURL:     "https://kodema-git-{tenant}.internal:8443",
+			TokenFile:    staticToken,
+			RoundTripper: rt,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newHTTPRepositoryProvisioner(admin-only): %v", err)
+	}
+	for _, bad := range []id.TenantID{"", "../other", "a@evil.example"} {
+		_, err := pAdminOnly.ProvisionRepository(context.Background(), opsapp.RepositoryProvisionRequest{
+			TenantID:      bad,
+			ProjectID:     id.ProjectID("proj-a"),
+			Repository:    "shop/web",
+			ResourceID:    "git-shop-web",
+			DefaultBranch: "main",
+		})
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("admin-only ProvisionRepository(TenantID=%q) err = %v (class=%v); want InvalidInput", bad, err, class)
+		}
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("HTTP transport called %d times on invalid admin-template tenant IDs; want 0", got)
 	}
 }

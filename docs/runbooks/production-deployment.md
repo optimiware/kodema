@@ -257,8 +257,18 @@ SAN: `kodema-tls` carries only the control-plane SANs, so issue a certificate
 whose SAN covers `kodema-git-<tenant>.<release-namespace>.svc` (or the name
 clients use) before enabling the entry. `scripts/bootstrap-secrets` issues it
 as `kodema-git-<tenant>-tls` for every descriptor tenant when
-`KODEMA_WITH_GIT_TLS` is set. Provisioning is an explicit operator
-step: run `kodema git provision-tenant` with the same `--storage-root`
+`KODEMA_WITH_GIT_TLS` is set. `gitService.tenants[].repositories` is optional:
+omit it or leave it empty to serve repositories dynamically from
+`admin/conf/git.conf`. To enable HTTP repository provisioning (`repository.create`)
+from the control plane, configure `gitService.tenants[].provisionToken`
+(`existingSecret` and `key`) plus optional `gitService.publicURL`,
+`gitService.serviceID`, and `gitService.trustedOrigins`; the chart mounts the
+token read-only on both workloads, adds control-plane ingress to each Git
+`NetworkPolicy`, and configures `KODEMA_GIT_ADMIN_URL`,
+`KODEMA_GIT_PROVISION_TOKEN_FILE`, `KODEMA_GIT_CA_FILE`,
+`KODEMA_GIT_PUBLIC_URL`, `KODEMA_GIT_TRUSTED_ORIGINS`, and optional
+`KODEMA_GIT_SERVICE_ID`. Tenant-level initialization (`kodema git provision-tenant`)
+remains an explicit operator step with the same `--storage-root`
 (`/var/lib/kodema/git/repos`) and `--journal-dir` (`/var/lib/kodema/git/journal`)
 on the PVC, for example through `kubectl exec` into the Git Pod. A `baseURL`
 pointing outside the cluster is refused by the rendered egress policy, which
@@ -303,11 +313,17 @@ on both nodes leaves the control plane Pod unscheduled. The keeper refuses to
 start if `KODEMA_GIT_STORAGE_ROOT` is missing or not a mounted directory, so an
 unmounted claim is a loud configuration error, never an empty sweep.
 
-The model gateway, the MCP tool proxy and private registries are not part of
-these blocks. The server reads `KODEMA_MODELS_FILE`, `KODEMA_TOOL_PROXY_FILE`,
-`KODEMA_REGISTRY_CONFIG_FILE` and `KODEMA_WORKLOAD_IMAGE_PULL_SECRETS`, but the
-chart has no values for them and `config.extraEnv` refuses them; inject them
-with an operator overlay (see [deploy/README.md](../../deploy/README.md)).
+Workload secret-name rules and the LLM proxy / model gateway are configured
+directly in the chart through `config.secretRules` (`KODEMA_SECRET_RULES_FILE`)
+and `config.models` (`KODEMA_MODELS_FILE`), either inline (rendered into
+`ConfigMap/kodema-secret-rules` and `ConfigMap/kodema-models` with checksum
+annotations) or via `existingConfigMap`. Both stay fail-closed/off by default
+in `production`, and production refuses `allowAll: true` secret rules and
+non-`https://` provider or model URLs. The MCP tool proxy and private-registry
+settings (`KODEMA_TOOL_PROXY_FILE`, `KODEMA_REGISTRY_CONFIG_FILE`, and
+`KODEMA_WORKLOAD_IMAGE_PULL_SECRETS`) are not yet rendered by the chart and
+`config.extraEnv` refuses them; inject those with an operator overlay (see
+[deploy/README.md](../../deploy/README.md)).
 
 ## 4. Network policy and exposure
 
@@ -607,8 +623,10 @@ it before you need to upgrade under pressure.
 
 The chart's `config.extraEnv` is a narrow allowlist for non-secret server
 variables. It refuses cloud credentials (`SCW_*`, `AWS_*`, `GOOGLE_*`),
-credential-shaped names, `KODEMA_DEV_*`, object values and values with URL
-`user:password@` userinfo. Never put a secret there.
+credential-shaped names (except allowlisted mounted `*_FILE` paths and public
+`*_ENDPOINT` discovery URLs such as `KODEMA_DISCOVERY_TOKEN_ENDPOINT`),
+`KODEMA_DEV_*`, object values and values with URL `user:password@` userinfo.
+Never put a secret there.
 
 `bootstrap-secrets` keeps credential material out of argv: generated passwords go
 to a 0600 env-file, the Scaleway KEK plaintext goes to the CLI as
@@ -673,13 +691,14 @@ enabled where real identities matter. Production takes any OIDC issuer through
 configuration; `scripts/oauthsonas-token` is a stage convenience and refuses the
 access code in argv or the environment ([scripts/oauthsonas-token](../../scripts/oauthsonas-token)).
 
-**Model provider credential.** The model gateway and the external MCP tool
-proxy are optional and stay disabled unless `KODEMA_MODELS_FILE` and
-`KODEMA_TOOL_PROXY_FILE` name a trusted configuration file; a named file that
-is unreadable or malformed refuses startup. The chart neither renders these
-variables nor accepts them in `config.extraEnv`, so enabling them needs an
-operator overlay that mounts the file and sets the variable. When enabled, the
-gateway's upstream
+**Model provider credential.** The streaming LLM proxy and model gateway stay
+disabled by default in `production` until `config.models` (inline
+`defaultProviders`, `providers`, `models`, `budgets`, `secretRules`, or
+`existingConfigMap`) renders `KODEMA_MODELS_FILE` (production refuses `http://`
+URLs and any raw API key field). The external MCP tool proxy
+(`KODEMA_TOOL_PROXY_FILE`) is not yet exposed as a chart value and still
+requires an operator overlay. A named file that is unreadable or malformed
+refuses startup. When enabled, the gateway's upstream
 credential is a Shell-managed secret in the `secrets` table and is resolved only
 when the Shell calls the provider; it is not a chart value and has no
 `existingSecret` name. Rotate by replacing the stored secret value through the
@@ -719,7 +738,9 @@ migrate` refuses to run without both variables and a `sha256:` digest. The
 pass `--allow-placeholder-image`.
 
 The chart also passes this reference to `kodema serve` as `KODEMA_TOOLBOX_IMAGE`.
-Without a digest the production server refuses to start. The tenant nodes pull
+Without a digest, `production` leaves `KODEMA_TOOLBOX_IMAGE` empty and the
+production server refuses to start (whereas `environment: "test"` falls back to
+`repository:tag`). The tenant nodes pull
 the same image to install `/kodema/bin/kodema` in each Job. For a private
 registry, configure pull access in the **tenant namespaces** as well as the
 release namespace; for mixed architectures, pin the multi-architecture index.

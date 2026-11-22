@@ -127,8 +127,63 @@ if os.fork() == 0:
 		t.Fatalf("toolbox Job: %v\n%s\n%s", waitErr, events.Stdout, logs.Stdout)
 	}
 	observed := waitForObservation(t, ctx, adapter, reconcile.ObserveRequest{Identity: identity, WorkspaceID: ws}, engine.ObservationExited)
-	combined, _ := runtimesupport.ReadAllLogs(t, ctx, adapter, identity, 1<<20)
-	if code, ok := observed.ExitStatus(); !ok || code != 0 || !strings.Contains(combined, "submitted outputs result") {
-		t.Fatalf("workload exit=%d/%t log=%s", code, ok, combined)
+	stdout, stderr := runtimesupport.ReadAllLogs(t, ctx, adapter, identity, 1<<20)
+	if code, ok := observed.ExitStatus(); !ok || code != 0 || !strings.Contains(stderr, "submitted outputs result") {
+		t.Fatalf("workload exit=%d/%t stdout=%q stderr=%q", code, ok, stdout, stderr)
+	}
+	if strings.Contains(stdout, "submitted outputs result") {
+		t.Fatalf("stderr output leaked into stdout: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+// TestJobToolboxSplitsStdoutAndStderr proves that when a Kubernetes adapter
+// mounts the toolbox image, the stateless stream-framing wrapper separates
+// workload stdout and stderr cleanly across interleaved lines, partial chunks,
+// and secret redaction on a real kind cluster.
+func TestJobToolboxSplitsStdoutAndStderr(t *testing.T) {
+	t.Parallel()
+	const ws = id.WorkspaceID("workspace-toolbox-split")
+	fx, ctx := newFixture(t, ws, fixtureOptions{withClaim: true})
+	image := loadToolbox(t, ctx, fx)
+	adapter, err := runtimekube.New(runtimekube.Config{
+		Cluster:      fx.Client,
+		Namespace:    fx.Namespace,
+		TenantID:     fx.Tenant,
+		KodemaURL:    testKodemaURL,
+		ToolboxImage: image,
+		Policy:       runtimekube.Policy{CPURequest: "50m", CPULimit: "500m", MemoryRequest: "32Mi", MemoryLimit: "256Mi", JobTTLSeconds: 120},
+		Cleanup:      runtimekube.CleanupPolicy{Attempts: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.Adapter = adapter
+
+	identity := testIdentity("exec-split-logs", "act-split-logs", "workload-split-logs", "split-logs")
+	request := workloadRequest(identity, ws, []string{
+		`printf 'out-line-1\n'`,
+		`printf 'err-line-1\n' >&2`,
+		`printf 'out-secret:%s\n' "$(cat /kodema/secrets/KODEMA_TOKEN)"`,
+		`printf 'err-secret:%s\n' "$(cat /kodema/secrets/KODEMA_TOKEN)" >&2`,
+		`printf 'out-partial'`,
+		`printf 'err-partial' >&2`,
+	}, "tok-split-secret")
+	startPrepared(t, ctx, fx, request)
+
+	observed := waitForObservation(t, ctx, adapter, reconcile.ObserveRequest{Identity: identity, WorkspaceID: ws}, engine.ObservationExited)
+	if code, ok := observed.ExitStatus(); !ok || code != 0 {
+		t.Fatalf("split-logs exit = (%d, %v); want (0, true)", code, ok)
+	}
+	stdout, stderr := runtimesupport.ReadAllLogs(t, ctx, adapter, identity, 13)
+	wantStdout := "out-line-1\nout-secret:" + runtimekube.Redacted + "\nout-partial"
+	wantStderr := "err-line-1\nerr-secret:" + runtimekube.Redacted + "\nerr-partial"
+	if stdout != wantStdout {
+		t.Fatalf("stdout = %q; want %q", stdout, wantStdout)
+	}
+	if stderr != wantStderr {
+		t.Fatalf("stderr = %q; want %q", stderr, wantStderr)
+	}
+	if strings.Contains(stdout, "tok-split-secret") || strings.Contains(stderr, "tok-split-secret") {
+		t.Fatal("credential leaked into split stdout/stderr logs")
 	}
 }

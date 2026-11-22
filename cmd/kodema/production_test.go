@@ -1050,6 +1050,18 @@ func TestBuildProductionRefusalNeverRendersSecrets(t *testing.T) {
 	}
 }
 
+func TestBuildProductionRefusesUnpinnedToolboxImage(t *testing.T) {
+	getenv, kube, options := productionFixture(t)
+	override := func(name string) string {
+		if name == "KODEMA_TOOLBOX_IMAGE" {
+			return "ghcr.io/optimiware/kodema:v1.0.0"
+		}
+		return getenv(name)
+	}
+	_, err := buildProduction(options, override, kube)
+	requireCommandInvalidInput(t, err, "unpinned production KODEMA_TOOLBOX_IMAGE")
+}
+
 // TestBuildProductionIgnoresDevelopmentAuthentication proves the production
 // profile constructs no development authenticator and no seeded identity even
 // when a development token and seed variables are present. The values are

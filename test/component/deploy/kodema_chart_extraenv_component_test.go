@@ -260,6 +260,7 @@ func TestKodemaChartExtraEnvRefusesDangerousNames(t *testing.T) {
 		"AWS_ACCESS_KEY_ID",
 		"GOOGLE_APPLICATION_CREDENTIALS",
 		"KODEMA_OIDC_TOKEN",
+		"KODEMA_FAKE_TOKEN_ENDPOINT",
 		"KODEMA_PRIVATE_KEY",
 		"KODEMA_PASSWORD",
 		"KODEMA_OIDC_ISSUER_EXTRA",
@@ -273,11 +274,67 @@ func TestKodemaChartExtraEnvRefusesDangerousNames(t *testing.T) {
 		})
 	}
 
-	// A mounted path is the one credential-shaped shape that is allowed; the
-	// allowlist still decides which names may carry it.
-	rendered, err := renderKodema(t, helm, chart, "--set", "config.extraEnv.KODEMA_OIDC_CA_FILE=/etc/kodema/oidc-ca/ca.crt")
+	// A mounted path and a public OAuth/OIDC discovery endpoint are the two
+	// credential-shaped suffixes allowed; the allowlist still decides which
+	// exact names may carry them.
+	rendered, err := renderKodema(t, helm, chart,
+		"--set", "config.extraEnv.KODEMA_OIDC_CA_FILE=/etc/kodema/oidc-ca/ca.crt",
+		"--set", "config.extraEnv.KODEMA_DISCOVERY_TOKEN_ENDPOINT=https://issuer.example/oauth/token",
+	)
 	if err != nil {
-		t.Fatalf("helm template refused the allowlisted KODEMA_OIDC_CA_FILE path: %v\n%s", err, rendered)
+		t.Fatalf("helm template refused allowlisted KODEMA_OIDC_CA_FILE / KODEMA_DISCOVERY_TOKEN_ENDPOINT: %v\n%s", err, rendered)
+	}
+}
+
+func TestKodemaChartExtraEnvRendersAll23AllowlistedVariables(t *testing.T) {
+	helm, charts := stagedCharts(t)
+	chart := filepath.Join(charts, "kodema")
+
+	allowlisted := map[string]string{
+		"KODEMA_OIDC_ISSUER":                             "https://issuer.example",
+		"KODEMA_OIDC_AUDIENCE":                           "kodema",
+		"KODEMA_OIDC_JWKS_URL":                           "https://issuer.example/.well-known/jwks.json",
+		"KODEMA_OIDC_TENANT_CLAIM":                       "org_id",
+		"KODEMA_OIDC_SUBJECT_CLAIM":                      "sub",
+		"KODEMA_OIDC_PROJECT_CLAIM":                      "project_id",
+		"KODEMA_OIDC_CA_FILE":                            "/etc/kodema/tls/ca.crt",
+		"KODEMA_DISCOVERY_ISSUER":                        "https://issuer.example",
+		"KODEMA_DISCOVERY_CLIENT_ID":                     "kodema-cli",
+		"KODEMA_DISCOVERY_AUDIENCE":                      "kodema",
+		"KODEMA_DISCOVERY_AUTHORIZATION_ENDPOINT":        "https://issuer.example/oauth/authorize",
+		"KODEMA_DISCOVERY_TOKEN_ENDPOINT":                "https://issuer.example/oauth/token",
+		"KODEMA_DISCOVERY_DEVICE_AUTHORIZATION_ENDPOINT": "https://issuer.example/oauth/device",
+		"KODEMA_DISCOVERY_REVOCATION_ENDPOINT":           "https://issuer.example/oauth/revoke",
+		"KODEMA_DISCOVERY_SCOPES":                        "openid profile email",
+		"KODEMA_DISCOVERY_API_URL":                       "https://kodema.example.com",
+		"KODEMA_TENANT_NAMESPACE":                        "kodema-tenant-tenant-a",
+		"KODEMA_WORKLOAD_CPU_REQUEST":                    "250m",
+		"KODEMA_WORKLOAD_CPU_LIMIT":                      "2",
+		"KODEMA_WORKLOAD_MEMORY_REQUEST":                 "256Mi",
+		"KODEMA_WORKLOAD_MEMORY_LIMIT":                   "2Gi",
+		"KODEMA_WORKLOAD_MAX_CPU_LIMIT":                  "4",
+		"KODEMA_WORKLOAD_MAX_MEMORY_LIMIT":               "4Gi",
+	}
+	if len(allowlisted) != 23 {
+		t.Fatalf("allowlisted test table has %d entries, want 23", len(allowlisted))
+	}
+
+	args := make([]string, 0, len(allowlisted)*2)
+	for name, value := range allowlisted {
+		args = append(args, "--set-string", "config.extraEnv."+name+"="+value)
+	}
+	rendered, err := renderChartArgs(t, helm, "kodema", chart, args...)
+	if err != nil {
+		t.Fatalf("helm template refused the 23 allowlisted config.extraEnv variables: %v\n%s", err, rendered)
+	}
+	assertContainerEnvNamesUnique(t, rendered)
+
+	deployment := renderedObjectOfKind(t, rendered, "Deployment")
+	for name, want := range allowlisted {
+		entry := renderedEnvEntry(t, deployment, name)
+		if got := stringAtKey(t, entry, "value"); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
 	}
 }
 
@@ -337,6 +394,11 @@ func TestKodemaChartExtraEnvRefusesCredentialURLAndObject(t *testing.T) {
 	out, err := renderKodema(t, helm, chart, "--set", "config.extraEnv.KODEMA_OIDC_CA_FILE=postgres://u:pw@h/db?sslmode=disable")
 	if err == nil {
 		t.Fatalf("helm template accepted a URL with inline userinfo credentials:\n%s", out)
+	}
+
+	out, err = renderKodema(t, helm, chart, "--set", "config.extraEnv.KODEMA_DISCOVERY_TOKEN_ENDPOINT=https://user:pass@issuer.example/oauth/token")
+	if err == nil {
+		t.Fatalf("helm template accepted KODEMA_DISCOVERY_TOKEN_ENDPOINT with inline userinfo credentials:\n%s", out)
 	}
 
 	out, err = renderKodema(t, helm, chart, "--set-json", `config.extraEnv.KODEMA_OIDC_CA_FILE={"valueFrom":{"secretKeyRef":{"name":"x","key":"y"}}}`)
@@ -409,8 +471,10 @@ func TestKodemaChartExtraEnvTemplateGuardAloneRefuses(t *testing.T) {
 		{"database URL", []string{"--set", "config.extraEnv.KODEMA_DATABASE_URL=postgres://u:pw@h/db"}, "collides with a fixed variable"},
 		{"cloud credential", []string{"--set", "config.extraEnv.SCW_SECRET_KEY=x"}, "must not set a cloud credential"},
 		{"credential name", []string{"--set", "config.extraEnv.KODEMA_OIDC_TOKEN=x"}, "looks like a credential name"},
+		{"non-allowlisted endpoint", []string{"--set", "config.extraEnv.KODEMA_FAKE_TOKEN_ENDPOINT=https://issuer.example/token"}, "not an allowlisted optional server variable"},
 		{"not allowlisted", []string{"--set", "config.extraEnv.UNRELATED=x"}, "not an allowlisted optional server variable"},
 		{"userinfo value", []string{"--set", "config.extraEnv.KODEMA_OIDC_ISSUER=postgres://u:pw@h/db"}, "inline userinfo credentials"},
+		{"token endpoint userinfo value", []string{"--set", "config.extraEnv.KODEMA_DISCOVERY_TOKEN_ENDPOINT=https://user:pass@issuer.example/oauth/token"}, "inline userinfo credentials"},
 		{"object value", []string{"--set-json", `config.extraEnv.KODEMA_OIDC_CA_FILE={"valueFrom":{"secretKeyRef":{"name":"x","key":"y"}}}`}, "must be a string literal value"},
 	}
 	for _, attempt := range attempts {

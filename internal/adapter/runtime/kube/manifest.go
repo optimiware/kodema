@@ -24,10 +24,14 @@ const workloadCAVolumeName = "workload-ca"
 // activation ConfigMap; it is never projected into the workload container.
 const toolboxPlanKey = "/kodema/toolbox-plan.json"
 
-func validateToolbox(image, gitURL string) error {
+func validateToolbox(image, gitURL string, allowUnpinned bool) error {
 	if image != "" {
-		if err := container.ValidatePinnedImage(image); err != nil {
-			return fault.Wrap(fault.InvalidInput, "toolbox image must be pinned by digest", err)
+		if !allowUnpinned || strings.Contains(image, "@") {
+			if err := container.ValidatePinnedImage(image); err != nil {
+				return fault.Wrap(fault.InvalidInput, "toolbox image must be pinned by digest", err)
+			}
+		} else if err := validateTaggedToolboxImage(image); err != nil {
+			return err
 		}
 	}
 	if gitURL != "" {
@@ -36,6 +40,62 @@ func validateToolbox(image, gitURL string) error {
 		}
 	}
 	return nil
+}
+
+// validateTaggedToolboxImage validates a well-formed repository:tag image
+// reference for non-production profiles when digest pinning is relaxed.
+func validateTaggedToolboxImage(image string) error {
+	if image == "" || strings.TrimSpace(image) != image {
+		return fault.New(fault.InvalidInput, "toolbox image must be a valid repository:tag reference")
+	}
+	for index := 0; index < len(image); index++ {
+		if image[index] <= 0x20 || image[index] == 0x7f {
+			return fault.New(fault.InvalidInput, "toolbox image contains whitespace or control characters")
+		}
+	}
+	lastSlash := strings.LastIndexByte(image, '/')
+	lastColon := strings.LastIndexByte(image, ':')
+	if lastColon <= 0 || lastColon <= lastSlash {
+		return fault.New(fault.InvalidInput, "toolbox image must include a tag")
+	}
+	repository := image[:lastColon]
+	tag := image[lastColon+1:]
+	if strings.HasPrefix(repository, "/") || strings.HasSuffix(repository, "/") {
+		return fault.New(fault.InvalidInput, "toolbox image repository has an empty segment")
+	}
+	for segmentIndex, segment := range strings.Split(repository, "/") {
+		if segment == "" {
+			return fault.New(fault.InvalidInput, "toolbox image repository has an empty segment")
+		}
+		if segmentIndex > 0 && strings.ContainsRune(segment, ':') {
+			return fault.New(fault.InvalidInput, "toolbox image repository has an invalid segment")
+		}
+	}
+	if !validImageTag(tag) {
+		return fault.New(fault.InvalidInput, "toolbox image tag is invalid")
+	}
+	return nil
+}
+
+func validImageTag(tag string) bool {
+	if len(tag) == 0 || len(tag) > 128 {
+		return false
+	}
+	first := tag[0]
+	if !isTagStartChar(first) {
+		return false
+	}
+	for index := 1; index < len(tag); index++ {
+		c := tag[index]
+		if !isTagStartChar(c) && c != '.' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isTagStartChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
 // activationConfigMapName returns the stable activation snapshot name.
@@ -267,7 +327,7 @@ func (a *Adapter) jobManifest(prepared preparedWorkload, identity reconcile.Effe
 				Name:      volName,
 				MountPath: mountPath,
 				ClaimName: cache.claimName,
-				SubPath:   cache.key,
+				SubPath:   cache.subPath,
 				ReadOnly:  false,
 			})
 		} else {
@@ -280,8 +340,9 @@ func (a *Adapter) jobManifest(prepared preparedWorkload, identity reconcile.Effe
 		}
 	}
 	command := workspace.Entrypoint(container.WorkloadScriptPath, workspace.Launch{
-		Toolbox: prepared.toolboxImage != "",
-		Outputs: prepared.outputDir != "",
+		Toolbox:      prepared.toolboxImage != "",
+		Outputs:      prepared.outputDir != "",
+		FrameStreams: prepared.toolboxImage != "",
 	})
 	resources := prepared.resources
 	if resources.CPURequest == "" {

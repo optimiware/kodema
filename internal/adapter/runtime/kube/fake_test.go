@@ -7,6 +7,7 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube/logframe"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
@@ -666,19 +668,44 @@ func (f *fakeCluster) ReadPodLogs(ctx context.Context, namespace, pod string, re
 			break
 		}
 	}
-	data := f.logs[pod][request.Stream]
+	var data []byte
+	if request.Stream == LogStreamSplit {
+		if raw, ok := f.logs[pod][LogStreamSplit]; ok {
+			data = raw
+		} else {
+			data = f.logs[pod][LogStreamCombined]
+		}
+	} else {
+		data = f.logs[pod][request.Stream]
+	}
 	f.logStreams = append(f.logStreams, request.Stream)
 	f.logRequests = append(f.logRequests, request)
 	f.mu.Unlock()
 	if !found {
 		return PodLogPage{}, fmt.Errorf("fake kubernetes: pod %q: %w", pod, ErrNotFound)
 	}
-	start := min(max(request.Offset, 0), int64(len(data)))
-	end := min(start+int64(request.Limit), int64(len(data)))
-	page := PodLogPage{
-		Data:       append([]byte(nil), data[start:end]...),
-		NextOffset: end,
-		Truncated:  end < int64(len(data)),
+	var page PodLogPage
+	if request.Stream == LogStreamSplit {
+		demuxed, err := logframe.Demux(bytes.NewReader(data), request.Offset, request.StderrOffset, request.Limit)
+		if err != nil {
+			return PodLogPage{}, err
+		}
+		page = PodLogPage{
+			Data:             demuxed.Stdout,
+			NextOffset:       demuxed.StdoutNext,
+			Truncated:        demuxed.StdoutTruncated,
+			StderrData:       demuxed.Stderr,
+			StderrNextOffset: demuxed.StderrNext,
+			StderrTruncated:  demuxed.StderrTruncated,
+		}
+	} else {
+		start := min(max(request.Offset, 0), int64(len(data)))
+		end := min(start+int64(request.Limit), int64(len(data)))
+		page = PodLogPage{
+			Data:       append([]byte(nil), data[start:end]...),
+			NextOffset: end,
+			Truncated:  end < int64(len(data)),
+		}
 	}
 	if err := f.end("ReadPodLogs"); err != nil {
 		return PodLogPage{}, err
