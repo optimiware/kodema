@@ -228,26 +228,26 @@ func TestTaskPortsDeclareExecutionAggregateReader(t *testing.T) {
 	}
 
 	// The declaration belongs to the contract-owned file, not an adapter file.
-	data, err := os.ReadFile(filepath.Join(repoRoot(t), "internal", "shell", "task", "ports.go"))
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "internal", "control", "task", "ports.go"))
 	if err != nil {
-		t.Fatalf("internal/shell/task/ports.go is missing or unreadable: %v", err)
+		t.Fatalf("internal/control/task/ports.go is missing or unreadable: %v", err)
 	}
 	text := string(data)
-	for _, needle := range []string{"type ExecutionAggregateReader interface", "Load(", "tenancy.Scope", "kernel.Execution"} {
+	for _, needle := range []string{"type ExecutionAggregateReader interface", "Load(", "tenancy.Scope", "engine.Execution"} {
 		if !strings.Contains(text, needle) {
-			t.Errorf("internal/shell/task/ports.go does not name %q", needle)
+			t.Errorf("internal/control/task/ports.go does not name %q", needle)
 		}
 	}
 }
 
 // TestValidateCancellationCommitIsDeclaredInContractFile pins where the pure
-// rule lives: an `internal/shell/task/contract_*.go` file. A validator hidden
+// rule lives: an `internal/control/task/contract_*.go` file. A validator hidden
 // in an adapter file would not be a pinned contract declaration.
 func TestValidateCancellationCommitIsDeclaredInContractFile(t *testing.T) {
-	dir := filepath.Join(repoRoot(t), "internal", "shell", "task")
+	dir := filepath.Join(repoRoot(t), "internal", "control", "task")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("internal/shell/task is missing or unreadable: %v", err)
+		t.Fatalf("internal/control/task is missing or unreadable: %v", err)
 	}
 	declared := false
 	for _, entry := range entries {
@@ -267,6 +267,6 @@ func TestValidateCancellationCommitIsDeclaredInContractFile(t *testing.T) {
 		}
 	}
 	if !declared {
-		t.Error("no internal/shell/task/contract_*.go declares func ValidateCancellationCommit(")
+		t.Error("no internal/control/task/contract_*.go declares func ValidateCancellationCommit(")
 	}
 }

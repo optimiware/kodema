@@ -17,10 +17,10 @@ func TestEngineProductionImportsStayInsideKernel(t *testing.T) {
 	allowedProduct := map[string]bool{
 		"github.com/optimiware/kodema/internal/id":                true,
 		"github.com/optimiware/kodema/internal/fault":             true,
-		"github.com/optimiware/kodema/internal/kernel":            true,
-		"github.com/optimiware/kodema/internal/kernel/definition": true,
-		"github.com/optimiware/kodema/internal/kernel/flow":       true,
-		"github.com/optimiware/kodema/internal/kernel/script":     true,
+		"github.com/optimiware/kodema/internal/engine":            true,
+		"github.com/optimiware/kodema/internal/engine/definition": true,
+		"github.com/optimiware/kodema/internal/engine/flow":       true,
+		"github.com/optimiware/kodema/internal/engine/script":     true,
 	}
 	forbiddenStdlib := map[string]bool{
 		"os/exec":      true,

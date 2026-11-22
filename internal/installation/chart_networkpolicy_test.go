@@ -443,8 +443,8 @@ func TestOpenCodeBrainSchemaValidation(t *testing.T) {
 // internal/shell/runtime/kube/{api,manifest}.go so NetworkPolicy selectors and
 // real Kubernetes workload pod labels can never drift out of sync.
 func TestOpenCodeBrainSandboxSelectorsMatchRuntimeKubeLabels(t *testing.T) {
-	kubeAPI := readText(t, filepath.Join(repoRoot(t), "internal", "shell", "runtime", "kube", "api.go"))
-	kubeManifest := readText(t, filepath.Join(repoRoot(t), "internal", "shell", "runtime", "kube", "manifest.go"))
+	kubeAPI := readText(t, filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "kube", "api.go"))
+	kubeManifest := readText(t, filepath.Join(repoRoot(t), "internal", "adapter", "runtime", "kube", "manifest.go"))
 	template := readText(t, chartPath(t, "templates", "workloads-opencode-brain.yaml"))
 
 	readConst := func(name string) string {
@@ -452,7 +452,7 @@ func TestOpenCodeBrainSandboxSelectorsMatchRuntimeKubeLabels(t *testing.T) {
 		re := regexp.MustCompile(`(?m)^[ \t]*` + regexp.QuoteMeta(name) + `[ \t]*=[ \t]*"([^"]+)"[ \t]*$`)
 		m := re.FindStringSubmatch(kubeAPI)
 		if m == nil {
-			t.Fatalf("internal/shell/runtime/kube/api.go missing constant %s", name)
+			t.Fatalf("internal/adapter/runtime/kube/api.go missing constant %s", name)
 		}
 		return m[1]
 	}
@@ -471,7 +471,7 @@ func TestOpenCodeBrainSandboxSelectorsMatchRuntimeKubeLabels(t *testing.T) {
 		"PodLabels:",
 	} {
 		if !strings.Contains(kubeManifest, wantRef) {
-			t.Fatalf("internal/shell/runtime/kube/manifest.go missing expected pod label emission %q", wantRef)
+			t.Fatalf("internal/adapter/runtime/kube/manifest.go missing expected pod label emission %q", wantRef)
 		}
 	}
 

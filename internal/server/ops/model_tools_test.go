@@ -103,7 +103,7 @@ func toolCompletion(model string) api.ChatCompletionResponse {
 // modelToolsVector reads the tool-calling wire vector.
 func modelToolsVector(t *testing.T) json.RawMessage {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "test", "contracts", "public", "testdata", "wire", "model-tools.json"))
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "contracts", "public", "testdata", "wire", "model-tools.json"))
 	if err != nil {
 		t.Fatalf("read model tool vector: %v", err)
 	}

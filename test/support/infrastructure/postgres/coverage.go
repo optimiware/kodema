@@ -91,7 +91,7 @@ func unitStateCoverageError(root string, states map[string][]string) error {
 	if len(states) == 0 {
 		return fmt.Errorf("unit×state coverage: no observed unit×state is registered")
 	}
-	types, err := unitTypes(filepath.Join(root, "internal", "shell"))
+	types, err := unitTypes(filepath.Join(root, "internal", "control"))
 	if err != nil {
 		return fmt.Errorf("unit×state coverage: %w", err)
 	}
