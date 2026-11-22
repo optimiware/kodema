@@ -28,8 +28,8 @@ import (
 
 	"github.com/optimiware/kodema/client"
 	"github.com/optimiware/kodema/internal/apps/cli"
-	"github.com/optimiware/kodema/internal/apps/kit/sessionlock"
-	"github.com/optimiware/kodema/internal/apps/kit/userlandfs"
+	"github.com/optimiware/kodema/internal/apps/cli/sessionlock"
+	"github.com/optimiware/kodema/internal/apps/cli/userlandfs"
 	"github.com/optimiware/kodema/internal/apps/up"
 	"github.com/optimiware/kodema/internal/fault"
 )

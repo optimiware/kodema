@@ -52,7 +52,7 @@ The repository mirrors the hexagonal Control Plane and `apps/` boundary directly
 | Adapter | `internal/adapter/store/{memory,postgres,storetest,units/*}`, `internal/adapter/runtime/{internal/adapterutil,process,podman,kube}`, `internal/adapter/integration/{keys,nats,oidc,platform,registry}` | Concrete persistence and store fixtures, process/Podman/Kubernetes runtimes, infrastructure integrations |
 | Transport | `internal/transport/{ops,httpapi,mcp}` | Single operation router and thin REST, SSE, and MCP edges |
 | Server | `internal/server` (`bridges`, `drivers`, `migrate`, `ops`) | Control Plane composition root, bridges, driver wiring, migrations, operation registration |
-| Apps | `internal/apps/{cli,git,agent,opencode,merge,email,up,auth}`, `internal/apps/kit/{principal,session,skill,sandbox,sessionlock,userlandfs,servicekit}` | Independent first-party programs speaking public contracts only, plus shared app helpers in `kit/` |
+| Apps | `internal/apps/{cli,git,agent,opencode,merge,email,up,auth}`, `internal/apps/kit/{principal,session,skill,sandbox,servicekit}` | Independent first-party programs speaking public contracts only (`cli` owns its `sessionlock`/`userlandfs` subpackages), plus shared app helpers in `kit/` |
 | Installation & examples | `internal/installation`, `deploy`, `examples` | Config/preflight, Helm/OpenTofu, reference delivery recipes |
 
 `api` contains public DTOs/schemas only. `internal/installation` is configuration and preflight logic, not a product layer or alternate composition root.

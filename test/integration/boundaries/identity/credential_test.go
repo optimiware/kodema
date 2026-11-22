@@ -13,7 +13,7 @@ import (
 
 	"github.com/optimiware/kodema/client"
 	"github.com/optimiware/kodema/internal/apps/cli"
-	"github.com/optimiware/kodema/internal/apps/kit/userlandfs"
+	"github.com/optimiware/kodema/internal/apps/cli/userlandfs"
 	"github.com/optimiware/kodema/internal/fault"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 )
