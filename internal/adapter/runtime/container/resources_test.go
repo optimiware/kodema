@@ -1,6 +1,7 @@
 package container
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -83,19 +84,29 @@ func TestParseResourcePolicy(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name                       string
+		name                           string
 		defMem, maxMem, defCPU, maxCPU string
+		wantField                      ResourcePolicyField
 	}{
-		{"bad default mem", "not-mem", "", "", ""},
-		{"bad max mem", "", "not-mem", "", ""},
-		{"bad default cpu", "", "", "not-cpu", ""},
-		{"bad max cpu", "", "", "", "not-cpu"},
-		{"default mem > max mem", "4Gi", "2Gi", "", ""},
-		{"default cpu > max cpu", "", "", "4", "2"},
+		{"bad default mem", "not-mem", "", "", "", ResourceFieldDefaultMemory},
+		{"bad max mem", "", "not-mem", "", "", ResourceFieldMaxMemory},
+		{"bad default cpu", "", "", "not-cpu", "", ResourceFieldDefaultCPU},
+		{"bad max cpu", "", "", "", "not-cpu", ResourceFieldMaxCPU},
+		{"default mem > max mem", "4Gi", "2Gi", "", "", ""},
+		{"default cpu > max cpu", "", "", "4", "2", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := ParseResourcePolicy(tc.defMem, tc.maxMem, tc.defCPU, tc.maxCPU)
 			assertFaultClass(t, err, fault.InvalidInput)
+			if tc.wantField != "" {
+				var parseErr *ResourcePolicyParseError
+				if !errors.As(err, &parseErr) {
+					t.Fatalf("error %v does not wrap *ResourcePolicyParseError", err)
+				}
+				if parseErr.Field != tc.wantField {
+					t.Fatalf("parse error field = %q; want %q", parseErr.Field, tc.wantField)
+				}
+			}
 		})
 	}
 }

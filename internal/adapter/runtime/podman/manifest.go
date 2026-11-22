@@ -18,10 +18,13 @@ import (
 
 // Host layout constants. Non-secret activation files under /kodema are written
 // at filepath.Join(<root>/<workload>, P) and bind-mounted read-only at /kodema.
-// Declared secrets and KODEMA_TOKEN are isolated in a separate 0700 host
-// directory <root>/<workload>/secrets and bind-mounted read-only at
-// /kodema/secrets. The shared installation CA bundle (when configured) lives at
-// <root>/.ca/<digest>/ca.crt and is bind-mounted read-only at /etc/kodema/ca.
+// Declared secrets and KODEMA_TOKEN are isolated under a 0700 host parent
+// directory <root>/<workload>/secrets with a 0755 child
+// <root>/<workload>/secrets/data bind-mounted read-only at /kodema/secrets, so
+// host confinement holds while non-root container users can still traverse
+// /kodema/secrets and read 0444 secret files. The shared installation CA bundle
+// (when configured) lives at <root>/.ca/<digest>/ca.crt and is bind-mounted
+// read-only at /etc/kodema/ca.
 const (
 	// activationRoot is the read-only bind destination of the activation data.
 	activationRoot = container.ActivationRoot
@@ -31,10 +34,13 @@ const (
 	readOnlyMode = container.ReadOnlyFileMode
 	// directoryMode is the explicit mode of non-secret prepared directories.
 	directoryMode = container.DirectoryMode
-	// secretDirectoryMode is the owner-only mode of the isolated secrets dir.
+	// secretDirectoryMode is the owner-only mode of the host secrets parent dir.
 	secretDirectoryMode = container.SecretDirectoryMode
-	// secretsDirectoryName is the per-workload host secrets sibling directory.
+	// secretsDirectoryName is the per-workload 0700 host secrets parent dir.
 	secretsDirectoryName = "secrets"
+	// secretsMountDirectoryName is the 0755 child of secretsDirectoryName
+	// bind-mounted read-only at /kodema/secrets.
+	secretsMountDirectoryName = "data"
 	// caDirectory holds shared installation CA bundles keyed by content digest.
 	caDirectory = ".ca"
 	// toolboxDirectory holds shared installation copies of the toolbox, keyed
@@ -87,10 +93,17 @@ func activationDir(root string, workload id.WorkloadID) string {
 	return filepath.Join(workloadRoot(root, workload), activationRoot)
 }
 
-// secretsDir returns the isolated 0700 host directory bind-mounted at
-// /kodema/secrets.
-func secretsDir(root string, workload id.WorkloadID) string {
+// secretsParentDir returns the 0700 host-confined parent directory that guards
+// the workload's secrets on the host filesystem.
+func secretsParentDir(root string, workload id.WorkloadID) string {
 	return filepath.Join(workloadRoot(root, workload), secretsDirectoryName)
+}
+
+// secretsDir returns the 0755 child directory under the 0700 host parent that
+// holds declared secrets and KODEMA_TOKEN and is bind-mounted read-only at
+// /kodema/secrets so non-root container users can read 0444 secret files.
+func secretsDir(root string, workload id.WorkloadID) string {
+	return filepath.Join(secretsParentDir(root, workload), secretsMountDirectoryName)
 }
 
 // secretHostPath returns the isolated host file path for one declared secret.

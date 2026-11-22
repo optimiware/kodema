@@ -219,13 +219,23 @@ func TestPodmanRuntimeUncertainStartAndStop(t *testing.T) {
 	if observation.Kind != engine.ObservationUnknown || observation.ProofOfNonexecution() {
 		t.Fatalf("created container after interrupted start = %+v; want ObservationUnknown", observation)
 	}
-	// A created container has no confirmed stop, so Remove retains it until
-	// the container itself is cleared; then Remove cleans up host files.
+	// A created container has no confirmed stop, so Remove retains it; Stop
+	// recovers via non-forced removal on real Podman and confirms termination,
+	// after which Remove cleans up host files and leaves zero containers so the
+	// workspace can be released cleanly.
+	if retry, retryErr := startAdapter.Start(ctx, reconcile.StartRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID}); retry.Outcome != reconcile.StartUnknown {
+		t.Fatalf("retry Start on created container = %+v, %v; want StartUnknown", retry, retryErr)
+	} else {
+		runtimesupport.RequireFaultClass(t, retryErr, fault.UncertainExternalEffect)
+	}
 	if retained, err := startAdapter.Remove(ctx, reconcile.RemoveRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID}); err != nil || retained.Removed {
 		t.Fatalf("Remove on created container = %+v, %v; want retained", retained, err)
 	}
-	if err := runtimesupport.RemoveRunContainersInWorkspace(ctx, string(fixture.workspaceID)); err != nil {
-		t.Fatalf("remove ambiguous container: %v", err)
+	if evidence, err := startAdapter.Stop(ctx, reconcile.StopRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID}); err != nil || !evidence.IsConfirmed() {
+		t.Fatalf("Stop on created container = %+v, %v; want confirmed termination", evidence, err)
+	}
+	if names := podmanContainerNames(t, ctx, fixture.workspaceID); len(names) != 0 {
+		t.Fatalf("containers remaining after created-container Stop = %v; want none", names)
 	}
 	if removal, err := startAdapter.Remove(ctx, reconcile.RemoveRequest{Identity: startIdentity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("clean ambiguous workload = %+v, %v; want removed", removal, err)

@@ -416,10 +416,8 @@ func parseProductionTenants(getenv productionEnv) (productionTenantSet, error) {
 const (
 	defaultKubeCPURequest    = "250m"
 	defaultKubeCPULimit      = "1"
-	defaultKubeCPUMillicores = int64(1000)
 	defaultKubeMemoryRequest = "256Mi"
 	defaultKubeMemoryLimit   = "1Gi"
-	defaultKubeMemoryBytes   = int64(1 << 30)
 	defaultKubeJobTTLSeconds = 600
 )
 

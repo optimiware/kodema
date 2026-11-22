@@ -266,8 +266,19 @@ func TestDurableTestCompositionUsesProductAdapters(t *testing.T) {
 	if !ok {
 		t.Fatalf("workspace = %T; want the fresh-only volume provisioning decorator", environment.workspace)
 	}
-	if provisioning.provisioner != config.Test.VolumeProvisioner {
-		t.Fatal("the provisioning decorator does not use the configured volume provisioner")
+	volumes := config.Test.VolumeProvisioner.(*recordingVolumes)
+	if err := provisioning.provision(context.Background(), "workspace-compose-1"); err != nil {
+		t.Fatalf("provisioning.provision: %v", err)
+	}
+	wantVolume, err := runtimepodman.WorkspaceVolumeName("workspace-compose-1")
+	if err != nil {
+		t.Fatalf("WorkspaceVolumeName: %v", err)
+	}
+	volumes.mu.Lock()
+	createdVolumes := append([]string(nil), volumes.created...)
+	volumes.mu.Unlock()
+	if !slices.Equal(createdVolumes, []string{wantVolume}) {
+		t.Fatalf("created volumes = %v; want [%q]", createdVolumes, wantVolume)
 	}
 	if environment.runtime != config.Test.Runtime {
 		t.Fatalf("runtime = %T; want the configured Podman runtime", environment.runtime)

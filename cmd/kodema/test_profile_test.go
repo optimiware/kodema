@@ -802,7 +802,7 @@ func TestBuildTestProfileWiresWorkloadResourceLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("kubernetes preserves default-equals-max ceiling when max is omitted", func(t *testing.T) {
+	t.Run("kubernetes shares podman defaults and ceilings in test profile", func(t *testing.T) {
 		fixture, kube := newKubeFixture(t)
 		build, err := buildTestProfileWithKube(fixture.options, fixture.getenv, kube)
 		if err != nil {
@@ -811,17 +811,18 @@ func TestBuildTestProfileWiresWorkloadResourceLimits(t *testing.T) {
 		gotDefault := inspectKubePolicy(t, build.Config.Test.Runtime)
 		wantDefault := runtimekube.Policy{
 			CPURequest:     "250m",
-			CPULimit:       "1",
-			MaxCPULimit:    "1",
+			CPULimit:       "2",
+			MaxCPULimit:    "4",
 			MemoryRequest:  "256Mi",
-			MemoryLimit:    "1Gi",
-			MaxMemoryLimit: "1Gi",
+			MemoryLimit:    "2Gi",
+			MaxMemoryLimit: "4Gi",
 			JobTTLSeconds:  600,
 		}
 		if gotDefault != wantDefault {
-			t.Fatalf("default kube policy = %+v; want %+v (ceiling must not widen)", gotDefault, wantDefault)
+			t.Fatalf("default kube policy = %+v; want %+v (must match podman test defaults/ceilings)", gotDefault, wantDefault)
 		}
 
+		// Explicit default below the canonical ceiling keeps the canonical 4Gi / 4 CPU ceiling.
 		overrideFixture, overrideKube := newKubeFixture(t)
 		overrideFixture.options.WorkloadMemory = "2Gi"
 		overrideFixture.options.WorkloadCPUs = "1500m"
@@ -833,14 +834,36 @@ func TestBuildTestProfileWiresWorkloadResourceLimits(t *testing.T) {
 		wantOverride := runtimekube.Policy{
 			CPURequest:     "250m",
 			CPULimit:       "1500m",
-			MaxCPULimit:    "1500m",
+			MaxCPULimit:    "4",
 			MemoryRequest:  "256Mi",
 			MemoryLimit:    "2Gi",
-			MaxMemoryLimit: "2Gi",
+			MaxMemoryLimit: "4Gi",
 			JobTTLSeconds:  600,
 		}
 		if gotOverride != wantOverride {
-			t.Fatalf("override kube policy = %+v; want %+v (omitted max must pin ceiling to default)", gotOverride, wantOverride)
+			t.Fatalf("override kube policy = %+v; want %+v", gotOverride, wantOverride)
+		}
+
+		// Explicit max below the canonical default clamps default down to max.
+		cappedFixture, cappedKube := newKubeFixture(t)
+		cappedFixture.options.WorkloadMaxMemory = "1Gi"
+		cappedFixture.options.WorkloadMaxCPUs = "1"
+		buildCapped, err := buildTestProfileWithKube(cappedFixture.options, cappedFixture.getenv, cappedKube)
+		if err != nil {
+			t.Fatalf("capped kube build: %v", err)
+		}
+		gotCapped := inspectKubePolicy(t, buildCapped.Config.Test.Runtime)
+		wantCapped := runtimekube.Policy{
+			CPURequest:     "250m",
+			CPULimit:       "1",
+			MaxCPULimit:    "1",
+			MemoryRequest:  "256Mi",
+			MemoryLimit:    "1Gi",
+			MaxMemoryLimit: "1Gi",
+			JobTTLSeconds:  600,
+		}
+		if gotCapped != wantCapped {
+			t.Fatalf("capped kube policy = %+v; want %+v", gotCapped, wantCapped)
 		}
 	})
 
@@ -856,10 +879,10 @@ func TestBuildTestProfileWiresWorkloadResourceLimits(t *testing.T) {
 		want := runtimekube.Policy{
 			CPURequest:     "100m",
 			CPULimit:       "100m",
-			MaxCPULimit:    "100m",
+			MaxCPULimit:    "4",
 			MemoryRequest:  "128Mi",
 			MemoryLimit:    "128Mi",
-			MaxMemoryLimit: "128Mi",
+			MaxMemoryLimit: "4Gi",
 			JobTTLSeconds:  600,
 		}
 		if got != want {

@@ -83,12 +83,26 @@ func TestStartLostCreateReplyStaysUnknownAndCreatedContainerStaysUncertain(t *te
 		t.Fatalf("retry issued StartContainer %d times for a created container", calls)
 	}
 
-	// Stop confirms whole-container termination and allows Remove to clean up.
+	// Stop confirms termination via non-forced removal of the created container
+	// (never calling StopContainer, which is a no-op on created containers in
+	// libpod), and Remove then cleans up the host materialization tree.
 	if evidence := fx.stop(t); !evidence.IsConfirmed() {
 		t.Fatal("Stop on a created container did not confirm termination")
 	}
+	if calls := fx.libpod.callsFor("StopContainer"); calls != 0 {
+		t.Fatalf("StopContainer calls on created container = %d, want 0", calls)
+	}
+	if calls := fx.libpod.callsFor("RemoveContainer"); calls != 1 {
+		t.Fatalf("RemoveContainer calls for created stop = %d, want 1", calls)
+	}
+	if count := fx.libpod.containerCount(); count != 0 {
+		t.Fatalf("containers remaining after created stop = %d, want 0", count)
+	}
 	if removal := fx.remove(t); !removal.Removed {
 		t.Fatalf("Remove after confirmed stop = %+v, want success", removal)
+	}
+	if hostFileExists(t, fx.workloadRoot()) {
+		t.Fatal("Remove left host materialization behind after created-container stop")
 	}
 }
 
@@ -189,10 +203,68 @@ func TestStartLostStartReplyStaysUnknownAndNeverReplays(t *testing.T) {
 		}
 
 		if evidence := fx.stop(t); !evidence.IsConfirmed() {
-			t.Fatal("Stop on a created container did not confirm whole-container termination")
+			t.Fatal("Stop on a created container did not confirm termination via non-forced remove")
+		}
+		if calls := fx.libpod.callsFor("StopContainer"); calls != 0 {
+			t.Fatalf("StopContainer calls on created container = %d, want 0", calls)
 		}
 		if removal := fx.remove(t); !removal.Removed {
 			t.Fatalf("removal after confirmed stop = %+v, want success", removal)
+		}
+	})
+
+	t.Run("created container started concurrently before non-forced remove falls through to stop", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedCreated(t, false)
+		fx.libpod.onRemove(func() {
+			fx.seedRunning(t)
+		})
+
+		evidence := fx.stop(t)
+		if !evidence.IsConfirmed() {
+			t.Fatalf("stop after concurrent start = %+v, want confirmed", evidence)
+		}
+		if calls := fx.libpod.callsFor("RemoveContainer"); calls != 1 {
+			t.Fatalf("RemoveContainer calls = %d, want 1", calls)
+		}
+		if calls := fx.libpod.callsFor("StopContainer"); calls != 1 {
+			t.Fatalf("StopContainer calls after refused remove = %d, want 1", calls)
+		}
+		if removal := fx.remove(t); !removal.Removed {
+			t.Fatalf("removal after confirmed stop = %+v, want success", removal)
+		}
+	})
+
+	t.Run("created container externally removed before non-forced remove stays pending", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedCreated(t, false)
+		fx.libpod.onRemove(func() {
+			fx.libpod.mu.Lock()
+			delete(fx.libpod.containers, fx.containerName)
+			fx.libpod.mu.Unlock()
+		})
+
+		evidence := fx.stop(t)
+		if evidence.IsConfirmed() {
+			t.Fatalf("stop confirmed when created container vanished externally: %+v", evidence)
+		}
+	})
+
+	t.Run("created container non-forced remove transport error stays uncertain", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.prepare(t)
+		fx.seedCreated(t, false)
+		fx.libpod.failNext("RemoveContainer", errFakeLost, false)
+
+		evidence, err := fx.adapter.Stop(context.Background(), stopRequest(fx))
+		assertFaultClass(t, err, fault.UncertainExternalEffect)
+		if evidence.IsConfirmed() {
+			t.Fatalf("stop confirmed on lost remove response: %+v", evidence)
+		}
+		if count := fx.libpod.containerCount(); count != 1 {
+			t.Fatalf("container count = %d, want 1 retained after failed remove", count)
 		}
 	})
 }

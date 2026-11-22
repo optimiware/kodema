@@ -181,7 +181,8 @@ func TestTaskSpecMaterializedInRealPod(t *testing.T) {
 		`test "$(cat /kodema/task/description)" = "$(printf 'Multi-line\ndescription ✓')"`,
 		`test "$(cat /kodema/task/metadata.json)" = '{"area":"kube","release":"0.6.0"}'`,
 		`test "$(cat /kodema/task/spec.json)" = '{"id":"task-kube-spec","title":"Kubernetes spec title","description":"Multi-line\ndescription ✓","metadata":{"area":"kube","release":"0.6.0"}}'`,
-		`test ! -w /kodema/task/title && test ! -w /kodema/task/spec.json`,
+		`if ( : >> /kodema/task/title ) 2>/dev/null; then exit 1; fi`,
+		`if ( : >> /kodema/task/spec.json ) 2>/dev/null; then exit 1; fi`,
 		`printf 'kube-task-spec-ok\n'`,
 	}, "tok-ktask")
 	req.TaskID = taskID

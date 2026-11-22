@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -478,10 +479,10 @@ func testBrokerTLS(getenv productionEnv) (*natsdriver.TLSConfig, error) {
 	return &natsdriver.TLSConfig{CAFile: caFile, CertFile: certFile, KeyFile: keyFile}, nil
 }
 
-// resolveTestWorkloadResources parses the optional test-profile default and
-// maximum workload memory/CPU settings into the shared container resource
-// policy. Unset settings remain zero so each runtime applies its own bounded
-// defaults (Podman bounded defaults vs. Kubernetes default-equals-max ceiling).
+// resolveTestWorkloadResources parses and normalizes the optional test-profile
+// default and maximum workload memory/CPU settings into the shared container
+// resource policy so both Podman and Kubernetes (k3s) test runtimes enforce
+// identical defaults (2 GiB / 2 CPUs) and ceilings (4 GiB / 4 CPUs).
 func resolveTestWorkloadResources(options serverOptions, getenv productionEnv) (runtimecontainer.ResourcePolicy, error) {
 	pick := func(explicit, envName string) string {
 		if value := strings.TrimSpace(explicit); value != "" {
@@ -496,36 +497,34 @@ func resolveTestWorkloadResources(options serverOptions, getenv productionEnv) (
 
 	policy, err := runtimecontainer.ParseRawResourcePolicy(rawMem, rawMaxMem, rawCPU, rawMaxCPU)
 	if err != nil {
-		msg := err.Error()
-		switch {
-		case strings.Contains(msg, "default memory limit"):
-			return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload memory (--workload-memory or KODEMA_WORKLOAD_MEMORY_LIMIT): %w", err)
-		case strings.Contains(msg, "maximum memory limit"):
-			return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload max memory (--workload-max-memory or KODEMA_WORKLOAD_MAX_MEMORY_LIMIT): %w", err)
-		case strings.Contains(msg, "default CPU limit"):
-			return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload CPUs (--workload-cpus or KODEMA_WORKLOAD_CPU_LIMIT): %w", err)
-		case strings.Contains(msg, "maximum CPU limit"):
-			return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload max CPUs (--workload-max-cpus or KODEMA_WORKLOAD_MAX_CPU_LIMIT): %w", err)
-		default:
-			return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload resources: %w", err)
+		var parseErr *runtimecontainer.ResourcePolicyParseError
+		if errors.As(err, &parseErr) {
+			switch parseErr.Field {
+			case runtimecontainer.ResourceFieldDefaultMemory:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload memory (--workload-memory or KODEMA_WORKLOAD_MEMORY_LIMIT): %w", err)
+			case runtimecontainer.ResourceFieldMaxMemory:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload max memory (--workload-max-memory or KODEMA_WORKLOAD_MAX_MEMORY_LIMIT): %w", err)
+			case runtimecontainer.ResourceFieldDefaultCPU:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload CPUs (--workload-cpus or KODEMA_WORKLOAD_CPU_LIMIT): %w", err)
+			case runtimecontainer.ResourceFieldMaxCPU:
+				return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload max CPUs (--workload-max-cpus or KODEMA_WORKLOAD_MAX_CPU_LIMIT): %w", err)
+			}
 		}
+		return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload resources: %w", err)
 	}
-	return policy, nil
+	normalized, err := runtimecontainer.NormalizeResourcePolicy(policy)
+	if err != nil {
+		return runtimecontainer.ResourcePolicy{}, fmt.Errorf("test profile workload resources: %w", err)
+	}
+	return normalized, nil
 }
 
-// resolveTestKubePolicy adapts a parsed test-profile ResourcePolicy onto the
-// Kubernetes runtime's Policy using NormalizeCeilingPolicy (so an omitted
-// maximum pins the ceiling to the default limit rather than widening it) and
-// ClampKubeRequest (so requests never exceed a lower configured limit).
+// resolveTestKubePolicy adapts a normalized test-profile ResourcePolicy onto
+// the Kubernetes runtime's Policy with identical defaults and ceilings as the
+// Podman test runtime, clamping pod requests so they never exceed lower
+// configured limits.
 func resolveTestKubePolicy(resources runtimecontainer.ResourcePolicy, getenv productionEnv) (runtimekube.Policy, error) {
-	policy := resources
-	if policy.DefaultMemoryBytes == 0 {
-		policy.DefaultMemoryBytes = defaultKubeMemoryBytes
-	}
-	if policy.DefaultCPUMillicores == 0 {
-		policy.DefaultCPUMillicores = defaultKubeCPUMillicores
-	}
-	normalized, err := runtimecontainer.NormalizeCeilingPolicy(policy)
+	normalized, err := runtimecontainer.NormalizeResourcePolicy(resources)
 	if err != nil {
 		return runtimekube.Policy{}, fmt.Errorf("test profile workload resources: %w", err)
 	}

@@ -13,10 +13,10 @@ import (
 )
 
 type fakeClock struct {
-	mu       sync.Mutex
-	now      time.Time
-	sleeps   []time.Duration
-	onSleep  func(context.Context, time.Duration) error
+	mu      sync.Mutex
+	now     time.Time
+	sleeps  []time.Duration
+	onSleep func(context.Context, time.Duration) error
 }
 
 func newFakeClock() *fakeClock {

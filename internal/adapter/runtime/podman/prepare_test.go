@@ -37,8 +37,11 @@ func TestPrepareHostLayoutModesAndConfinement(t *testing.T) {
 			t.Fatalf("%s mode = %o, want 0444", path, mode)
 		}
 	}
-	if mode := hostFileMode(t, fx.secretsRoot()); mode != 0o700 {
-		t.Fatalf("secrets directory mode = %o, want 0700", mode)
+	if mode := hostFileMode(t, fx.secretsParentRoot()); mode != 0o700 {
+		t.Fatalf("secrets parent directory mode = %o, want 0700", mode)
+	}
+	if mode := hostFileMode(t, fx.secretsRoot()); mode != 0o755 {
+		t.Fatalf("secrets bind directory mode = %o, want 0755", mode)
 	}
 
 	// /kodema/secrets inside the activation bind must be an empty mount point;
@@ -59,10 +62,10 @@ func TestPrepareHostLayoutModesAndConfinement(t *testing.T) {
 
 func TestPrepareRefusesPermissiveSecretsDirectory(t *testing.T) {
 	fx := newFixture(t)
-	if err := os.MkdirAll(fx.secretsRoot(), 0o755); err != nil {
+	if err := os.MkdirAll(fx.secretsParentRoot(), 0o755); err != nil {
 		t.Fatalf("creating permissive secrets dir: %v", err)
 	}
-	if err := os.Chmod(fx.secretsRoot(), 0o755); err != nil {
+	if err := os.Chmod(fx.secretsParentRoot(), 0o755); err != nil {
 		t.Fatalf("chmod permissive secrets dir: %v", err)
 	}
 

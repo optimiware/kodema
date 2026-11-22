@@ -122,11 +122,18 @@ func isTransientTempFile(name string) bool {
 }
 
 // redactionValues reads every configured secret and credential file directly
-// from the isolated <root>/<workload>/secrets directory, returning non-empty
-// values longest first. A missing/unreadable/non-directory secrets root, a
-// symlink or non-regular entry, a missing KODEMA_TOKEN, or any missing declared
-// secret fails closed so log output is never emitted without redaction.
+// from the isolated <root>/<workload>/secrets/data directory, returning
+// non-empty values longest first. A missing/unreadable/non-directory secrets
+// root, a symlink or non-regular entry, a missing KODEMA_TOKEN, or any missing
+// declared secret fails closed so log output is never emitted without redaction.
 func (a *Adapter) redactionValues(ctx context.Context, workload id.WorkloadID) ([]string, error) {
+	parentInfo, err := a.files.Lstat(ctx, secretsParentDir(a.root, workload))
+	if err != nil {
+		return nil, err
+	}
+	if parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() {
+		return nil, fault.New(fault.Forbidden, "redaction source directory is not a directory")
+	}
 	dir := secretsDir(a.root, workload)
 	dirInfo, err := a.files.Lstat(ctx, dir)
 	if err != nil {

@@ -102,6 +102,26 @@ func NormalizeCeilingPolicy(policy ResourcePolicy) (ResourcePolicy, error) {
 	return policy, nil
 }
 
+// ResourcePolicyField identifies one field of a ResourcePolicy during parsing.
+type ResourcePolicyField string
+
+const (
+	ResourceFieldDefaultMemory ResourcePolicyField = "default_memory"
+	ResourceFieldMaxMemory     ResourcePolicyField = "max_memory"
+	ResourceFieldDefaultCPU    ResourcePolicyField = "default_cpu"
+	ResourceFieldMaxCPU        ResourcePolicyField = "max_cpu"
+)
+
+// ResourcePolicyParseError reports which field of a ResourcePolicy failed to
+// parse, wrapping the underlying InvalidInput fault.
+type ResourcePolicyParseError struct {
+	Field ResourcePolicyField
+	Err   error
+}
+
+func (e *ResourcePolicyParseError) Error() string { return e.Err.Error() }
+func (e *ResourcePolicyParseError) Unwrap() error { return e.Err }
+
 // ParseRawResourcePolicy parses optional Kubernetes-compatible memory and CPU
 // quantity strings without applying default ceilings so callers can choose
 // NormalizeResourcePolicy (Podman bounded defaults) or NormalizeCeilingPolicy
@@ -111,28 +131,40 @@ func ParseRawResourcePolicy(defaultMem, maxMem, defaultCPU, maxCPU string) (Reso
 	if raw := strings.TrimSpace(defaultMem); raw != "" {
 		parsed, err := definition.ParseMemoryQuantity(raw)
 		if err != nil {
-			return ResourcePolicy{}, fault.Wrap(fault.InvalidInput, "default memory limit is invalid", err)
+			return ResourcePolicy{}, &ResourcePolicyParseError{
+				Field: ResourceFieldDefaultMemory,
+				Err:   fault.Wrap(fault.InvalidInput, "default memory limit is invalid", err),
+			}
 		}
 		policy.DefaultMemoryBytes = parsed
 	}
 	if raw := strings.TrimSpace(maxMem); raw != "" {
 		parsed, err := definition.ParseMemoryQuantity(raw)
 		if err != nil {
-			return ResourcePolicy{}, fault.Wrap(fault.InvalidInput, "maximum memory limit is invalid", err)
+			return ResourcePolicy{}, &ResourcePolicyParseError{
+				Field: ResourceFieldMaxMemory,
+				Err:   fault.Wrap(fault.InvalidInput, "maximum memory limit is invalid", err),
+			}
 		}
 		policy.MaxMemoryBytes = parsed
 	}
 	if raw := strings.TrimSpace(defaultCPU); raw != "" {
 		parsed, err := definition.ParseCPUQuantity(raw)
 		if err != nil {
-			return ResourcePolicy{}, fault.Wrap(fault.InvalidInput, "default CPU limit is invalid", err)
+			return ResourcePolicy{}, &ResourcePolicyParseError{
+				Field: ResourceFieldDefaultCPU,
+				Err:   fault.Wrap(fault.InvalidInput, "default CPU limit is invalid", err),
+			}
 		}
 		policy.DefaultCPUMillicores = parsed
 	}
 	if raw := strings.TrimSpace(maxCPU); raw != "" {
 		parsed, err := definition.ParseCPUQuantity(raw)
 		if err != nil {
-			return ResourcePolicy{}, fault.Wrap(fault.InvalidInput, "maximum CPU limit is invalid", err)
+			return ResourcePolicy{}, &ResourcePolicyParseError{
+				Field: ResourceFieldMaxCPU,
+				Err:   fault.Wrap(fault.InvalidInput, "maximum CPU limit is invalid", err),
+			}
 		}
 		policy.MaxCPUMillicores = parsed
 	}

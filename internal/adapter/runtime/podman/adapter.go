@@ -121,7 +121,10 @@ func (a *Adapter) ensureConfinedDirectories(ctx context.Context, workload id.Wor
 			created[current] = true
 		}
 	}
-	return a.ensureDirectoryWithMode(ctx, secretsDir(a.root, workload), secretDirectoryMode)
+	if err := a.ensureDirectoryWithMode(ctx, secretsParentDir(a.root, workload), secretDirectoryMode); err != nil {
+		return err
+	}
+	return a.ensureDirectory(ctx, secretsDir(a.root, workload))
 }
 
 // ensureMountPoint creates one empty directory inside the activation
@@ -249,10 +252,20 @@ func (a *Adapter) writeCredential(ctx context.Context, workload id.WorkloadID, c
 	return a.replaceFile(ctx, target, []byte(credential))
 }
 
-// verifyPreparedFiles confirms the activation tree, isolated secrets directory,
-// declared secrets, and KODEMA_TOKEN exist as regular non-symlinked files
-// before Start creates a container.
+// verifyPreparedFiles confirms the activation tree, 0700 secrets parent,
+// bind-mounted secrets child, declared secrets, and KODEMA_TOKEN exist as
+// confined non-symlinked directories/files before Start creates a container.
 func (a *Adapter) verifyPreparedFiles(ctx context.Context, workload id.WorkloadID, prepared preparedWorkload) error {
+	parentInfo, err := a.files.Lstat(ctx, secretsParentDir(a.root, workload))
+	if err != nil {
+		return fault.Wrap(fault.DependencyUnavailable, "prepared directory is missing", err)
+	}
+	if parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() {
+		return fault.New(fault.Forbidden, "prepared directory is not a directory")
+	}
+	if parentInfo.Mode().Perm()&0o077 != 0 {
+		return fault.New(fault.Forbidden, "secrets directory permissions are too permissive")
+	}
 	for _, dir := range []string{activationDir(a.root, workload), secretsDir(a.root, workload)} {
 		info, err := a.files.Lstat(ctx, dir)
 		if err != nil {
@@ -954,7 +967,43 @@ func (a *Adapter) Stop(ctx context.Context, request reconcile.StopRequest) (engi
 	}
 
 	switch state.Status {
-	case ContainerStatusRunning, ContainerStatusCreated:
+	case ContainerStatusCreated:
+		// Real libpod leaves a "created" container in "created" status after
+		// StopContainer (pid 0, zero FinishedAt), which can never yield
+		// whole-container exit evidence. Instead, issue a non-forced remove:
+		// libpod refuses non-forced DELETE if the container started
+		// concurrently, so a clean removal affirmatively proves no container
+		// process is running and no delayed start can launch it.
+		removeErr := a.libpod.RemoveContainer(ctx, name)
+		switch {
+		case removeErr == nil:
+			return engine.ConfirmedStop(fmt.Sprintf(
+				"container %q was removed without force from created state; no container process can run", name)), nil
+		case errors.Is(removeErr, ErrNotFound):
+			return engine.PendingStop(fmt.Sprintf(
+				"stop unconfirmed: container %q disappeared without termination evidence", name)), nil
+		default:
+			// If a concurrent start moved the container into "running" before
+			// our non-forced delete, re-inspect and fall through to
+			// StopContainer; otherwise keep the outcome uncertain.
+			nextState, inspectErr := a.libpod.InspectContainer(ctx, name)
+			if inspectErr == nil && nextState.Status == ContainerStatusRunning {
+				if err := checkContainerIdentity(nextState, request.Identity); err != nil {
+					return engine.PendingStop(fmt.Sprintf("stop unconfirmed: container %q is not owned by this identity", name)), err
+				}
+				if err := checkContainerWorkspace(nextState, request.WorkspaceID); err != nil {
+					return engine.PendingStop(fmt.Sprintf("stop unconfirmed: container %q is bound to a different workspace", name)), err
+				}
+				if stopErr := a.libpod.StopContainer(ctx, name); stopErr != nil && !errors.Is(stopErr, ErrNotFound) {
+					return engine.PendingStop(fmt.Sprintf("stop unconfirmed: container %q stop outcome is unknown", name)),
+						fault.Wrap(fault.UncertainExternalEffect, "container stop outcome is unknown", stopErr)
+				}
+				break
+			}
+			return engine.PendingStop(fmt.Sprintf("stop unconfirmed: container %q stop outcome is unknown", name)),
+				fault.Wrap(fault.UncertainExternalEffect, "container stop outcome is unknown", removeErr)
+		}
+	case ContainerStatusRunning:
 		// An already exited container is never sent a stop request: only its
 		// observed termination evidence may confirm the barrier.
 		if err := a.libpod.StopContainer(ctx, name); err != nil && !errors.Is(err, ErrNotFound) {
@@ -1084,6 +1133,24 @@ func (a *Adapter) RefreshCredential(ctx context.Context, request reconcile.Crede
 
 	unlock := a.lockFor(request.Identity.WorkloadID)
 	defer unlock()
+
+	parentInfo, err := a.files.Lstat(ctx, secretsParentDir(a.root, request.Identity.WorkloadID))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return reconcile.CredentialRefresh{Detail: "credential refresh requires a completed preparation"},
+				fault.New(fault.NotFound, "credential refresh requires a completed preparation")
+		}
+		return reconcile.CredentialRefresh{Detail: "credential refresh refused: secrets directory is unreachable"},
+			fault.Wrap(fault.DependencyUnavailable, "secrets directory is unreachable", err)
+	}
+	if parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() {
+		return reconcile.CredentialRefresh{Detail: "credential refresh refused: secrets path is not a directory"},
+			fault.New(fault.Forbidden, "secrets path is not a directory")
+	}
+	if parentInfo.Mode().Perm()&0o077 != 0 {
+		return reconcile.CredentialRefresh{Detail: "credential refresh refused: secrets directory permissions are too permissive"},
+			fault.New(fault.Forbidden, "secrets directory permissions are too permissive")
+	}
 
 	dir := secretsDir(a.root, request.Identity.WorkloadID)
 	dirInfo, err := a.files.Lstat(ctx, dir)

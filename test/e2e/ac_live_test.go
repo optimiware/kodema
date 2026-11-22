@@ -298,7 +298,7 @@ func TestE2E_AC11Materialization(t *testing.T) {
 		`test -w /workspace`,
 		`test -x /kodema/bin/kodema`,
 		`test "$(command -v kodema)" = "/kodema/bin/kodema"`,
-		`test ! -w /kodema/bin/kodema`,
+		`if ( : >> /kodema/bin/kodema ) 2>/dev/null; then exit 1; fi`,
 		`test ! -e /kodema/task && test ! -e /kodema/task.json && test -z "${KODEMA_TASK:-}"`,
 		`test -r /kodema/secrets/KODEMA_TOKEN && test -s /kodema/secrets/KODEMA_TOKEN`,
 		`printf 'token_check=%s\n' "$(cat /kodema/secrets/KODEMA_TOKEN)"`,
@@ -312,7 +312,8 @@ func TestE2E_AC11Materialization(t *testing.T) {
 	if instance.config.WorkloadCAFile != "" || instance.config.CAPEM != "" {
 		writeCommands = append(writeCommands,
 			`test "$KODEMA_CA_FILE" = "/etc/kodema/ca/ca.crt"`,
-			`test -r /etc/kodema/ca/ca.crt && test ! -w /etc/kodema/ca/ca.crt`,
+			`test -r /etc/kodema/ca/ca.crt`,
+			`if ( : >> /etc/kodema/ca/ca.crt ) 2>/dev/null; then exit 1; fi`,
 		)
 	}
 
@@ -335,7 +336,8 @@ func TestE2E_AC11Materialization(t *testing.T) {
 					`test "$AC11_ENV" = "ac11-override"`,
 					`test "$(pwd)" = "/workspace"`,
 					`test "$(cat /workspace/ac11.txt)" = "ac11-materialized"`,
-					`test -r /kodema/outputs/ac11-write/contract_out && test ! -w /kodema/outputs/ac11-write/contract_out`,
+					`test -r /kodema/outputs/ac11-write/contract_out`,
+					`if ( : >> /kodema/outputs/ac11-write/contract_out ) 2>/dev/null; then exit 1; fi`,
 					`test "$(cat /kodema/outputs/ac11-write/contract_out)" = "` + contractOutputValue + `"`,
 					`echo "ac11-override=$AC11_ENV"`,
 					`echo "ac11-shared-workspace-ok"`,

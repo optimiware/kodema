@@ -349,11 +349,13 @@ func AssertMaterializationContract(t testing.TB, ctx context.Context, h Containe
 
 	commands := []string{
 		`test "$PWD" = /workspace`,
-		`test ! -w /kodema/inputs/input-a`,
-		`test ! -w /kodema/outputs/earlier/out-a`,
-		`test ! -w /kodema/task.json`,
-		`test ! -w /kodema/task/title && test ! -w /kodema/task/spec.json`,
-		`test ! -w /kodema/secrets/API_KEY && test ! -w /kodema/secrets/KODEMA_TOKEN`,
+		`if ( : >> /kodema/inputs/input-a ) 2>/dev/null; then exit 1; fi`,
+		`if ( : >> /kodema/outputs/earlier/out-a ) 2>/dev/null; then exit 1; fi`,
+		`if ( : >> /kodema/task.json ) 2>/dev/null; then exit 1; fi`,
+		`if ( : >> /kodema/task/title ) 2>/dev/null; then exit 1; fi`,
+		`if ( : >> /kodema/task/spec.json ) 2>/dev/null; then exit 1; fi`,
+		`if ( : >> /kodema/secrets/API_KEY ) 2>/dev/null; then exit 1; fi`,
+		`if ( : >> /kodema/secrets/KODEMA_TOKEN ) 2>/dev/null; then exit 1; fi`,
 		`test "$(tr '\n' '|' < /kodema/inputs/input-a)" = "line1|line2|"`,
 		`test "$(cat /kodema/outputs/earlier/out-a)" = "earlier-output"`,
 		`test "$(cat /kodema/task.json)" = '{"id":"task-1"}'`,
@@ -370,7 +372,7 @@ func AssertMaterializationContract(t testing.TB, ctx context.Context, h Containe
 		commands = append([]string{
 			`test "$KODEMA_CA_FILE" = "` + container.WorkloadCAPath + `"`,
 			`test -s "` + container.WorkloadCAPath + `"`,
-			`test ! -w "` + container.WorkloadCAPath + `"`,
+			`if ( : >> "` + container.WorkloadCAPath + `" ) 2>/dev/null; then exit 1; fi`,
 		}, commands...)
 	}
 

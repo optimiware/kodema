@@ -133,11 +133,6 @@ type provisioningWorkspace struct {
 	activation     WorkspaceActivation
 	expectedTenant id.TenantID
 	provision      func(ctx context.Context, workspaceID id.WorkspaceID) error
-
-	// provisioner and claim retain the configured backend dependency and
-	// optional PVC template for composition inspection.
-	provisioner any
-	claim       WorkspacePVC
 }
 
 var _ kernelengine.Workspace = (*provisioningWorkspace)(nil)
@@ -156,9 +151,8 @@ func newProvisioningWorkspace(inner kernelengine.Workspace, provisioner VolumePr
 		return nil, fault.New(fault.InvalidInput, "provisioning workspace requires an activation fact source")
 	}
 	return &provisioningWorkspace{
-		inner:       inner,
-		activation:  activation,
-		provisioner: provisioner,
+		inner:      inner,
+		activation: activation,
 		provision: func(ctx context.Context, workspaceID id.WorkspaceID) error {
 			volumeName, err := runtimepodman.WorkspaceVolumeName(workspaceID)
 			if err != nil {
@@ -206,8 +200,6 @@ func newKubeProvisioningWorkspace(inner kernelengine.Workspace, provisioner Clai
 		inner:          inner,
 		activation:     activation,
 		expectedTenant: claim.TenantID,
-		provisioner:    provisioner,
-		claim:          claim,
 		provision: func(ctx context.Context, workspaceID id.WorkspaceID) error {
 			spec := driverkube.ClaimSpec{
 				Namespace:    claim.Namespace,

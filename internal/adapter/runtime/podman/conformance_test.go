@@ -191,7 +191,7 @@ func (p *podmanConformanceFixture) AppendLog(t *testing.T, identity reconcile.Ef
 
 func (p *podmanConformanceFixture) BreakRedactionSource(t *testing.T, identity reconcile.EffectIdentity) {
 	t.Helper()
-	if err := os.RemoveAll(secretsDir(p.fx.root, identity.WorkloadID)); err != nil {
+	if err := os.RemoveAll(secretsParentDir(p.fx.root, identity.WorkloadID)); err != nil {
 		t.Fatalf("removing secrets dir: %v", err)
 	}
 }
