@@ -10,23 +10,52 @@ Kodema is an Apache-2.0, API-first, multi-tenant software factory, deployable st
 
 **The central rule: a pipeline is an ordered list of actions; an action runs a container or requests an answer; an execution runs a pipeline once; a task is a conversation that starts executions.**
 
-### Three functional layers
+### Architecture
 
-| Layer | Responsibilities |
+Kodema has a **two-sided (hourglass) architecture** separated by a narrow public contract (`api/` and `client/`), with a **hexagonal Control Plane** on the inside and **Apps & Workloads** on the outside:
+
+```text
+          CONTROL PLANE (Hexagonal / Ports & Adapters)
+          ┌──────────────────────────────────────────────┐
+          │  Transports: REST, MCP                       │
+          │       ↓                                      │
+          │  Control: authz, verify, tasks, inbox, KV,   │
+          │           secrets, tokens, triggers ...      │
+          │       ↓                          ↑           │
+          │  Engine (pure)               Adapters        │
+          │  (ordered lifecycle,     (PG, NATS, Podman,  │
+          │   deadlines, recovery)    K8s, KMS, OCI)     │
+          └──────────────────────┬───────────────────────┘
+                                 │
+              ════════════ api / client ════════════   ← public contract waist
+                                 │
+          ┌──────────────────────┴───────────────────────┐
+          │            APPS & WORKLOADS                  │
+          │  (zero server imports; public contracts only)│
+          │                                              │
+          │  cli · git serve · agent · services ·        │
+          │  sandbox · up + external containers & tools  │
+          └──────────────────────────────────────────────┘
+```
+
+| Part | Responsibilities |
 |---|---|
-| **1. Kernel** | Executions, container and request action lifecycles, shared workspaces, declared secret delivery, cancellation, action deadlines, recovery, logs, and outputs. |
-| **2. Shell** | Control plane: tenants, projects, identity, authorization and verification, resource bindings, pipelines, task conversations, request decisions, inbox, secrets, service accounts, persistence, the event table as stream, event publication, push triggers, and one operation router with REST and MCP edges. Optional in-process capabilities: model gateway, external MCP proxy. |
-| **3. Userland** | Actual work and integrations: pipeline definitions, containers, scripts, images, engineering conventions, delivery recipes, adapters, optional Git hosting, independently operated agentic services, external harnesses, and the native agent. |
+| **Control Plane — Engine** | Pure ordered-action state machine: executions, container and request action lifecycles, shared workspaces, declared secret delivery, cancellation, action deadlines, recovery, logs, and outputs. |
+| **Control Plane — Control** | Pure domain rules and authority: tenants, projects, identity, authorization and verification, resource bindings, pipelines, task conversations, request decisions, inbox, immutable KV store, secrets, service accounts, durable event publication intent, and push triggers. Optional in-process capabilities: model gateway, external MCP proxy. |
+| **Control Plane — Adapters & Transports** | Concrete I/O and edges: PostgreSQL/memory persistence, container/process runtimes, NATS/KMS/OIDC/OCI integrations, one shared operation router behind thin REST and MCP edges, and one explicit server composition root. |
+| **Public Contract (`api` / `client`)** | Typed wire schemas, REST and MCP operations, scoped NATS event/log streams, and the materialized workload contract. |
+| **Apps & Workloads** | Everything outside the control plane: first-party CLI and container toolbox, optional Git service, native agent, sandbox server, independent agentic/merge/intake services, pipeline definitions, containers, scripts, images, engineering conventions, delivery recipes, and external harnesses. |
 
-**Kernel executes. Shell coordinates and authorizes. Userland performs the work.** From inside out: **Kernel → Shell → Userland**; dependency direction: **Userland → Shell → Kernel**. These are code-ownership and dependency boundaries; deployment topology is an installation choice. `Shell` means the control plane; container command shells are workload tools.
+**The Engine executes. The Control Plane coordinates, persists, and authorizes. Apps & Workloads perform the work.** Two distinct boundaries govern code ownership and trust:
 
-The kernel consumes small interfaces for durable state, workloads, resources, secrets, workspace preparation, logs, and time, implemented and composed by the Shell. It depends on no tasks, Git hosting, identity, HTTP, SQL drivers, NATS, or agents. Request settlement enters through these interfaces; the Shell owns who may answer and records what was approved.
+- **Inside the Control Plane (hexagonal isolation):** Go imports point inward—composition (`server`) wires `transport` and `adapter` around pure `control` capabilities, which compose the pure `engine`. The Engine consumes small consumer-owned interfaces for durable state, workloads, resources, secrets, workspace preparation, logs, and time; it depends on no tasks, Git hosting, identity, HTTP, SQL drivers, NATS, or agents. Request settlement enters through these interfaces; the Control Plane owns who may answer and records what was approved.
+- **Across the Control Plane perimeter (trust boundary):** Apps & Workloads never import Control Plane or Engine internals and never access the factory database or tenant derivation keys—even when linked into the same `kodema` binary. They communicate strictly across the Public Contract (`api/`, `client/`, REST, MCP, NATS, and mounted workload files). Independent first-party apps (`cli`, `git`, `agent`, services, `up`) are isolated from each other and share only public contracts and minimal client helpers.
 
-Optional in-process capabilities belong to the Shell and invoke its authorizer directly. Independent services belong to Userland and use public APIs and scoped NATS events, never Shell internals. Only the Shell accesses the factory database. Projects can operate without Git or gateways. Optionality is configuration within these three layers; there is no separate Modules layer.
+Optional in-process capabilities (model gateway, external MCP proxy) belong to the Control Plane and invoke its authorizer directly. Independent services belong outside the Control Plane and use public APIs and scoped NATS events. Only Control Plane adapters access the factory database. Projects can operate without Git or gateways; optionality is configuration, not a separate Modules layer.
 
-**The kernel advances executions; PostgreSQL records facts; NATS distributes activity; the Shell authorizes operations and connects them.** NATS is an independent integration boundary: execution progression, runtime observation, and deadline recovery do not depend on broker delivery.
+**The Engine advances executions; PostgreSQL records facts; NATS distributes activity; the Control Plane authorizes operations and connects them.** NATS is an independent integration boundary: execution progression, runtime observation, and deadline recovery do not depend on broker delivery.
 
-**Kodema owns identity, roles, and recorded decisions. Services own resources, their access rules, and enforcement.** [Authorization and verification](#authorization-and-verification) are Shell capabilities, not another layer or an execution engine.
+**Kodema owns identity, roles, and recorded decisions. Services own resources, their access rules, and enforcement.** [Authorization and verification](#authorization-and-verification) are Control Plane capabilities, not another layer or an execution engine.
 
 ### Core model
 
@@ -38,16 +67,17 @@ Tenants
       Executions
         Actions → container or request
     Tasks → conversation + selected pipeline + execution history
+    KV store → content-addressed immutable objects
     Secrets, service accounts
 ```
 
-The primary entities are **Pipelines, Projects, Tenants, Tasks, Executions, and Actions**, named consistently in authoring, operations, persistence, and public contracts. Requests are actions in `actions`, not a task kind or separate entity. Artifacts are output values whose bytes live in external registries, not entities. For bounded specifications, plans, and review reports that exceed the 4 KiB action-output limit, projects also expose a content-addressed, write-once immutable **KV store** (`kv.put` / `kv.get`, returning `kv:sha256:<64-hex>` keys up to 16 MiB).
+The primary entities are **Pipelines, Projects, Tenants, Tasks, Executions, and Actions**, named consistently in authoring, operations, persistence, and public contracts. Requests are actions in `actions`, not a task kind or separate entity. Artifacts are output values whose bytes live in external registries, not entities. For bounded specifications, plans, and review reports that exceed the 4 KiB action-output limit, projects expose a content-addressed, write-once [immutable KV store](#immutable-kv-store).
 
 A tenant owns an isolated organization. A project groups its software, work, configuration, and resources.
 
 A resource binding records a stable resource ID, ownership scope, enforcing service, registered endpoint origins, verifiable operations, and reportable events. Repository bindings add remote metadata such as path and default branch; the Git service owns objects, refs, and [access rules](#git-access-rules). Admins manage bindings through the API; each change increments the binding version, is audited, and publishes an event. Services and workloads cannot claim another resource. Registration stores metadata, not bytes, access rules, or provisioning jobs.
 
-A pipeline has a stable ID, project-unique name, and YAML, created or updated only through the API. Files kept in Git can be posted with `kodema pipeline apply .kodema/`; the Shell never discovers or synchronizes them on push. Git push imports code, not pipeline definitions, and is not the standard work-submission mechanism.
+A pipeline has a stable ID, project-unique name, and YAML, created or updated only through the API. Files kept in Git can be posted with `kodema pipeline apply .kodema/`; the Control Plane never discovers or synchronizes them on push. Git push imports code, not pipeline definitions, and is not the standard work-submission mechanism.
 
 Admission stores the exact YAML bytes and their SHA-256 hash, resolves images to immutable digests, and snapshots inputs, declared secret names, runtime requirements, and any task conversation and metadata. Pipeline edits cannot change this snapshot. Commits, refs, and artifact digests are ordinary input and output values; Git is one optional snapshot system, not a Kodema concept. Executions need neither a task nor a source repository; task-free runs may use inline YAML. There is no YAML canonicalization, separate definition-blob store, mutable digest ref, or pipeline version table. Secret values resolve at container activation.
 
@@ -59,13 +89,13 @@ Ownership, identities, references, queryable states, and concurrency versions ar
 
 ### Ordered flow
 
-The kernel visits container or request actions in declaration order, with at most one active action per execution. Activation persists the action's absolute deadline, then runs its container or makes its request answerable. Only success permits advancement; failure or cancellation stops progression.
+The Engine visits container or request actions in declaration order, with at most one active action per execution. Activation persists the action's absolute deadline, then runs its container or makes its request answerable. Only success permits advancement; failure or cancellation stops progression.
 
 There are no `when` conditions, general expressions, parallel actions, dependency graphs, joins, loops, backward jumps, or `skipped` state. Conditional behavior belongs in scripts or a separately selected pipeline. Each action settles once; rework creates a new execution starting at the first action, never resetting history or resuming an interrupted command.
 
 Request subjects allow literals and direct lookups only, with no expressions or transformations: `{from: inputs.<key>}` or `{from: <action>.outputs.<key>}`. Admission rejects unknown, invalid, self, or forward references, unsupported or mixed action kinds, conditions, and dependency/join declarations. An unavailable subject value fails the request before it becomes answerable.
 
-The kernel records settlement and advances; it never interprets human roles or access rules. Services owning protected resources check approvals through [verification](#authorization-and-verification).
+The Engine records settlement and advances; it never interprets human roles or access rules. Services owning protected resources check approvals through [verification](#authorization-and-verification).
 
 ### Container actions
 
@@ -75,11 +105,11 @@ A container action declares its image, commands, environment, secret references,
 
 Following Drone's model, the adapter replaces the entrypoint with a fail-fast script using the image's shell and tools, without automatic command tracing or a Kodema process that supervises the commands. The commands start in `/workspace`. The runtime supplies exit status and stdout/stderr logs; the controller owns scheduling, cancellation, deadlines, and recovery.
 
-Container runtimes mount the `kodema` binary of the control plane's own version read-only at `/kodema/bin` and add that directory to the end of `PATH`. It is a toolbox: commands may call it, it is never a process between the commands and the runtime, and the Kernel does not depend on it. Commands use it, or HTTP, Git, and MCP directly; an image needs no Kodema software of its own.
+Container runtimes mount the `kodema` binary of the control plane's own version read-only at `/kodema/bin` and add that directory to the end of `PATH`. It is a toolbox: commands may call it, it is never a process between the commands and the runtime, and the Engine does not depend on it. Commands use it, or HTTP, Git, and MCP directly; an image needs no Kodema software of its own.
 
 Container actions share one disposable `/workspace`, used sequentially and retained across request waits and controller restarts. A request runs no container; its successor receives the same files. Workspace loss fails the execution visibly rather than recreating scratch state or replaying commands.
 
-The Shell publishes lifecycle events and log chunks. Containers may publish custom observations through the authenticated API using their execution credential; these never settle actions. Standard success events follow settlement and include available outputs or references.
+The Control Plane publishes lifecycle events and log chunks. Containers may publish custom observations through the authenticated API using their execution credential; these never settle actions. Standard success events follow settlement and include available outputs or references.
 
 ### Request actions
 
@@ -99,13 +129,13 @@ Container outputs and request responses share nullable `actions.outputs`: one JS
 
 `PUT /api/v1/executions/{execution}/actions/{action}/outputs` accepts container outputs using the execution credential only while that container action is current and running. Submission and settlement serialize on the action row. Identical retries converge; different replacements are refused. Values remain staged until runtime-confirmed success; failure or cancellation clears them.
 
-A container action that declares outputs has a writable directory at `/kodema/outputs/<its own name>`, where a command writes each value to the file named for its key: `git rev-parse HEAD > /kodema/outputs/build/candidate`. After the last command has succeeded, the shell runs `kodema output push` as the action's final command. It reads the files of that directory, removes one trailing newline from each value, and submits them in one request to the operation above; an empty directory submits nothing, and a refused submission fails the action. The values reach the Shell over HTTP with the execution credential, so identity, validation, and serialization with settlement are those of every other submission, which a command may still make itself.
+A container action that declares outputs has a writable directory at `/kodema/outputs/<its own name>`, where a command writes each value to the file named for its key: `git rev-parse HEAD > /kodema/outputs/build/candidate`. After the last command has succeeded, the container shell runs `kodema output push` as the action's final command. It reads the files of that directory, removes one trailing newline from each value, and submits them in one request to the operation above; an empty directory submits nothing, and a refused submission fails the action. The values reach the Control Plane over HTTP with the execution credential, so identity, validation, and serialization with settlement are those of every other submission, which a command may still make itself.
 
 Only succeeded actions supply downstream output files: runtime-confirmed container outputs or authorized passed-request responses. Rejected responses remain inspectable in the action's decision record without becoming downstream outputs.
 
 ### Environment and materialized files
 
-The Shell supplies four standard environment variables through the runtime adapter:
+The Control Plane supplies four standard environment variables through the runtime adapter:
 
 | Variable | Value |
 |---|---|
@@ -140,7 +170,7 @@ At container action activation, one `Prepare(action)` call materializes database
 | `/kodema/cache/<name>` | Writable tenant/project-scoped non-authoritative cache volume for each declared entry in `caches: [...]` |
 | `/kodema/bin/kodema` | The toolbox: the control plane's own `kodema` binary (`harness exec`, `kv`, `sandbox serve`, `docs`, `context`, `output push`, `git credential`) |
 
-`Prepare(action)` also supplies writable `/workspace` and, for an action that declares outputs, the writable and initially empty `/kodema/outputs/<its own name>`; read-only files stay outside both and remain fixed for that workload. Subject lookups and files share one source: `<action>.outputs.<key>` maps to `/kodema/outputs/<action>/<key>`, the path the action wrote and later actions read. Preparation failure prevents workload start. Reads use activation-time files; output values reach the Shell over HTTP for identity and serialization with settlement. The runtime never inspects container filesystems.
+`Prepare(action)` also supplies writable `/workspace` and, for an action that declares outputs, the writable and initially empty `/kodema/outputs/<its own name>`; read-only files stay outside both and remain fixed for that workload. Subject lookups and files share one source: `<action>.outputs.<key>` maps to `/kodema/outputs/<action>/<key>`, the path the action wrote and later actions read. Preparation failure prevents workload start. Reads use activation-time files; output values reach the Control Plane over HTTP for identity and serialization with settlement. The runtime never inspects container filesystems.
 
 The credential mounts read-only at `/kodema/secrets/KODEMA_TOKEN`, a name stored secrets cannot shadow. Among materialized read-only files, only this file changes during a workload, on controller-managed renewal. Clients read its current value when authenticating; `kodema` does so by default. Tools needing secret environment variables use explicit commands such as `export DB_PASSWORD="$(cat /kodema/secrets/TEST_DB_PASSWORD)"`.
 
@@ -207,11 +237,11 @@ Cleanup is separate from execution outcome: confirmed or visibly pending with re
 
 Every fresh attempt starts at the first action with a new identity, workspace, action deadlines, and credential. Inputs and the task snapshot may name durable references such as commits, digests, and answers, but never inherit scratch state, process memory, prior action success, or approvals. It obtains its own required decisions and reconciles unknown external effects before repeating them.
 
-## 3. Shell capabilities
+## 3. Control-plane capabilities
 
 ### Tasks and role inbox
 
-A task holds a title, Markdown description and messages, metadata, optional `parent_id` (grouping subtasks within the same project without imposing execution prerequisites), selected pipeline and inputs, initiating principal, execution history, and waiting assignee. `metadata` is one bounded JSON object of string values (`map[string]string`, matching resource binding metadata) for userland state such as labels, priority, or workflow stage; Kodema stores, versions, snapshots, and publishes it without interpreting it. Authorized pipeline selection records the principal whose current start authority is checked on replies. Messages retain author, time, and durable references. There is no task `kind` or continuation definition.
+A task holds a title, Markdown description and messages, metadata, optional `parent_id` (grouping subtasks within the same project without imposing execution prerequisites), selected pipeline and inputs, initiating principal, execution history, and waiting assignee. `metadata` is one bounded JSON object of string values (`map[string]string`, matching resource binding metadata) for client and workflow state such as labels, priority, or stage; Kodema stores, versions, snapshots, and publishes it without interpreting it. Authorized pipeline selection records the principal whose current start authority is checked on replies. Messages retain author, time, and durable references. There is no task `kind` or continuation definition.
 
 | State | Meaning |
 |---|---|
@@ -220,7 +250,7 @@ A task holds a title, Markdown description and messages, metadata, optional `par
 | `done` | An execution with `completes_task: true` (the default) succeeded while the task was open, or the task was explicitly closed via `task.complete`. |
 | `cancelled` | The task was explicitly cancelled. |
 
-A task's status has three layers: its own state above, the current execution's state, and that execution's current or last action state. The latter two come from the derived, rebuildable execution view, so queued, running, and failed are execution states, never separately maintained task progress. Metadata customizes further. A declared request leaves its task open; `waiting` means a conversational handoff. Multi-stage pipelines set `completes_task: false` (in YAML or per start/restart) so intermediate stage successes keep the task `open` until explicit `task.complete` (or a final completing stage). Older events cannot regress progress or overwrite waiting, cancelled, or newer work.
+A task's status has three levels: its own state above, the current execution's state, and that execution's current or last action state. The latter two come from the derived, rebuildable execution view, so queued, running, and failed are execution states, never separately maintained task progress. Metadata customizes further. A declared request leaves its task open; `waiting` means a conversational handoff. Multi-stage pipelines set `completes_task: false` (in YAML or per start/restart) so intermediate stage successes keep the task `open` until explicit `task.complete` (or a final completing stage). Older events cannot regress progress or overwrite waiting, cancelled, or newer work.
 
 Creating a task alone starts nothing. Start and create-and-start atomically admit a queued execution with the task update and operation receipt, checking pipeline, inputs, and current authority. The task must be open, with at most one current execution. A replacement may be admitted and queued while its predecessor is still nonterminal; it becomes the task's current execution and dispatches only after all prior workloads are confirmed stopped. A start granted only by the operator role requires a failed current execution. The queued execution itself is the durable dispatch record, with no separate start-intent lifecycle.
 
@@ -244,7 +274,7 @@ A merge service can answer an assigned request with the observed merge/rebase re
 
 ### Authorization and verification
 
-Shell operations and optional in-process capabilities call one authorizer:
+Control Plane operations and optional in-process capabilities call one authorizer:
 
 ```text
 Authorize(principal, operation, resource) → allow | deny
@@ -252,7 +282,7 @@ Authorize(principal, operation, resource) → allow | deny
 
 The principal is verified identity, never an asserted ID or role. Operations have known schemas validating names, types, and required fields. Resources derive scope from relational ownership, and creation from the owning tenant/project. Each check validates current credentials and principal state (service enablement, or the execution's running container action and deadline), tenant/project scope, and the principal's roles or execution permissions. Unknown operations or resources, invalid input, and unavailable authorization are refused. Authorization is explicit code, not an expression language or user-supplied policy program.
 
-Enforcing services own their resources' access rules and decide every effect themselves. Immediately before an effect, they ask the Shell for facts:
+Enforcing services own their resources' access rules and decide every effect themselves. Immediately before an effect, they ask the Control Plane for facts:
 
 ```text
 POST /api/v1/verify
@@ -266,7 +296,7 @@ POST /api/v1/verify
 
 Verification authenticates the calling service and checks that its binding covers the resource and operation, then separately verifies the actor's credential and current state; service permissions never substitute for the actor's. Approval evidence is either an earlier passed request in the actor's own execution, or—when `decision_id` is supplied—an immutable, unrevoked, unexpired `pass` decision in the same tenant and project, assigned to exactly that `role/<role>`, whose subject matches the operation, resource, and every supplied subject field, presented by an execution on the same execution/task or an enabled service holding an active assigned request on that execution/task; resolution already verified that the answerer held the role. Without a valid `decision_id`, humans and services carry no approval evidence, and copied result strings never count.
 
-Verification returns facts, not decisions. Which roles grant access, and which effects need which approver, are the enforcing service's rules, such as the [Git access rules](#git-access-rules); pipeline authors, request assignments, and workloads cannot change them. The Shell records each verification with service, actor, execution/action where applicable, resource, operation, subject, requested approval, and result. Its ID proves a check, not a bearer grant or completed effect.
+Verification returns facts, not decisions. Which roles grant access, and which effects need which approver, are the enforcing service's rules, such as the [Git access rules](#git-access-rules); pipeline authors, request assignments, and workloads cannot change them. The Control Plane records each verification with service, actor, execution/action where applicable, resource, operation, subject, requested approval, and result. Its ID proves a check, not a bearer grant or completed effect.
 
 Forwarded actor credentials are secret, used only for verification, and never persisted in journals, receipts, logs, or events. Services receive no tenant derivation keys or factory database access. Every call evaluates current state; prior results and mutation receipts cannot bypass revocation, membership changes, or cancellation.
 
@@ -282,15 +312,15 @@ Humans authenticate through external OAuth/OIDC with RBAC. Tenant and project me
 - **Operator:** runtime operations.
 - **Viewer:** read-only project membership holding no mutation or approval role.
 
-The Project is the read/visibility boundary for non-secret project operational state: every authenticated human member of a project (holding any membership role in scope) and every enabled service account in that project (including services with no assigned roles) can read project-scoped operational state (`execution.*`, `task.*`, `pipeline.*`, `resource.binding.*`, `secret.metadata.*`, `service.list`, `event.read`, `event.subscribe`), while roles enforce mutation, approval, and administration authority. The Admin role grants no review authority, and access to service-owned resources follows each owning service's rules.
+The Project is the read/visibility boundary for non-secret project operational state: every authenticated human member of a project (holding any membership role in scope) and every enabled service account in that project (including services with no assigned roles) can read project-scoped operational state (`execution.*`, `task.*`, `pipeline.*`, `kv.get`, `resource.binding.*`, `secret.metadata.*`, `service.list`, `event.read`, `event.subscribe`), while roles enforce mutation, approval, and administration authority. The Admin role grants no review authority, and access to service-owned resources follows each owning service's rules.
 
-Humans present OAuth access tokens issued for Kodema's audience, to Kodema APIs and to enforcing services that forward them to verification. The Shell validates issuer, signature, audience, and expiry, then resolves current memberships: role changes apply on the next call, and identity-provider disablement within the short access-token lifetime. `kodema login` holds the session, and `kodema git credential` is the Git credential helper that supplies a fresh access token as the password for username `kodema`. Automation uses service accounts, never human sessions.
+Humans present OAuth access tokens issued for Kodema's audience, to Kodema APIs and to enforcing services that forward them to verification. The Control Plane validates issuer, signature, audience, and expiry, then resolves current memberships: role changes apply on the next call, and identity-provider disablement within the short access-token lifetime. `kodema login` holds the session, and `kodema git credential` is the Git credential helper that supplies a fresh access token as the password for username `kodema`. Automation uses service accounts, never human sessions.
 
 Tenant isolation applies to database records, execution, networking, credentials, logs, and events. Registered enforcing services, including Git, enforce the same scope on their own storage and protocols. PostgreSQL uses forced row-level security under a non-owner runtime role, with composite ownership constraints and project-level authorization.
 
 ### Service accounts
 
-**Userland services authenticate as service accounts:** tenant/project-scoped software principals outside executions, unrelated to Kubernetes ServiceAccounts. `services` records scope, enabled state, roles, and the credential fields below. Admins create/disable accounts and issue/rotate/revoke credentials through the API; ordinary management reads expose metadata only.
+**Independent services authenticate as service accounts:** tenant/project-scoped software principals outside executions, unrelated to Kubernetes ServiceAccounts. `services` records scope, enabled state, roles, and the credential fields below. Admins create/disable accounts and issue/rotate/revoke credentials through the API; ordinary management reads expose metadata only.
 
 Services have scoped human-style roles excluding Admin; enabled services without mutation roles (`roles: []`) still have project-scoped operational read visibility and can poll their inbox and answer explicit `service/<id>` assignments. Requests and conversation replies require explicit service-ID assignment, never human-role membership. Broker access derives from scope/roles: subscribe to authorized events/logs and publish custom observations under the authenticated source. Admin-managed resource bindings permit verification calls and specified event reports, not arbitrary impersonation or approval.
 
@@ -298,7 +328,7 @@ Services have no factory database access, plaintext secret-management reads, or 
 
 ### Bearer-token security model
 
-The Shell issues HMAC-derived Bearer tokens: adapters deliver execution tokens, service owners deliver service tokens. Cluster location grants no authority. The execution is the workload trust boundary: all its containers share the current credential, and a retained valid token exercises current execution authority regardless of the receiving action. A service token identifies only its service account.
+The Control Plane issues HMAC-derived Bearer tokens: adapters deliver execution tokens, service owners deliver service tokens. Cluster location grants no authority. The execution is the workload trust boundary: all its containers share the current credential, and a retained valid token exercises current execution authority regardless of the receiving action. A service token identifies only its service account.
 
 ```text
 execution_mac = HMAC-SHA256(
@@ -316,22 +346,28 @@ service_token = "kodsvc." + service_id + "." + base64url(service_mac)
 
 `encode` is unambiguous canonical encoding; `base64url` has no padding. IDs are lookup hints until constant-time MAC verification against the current tenant key and stored nonce/expiry. Distinct prefixes/domains prevent principal-kind substitution. Authentication also checks expiry, principal state, and current authority; missing nonce or expiry is refused.
 
-- **Key and storage:** each tenant has one Shell-only derivation key, at least 256 bits of entropy, stored in PostgreSQL encrypted under the configured key provider and outside declared workload secrets. Each principal has one current nonce of at least 256 random bits and absolute expiry in nullable `executions.token_nonce`/`executions.token_expires_at` or `services.token_nonce`/`services.token_expires_at`. The Shell reconstructs tokens for delivery/recovery; plaintext exists only for delivery/use, and PostgreSQL stores neither tokens nor token hashes.
+- **Key and storage:** each tenant has one Control Plane-only derivation key, at least 256 bits of entropy, stored in PostgreSQL encrypted under the configured key provider and outside declared workload secrets. Each principal has one current nonce of at least 256 random bits and absolute expiry in nullable `executions.token_nonce`/`executions.token_expires_at` or `services.token_nonce`/`services.token_expires_at`. The Control Plane reconstructs tokens for delivery/recovery; plaintext exists only for delivery/use, and PostgreSQL stores neither tokens nor token hashes.
 - **Tenant rotation:** tenant Admins rotate through the API, immediately invalidating that tenant's execution and service tokens. The controller replaces tokens for eligible running containers without restart; service owners obtain replacements through authorized issuance. Other tenants are unaffected.
 - **Service lifecycle:** expiry is required and explicitly configured. Issuance/rotation atomically replaces nonce/expiry and securely returns the token; replacement immediately invalidates the old token, and disabling/revoking clears both fields. There is no controller-managed service renewal. HTTP, MCP, and NATS use the same credential and enforce expiry, replacement, revocation, and disablement, including established broker connections/subscriptions.
 - **Execution authority:** check tenant/project scope, execution state, running container action, and its deadline together. Permissions derive from the admitted definition/current action; URL IDs and environment cannot widen them. No workload access is granted during a request wait. Service authority instead derives from its enabled record, scope, and current roles.
 - **Execution lifetime:** first issue occurs at container activation; issuance and renewal use TTL at most eight hours, bounded by the active action's deadline. Consecutive containers reuse an unexpired token while checks use the new action's deadline. Renew before expiry during long actions by atomically replacing nonce/expiry in PostgreSQL, then updating the mounted file through the adapter. Replace expired tokens before another container activation.
 - **Revocation:** request entry clears credential fields; the next container after a pass gets a new nonce/expiry in the same execution. Cancellation, including the one an ask commits, and every terminal execution transition clear both fields atomically with the state change. Fresh attempts get new credentials. Refresh never replays work or revives terminal executions; started effects still require stopping/reconciliation.
-- **Execution permissions:** assigned-task content and metadata, project task creation, questions on its task, declared outputs, custom events, and configured models/tools. Excluded: membership/pipeline/resource-binding administration, plaintext secret-management reads, request resolution, and assigned conversation replies. Service-owned resources, such as Git repositories, apply their own rules to `@execution`; questions and references cannot widen authority.
+- **Execution permissions:** assigned-task content and metadata, project task creation, project KV read/write, questions on its task, declared outputs, custom events, and configured models/tools. Excluded: membership/pipeline/resource-binding administration, plaintext secret-management reads, request resolution, and assigned conversation replies. Service-owned resources, such as Git repositories, apply their own rules to `@execution`; questions and references cannot widen authority.
 - **Transport:** HTTPS Bearer for REST, MCP, and the `kodema` client commands. The supplied Git service accepts Bearer or credential-helper password with username `kodema`, forwarding only to verification. The `kodema git credential` helper reads the mounted token inside containers and the human session elsewhere, and supplies either only to registered trusted Git-service origins/paths. Tokens never enter URLs, repository-local configuration, logs, events, or metadata, follow redirects to unregistered origins, or reach upstream Git providers; those use provider credentials behind a trusted integration.
 
 ### Secret custody
 
-User-managed secrets are **project-scoped**: the public secret operations (`secret.write`, `secret.metadata.read`, `secret.metadata.list`, and `secret.delete`) require `project_id` and operate strictly within that project (tenant-scoped secret management is not exposed on the public API). The Shell's `secrets` table contains `id`, `tenant_id`, nullable `project_id`, `name`, `ciphertext`, `wrapped_key`, `key_ref`, `created_at`, and `updated_at`, with names unique per scope. Rows hold only current values: writes replace, deletion removes. Authenticated envelope encryption binds ciphertext to installation and scoped identity; the wrapped data key shares the row.
+User-managed secrets are **project-scoped**: the public secret operations (`secret.write`, `secret.metadata.read`, `secret.metadata.list`, and `secret.delete`) require `project_id` and operate strictly within that project (tenant-scoped secret management is not exposed on the public API). The Control Plane's `secrets` table contains `id`, `tenant_id`, nullable `project_id`, `name`, `ciphertext`, `wrapped_key`, `key_ref`, `created_at`, and `updated_at`, with names unique per scope. Rows hold only current values: writes replace, deletion removes. Authenticated envelope encryption binds ciphertext to installation and scoped identity; the wrapped data key shares the row.
 
-At container activation, the resolver policy-checks declared names against the server's workload secret-name rules (`Config.SecretRules` / `KODEMA_SECRET_RULES_FILE`) and resolves the current stored value in the execution's project scope (falling back to any internally stored tenant-wide row only when no project row exists). Workload secret resolution is deny-by-default in `production` (which requires explicit exact-name rules and refuses wildcards); local `kodema up` stacks enable tenant-scoped workload secret resolution for projects in the local tenant by default (configurable via `--allow-project-secrets` and `--allow-secret`). Missing, denied, or unreadable values fail preparation, naming the unauthorized secret when refused by policy. Materialized secret files stay fixed (`0444`); changes affect subsequent activations. Request actions resolve no secrets, and the kernel knows only the resolver/materialization contract.
+At container activation, the resolver policy-checks declared names against the server's workload secret-name rules and resolves the current stored value in the execution's project scope (falling back to any internally stored tenant-wide row only when no project row exists). Workload secret resolution is deny-by-default in `production`, which requires explicit exact-name rules and refuses wildcards; local `kodema up` stacks allow project secrets within the local tenant by default and may be narrowed explicitly. Missing, denied, or unreadable values fail preparation, naming the unauthorized secret when refused by policy without revealing allowed rule names or secret material. Materialized secret files stay fixed (`0444`); changes affect subsequent activations. Request actions resolve no secrets, and the Engine knows only the resolver/materialization contract.
 
-Management reads expose metadata only. Model/MCP proxies resolve upstream secrets within the Shell on use. Bootstrap database and key-provider access stay outside this store.
+Management reads expose metadata only. Model/MCP proxies resolve upstream secrets within the Control Plane on use, and provider keys owned by configured LLM proxy providers are never materialized into workload containers. Bootstrap database and key-provider access stay outside this store.
+
+### Immutable KV store
+
+Projects expose a content-addressed, write-once immutable KV store (`kv.put`, `kv.get`) for bounded specifications, plans, review reports, and handoff payloads that exceed the 4 KiB action-output limit. Keys are derived strictly server-side from SHA-256 of the raw payload bytes in canonical form `kv:sha256:<64-lowercase-hex>`; callers never choose arbitrary keys. Each object is bounded to 16 MiB with an optional validated MIME `content_type`.
+
+Objects are strictly project-scoped: putting identical bytes in the same project converges idempotently to the existing record, while identical bytes in another project or tenant remain completely isolated. `kv.get` follows project read visibility (any project member, enabled project service, or running project execution); `kv.put` is authorized for human `engineer`, `operator`, and `reviewer` roles, any enabled project service, and running project executions.
 
 ### Events and operations
 
@@ -341,15 +377,15 @@ Events are owner-published named facts or observations; operations are authorize
 
 **Publish activity by default:** scoped events cover task creation/questions/replies, request activation/resolution, configuration, verified Git updates, execution/action transitions, service accounts, cleanup, usage, progress, and logs—every domain change and observable runtime activity.
 
-The versioned envelope holds stable ID, type, source, timestamp, ownership scope, applicable subject identity/version, optional correlation/causation, and bounded data or authorized references. Scope/source derive from authentication or verified ingress, never the body. Shell/userland use separate publish subjects. Credentials and plaintext secrets are excluded.
+The versioned envelope holds stable ID, type, source, timestamp, ownership scope, applicable subject identity/version, optional correlation/causation, and bounded data or authorized references. Scope/source derive from authentication or verified ingress, never the body. Control Plane facts and external observations use separate publish subjects. Credentials and plaintext secrets are excluded.
 
-The Shell's PostgreSQL event table is the durable stream: domain mutations commit state, audit, and event rows (publication intent) together. Custom ingress authenticates and records before routing; publication retries preserve IDs. Events describe domain changes, not SQL row layouts. External services own their state and recovery boundaries, such as Git's receive journal.
+The Control Plane's PostgreSQL event table is the durable stream: domain mutations commit state, audit, and event rows (publication intent) together. Custom ingress authenticates and records before routing; publication retries preserve IDs. Events describe domain changes, not SQL row layouts. External services own their state and recovery boundaries, such as Git's receive journal.
 
 Resource ingress verifies reporting service, binding, allowed event type, and schema. Accepted Git updates carry a stable source event ID and the `pre-receive` hook's verification ID. That verification must belong to the reporting service and match the reported resource, operation, and subject; its record supplies actor and execution causation. Deduplicate by service/source-event ID and refuse changed content. Reports authenticate the service, so previously accepted effects can be reported after actor-token expiry/revocation. They retain the service's source and grant no new authorization. Custom HTTP/NATS publication cannot impersonate this verified path.
 
-NATS connects Shell, services, agents, and clients. JetStream provides durable at-least-once delivery/replay; Core NATS carries live logs/progress, with retained logs fetched separately. Consumers deduplicate and tolerate reordering. Outages expose publication backlog and delay userland integrations, while execution progression, request settlement, push triggers, queued dispatch, and deadline reconciliation continue. Browsers use read-only NATS WebSocket subscriptions.
+NATS connects the Control Plane, independent services, agents, and clients. JetStream provides durable at-least-once delivery/replay; Core NATS carries live logs/progress, with retained logs fetched separately. Consumers deduplicate and tolerate reordering. Outages expose publication backlog and delay external integrations, while execution progression, request settlement, push triggers, queued dispatch, and deadline reconciliation continue. Browsers use read-only NATS WebSocket subscriptions.
 
-### Pipeline push triggers and userland services
+### Pipeline push triggers and independent services
 
 Optional `on.push` in API-posted YAML starts that pipeline for accepted external pushes to an explicitly selected repository/ref:
 
@@ -366,11 +402,11 @@ actions:
       - test-commit "$(cat /kodema/inputs/commit)"
 ```
 
-`repository` names the registered resource, whose binding selects its trusted event source; `service` names the automatic-start principal, not necessarily the reporting Git service. Refs match exactly. Admission pins the pushed commit and supplies declared inputs from `repository`, `ref`, `commit`, `previous_commit`; no other inputs may be required. Ref deletions and execution-originated pushes start nothing, even across pipelines. There are no filter expressions, input mappings, selectable operations, separate trigger entities, or trigger-management API.
+`repository` names the registered resource, whose binding selects its trusted event source; `service` names the automatic-start principal, not necessarily the reporting Git service. Refs match exactly (or by anchored prefix ending in `/`). Admission pins the pushed commit and supplies declared inputs from `repository`, `ref`, `commit`, `previous_commit`; no other inputs may be required. Ref deletions and execution-originated pushes start nothing, even across pipelines. There are no filter expressions, input mappings, selectable operations, separate trigger entities, or trigger-management API.
 
 Configuration checks pipeline-management authority and Admin authority to bind/change the service principal. Invocation uses the shared start operation, checking enabled service, project scope, event-read permission, and current start authority for the definition. Referencing service IDs rather than tokens preserves bindings across rotation; disabling the start principal prevents invocation.
 
-`(pipeline ID, event ID)` selects a common operation receipt independently of definition/binding edits. First handling selects the current YAML; the receipt retains event content identity, YAML snapshot, service, inputs, and result. Replay uses that selection, not edited configuration. The Shell reads accepted push events from its own event table, not NATS delivery, and advances past each only after a recorded result; permanent refusals are recorded and published, and transient failures retry. Suppressing execution-originated pushes removes automatic push chains.
+`(pipeline ID, event ID)` selects a common operation receipt independently of definition/binding edits. First handling selects the current YAML; the receipt retains event content identity, YAML snapshot, service, inputs, and result. Replay uses that selection, not edited configuration. The Control Plane reads accepted push events from its own event table, not NATS delivery, and advances past each only after a recorded result; permanent refusals are recorded and published, and transient failures retry. Suppressing execution-originated pushes removes automatic push chains.
 
 Slack/email/webhook/timer services handle external protocols, publish observations, and call APIs with stable idempotency keys to create/start tasks or executions or answer explicitly assigned requests. There is no generic event-to-operation engine; request progression and task replies use persisted lifecycles, not triggers.
 
@@ -380,16 +416,16 @@ email adapter → API → create and start diagnostic task
 diagnostic pipeline → request: role/operator → pass → next action, same execution
 agent question → waiting task → assigned reply → fresh execution
 action.requested → assigned service → API → resolve exact request action
-action/execution events + logs → userland service or web UI
+action/execution events + logs → independent service or web UI
 ```
 
-A **userland service** is independently operated outside the Shell: Git, agents, Redis, managed databases, validators, or adapters. Even supplied companions such as `kodema git serve` are deployed/supervised by installation operators. Services use public API/NATS contracts as service accounts; enforcing services also use verification. Pipelines connect through registered endpoints or declared address/credential secrets; reachability is installation network configuration, not pipeline syntax.
+An **independent service** operates outside the Control Plane: Git, agents, Redis, managed databases, validators, or adapters. Even first-party apps such as `kodema git serve` are deployed and supervised independently by installation operators. Services use public API/NATS contracts as service accounts; enforcing services also use verification. Pipelines connect through registered endpoints or declared address/credential secrets; reachability is installation network configuration, not pipeline syntax.
 
 ### Public operations
 
 One router dispatches every application operation to a shared handler behind two HTTP edges, REST and MCP JSON-RPC, so both expose the same operations and authorization. The client commands of `kodema` are a REST client:
 
-- Manage projects, resource bindings and their metadata, API-posted pipelines, secrets, and service accounts.
+- Manage projects, resource bindings and their metadata, API-posted pipelines, immutable KV objects, secrets, and service accounts.
 - Create, inspect, and update tasks and their conversations; create and start work; query the role inbox.
 - Ask and answer assigned task questions; cancel tasks; resolve active request actions.
 - Start eligible executions with or without tasks; inspect, watch, and cancel them.
@@ -402,11 +438,11 @@ A mutation requiring idempotency atomically records its effects and a durable re
 
 Laptops, external applications/CI, and containers use the same API. Task edits require no execution.
 
-## 4. Userland, agents, and software delivery
+## 4. Apps, workloads, and software delivery
 
 ### Git service and knowledge
 
-The optional `kodema git serve` companion owns native Git binaries, smart HTTP, provisioning, hooks, access rules, storage, receive journal, and recovery. It runs independently as a registered service account using only public API/NATS contracts, without factory database access, tenant derivation keys, or Shell internals. Existing hosts require an integration implementing the same verification, access-rule, event, and retention contracts.
+The optional `kodema git serve` app owns native Git binaries, smart HTTP, provisioning, hooks, access rules, storage, receive journal, and recovery. It runs independently as a registered service account using only public API/NATS contracts, without factory database access, tenant derivation keys, or Control Plane internals. Existing hosts require an integration implementing the same verification, access-rule, event, and retention contracts.
 
 The service owns Git protocol handling, access rules, and resource mutation. Kodema owns registered repository identities, scope, actor authentication, roles, and approval decisions.
 
@@ -414,7 +450,7 @@ Smart HTTP verifies the actor and applies read rules; the `pre-receive` hook ver
 
 Provision repositories through the Git service and register their metadata with Kodema. Humans reach Git with their access tokens, and container actions with their execution credential, through the `kodema git credential` helper. The supplied service isolates tenants with separate Git workers and durable volumes that execution containers never mount; other hosts must provide equivalent isolation.
 
-Container Git commands clone/fetch/push and verify commits named by inputs or outputs from registered repositories in `/workspace`; the Shell does not perform checkout. Naming conventions are:
+Container Git commands clone/fetch/push and verify commits named by inputs or outputs from registered repositories in `/workspace`; the Control Plane does not perform checkout. Naming conventions are:
 
 ```text
 <tenant>/admin
@@ -428,7 +464,7 @@ Context repositories hold Markdown architecture, domain language, skills, bluepr
 
 ### Git access rules
 
-In the spirit of gitolite, access rules live in the tenant's `admin` repository. Tenant Admins edit `conf/git.conf` and push; the Git service applies the rules once it accepts that push. Rule changes are commits with history, review, and revert from Git itself; neither Kernel nor Shell stores Git rules.
+In the spirit of gitolite, access rules live in the tenant's `admin` repository. Tenant Admins edit `conf/git.conf` and push; the Git service applies the rules once it accepts that push. Rule changes are commits with history, review, and revert from Git itself; the Control Plane stores no Git rules.
 
 ```text
 # <tenant>/admin → conf/git.conf
@@ -457,11 +493,19 @@ Repository names are relative to the tenant. `R` reads the repository, `RW` crea
 
 `option approve.<ref> = <role>` makes every update to that ref also require approval evidence: the `pre-receive` hook asks verification for a passed `request: role/<role>` whose subject holds `operation: git.ref.update`, the repository, and the exact `ref`, `expected_base`, and `candidate`—either in the pushing execution itself, or via an immutable cross-execution Decision ID passed as Git push option `-o kodema.decision_id=<id>` (for example by a separate integration execution or `service/merge-coordinator` running `kodema services --kind merge_coordinator`). Service roles, result strings, and labels never count. Humans carry no approval evidence, so they cannot update approval-guarded refs directly; integrating laptop work means pushing a work branch and starting a review/integration pipeline.
 
-Strict exact `(expected_base, candidate)` matching is always the default. Repositories that want to accept a clean rebase onto a moved target ref without re-running human review may opt in per ref with `option approve-rebase.<ref> = disjoint` alongside a covering `option approve.<ref> = <role>` rule (a dangling `approve-rebase` rule or unknown mode is rejected at parse time). When opted in and the pushing execution or authorized merge service supplies both Git push options `-o kodema.approved_base=<sha>` and `-o kodema.approved_candidate=<sha>` (optionally paired with `-o kodema.decision_id=<id>`) for a non-creation update, `pre-receive` verifies entirely inside the Git service that: (1) either the pushing execution holds a passed `request: role/<role>` or the supplied `kodema.decision_id` verifies that approval for `(approved_base, approved_candidate)`; (2) `approved_base` and `approved_candidate` are existing commit objects with `approved_base` a strict ancestor of `approved_candidate` and an ancestor of (or equal to) the current ref, and the push is a strict fast-forward; (3) both `approved_base..approved_candidate` and `current_ref..pushed` are linear, merge-free commit series of identical length; (4) every path modified by the approved and pushed series is completely disjoint from every path modified in `approved_base..current_ref` (checked with `--no-renames` so both source and destination paths are checked, plus file/directory prefix collisions); and (5) every commit in `current_ref..pushed` matches its counterpart in `approved_base..approved_candidate` byte-for-byte in `diff-tree --raw --no-abbrev --no-renames` (preserving exact file content, whitespace, binary blobs, symlinks, and file modes). Any violation refuses the push and requires a fresh review. Accepted disjoint rebases still verify and report `git.ref.updated` with the actual pushed commit OID.
+Strict exact `(expected_base, candidate)` matching is always the default. Repositories that want to accept a clean rebase onto a moved target ref without re-running human review may opt in per ref with `option approve-rebase.<ref> = disjoint` alongside a covering `option approve.<ref> = <role>` rule (a dangling `approve-rebase` rule or unknown mode is rejected at parse time). When opted in and the pushing execution or authorized merge service supplies both `-o kodema.approved_base=<sha>` and `-o kodema.approved_candidate=<sha>` (optionally paired with `-o kodema.decision_id=<id>`) for a non-creation update, `pre-receive` verifies entirely inside the Git service that:
+
+1. **Approval:** either the pushing execution holds a passed `request: role/<role>` or the supplied `kodema.decision_id` verifies that approval for `(approved_base, approved_candidate)`.
+2. **Ancestry:** `approved_base` and `approved_candidate` are existing commit objects with `approved_base` a strict ancestor of `approved_candidate` and an ancestor of (or equal to) the current ref, and the push is a strict fast-forward.
+3. **Linearity:** both `approved_base..approved_candidate` and `current_ref..pushed` are linear, merge-free commit series of identical length.
+4. **Disjoint paths:** every path modified by the approved and pushed series is completely disjoint from every path modified in `approved_base..current_ref` (checked with `--no-renames` so both source and destination paths are checked, plus file/directory prefix collisions).
+5. **Byte-for-byte equivalence:** every commit in `current_ref..pushed` matches its counterpart in `approved_base..approved_candidate` byte-for-byte in `diff-tree --raw --no-abbrev --no-renames` (preserving exact file content, whitespace, binary blobs, symlinks, and file modes).
+
+Any violation refuses the push and requires a fresh review. Accepted disjoint rebases still verify and report `git.ref.updated` with the actual pushed commit OID.
 
 Provisioning a tenant creates `admin` with `RW` for `@admin`, keeping rule history append-only. Provisioning a repository adds default rules: `option resource = <resource-id>`, `R` for `@all`, `RW+` on `refs/heads/work/` for `@engineer` and `@execution`, and `RW` on the default branch for `@execution` with `reviewer` approval. Engineers import history into empty repositories under rules Admins grant. Admins have no bypass beyond a recorded rule change in `admin`, which may itself require approval.
 
-Git applies each accepted update atomically: fast-forward ancestry unless the rule grants `RW+`, and only if the ref still equals the expected base. A moved target fails integration; a changed candidate needs fresh review. Before mutation, journal intent, stable source event ID, and verification ID. Confirm the outcome from Git and durably record acceptance before reporting `git.ref.updated` through [verified ingress](#events-and-operations); the Shell then records and distributes it on NATS. Reconcile uncertain entries against repository evidence before retrying; retry interrupted reporting, not the push. Verified causation keeps execution-originated pushes out of push triggers even when reported after the execution ends.
+Git applies each accepted update atomically: fast-forward ancestry unless the rule grants `RW+`, and only if the ref still equals the expected base. A moved target fails integration; a changed candidate needs fresh review. Before mutation, journal intent, stable source event ID, and verification ID. Confirm the outcome from Git and durably record acceptance before reporting `git.ref.updated` through [verified ingress](#events-and-operations); the Control Plane then records and distributes it on NATS. Reconcile uncertain entries against repository evidence before retrying; retry interrupted reporting, not the push. Verified causation keeps execution-originated pushes out of push triggers even when reported after the execution ends.
 
 Commits named in retained executions' inputs or outputs must remain reachable. The service discovers them through authorized execution queries, using events as notifications rather than sole truth. Its operator owns storage, journal recovery, retention, and backups; Kodema exposes coordinating references.
 
@@ -471,31 +515,31 @@ Commits named in retained executions' inputs or outputs must remain reachable. T
 
 **The native `kodema agent` runtime** adds planning, decomposition, review, validation, Git operations, knowledge lookup, and reusable Markdown skills. It records session identity, model/tool usage, structured outcomes, and optionally retained transcripts.
 
-Both run as userland images under the same pipeline lifecycle. Agents produce results, use declared requests for planned decisions, and follow [conversation handoffs](#conversation-handoffs-and-fresh-executions) for unplanned input and durable session restoration. Neither waiting mechanism preserves a live agent process.
+Both run as ordinary workload images under the same pipeline lifecycle. Agents produce results, use declared requests for planned decisions, and follow [conversation handoffs](#conversation-handoffs-and-fresh-executions) for unplanned input and durable session restoration. Neither waiting mechanism preserves a live agent process.
 
 ### Agentic services
 
-Independent agentic services plan, implement, review, answer explicitly assigned requests, or provide tools as ordinary userland clients. Pipeline agents use `kodex`; independent services use `kodsvc` (including attributed LLM proxy calls carrying `X-Kodema-Execution` and `X-Kodema-Action` headers bound to an active `request: service/<id>` action, subject to live execution/task budgets and cancellation cutoff). Kodema APIs already authorize calls; services enforcing owned resources use verification, including separate actor proof. Agents receive no special permissions or decision policy.
+Independent agentic services plan, implement, review, answer explicitly assigned requests, or provide tools as ordinary API clients. Pipeline agents use `kodex`; independent services use `kodsvc` (including attributed LLM proxy calls carrying `X-Kodema-Execution` and `X-Kodema-Action` headers bound to an active `request: service/<id>` action, subject to live execution/task budgets and cancellation cutoff). Kodema APIs already authorize calls; services enforcing owned resources use verification, including separate actor proof. Agents receive no special permissions or decision policy.
 
-Kodema ships a project-scoped OpenCode service adapter (`kodema services --kind opencode`) supporting two execution modes:
+Kodema ships a project-scoped OpenCode service app (`kodema services --kind opencode`) supporting two execution modes:
 
-- **Option 1 (`--mode worktree`, default):** Persists durable `task_id -> opencode_session_id` mappings, prepares isolated per-task Git worktrees (`refs/heads/work/<task-id>`), stores/reads KV handoffs, and aborts active sessions on execution cancellation via SSE—requiring no `engineer` role on the service account.
-- **Option 2 (`--mode brain` + `kodema sandbox serve`):** Disables all local shell and filesystem tools in the Brain pod and spawns ephemeral per-task toolchain sandboxes on stock upstream images via Kodema's public API (`KodemaExecutionSandboxManager`, requiring the `engineer` role on the Brain service account for `pipeline.start`, `execution.cancel`, and ephemeral `secret.write`/`secret.delete` sandbox tokens). Each sandbox runs `/kodema/bin/kodema sandbox serve` (pure Go stdlib, `os.Root`-jailed `/workspace` MCP tools `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`, constant-time Bearer auth, process-group timeout teardown) isolated by per-project Helm `opencodeBrain` NetworkPolicies. Non-coding turns (`plan`, `ai_review` without `sandbox_image`) execute directly in Brain with no sandbox container.
+- **Worktree mode (default):** Persists durable task-to-session mappings, prepares isolated per-task Git worktrees (`refs/heads/work/<task-id>`), stores/reads KV handoffs, and aborts active sessions on execution cancellation via SSE—requiring no `engineer` role on the service account.
+- **Brain + sandbox mode (`kodema sandbox serve`):** Disables all local shell and filesystem tools in the orchestrating brain process and spawns ephemeral per-task toolchain sandboxes on stock upstream images through Kodema's public API (requiring the `engineer` role on the brain service account to start/cancel sandbox executions and manage ephemeral sandbox tokens). Each sandbox exposes `/workspace`-confined MCP tools (`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`) behind constant-time Bearer auth with process-group timeout teardown and per-project network isolation. Non-coding turns (`plan`, `ai_review` without a sandbox image) execute directly in the brain with no sandbox container.
 
 ### Model and tool access
 
-Two optional in-process Shell capabilities keep upstream credentials within the Shell and call its authorizer:
+Two optional in-process Control Plane capabilities keep upstream credentials within the Control Plane and call its authorizer:
 
 - **Model gateway & streaming LLM proxy:** OpenAI-compatible model gateway plus streaming `/llm/{provider}/*` proxy for `kodex.` workloads (typically wrapped with `kodema harness exec -- <cmd>` for rotation-safe loopback proxying) and attributed `kodsvc.` agentic services, with model allowlists, active action/execution/task token and USD budgets (`429` / `budget_exceeded`), and attributable usage.
 - **External MCP proxy:** registered MCP servers and allowed tools under current caller authority.
 
-The MCP edge exposes Kodema operations; the proxy federates outside tools. Neither adds an execution engine. Ordinary pipelines need neither capability nor agent runtime. Independently operated equivalents are userland services using the public contract for Kodema-governed effects.
+The MCP edge exposes Kodema operations; the proxy federates outside tools. Neither adds an execution engine. Ordinary pipelines need neither capability nor agent runtime. Independently operated equivalents are external services using the public contract for Kodema-governed effects.
 
 ### Delivery recipes and artifacts
 
 Build, test, review, publish, deploy, rollback, cleanup, and notification compose container/request actions using standard tools and explicitly authorized credentials. Targets include Kubernetes, cloud services, static hosting, or any system those tools support.
 
-An artifact is an output value, not a Kodema entity. A build action publishes bytes with registry credentials, then submits a digest-pinned reference such as `registry.example.com/acme/web@sha256:…` as a declared output; an OCI image index carries several platforms under one digest. The external registry owns bytes, retention, and attached SBOMs or attestations. There is no artifact table, registration API, or catalog; userland indexes registries or `action.succeeded` events when it needs one.
+An artifact is an output value, not a Kodema entity. A build action publishes bytes with registry credentials, then submits a digest-pinned reference such as `registry.example.com/acme/web@sha256:…` as a declared output; an OCI image index carries several platforms under one digest. The external registry owns bytes, retention, and attached SBOMs or attestations. There is no artifact table, registration API, or catalog; external tools index registries or `action.succeeded` events when they need one.
 
 A recorded output proves which execution and action submitted it, not independently verified publication or target health. Images may carry the execution ID as a label; `GET /api/v1/executions/{execution}` confirms that pointer against recorded outputs. A lost output response is retried with the identical value, without rebuilding. Only results that actually test or build a candidate are candidate-bound.
 
@@ -507,9 +551,9 @@ Recipes own readiness checks and reconciliation: successful command exit alone d
 
 ### Implementation discipline
 
-Use one Go module organized around Kernel, Shell, and Userland, with one explicit Shell composition, one operation router, one pipeline authoring model, and one execution engine. Prefer standard-library facilities, ordinary SQL, and small consumer-owned interfaces; native Git stays in its companion. Colocate explicit business transitions and domain invariants with their owning capability/service. Add abstractions only for concrete boundaries or demonstrated reuse. Request answers enter through authorized Shell operations, not a second workflow engine.
+Use one Go module structured around the hexagonal Control Plane and isolated first-party apps: `api` and `client` at the public contract waist; `internal/engine` (pure execution state machine), `internal/control` (pure domain capabilities), `internal/adapter` (concrete persistence, runtime, and infrastructure integrations), `internal/transport` (shared router, REST, MCP), and `internal/server` (one explicit Control Plane composition) on the inside; and `internal/apps` (independent first-party programs sharing no server internals and isolated from each other) on the outside. Prefer standard-library facilities, ordinary SQL, and small consumer-owned interfaces; native Git stays in its independent app. Colocate explicit business transitions and domain invariants with their owning capability/service. Add abstractions only for concrete boundaries or demonstrated reuse. Request answers enter through authorized Control Plane operations, not a second workflow engine.
 
-The single entrypoint is `kodema`, one static binary in three places. It is the control plane and its companions: `serve` for Shell plus Kernel; `git serve`, `git hook`, `git provision-tenant`, and `git provision-repository` for the independent Git companion; `agent`; `services`; `migrate`; and `bootstrap-admin`. It is the client on a workstation: `login`, `run`, `inbox`, `approve`, `logs`, `task`, `pipeline`, `call`, and the other commands over the public API. It is the toolbox mounted into every container action. A command starts only what it names: a client command opens no store and starts no server. Client code keeps its import boundary, the public API and `client`, whatever binary links it. Other workload tools remain ordinary image dependencies.
+The single entrypoint is `kodema`, one static binary in three places. It is the control plane and its independent apps: `serve` for the Control Plane (including Engine); `git serve`, `git hook`, `git provision-tenant`, and `git provision-repository` for the Git app; `agent`; `services`; `sandbox serve`; `migrate`; and `bootstrap-admin`. It is the client on a workstation: `login`, `run`, `inbox`, `approve`, `logs`, `task`, `pipeline`, `call`, and the other commands over the public API. It is the toolbox mounted into every container action. A command starts only what it names: a client command opens no store and starts no server. App and client code keep their import boundary—the public `api` and `client`—whatever binary links them. Other workload tools remain ordinary image dependencies.
 
 ### Execution environments
 
@@ -525,6 +569,8 @@ Environment selection is explicit. Production refuses development and test adapt
 
 One runtime contract provides `Prepare(action)` as [specified above](#environment-and-materialized-files), start, observe, logs, stop, remove, credential refresh, and capabilities. Process runs host-process tests; Podman and Kubernetes run containers. Requests need no separate adapter. Admission rejects unsupported runtime requirements; Process tests establish neither container nor isolation guarantees.
 
+**Container-runtime parity and state ownership:** PostgreSQL and the container runtime backend are the sole durable authorities for lifecycle state—container adapters do not maintain local disk state machines, retention marker files, or unbounded removal tombstones. Podman and Kubernetes share one container assembly contract (`WorkingDir: /workspace`, shared launcher entrypoint, canonical CA bundle mount path `/etc/kodema/ca/ca.crt`, isolated secret/credential mounts, identical log redaction and cursor semantics, and workspace-ownership checks across all lifecycle calls) and align observation semantics so an absent runtime object reports `absent` rather than inferred `never_started`. Only backend object models, stop barriers, and multi-tenant network isolation differ by driver.
+
 Production uses Helm, an initially single-replica control plane, tenant execution namespaces, resource limits, and tenant-isolating network policies. Native Kubernetes Jobs run actions without automatic command replay. Workloads reach Kodema, configured Git, and other services permitted by installation network policy. Independent Git-service verification and event calls use authenticated HTTPS.
 
 The initial execution trust model is trusted project engineers using regular containers. Stronger hostile-workload isolation requires separate qualification.
@@ -535,7 +581,7 @@ Supported installation clouds are AWS, GCP, and Scaleway, with one explicitly se
 
 In hosted operation, Optimi Platform owns tenant authority, entitlements, billing, and commercial policy; Kodema owns factory execution and operational usage evidence. Integration uses public contracts. Hosted authority failure never falls back to standalone grants. Any optional UI belongs in Platform.
 
-Expose health/readiness, bounded logs, audit history, authorization and verification records, bindings, waiting tasks, active requests, queued/running execution progress, cleanup, publication backlog, consumer lag, refused push starts, rejected resource reports, and dependency failures. Userland operators expose resource health and reconciliation backlog.
+Expose health/readiness, bounded logs, audit history, authorization and verification records, bindings, waiting tasks, active requests, queued/running execution progress, cleanup, publication backlog, consumer lag, refused push starts, rejected resource reports, and dependency failures. Operators of independent services expose resource health and reconciliation backlog.
 
 Control-plane backup covers PostgreSQL, retained logs, encryption keys, and JetStream event/consumer state. Coordinate external-output retention and Git repository/journal/configuration backups with their operators. Owning services retain referenced commits and artifacts; disposable workspaces are excluded. Restore fences old controllers, enforcing services, and consumers, preserves resource bindings, verification records, pipeline IDs, conversations, request decisions, receipts, and queued executions, and reconciles external effects before dispatch. Unrecoverable workspaces fail executions; operators may start fresh attempts.
 
@@ -543,18 +589,18 @@ Recommended recovery objectives: RPO ≤15 minutes, RTO ≤4 hours, and 30-day P
 
 ### Delivery order
 
-1. **Standalone kernel:** ordered containers sharing files; workload-free request pass/reject/timeout; cancellation and recovery through injected adapters.
-2. **First useful factory:** compose identity, authorization/verification and bindings, PostgreSQL, NATS/event stream, tasks/decisions, secrets, interfaces, and the Git companion. Prove task → external coding harness → tests → review → protected integration under `admin` rules in one execution/workspace, plus conversation handoffs and operator retries. Expose lifecycle events and live logs to subscribers.
-3. **Composable services:** prove verified push starts, email-created diagnostic work, service-request resolution, serialized merges, and durable agent restoration. Complete optional gateways, userland runtimes, knowledge conventions, and delivery recipes; reuse verification as further enforcing services arrive.
+1. **Standalone Engine:** ordered containers sharing files; workload-free request pass/reject/timeout; cancellation and recovery through injected adapters.
+2. **First useful factory:** compose identity, authorization/verification and bindings, PostgreSQL, NATS/event stream, tasks/decisions, secrets, interfaces, and the Git app. Prove task → external coding harness → tests → review → protected integration under `admin` rules in one execution/workspace, plus conversation handoffs and operator retries. Expose lifecycle events and live logs to subscribers.
+3. **Composable services:** prove verified push starts, email-created diagnostic work, service-request resolution, serialized merges, and durable agent restoration. Complete optional gateways, independent apps and runtimes, knowledge conventions, and delivery recipes; reuse verification as further enforcing services arrive.
 4. **Production qualification:** exercise real Kubernetes, KMS, isolation, cleanup, backup, and restore.
 
 ### Acceptance criteria
 
 These numbered checks exercise the complete contracts linked below; they are a verification index, not replacement definitions.
 
-1. **Kernel independence:** reconstruct both action kinds through injected adapters/settlement, without Shell, agent, or broker; ordinary images expose logs/status without a supervising Kodema process, and the Kernel needs no toolbox. [Execution](#container-actions)
+1. **Engine independence:** reconstruct both action kinds through injected adapters/settlement, without Control Plane capabilities, agents, or broker; ordinary images expose logs/status without a supervising Kodema process, and the Engine needs no toolbox. [Execution](#container-actions)
 2. **Immutable admission:** API-only definitions, exact YAML/hash snapshots, inline task-free runs, and immunity to pipeline edits or Git imports. [Model](#core-model)
-3. **Idempotency:** retry interfaces and replay events without duplicate work or regressed progress, including pipeline/binding edits. [Operations](#public-operations), [triggers](#pipeline-push-triggers-and-userland-services)
+3. **Idempotency:** retry interfaces and replay events without duplicate work or regressed progress, including pipeline/binding edits. [Operations](#public-operations), [triggers](#pipeline-push-triggers-and-independent-services)
 4. **Request settlement:** restart and race authorized answers against timeout/cancellation; validate assignment/version and retain rejected answers without downstream outputs. [Requests](#request-actions)
 5. **Protected integration:** refuse rejected, stale, foreign, wrong-assignee, wrong-operation/candidate/base, or prior-execution evidence, forged approval strings, direct human pushes to approval-guarded refs, and rewinds or deletions without `RW+`; apply `admin` rule changes on the next push and enforce atomic fast-forward updates. [Git rules](#git-access-rules)
 6. **Recovery:** uncertain launch/stop causes neither blind replay nor concurrent workspace ownership; requests/controller restarts preserve workspace, and loss fails visibly. [Recovery](#lifecycle-and-recovery)
@@ -565,12 +611,12 @@ These numbered checks exercise the complete contracts linked below; they are a v
 11. **Materialization:** verify reserved variables/token name, literal environment precedence, file snapshots, the mounted toolbox and its Git configuration, shared workspace, live token renewal, and secret-change isolation. [Files](#environment-and-materialized-files), [secrets](#secret-custody)
 12. **Outputs:** race HTTP submission/retries with settlement; submit the files a succeeded action wrote to its output directory, with one trailing newline removed; expose only successful results, discard failed/cancelled staging, and never inspect container filesystems. [Results](#results)
 13. **Ordered flow:** reject unsupported declarations/references, enforce single-action progression and persisted action deadlines, and prevent activation after failure/cancellation or preparation errors. [Flow](#ordered-flow), [time](#time)
-14. **Integrations:** verify scoped NATS delivery, authenticated Git reporting and delayed causation, push exclusions/deduplication, direct adapter APIs, and durable queued starts. [Events](#events-and-operations), [triggers](#pipeline-push-triggers-and-userland-services)
+14. **Integrations:** verify scoped NATS delivery, authenticated Git reporting and delayed causation, push exclusions/deduplication, direct adapter APIs, and durable queued starts. [Events](#events-and-operations), [triggers](#pipeline-push-triggers-and-independent-services)
 15. **Broker independence:** recover publication backlog without blocking persisted execution/request/push-start/dispatch/deadline work; preserve event IDs and refuse forged runtime/decision status. [Events](#events-and-operations)
 16. **Planned waits:** no live workload, retained execution/workspace, assigned inbox, exactly-once advancement on pass, and no advancement after rejection/timeout/cancellation. [Requests](#request-actions)
 17. **Conversation handoffs:** atomically ask/cancel and reply/queue; race replies with stop confirmation, reject stale/bypass starts, restore durable references, and fail the restoring action when they are missing. [Handoffs](#conversation-handoffs-and-fresh-executions)
 18. **Task progress:** operator retry preserves failure history without automatic recovery requests; only current success completes open work, never overwriting waiting/cancelled/newer work. [Tasks](#tasks-and-role-inbox)
 19. **Authorization and verification:** exercise in-process authorization, service-plus-actor verification, exact approval matching with ignored display fields, forwarded-credential secrecy, and fresh results after revocation, membership changes, or cancellation. [Verification](#authorization-and-verification)
-20. **Userland Git:** public-contract-only operation, ordered gitolite-style rules from `admin` with exact or prefix refs and default refusal, owned storage/retention/backups, uncertain-effect reconciliation, and journal replay that reports rather than reapplies updates. [Git](#git-service-and-knowledge), [rules](#git-access-rules)
+20. **Independent Git:** public-contract-only operation, ordered gitolite-style rules from `admin` with exact or prefix refs and default refusal, owned storage/retention/backups, uncertain-effect reconciliation, and journal replay that reports rather than reapplies updates. [Git](#git-service-and-knowledge), [rules](#git-access-rules)
 
 **KISS means one owner for each fact, one mechanism for each lifecycle, and composition through a small set of reliable primitives.**

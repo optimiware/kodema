@@ -1,6 +1,6 @@
-# S06 — Shell executions, requests, tasks, and configuration
+# S06 — Control-plane executions, requests, tasks, and configuration
 
-Source: [Shell capabilities](../../KODEMA.md#3-shell-capabilities). Owners: P01, P04–P06. AC: 2, 4, 16–18.
+Source: [Control-plane capabilities](../../KODEMA.md#3-control-plane-capabilities). Owners: P01, P04–P06. AC: 2, 4, 16–18.
 
 ## 1. Execution operations
 

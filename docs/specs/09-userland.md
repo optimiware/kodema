@@ -1,6 +1,6 @@
-# S09 — Userland, Git, agents, and optional capabilities
+# S09 — Apps, Git, agents, and optional capabilities
 
-Source: [Userland](../../KODEMA.md#4-userland-agents-and-software-delivery). Owners: P10, P11, P22–P27. AC: 5, 8, 10, 14, 20.
+Source: [Apps and workloads](../../KODEMA.md#4-apps-workloads-and-software-delivery). Owners: P10, P11, P22–P27. AC: 5, 8, 10, 14, 20.
 
 ## 1. Public client and CLI
 

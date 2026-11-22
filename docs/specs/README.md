@@ -4,15 +4,15 @@ These specs refine [KODEMA.md](../../KODEMA.md) into implementation contracts. *
 
 | Spec | Scope | Main acceptance criteria |
 |---|---|---|
-| [S01 — Architecture and contracts](01-architecture.md) | Package catalog, imports, ports, error model | 1, 10, 19, 20 |
-| [S02 — Kernel](02-kernel.md) | Ordered lifecycle, outputs, reconciliation, stop barriers | 1, 4, 6, 9, 12, 13, 16 |
+| [S01 — Architecture and contracts](01-architecture.md) | Hexagonal control plane, contract waist, `apps/` isolation, ports, errors | 1, 10, 19, 20 |
+| [S02 — Execution engine](02-kernel.md) | Ordered lifecycle, outputs, reconciliation, stop barriers | 1, 4, 6, 9, 12, 13, 16 |
 | [S03 — Definitions and admission](03-admission.md) | Strict YAML, references, immutable snapshots | 2, 11, 13, 14 |
 | [S04 — Persistence and transactions](04-persistence.md) | Relational ownership, RLS, atomic commit units, receipts | 3, 4, 7, 12, 17, 18 |
 | [S05 — Identity and authorization](05-identity-authorization.md) | Tokens, roles, verification, evidence matching | 5, 7, 19 |
-| [S06 — Shell lifecycles](06-shell-lifecycles.md) | Executions, requests, tasks, inbox, configuration | 4, 16, 17, 18 |
-| [S07 — Runtimes, workspaces, and secrets](07-runtime-secrets.md) | Materialization, adapters, keys, logs | 1, 6, 7, 9, 11 |
+| [S06 — Control-plane lifecycles](06-shell-lifecycles.md) | Executions, requests, tasks, inbox, configuration | 4, 16, 17, 18 |
+| [S07 — Runtimes, workspaces, and secrets](07-runtime-secrets.md) | Materialization, container-runtime parity, adapters, keys, logs | 1, 6, 7, 9, 11 |
 | [S08 — Operations and events](08-operations-events.md) | Shared router, REST/MCP, stream, NATS, push | 3, 14, 15, 19 |
-| [S09 — Userland and optional capabilities](09-userland.md) | Git, client/CLI, agents, recipes, gateways | 5, 8, 10, 14, 20 |
+| [S09 — Apps, workloads, and optional capabilities](09-userland.md) | Git, client/CLI, agents, recipes, gateways | 5, 8, 10, 14, 20 |
 | [S10 — Production and operations](10-production.md) | Environments, isolation, restore, retention | 6, 7, 9, 15, 20 |
 | [S11 — Verification matrix](11-verification.md) | Unit obligations, delayed integration, AC trace | 1–20 |
 
