@@ -43,6 +43,9 @@ func NewSafeStorage(inner git.Storage, root string, tenant id.TenantID) (*SafeSt
 
 // RepositoryPath returns the guarded tenant-scoped repository path.
 func (storage *SafeStorage) RepositoryPath(tenant id.TenantID, repository string) (string, error) {
+	if tenant != storage.tenant {
+		return "", fmt.Errorf("%w: tenant %q does not match bound tenant %q", git.ErrInvalidRepository, tenant, storage.tenant)
+	}
 	path, err := storage.inner.RepositoryPath(tenant, repository)
 	if err != nil {
 		return "", err
@@ -56,6 +59,16 @@ func (storage *SafeStorage) RepositoryPath(tenant id.TenantID, repository string
 // EnsureRepository creates the tenant-scoped repository directory and proves
 // the result stays inside the tenant directory.
 func (storage *SafeStorage) EnsureRepository(tenant id.TenantID, repository string) (git.RepositoryLocation, error) {
+	if tenant != storage.tenant {
+		return git.RepositoryLocation{}, fmt.Errorf("%w: tenant %q does not match bound tenant %q", git.ErrInvalidRepository, tenant, storage.tenant)
+	}
+	path, err := storage.inner.RepositoryPath(tenant, repository)
+	if err != nil {
+		return git.RepositoryLocation{}, err
+	}
+	if err := storage.withinTenant(tenant, path); err != nil {
+		return git.RepositoryLocation{}, err
+	}
 	location, err := storage.inner.EnsureRepository(tenant, repository)
 	if err != nil {
 		return git.RepositoryLocation{}, err

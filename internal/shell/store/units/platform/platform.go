@@ -63,10 +63,9 @@ const (
 	stateColumn            = "state"
 	rolesColumn            = "roles"
 	versionColumn          = "version"
+	lifecycleVersionColumn = "lifecycle_version"
 	tokenNonceColumn       = "token_nonce"
-	publishStateColumn     = "publish_state"
 	publishSequenceColumn  = "publish_sequence"
-	pendingPublishState    = "pending"
 	runningExecutionState  = "running"
 	enabledServiceState    = "enabled"
 	requestActionKind      = "request"
@@ -403,36 +402,55 @@ func authorityLocks(
 			}
 			add(lock)
 		case authorize.CheckBindingVersion:
-			add(store.Lock{
-				Table:         resourceBindingsTable,
-				IDs:           []string{read.TargetID},
-				ExpectVersion: read.ExpectedVersion,
-			})
+			lock, err := versionedAuthorityLock(read, resourceBindingsTable, versionColumn)
+			if err != nil {
+				return nil, err
+			}
+			add(lock)
 		case authorize.CheckResourceOwnership:
 			add(store.Lock{Table: resourcesTable, IDs: []string{read.TargetID}})
 		case authorize.CheckTaskVersion:
-			add(store.Lock{
-				Table:         tasksTable,
-				IDs:           []string{read.TargetID},
-				ExpectVersion: read.ExpectedVersion,
-			})
+			lock, err := versionedAuthorityLock(read, tasksTable, lifecycleVersionColumn)
+			if err != nil {
+				return nil, err
+			}
+			add(lock)
 		case authorize.CheckExecutionVersion:
-			add(store.Lock{
-				Table:         executionsTable,
-				IDs:           []string{read.TargetID},
-				ExpectVersion: read.ExpectedVersion,
-			})
+			lock, err := versionedAuthorityLock(read, executionsTable, versionColumn)
+			if err != nil {
+				return nil, err
+			}
+			add(lock)
 		case authorize.CheckPipelineVersion:
-			add(store.Lock{
-				Table:         pipelinesTable,
-				IDs:           []string{read.TargetID},
-				ExpectVersion: read.ExpectedVersion,
-			})
+			lock, err := versionedAuthorityLock(read, pipelinesTable, versionColumn)
+			if err != nil {
+				return nil, err
+			}
+			add(lock)
 		default:
 			return nil, fault.New(fault.InternalFailure, fmt.Sprintf("unknown authority check %q", read.Check))
 		}
 	}
 	return locks, nil
+}
+
+// versionedAuthorityLock validates and builds the guarded lock for a versioned
+// authority check. Tables with a single version column use ExpectVersion;
+// versionless tables such as tasks guard their named version column in Expect.
+func versionedAuthorityLock(read authorize.AuthorityRead, table, column string) (store.Lock, error) {
+	if read.TargetID == "" {
+		return store.Lock{}, fault.New(fault.InvalidInput, fmt.Sprintf("authority check %q must name its target row", read.Check))
+	}
+	if read.ExpectedVersion == 0 {
+		return store.Lock{}, fault.New(fault.InvalidInput, fmt.Sprintf("authority check %q must carry its expected version", read.Check))
+	}
+	lock := store.Lock{Table: table, IDs: []string{read.TargetID}}
+	if column == versionColumn {
+		lock.ExpectVersion = read.ExpectedVersion
+	} else {
+		lock.Expect = map[string]any{column: read.ExpectedVersion}
+	}
+	return lock, nil
 }
 
 // principalEnabledLock maps a principal-enablement read onto the durable row

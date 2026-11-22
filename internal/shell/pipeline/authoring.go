@@ -269,7 +269,7 @@ func scalarValue(node *yaml.Node, label string) (string, error) {
 }
 
 func boolValue(node *yaml.Node, label string) (bool, error) {
-	if node == nil || node.Kind != yaml.ScalarNode {
+	if node == nil || node.Kind != yaml.ScalarNode || node.Tag == "!!null" {
 		return false, invalidInputf("%s must be a boolean", label)
 	}
 	var value bool

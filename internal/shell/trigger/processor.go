@@ -327,28 +327,11 @@ func (processor *Processor) resume(ctx context.Context, envelope event.Envelope,
 // the automatic-service membership, enablement and event-read reads still
 // apply. The persisted first selection and its common receipt are preserved.
 func (processor *Processor) refuseOrphan(ctx context.Context, envelope event.Envelope, stored Result, outcome *eventOutcome) (bool, error) {
-	selection := stored.Selection
 	record := stored.Receipt
 	if record.ID == "" {
 		record.ID = stored.ReceiptID
 	}
-	unit, err := processor.startUnit(envelope, Candidate{}, selection, record, pipeline.AdmissionResult{}, StatusRefused, "", RefusalReasonDefinitionMissing)
-	if err != nil {
-		return true, nil
-	}
-	started, err := processor.startPort.Start(ctx, unit)
-	if err != nil {
-		return true, nil
-	}
-	if started.Status == StatusRefused {
-		outcome.refused = append(outcome.refused, envelope.ID)
-		return false, nil
-	}
-	if started.ExecutionID != "" {
-		outcome.started = append(outcome.started, started.ExecutionID)
-		return false, nil
-	}
-	return true, nil
+	return processor.refuse(ctx, envelope, Candidate{}, stored.Selection, record, RefusalReasonDefinitionMissing, outcome)
 }
 
 // start admits the persisted exact bytes and invokes the shared start commit.

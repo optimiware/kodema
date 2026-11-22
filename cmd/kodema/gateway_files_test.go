@@ -412,3 +412,30 @@ func TestServerModelsFileAndLLMProviderFlags(t *testing.T) {
 		t.Fatalf("mergedCfg.Models.SecretRules = %+v; want empty so gateway rules derive for all providers", mergedCfg.Models.SecretRules)
 	}
 }
+
+func TestServerToolProxyFileFlag(t *testing.T) {
+	fileToolsPath := writeGatewaySettingsFile(t, "tools-file.json", entryToolProxyFile)
+	flagToolsPath := writeGatewaySettingsFile(t, "tools-flag.json", entryToolProxyFile)
+	t.Setenv(shellapp.ToolProxyFileSetting, fileToolsPath)
+
+	var stderr lockedBuffer
+	options, code := parseServerOptions([]string{
+		"--profile", "development",
+		"--data-dir", t.TempDir(),
+		"--dev-token", "dev-token",
+		"--tool-proxy-file", flagToolsPath,
+	}, &stderr)
+	if code != 0 {
+		t.Fatalf("parseServerOptions(--tool-proxy-file) exited %d: %s", code, stderr.String())
+	}
+	if options.ToolProxyFile != flagToolsPath {
+		t.Fatalf("ToolProxyFile = %q; want %q", options.ToolProxyFile, flagToolsPath)
+	}
+	cfg, err := options.config()
+	if err != nil {
+		t.Fatalf("options.config: %v", err)
+	}
+	if cfg.ToolProxy == nil || len(cfg.ToolProxy.Projects) != 1 {
+		t.Fatalf("ToolProxy = %+v; want 1 project", cfg.ToolProxy)
+	}
+}

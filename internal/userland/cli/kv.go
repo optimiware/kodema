@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/optimiware/kodema/api"
@@ -186,17 +185,7 @@ func resolveKVProject(ctx context.Context, flagValue string, config Config, port
 	if projectID := resolveProject(flagValue, config, deps); projectID != "" {
 		return projectID, nil
 	}
-	getenv := deps.Env
-	if getenv == nil {
-		getenv = deps.Login.Environment
-	}
-	if getenv == nil {
-		getenv = os.Getenv
-	}
-	if projectEnv := strings.TrimSpace(getenv("KODEMA_PROJECT")); projectEnv != "" {
-		return projectEnv, nil
-	}
-	if strings.TrimSpace(getenv("KODEMA_EXECUTION")) == "" {
+	if strings.TrimSpace(resolveEnv(deps)("KODEMA_EXECUTION")) == "" {
 		return "", nil
 	}
 	res, err := ports.Client.Invoke(ctx, api.Invocation{

@@ -7,54 +7,13 @@ package kube
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
-	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel"
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
-
-// validateIdentity refuses an unusable persisted identity before any effect.
-func validateIdentity(identity engine.EffectIdentity) error {
-	if _, err := id.ParseWorkloadID(string(identity.WorkloadID)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "workload id is invalid", err)
-	}
-	if _, err := id.ParseExecutionID(string(identity.ExecutionID)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "execution id is invalid", err)
-	}
-	if _, err := id.ParseActionID(string(identity.ActionID)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "action id is invalid", err)
-	}
-	if strings.TrimSpace(identity.IdempotencyKey) == "" {
-		return fault.New(fault.InvalidInput, "idempotency key is empty")
-	}
-	return nil
-}
-
-// validateWorkspaceID refuses an unusable workspace identity before any effect.
-func validateWorkspaceID(workspaceID id.WorkspaceID) error {
-	if _, err := id.ParseWorkspaceID(string(workspaceID)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "workspace id is invalid", err)
-	}
-	return nil
-}
-
-// validatePrepareContext refuses an unusable action slug or task identity before
-// any effect. An empty task id is valid and means the execution is task-free;
-// an action slug is always required.
-func validatePrepareContext(actionName id.ActionName, taskID id.TaskID) error {
-	if _, err := id.ParseActionName(string(actionName)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "action name is invalid", err)
-	}
-	if taskID != "" {
-		if _, err := id.ParseTaskID(string(taskID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "task id is invalid", err)
-		}
-	}
-	return nil
-}
 
 // workloadSelector is the only pod selector the adapter uses. The workload
 // label is the stable effect identity; namespace ownership provides the tenant
@@ -255,18 +214,10 @@ func suspensionConfirmed(before, mid, after Job, identity engine.EffectIdentity,
 	return true
 }
 
-// workspaceReleasable reports whether no live workload can still write to the
-// retained workspace. Only no pod, or exactly one pod whose workload container
-// affirmatively terminated, qualifies; a terminating pod without that evidence
-// still retains the workspace.
-func workspaceReleasable(pods []Pod) bool {
-	if len(pods) == 0 {
-		return true
-	}
-	if len(pods) > 1 {
-		return false
-	}
-	pod := pods[0]
+// podTerminated reports whether a single pod's workload container has
+// affirmatively terminated and can no longer write to a retained workspace. A
+// terminating pod without terminated-container evidence is not terminated.
+func podTerminated(pod Pod) bool {
 	if pod.DeletionTimestamp != nil {
 		// TTL cleanup of a finished Job sets a deletion timestamp on an already
 		// terminated pod; a live terminating container is still not releasable.
@@ -282,6 +233,20 @@ func workspaceReleasable(pods []Pod) bool {
 	}
 }
 
+// workspaceReleasable reports whether no live workload can still write to the
+// retained workspace for one workload identity. Only no pod, or exactly one pod
+// whose workload container affirmatively terminated, qualifies; multiple pods
+// for one workload identity stay unreleasable.
+func workspaceReleasable(pods []Pod) bool {
+	if len(pods) == 0 {
+		return true
+	}
+	if len(pods) > 1 {
+		return false
+	}
+	return podTerminated(pods[0])
+}
+
 // redactionValues returns every configured value that must be removed from log
 // output, longest first so a shorter value cannot partially obscure a longer
 // one.
@@ -293,11 +258,5 @@ func redactionValues(secret Secret) []string {
 		}
 		values = append(values, string(value))
 	}
-	sort.Slice(values, func(left, right int) bool {
-		if len(values[left]) != len(values[right]) {
-			return len(values[left]) > len(values[right])
-		}
-		return values[left] < values[right]
-	})
-	return values
+	return adapterutil.SortRedactionValues(values)
 }

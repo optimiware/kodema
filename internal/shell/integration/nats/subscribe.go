@@ -70,6 +70,7 @@ func (broker *Broker) Subscribe(ctx context.Context, request SubscriptionRequest
 		cancel:     cancel,
 		done:       make(chan struct{}),
 	}
+	subscription.idle = sync.NewCond(&subscription.mu)
 	clientSubscription, err := client.Subscribe(ctx, subject, subscription.handleDelivery)
 	if err != nil {
 		cancel()
@@ -84,13 +85,28 @@ func (broker *Broker) Subscribe(ctx context.Context, request SubscriptionRequest
 		return nil, fault.New(fault.DependencyUnavailable, "broker adapter is closed")
 	}
 	subscription.mu.Lock()
+	if subscription.closed {
+		subscription.mu.Unlock()
+		broker.mu.Unlock()
+		cancel()
+		_ = clientSubscription.Close(context.Background())
+		return subscription, nil
+	}
 	subscription.clientSubscription = clientSubscription
 	subscription.started = true
 	subscription.mu.Unlock()
 	broker.subscriptions[subscription] = struct{}{}
+	clientChanged := broker.client != client
+	if clientChanged {
+		broker.resubscribePending = true
+	}
+	resumeNow := clientChanged && broker.client != nil
 	broker.mu.Unlock()
 
 	go subscription.idleLoop()
+	if resumeNow {
+		broker.resumeSubscriptions(ctx)
+	}
 	return subscription, nil
 }
 
@@ -109,13 +125,16 @@ type subscription struct {
 	done   chan struct{}
 
 	mu                 sync.Mutex
+	idle               *sync.Cond
 	clientSubscription Subscription
 	started            bool
 	closed             bool
+	inFlight           int
 }
 
-// Close closes the subscription, cancels and joins the idle worker. It is
-// idempotent.
+// Close closes the subscription, cancels and joins the idle worker and any
+// in-flight delivery callback. It is idempotent and must not be called from
+// inside the subscription's own delivery handler.
 func (subscription *subscription) Close(context.Context) error {
 	subscription.shutdown()
 	subscription.wait()
@@ -126,9 +145,15 @@ func (subscription *subscription) Close(context.Context) error {
 // refuses a cross-scope message without closing, delivers at-least-once and
 // closes on a self-invalidation.
 func (subscription *subscription) handleDelivery(ctx context.Context, payload []byte) error {
-	if subscription.isClosed() {
+	subscription.mu.Lock()
+	if subscription.closed {
+		subscription.mu.Unlock()
 		return fault.New(fault.DependencyUnavailable, "subscription is closed")
 	}
+	subscription.inFlight++
+	subscription.mu.Unlock()
+	defer subscription.finishDelivery()
+
 	if err := subscription.revalidate(ctx); err != nil {
 		subscription.shutdown()
 		return err
@@ -257,7 +282,7 @@ func (subscription *subscription) shutdown() {
 	}
 }
 
-// wait joins the idle worker when it was started.
+// wait joins the idle worker when it was started and any in-flight delivery.
 func (subscription *subscription) wait() {
 	subscription.mu.Lock()
 	started := subscription.started
@@ -265,6 +290,21 @@ func (subscription *subscription) wait() {
 	if started {
 		<-subscription.done
 	}
+	subscription.mu.Lock()
+	for subscription.inFlight > 0 {
+		subscription.idle.Wait()
+	}
+	subscription.mu.Unlock()
+}
+
+// finishDelivery records that one delivery callback returned.
+func (subscription *subscription) finishDelivery() {
+	subscription.mu.Lock()
+	subscription.inFlight--
+	if subscription.inFlight == 0 {
+		subscription.idle.Broadcast()
+	}
+	subscription.mu.Unlock()
 }
 
 // isClosed reports whether shutdown has run.

@@ -49,24 +49,17 @@ func DecodeRequest(data []byte) (Request, error) {
 
 // DecodeResult decodes one bounded result envelope.
 func DecodeResult(data []byte) (Result, error) {
-	if len(data) > MaxResponseBytes {
-		return Result{}, invalid("response body is %d bytes; at most %d are allowed", len(data), MaxResponseBytes)
-	}
-	var result Result
-	if err := decodeStrict(data, &result); err != nil {
-		return Result{}, err
-	}
-	if err := result.Validate(); err != nil {
-		return Result{}, err
-	}
-	return result, nil
+	return decodeBoundedResult(data, MaxResponseBytes)
 }
 
 // DecodeOperationResult decodes one bounded result envelope using the
 // operation's response size bound (MaxKVResponseBytes for kv.get,
 // MaxResponseBytes otherwise).
 func DecodeOperationResult(operation string, data []byte) (Result, error) {
-	bound := MaxOperationResponseBytes(operation)
+	return decodeBoundedResult(data, MaxOperationResponseBytes(operation))
+}
+
+func decodeBoundedResult(data []byte, bound int) (Result, error) {
 	if len(data) > bound {
 		return Result{}, invalid("response body is %d bytes; at most %d are allowed", len(data), bound)
 	}

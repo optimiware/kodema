@@ -416,7 +416,7 @@ func TestStartRefusesAfterDurableFenceWithPreparationIntact(t *testing.T) {
 	if err := fx.adapter.writeFence(context.Background(), fx.request.Identity, fx.request.WorkspaceID); err != nil {
 		t.Fatalf("writing the removal fence: %v", err)
 	}
-	if !hostFileExists(t, preparationPath(fx.root, fx.request.Identity.WorkloadID)) {
+	if !hostFileExists(t, preparationRecordPath(fx.root, fx.request.Identity.WorkloadID)) {
 		t.Fatal("test fixture removed the preparation record")
 	}
 

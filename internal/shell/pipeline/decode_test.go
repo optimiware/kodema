@@ -600,6 +600,82 @@ actions:
 	}
 }
 
+func TestDecodeRefusesNullAndEmptyBooleans(t *testing.T) {
+	cases := map[string]string{
+		"required null": `inputs:
+  - key: branch
+    kind: string
+    required: null
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [echo ok]
+`,
+		"required tilde": `inputs:
+  - key: branch
+    kind: string
+    required: ~
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [echo ok]
+`,
+		"required empty": `inputs:
+  - key: branch
+    kind: string
+    required:
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [echo ok]
+`,
+		"completes_task null": `completes_task: null
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [echo ok]
+`,
+		"completes_task tilde": `completes_task: ~
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [echo ok]
+`,
+		"completes_task empty": `completes_task:
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [echo ok]
+`,
+	}
+	for name, document := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := pipeline.Decode([]byte(document), pipeline.DefaultLimits)
+			requireFaultClass(t, err, fault.InvalidInput)
+			if !strings.Contains(err.Error(), "must be a boolean") {
+				t.Fatalf("err = %q; want boolean refusal", err)
+			}
+		})
+	}
+	t.Run("yaml 1.1 boolean spellings remain accepted for stored pipelines", func(t *testing.T) {
+		doc := `completes_task: no
+inputs:
+  - key: branch
+    kind: string
+    required: yes
+actions:
+  - name: build
+    image: registry.example.com/build:latest
+    commands: [echo ok]
+`
+		decoded, err := pipeline.Decode([]byte(doc), pipeline.DefaultLimits)
+		requireNoError(t, err, "decode yaml 1.1 booleans")
+		if len(decoded.Inputs) != 1 || decoded.Inputs[0] != "branch" {
+			t.Fatalf("Inputs = %+v; want [branch]", decoded.Inputs)
+		}
+	})
+}
+
 func TestDecodeTimeoutBounds(t *testing.T) {
 	document := func(timeout string) []byte {
 		return []byte(`actions:

@@ -142,10 +142,11 @@ func (sweeper *RetentionSweeper) Sweep(ctx context.Context, scopes []RetentionSc
 	result.Scopes = len(unique)
 
 	var failures []error
+scopesLoop:
 	for _, scope := range unique {
 		if err := ctx.Err(); err != nil {
 			failures = append(failures, err)
-			break
+			break scopesLoop
 		}
 		for _, class := range sweeper.classes {
 			window, err := sweeper.policy.Window(class)
@@ -159,11 +160,18 @@ func (sweeper *RetentionSweeper) Sweep(ctx context.Context, scopes []RetentionSc
 				// project deletion have no deletable candidates by definition.
 				continue
 			}
+			if err := ctx.Err(); err != nil {
+				failures = append(failures, err)
+				break scopesLoop
+			}
 			before := now.Add(-window.Duration)
 			candidates, err := sweeper.store.Candidates(ctx, scope, class, before)
 			if err != nil {
 				failures = append(failures, fmt.Errorf("retention %s candidates in %s/%s: %w",
 					class, scope.TenantID, scope.ProjectID, err))
+				if ctx.Err() != nil {
+					break scopesLoop
+				}
 				continue
 			}
 			result.Candidates += len(candidates)
@@ -189,10 +197,17 @@ func (sweeper *RetentionSweeper) Sweep(ctx context.Context, scopes []RetentionSc
 					result.KeptByClass[class]++
 					continue
 				}
+				if err := ctx.Err(); err != nil {
+					failures = append(failures, err)
+					break scopesLoop
+				}
 				deleted, err := sweeper.store.Delete(ctx, scope, class, candidate, before)
 				if err != nil {
 					failures = append(failures, fmt.Errorf("retention %s delete in %s/%s: %w",
 						class, scope.TenantID, scope.ProjectID, err))
+					if ctx.Err() != nil {
+						break scopesLoop
+					}
 					continue
 				}
 				if !deleted {

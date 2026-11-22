@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -765,5 +766,145 @@ func TestRequestBodySizeLimitEnforced(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d; want 413", resp.StatusCode)
+	}
+}
+
+func TestServerStartTwiceReturnsErrorAndShutdownExitsWatcher(t *testing.T) {
+	ws := t.TempDir()
+	token, err := GenerateBearerToken()
+	if err != nil {
+		t.Fatalf("GenerateBearerToken: %v", err)
+	}
+
+	// Double Start / Serve on the same Server must fail cleanly.
+	srv, err := NewServer(Config{
+		ListenAddr:   "127.0.0.1:0",
+		WorkspaceDir: ws,
+		Token:        token,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if _, err := srv.Start(context.Background()); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	if _, err := srv.Start(context.Background()); err == nil {
+		t.Fatal("second Start succeeded; want error")
+	}
+	if err := srv.Serve(context.Background()); err == nil {
+		t.Fatal("Serve after Start succeeded; want error")
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// Starting with a non-cancelled context and shutting down directly must not
+	// leak the Start context-watcher goroutine.
+	runtime.GC()
+	before := runtime.NumGoroutine()
+	const iterations = 20
+	for range iterations {
+		s, err := NewServer(Config{
+			ListenAddr:   "127.0.0.1:0",
+			WorkspaceDir: ws,
+			Token:        token,
+		})
+		if err != nil {
+			t.Fatalf("NewServer: %v", err)
+		}
+		if _, err := s.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if err := s.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before+5 && time.Now().Before(deadline) {
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > before+5 {
+		t.Fatalf("goroutines leaked across Start/Shutdown: before=%d after=%d (iterations=%d)", before, after, iterations)
+	}
+}
+
+func TestToolBashWatchdogConsistencyUnderRace(t *testing.T) {
+	srv, _, _, _ := startTestServer(t, func(c *Config) {
+		c.MaxCmdTimeout = 5 * time.Second
+		c.DefaultCmdTimeout = 2 * time.Second
+	})
+
+	// Exercise timeout and cancellation boundaries repeatedly under -race to
+	// confirm the watchdog goroutine is joined before reading timedOut/cancelled
+	// and that formatted output always agrees with IsError.
+	for i := range 8 {
+		ctx, cancel := context.WithCancel(context.Background())
+		if i%2 == 0 {
+			go func() {
+				time.Sleep(15 * time.Millisecond)
+				cancel()
+			}()
+		}
+		raw, _ := json.Marshal(map[string]any{
+			"command":         "sleep 0.05",
+			"timeout_seconds": 0.1,
+		})
+		res := srv.toolBash(ctx, raw)
+		cancel()
+		if len(res.Content) != 1 {
+			t.Fatalf("unexpected content len %d", len(res.Content))
+		}
+		text := res.Content[0].Text
+		hasTimeout := strings.Contains(text, "timed_out: true")
+		hasCancel := strings.Contains(text, "cancelled: true")
+		hasZeroExit := strings.HasPrefix(text, "exit_code: 0\n") || text == "exit_code: 0"
+		wantErr := hasTimeout || hasCancel || !hasZeroExit
+		if res.IsError != wantErr {
+			t.Fatalf("iter %d: IsError=%v inconsistent with output:\n%s", i, res.IsError, text)
+		}
+	}
+}
+
+func TestToolGrepMatchesLineExceeding4MiB(t *testing.T) {
+	srv, cli, _, _ := startTestServer(t, func(c *Config) {
+		c.MaxFileBytes = 8 << 20
+	})
+	const bigLen = (4 << 20) + 1024
+	var content strings.Builder
+	content.Grow(bigLen + 64)
+	content.WriteString("first line\r\n")
+	content.WriteString(strings.Repeat("a", bigLen))
+	content.WriteString("NEEDLE_BEYOND_4MIB\r\n")
+	content.WriteString("last line\n")
+
+	if err := os.WriteFile(filepath.Join(srv.WorkspaceRoot(), "huge.txt"), []byte(content.String()), 0o600); err != nil {
+		t.Fatalf("write huge.txt: %v", err)
+	}
+	res, err := cli.CallTool(context.Background(), "grep", map[string]any{
+		"pattern": "NEEDLE_BEYOND_4MIB",
+		"path":    "huge.txt",
+	})
+	if err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("grep returned error: %+v", res)
+	}
+	got := res.Content[0].Text
+	if !strings.HasPrefix(got, "huge.txt:2:") || !strings.HasSuffix(got, "...[truncated]") {
+		t.Fatalf("grep huge line result = %q; want line 2 match truncated", got)
+	}
+
+	// Verify CRLF stripping on normal lines too.
+	res2, err := cli.CallTool(context.Background(), "grep", map[string]any{
+		"pattern": "^first line$",
+		"path":    "huge.txt",
+	})
+	if err != nil {
+		t.Fatalf("grep first line: %v", err)
+	}
+	if res2.Content[0].Text != "huge.txt:1:first line" {
+		t.Fatalf("grep CRLF line = %q; want %q", res2.Content[0].Text, "huge.txt:1:first line")
 	}
 }

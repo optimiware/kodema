@@ -167,35 +167,30 @@ func renderTaskReviewLifecycleMigration() string {
 		"ALTER TABLE actions ADD CONSTRAINT actions_request_decision CHECK (request_decision IS NULL OR request_decision IN ('pass', 'revise', 'fail'));\n"
 }
 
-// renderApprovalDecisionsMigration renders incremental migration 0009 adding
-// the immutable cross-execution approval_decisions table (with composite
-// ownership FKs, uniqueness, checks, indexes, forced RLS, owner and runtime
-// privileges) and nullable verifications.decision_id provenance column.
-func renderApprovalDecisionsMigration() string {
-	design := store.SchemaDesign()
-	var table store.Table
-	found := false
+// mustSchemaTable looks up a declared table by name from design or panics.
+func mustSchemaTable(design store.Schema, name string) store.Table {
 	for _, candidate := range design.Tables {
-		if candidate.Name == store.ApprovalDecisionsTable {
-			table = candidate
-			found = true
-			break
+		if candidate.Name == name {
+			return candidate
 		}
 	}
-	if !found {
-		panic("postgres: approval_decisions table missing from schema design")
-	}
+	panic("postgres: SchemaDesign is missing " + name)
+}
+
+// renderIncrementalTableDDL renders the complete CREATE TABLE, constraints,
+// indexes, forced RLS, ownership and runtime-role GRANT statements for one
+// post-baseline table migration.
+func renderIncrementalTableDDL(design store.Schema, table store.Table, runtimePrivileges string) string {
 	var builder strings.Builder
-	builder.WriteString("-- Migration 0009: immutable cross-execution approval decisions and verification decision provenance.\n")
 	builder.WriteString(renderCreateTable(table))
-	for _, u := range table.Unique {
+	for _, unique := range table.Unique {
 		nulls := ""
-		if u.NullsNotDistinct {
+		if unique.NullsNotDistinct {
 			nulls = " NULLS NOT DISTINCT"
 		}
 		builder.WriteString(fmt.Sprintf(
 			"ALTER TABLE %s ADD CONSTRAINT %s UNIQUE%s (%s);\n",
-			table.Name, u.Name, nulls, strings.Join(u.Columns, ", "),
+			table.Name, unique.Name, nulls, strings.Join(unique.Columns, ", "),
 		))
 	}
 	for _, key := range table.ForeignKeys {
@@ -206,20 +201,20 @@ func renderApprovalDecisionsMigration() string {
 			strings.Join(key.ReferencedColumns, ", "),
 		))
 	}
-	for _, chk := range table.Checks {
+	for _, check := range table.Checks {
 		builder.WriteString(fmt.Sprintf(
 			"ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);\n",
-			table.Name, chk.Name, chk.Expression,
+			table.Name, check.Name, check.Expression,
 		))
 	}
 	for _, idx := range table.Indexes {
-		u := ""
+		unique := ""
 		if idx.Unique {
-			u = "UNIQUE "
+			unique = "UNIQUE "
 		}
 		builder.WriteString(fmt.Sprintf(
 			"CREATE %sINDEX %s ON %s (%s)",
-			u, idx.Name, table.Name, strings.Join(idx.Columns, ", "),
+			unique, idx.Name, table.Name, strings.Join(idx.Columns, ", "),
 		))
 		if idx.Predicate != "" {
 			builder.WriteString(" WHERE " + idx.Predicate)
@@ -230,9 +225,20 @@ func renderApprovalDecisionsMigration() string {
 	builder.WriteString(fmt.Sprintf("ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", table.Name))
 	builder.WriteString(renderPolicy(table) + "\n")
 	builder.WriteString(fmt.Sprintf("ALTER TABLE %s OWNER TO %s;\n", table.Name, design.OwnerRole))
-	builder.WriteString(fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s;\n", table.Name, design.RuntimeRole))
-	builder.WriteString("ALTER TABLE verifications ADD COLUMN decision_id TEXT;\n")
+	builder.WriteString(fmt.Sprintf("GRANT %s ON %s TO %s;\n", runtimePrivileges, table.Name, design.RuntimeRole))
 	return builder.String()
+}
+
+// renderApprovalDecisionsMigration renders incremental migration 0009 adding
+// the immutable cross-execution approval_decisions table (with composite
+// ownership FKs, uniqueness, checks, indexes, forced RLS, owner and runtime
+// privileges) and nullable verifications.decision_id provenance column.
+func renderApprovalDecisionsMigration() string {
+	design := store.SchemaDesign()
+	table := mustSchemaTable(design, store.ApprovalDecisionsTable)
+	return "-- Migration 0009: immutable cross-execution approval decisions and verification decision provenance.\n" +
+		renderIncrementalTableDDL(design, table, "SELECT, INSERT, UPDATE, DELETE") +
+		"ALTER TABLE verifications ADD COLUMN decision_id TEXT;\n"
 }
 
 // renderKVStoreMigration renders incremental migration 0010 adding the
@@ -241,65 +247,9 @@ func renderApprovalDecisionsMigration() string {
 // role privileges (SELECT and INSERT only).
 func renderKVStoreMigration() string {
 	design := store.SchemaDesign()
-	var kvTable store.Table
-	found := false
-	for _, table := range design.Tables {
-		if table.Name == store.KVObjectsTable {
-			kvTable = table
-			found = true
-			break
-		}
-	}
-	if !found {
-		panic("postgres: SchemaDesign is missing " + store.KVObjectsTable)
-	}
-	var builder strings.Builder
-	builder.WriteString("-- Migration 0010: project-scoped, content-addressed immutable KV store.\n")
-	builder.WriteString(renderCreateTable(kvTable))
-	for _, unique := range kvTable.Unique {
-		nulls := ""
-		if unique.NullsNotDistinct {
-			nulls = " NULLS NOT DISTINCT"
-		}
-		builder.WriteString(fmt.Sprintf(
-			"ALTER TABLE %s ADD CONSTRAINT %s UNIQUE%s (%s);\n",
-			kvTable.Name, unique.Name, nulls, strings.Join(unique.Columns, ", "),
-		))
-	}
-	for _, key := range kvTable.ForeignKeys {
-		builder.WriteString(fmt.Sprintf(
-			"ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s);\n",
-			kvTable.Name, key.Name,
-			strings.Join(key.Columns, ", "), key.References,
-			strings.Join(key.ReferencedColumns, ", "),
-		))
-	}
-	for _, check := range kvTable.Checks {
-		builder.WriteString(fmt.Sprintf(
-			"ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);\n",
-			kvTable.Name, check.Name, check.Expression,
-		))
-	}
-	for _, idx := range kvTable.Indexes {
-		unique := ""
-		if idx.Unique {
-			unique = "UNIQUE "
-		}
-		builder.WriteString(fmt.Sprintf(
-			"CREATE %sINDEX %s ON %s (%s)",
-			unique, idx.Name, kvTable.Name, strings.Join(idx.Columns, ", "),
-		))
-		if idx.Predicate != "" {
-			builder.WriteString(" WHERE " + idx.Predicate)
-		}
-		builder.WriteString(";\n")
-	}
-	builder.WriteString(fmt.Sprintf("ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n", kvTable.Name))
-	builder.WriteString(fmt.Sprintf("ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", kvTable.Name))
-	builder.WriteString(renderPolicy(kvTable) + "\n")
-	builder.WriteString(fmt.Sprintf("ALTER TABLE %s OWNER TO %s;\n", kvTable.Name, design.OwnerRole))
-	builder.WriteString(fmt.Sprintf("GRANT SELECT, INSERT ON %s TO %s;\n", kvTable.Name, design.RuntimeRole))
-	return builder.String()
+	table := mustSchemaTable(design, store.KVObjectsTable)
+	return "-- Migration 0010: project-scoped, content-addressed immutable KV store.\n" +
+		renderIncrementalTableDDL(design, table, "SELECT, INSERT")
 }
 
 // migrationTableOrder returns the schema tables so every referenced table is

@@ -1,17 +1,12 @@
 package memory
 
 import (
-	"bytes"
-	"encoding/hex"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/receipt"
 	"github.com/optimiware/kodema/internal/shell/store"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
@@ -85,7 +80,7 @@ func planWrite(scope tenancy.Scope, write store.Write) (plannedWrite, error) {
 	if err := scope.Validate(); err != nil {
 		return plannedWrite{}, err
 	}
-	if !validIdentity(write.ID) {
+	if !store.ValidIdentity(write.ID) {
 		return plannedWrite{}, faultInvalid(fmt.Sprintf("row id %q is not a valid identity", write.ID))
 	}
 	if err := checkRowIdentityScope(meta, scope, write.ID); err != nil {
@@ -328,6 +323,9 @@ func planLocks(scope tenancy.Scope, locks []store.Lock) ([]plannedLock, error) {
 				}
 				key[name] = value
 			}
+			if err := checkAbsenceKeyScope(scope, key); err != nil {
+				return nil, err
+			}
 			plans = append(plans, plannedLock{
 				meta:       meta,
 				table:      lock.Table,
@@ -350,16 +348,16 @@ func planLocks(scope tenancy.Scope, locks []store.Lock) ([]plannedLock, error) {
 		}
 		identities := append([]string(nil), lock.IDs...)
 		for _, identity := range identities {
-			if !validIdentity(identity) {
+			if !store.ValidIdentity(identity) {
 				return nil, faultInvalid(fmt.Sprintf("lock id %q is not a valid identity", identity))
 			}
 		}
 		guarded := lock.ExpectVersion != 0 || len(lock.Expect) > 0
+		if (guarded || lock.Deadline != nil) && len(identities) != 1 {
+			return nil, faultInvalid("a guarded lock must name exactly one row")
+		}
 		expect := make(map[string]any, len(lock.Expect))
 		if guarded {
-			if len(identities) != 1 {
-				return nil, faultInvalid("a guarded lock must name exactly one row")
-			}
 			if lock.ExpectVersion != 0 && !meta.hasVersion {
 				return nil, faultInvalid(fmt.Sprintf("table %q has no version column", lock.Table))
 			}
@@ -399,17 +397,44 @@ func planLocks(scope tenancy.Scope, locks []store.Lock) ([]plannedLock, error) {
 		}
 	}
 	sort.SliceStable(plans, func(left, right int) bool {
-		if plans[left].rank != plans[right].rank {
-			return plans[left].rank < plans[right].rank
+		l, r := plans[left], plans[right]
+		if l.rank != r.rank {
+			return l.rank < r.rank
 		}
-		// Two absence guards on the same table sort by their canonical unique
-		// key; a guard shares its table's write rank with a present-row lock.
-		if plans[left].absence && plans[right].absence && plans[left].keyText != plans[right].keyText {
-			return plans[left].keyText < plans[right].keyText
+		// Match postgres sortPlannedLocks: within one table, absence guards
+		// sort before present-row locks (by canonical unique key), and
+		// present-row locks sort by row id before caller position.
+		if l.absence != r.absence {
+			return l.absence
 		}
-		return plans[left].position < plans[right].position
+		if l.absence && r.absence {
+			if l.keyText != r.keyText {
+				return l.keyText < r.keyText
+			}
+			return l.position < r.position
+		}
+		if l.identity != r.identity {
+			return l.identity < r.identity
+		}
+		return l.position < r.position
 	})
 	return plans, nil
+}
+
+// checkAbsenceKeyScope confines an absence guard's key to the commit unit's
+// scope. The tenant must match the unit's tenant, and a non-nil project key
+// requires a project-scoped unit for that exact project; a project-scoped unit
+// may still guard its own tenant-wide (project_id: nil) key.
+func checkAbsenceKeyScope(scope tenancy.Scope, key map[string]any) error {
+	if tenant, ok := key["tenant_id"]; ok && tenant != string(scope.TenantID) {
+		return faultForbidden("absence guard tenant does not match the commit unit scope")
+	}
+	if project, ok := key["project_id"]; ok && project != nil {
+		if !scope.ProjectScoped() || project != string(scope.ProjectID) {
+			return faultForbidden("absence guard project does not match the commit unit scope")
+		}
+	}
+	return nil
 }
 
 // absenceKeyText renders the canonical unique-key identity of one absence guard:
@@ -428,87 +453,4 @@ func absenceKeyText(table string, columns []string, key map[string]any) string {
 		parts = append(parts, fmt.Sprintf("%v", key[name]))
 	}
 	return strings.Join(parts, "\x00")
-}
-
-// validateAudit refuses an audit row outside the unit scope or with an unusable
-// identity, actor, operation or time.
-func validateAudit(scope tenancy.Scope, audit event.Audit) error {
-	if audit.Scope != scope {
-		return faultForbidden("audit record scope does not match the commit unit scope")
-	}
-	if _, err := id.ParseEventID(string(audit.ID)); err != nil {
-		return faultInvalid("audit record id is invalid")
-	}
-	if audit.Actor == "" {
-		return faultInvalid("audit record actor is empty")
-	}
-	if audit.Operation == "" {
-		return faultInvalid("audit record operation is empty")
-	}
-	if audit.At.IsZero() {
-		return faultInvalid("audit record time is zero")
-	}
-	return nil
-}
-
-// validateEvent refuses an event envelope outside the unit scope or with an
-// unusable type, source, time or payload. The envelope rules themselves are the
-// event contract's.
-func validateEvent(scope tenancy.Scope, envelope event.Envelope) error {
-	if err := envelope.Validate(); err != nil {
-		return err
-	}
-	if envelope.Scope != scope {
-		return faultForbidden("event scope does not match the commit unit scope")
-	}
-	return nil
-}
-
-// validateReceipt refuses a receipt whose identity, content hash or scope cannot
-// protect the unit. Receipt identity is (tenant, project, principal, operation,
-// caller key), and the project must be exactly the unit scope's project.
-func validateReceipt(scope tenancy.Scope, record receipt.Record) error {
-	if err := record.Key.Validate(); err != nil {
-		return err
-	}
-	if _, err := id.ParseReceiptID(string(record.ID)); err != nil {
-		return faultInvalid("receipt id is invalid")
-	}
-	if _, err := contentHashBytes(record.ContentHash); err != nil {
-		return faultInvalid("receipt content hash is not a sha256 fingerprint")
-	}
-	if record.At.IsZero() {
-		return faultInvalid("receipt time is zero")
-	}
-	if record.Key.TenantID != scope.TenantID || record.Key.ProjectID != scope.ProjectID {
-		return faultForbidden("receipt identity does not match the commit unit scope")
-	}
-	return nil
-}
-
-// contentHashBytes decodes a receipt content fingerprint into its byte form.
-func contentHashBytes(value string) ([]byte, error) {
-	const prefix = "sha256:"
-	if !strings.HasPrefix(value, prefix) {
-		return nil, fmt.Errorf("receipt content hash has no sha256 prefix")
-	}
-	decoded, err := hex.DecodeString(value[len(prefix):])
-	if err != nil {
-		return nil, err
-	}
-	if len(decoded) != 32 {
-		return nil, fmt.Errorf("receipt content hash is %d bytes; want 32", len(decoded))
-	}
-	return decoded, nil
-}
-
-// sameContentHash compares two receipt fingerprints byte-exactly, falling back
-// to text equality only if a stored value is not a well-formed fingerprint.
-func sameContentHash(left, right string) bool {
-	leftBytes, leftErr := contentHashBytes(left)
-	rightBytes, rightErr := contentHashBytes(right)
-	if leftErr != nil || rightErr != nil {
-		return left == right
-	}
-	return bytes.Equal(leftBytes, rightBytes)
 }

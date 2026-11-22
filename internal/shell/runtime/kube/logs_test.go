@@ -12,6 +12,7 @@ import (
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/kernel/engine"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 // TestLogsAreOrderedBoundedAndRedacted proves a read returns ordered identified
@@ -193,13 +194,14 @@ func TestLogsCursorHighHalfAdvancesAndStderrHalfStaysZero(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step %d Logs returned error: %v", step, err)
 		}
-		if batch.NextOffset>>logCursorStreamBits != want {
+		stdoutPos, stderrPos := adapterutil.DecodeLogCursor(batch.NextOffset)
+		if stdoutPos != want {
 			t.Fatalf("step %d high half = %d; want the stdout position %d",
-				step, batch.NextOffset>>logCursorStreamBits, want)
+				step, stdoutPos, want)
 		}
-		if batch.NextOffset&logCursorStreamMask != 0 {
+		if stderrPos != 0 {
 			t.Fatalf("step %d stderr half = %d; want 0",
-				step, batch.NextOffset&logCursorStreamMask)
+				step, stderrPos)
 		}
 		cursor = batch.NextOffset
 	}
@@ -367,7 +369,7 @@ func TestLogsRedactsValueEndingAtThePageBoundary(t *testing.T) {
 func TestLogsRefusesLegacySplitStreamCursor(t *testing.T) {
 	fake, _, adapter := testSetup(t)
 	request := testPrepareRequest()
-	legacy := int64(7)<<logCursorStreamBits | 5
+	legacy := adapterutil.EncodeLogCursor(7, 5)
 
 	batch, err := adapter.Logs(context.Background(), engine.LogsRequest{
 		Identity:    request.Identity,
@@ -401,7 +403,7 @@ func TestLogsAcceptsCombinedCursor(t *testing.T) {
 
 	batch, err := adapter.Logs(context.Background(), engine.LogsRequest{
 		Identity:    request.Identity,
-		AfterOffset: encodeLogCursor(3, 0),
+		AfterOffset: adapterutil.EncodeLogCursor(3, 0),
 		Limit:       4,
 	})
 	if err != nil {
@@ -410,7 +412,7 @@ func TestLogsAcceptsCombinedCursor(t *testing.T) {
 	if len(batch.Chunks) != 1 || batch.Chunks[0].Offset != 3 || string(batch.Chunks[0].Data) != "3456" {
 		t.Fatalf("resumed chunks = %+v; want offset 3 data 3456", batch.Chunks)
 	}
-	if want := encodeLogCursor(7, 0); batch.NextOffset != want {
+	if want := adapterutil.EncodeLogCursor(7, 0); batch.NextOffset != want {
 		t.Fatalf("NextOffset = %d; want %d", batch.NextOffset, want)
 	}
 }

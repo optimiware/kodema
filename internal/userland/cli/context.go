@@ -754,21 +754,11 @@ func runContextShow(ctx context.Context, config Config, args []string, ports Por
 	return failure(ports.Err, fmt.Errorf("skill %q not found in %s", name, dir))
 }
 
-func resolveContextEnv(deps CommandDeps) func(string) string {
-	if deps.Env != nil {
-		return deps.Env
-	}
-	if deps.Login.Environment != nil {
-		return deps.Login.Environment
-	}
-	return os.Getenv
-}
-
 func resolveContextGitBaseURL(flagVal string, config Config, deps CommandDeps) string {
 	if trimmed := strings.TrimSpace(flagVal); trimmed != "" {
 		return strings.TrimRight(trimmed, "/")
 	}
-	env := resolveContextEnv(deps)
+	env := resolveEnv(deps)
 	if trimmed := strings.TrimSpace(env("KODEMA_GIT_URL")); trimmed != "" {
 		return strings.TrimRight(trimmed, "/")
 	}
@@ -933,7 +923,7 @@ func hasControlRune(value string) bool {
 // injected GIT_CONFIG_COUNT. Never emits token material and never touches
 // unrelated or file:// origins.
 func contextGitConfigArgs(repoURL string, config Config, deps CommandDeps) []string {
-	env := resolveContextEnv(deps)
+	env := resolveEnv(deps)
 	if strings.TrimSpace(env("GIT_CONFIG_COUNT")) != "" {
 		return nil
 	}

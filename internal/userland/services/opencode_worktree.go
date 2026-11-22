@@ -3,7 +3,6 @@ package services
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/url"
@@ -31,8 +30,8 @@ type GitOpenCodeWorktreeConfig struct {
 	// (e.g. "kodema git credential") scoped to the trusted remote origin when
 	// CredentialFile is empty.
 	CredentialHelper string
-	// CAFile optionally configures http.sslCAInfo via GIT_CONFIG_* for HTTPS
-	// Git servers using a private CA bundle.
+	// CAFile optionally configures http.<origin>.sslCAInfo via GIT_CONFIG_* for
+	// HTTPS Git servers using a private CA bundle.
 	CAFile string
 	// Executor runs native git commands without a shell and with process-group
 	// cancellation so cancelling a turn immediately terminates active git
@@ -75,6 +74,10 @@ func NewGitOpenCodeWorktreeManager(config GitOpenCodeWorktreeConfig) (*GitOpenCo
 	if err != nil {
 		return nil, fmt.Errorf("resolve opencode state directory: %w", err)
 	}
+	caFile, err := normalizeGitCAFile(config.CAFile, "opencode git worktree")
+	if err != nil {
+		return nil, err
+	}
 	reposDir := filepath.Join(absState, "repos")
 	worktreesDir := filepath.Join(absState, "worktrees")
 	if err := os.MkdirAll(reposDir, 0o700); err != nil {
@@ -89,7 +92,7 @@ func NewGitOpenCodeWorktreeManager(config GitOpenCodeWorktreeConfig) (*GitOpenCo
 		worktreesDir:     worktreesDir,
 		credentialFile:   strings.TrimSpace(config.CredentialFile),
 		credentialHelper: strings.TrimSpace(config.CredentialHelper),
-		caFile:           strings.TrimSpace(config.CAFile),
+		caFile:           caFile,
 		executor:         config.Executor,
 	}, nil
 }
@@ -426,52 +429,7 @@ func (m *GitOpenCodeWorktreeManager) repositoryURL(repository string) string {
 // or command arguments), and optionally returns origin-scoped credential helper
 // `-c` overrides when CredentialHelper is used without CredentialFile.
 func (m *GitOpenCodeWorktreeManager) remoteEnvironment(remoteURL string) ([]string, []string, error) {
-	parsed, err := url.Parse(remoteURL)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse opencode git remote URL: %w", err)
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, nil, nil
-	}
-	type cfgPair struct{ k, v string }
-	var pairs []cfgPair
-	var extraArgs []string
-	if m.caFile != "" {
-		pairs = append(pairs, cfgPair{k: "http.sslCAInfo", v: m.caFile})
-	}
-	switch {
-	case m.credentialFile != "":
-		data, err := os.ReadFile(m.credentialFile)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read opencode git credential: %w", err)
-		}
-		tok := strings.TrimSpace(string(data))
-		if tok == "" {
-			return nil, nil, fmt.Errorf("opencode git credential file is empty")
-		}
-		basic := base64.StdEncoding.EncodeToString([]byte("kodema:" + tok))
-		pairs = append(pairs, cfgPair{
-			k: "http." + remoteURL + ".extraHeader",
-			v: "Authorization: Basic " + basic,
-		})
-	case m.credentialHelper != "":
-		origin := parsed.Scheme + "://" + parsed.Host
-		extraArgs = append(extraArgs, "-c", "credential."+origin+".helper="+m.credentialHelper)
-	default:
-		return nil, nil, fmt.Errorf("an HTTP(S) git remote requires a credential file or credential helper")
-	}
-	if len(pairs) == 0 {
-		return nil, extraArgs, nil
-	}
-	env := make([]string, 0, 1+2*len(pairs))
-	env = append(env, fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(pairs)))
-	for i, pair := range pairs {
-		env = append(env,
-			fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, pair.k),
-			fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, pair.v),
-		)
-	}
-	return env, extraArgs, nil
+	return buildGitRemoteEnv(remoteURL, m.credentialFile, m.credentialHelper, m.caFile)
 }
 
 // gitHardeningArgs returns explicit `-c` overrides prepended to EVERY native

@@ -602,3 +602,100 @@ func selfSignedCAPEM(t *testing.T) []byte {
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
+
+type fakeSessionLockConn struct {
+	mu           sync.Mutex
+	lockErr      error
+	unlockErr    error
+	events       []string
+	lockCalls    int
+	unlockCalls  int
+	closeCalls   int
+	releaseCalls int
+}
+
+func (c *fakeSessionLockConn) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if strings.Contains(sql, "pg_advisory_lock") {
+		c.lockCalls++
+		c.events = append(c.events, "lock")
+		return pgconn.CommandTag{}, c.lockErr
+	}
+	if strings.Contains(sql, "pg_advisory_unlock") {
+		c.unlockCalls++
+		c.events = append(c.events, "unlock")
+		return pgconn.CommandTag{}, c.unlockErr
+	}
+	return pgconn.CommandTag{}, errors.New("unexpected sql: " + sql)
+}
+
+func (c *fakeSessionLockConn) ClosePhysical(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closeCalls++
+	c.events = append(c.events, "close")
+	return nil
+}
+
+func (c *fakeSessionLockConn) Release() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseCalls++
+	c.events = append(c.events, "release")
+}
+
+func TestLockSessionOnConnReleaseOnceAndDiscardsFailedUnlock(t *testing.T) {
+	t.Run("successful unlock releases once without closing physical conn", func(t *testing.T) {
+		conn := &fakeSessionLockConn{}
+		release, err := lockSessionOnConn(context.Background(), conn, 42)
+		if err != nil {
+			t.Fatalf("lockSessionOnConn: %v", err)
+		}
+		if err := release(context.Background()); err != nil {
+			t.Fatalf("first release: %v", err)
+		}
+		if err := release(context.Background()); err != nil {
+			t.Fatalf("second release: %v", err)
+		}
+		if conn.lockCalls != 1 || conn.unlockCalls != 1 || conn.closeCalls != 0 || conn.releaseCalls != 1 {
+			t.Fatalf("calls lock=%d unlock=%d close=%d release=%d; want 1/1/0/1",
+				conn.lockCalls, conn.unlockCalls, conn.closeCalls, conn.releaseCalls)
+		}
+	})
+
+	t.Run("failed unlock closes physical conn before releasing and is idempotent", func(t *testing.T) {
+		conn := &fakeSessionLockConn{unlockErr: errors.New("connection broken")}
+		release, err := lockSessionOnConn(context.Background(), conn, 42)
+		if err != nil {
+			t.Fatalf("lockSessionOnConn: %v", err)
+		}
+		firstErr := release(context.Background())
+		if class, ok := fault.ClassOf(firstErr); !ok || class != fault.DependencyUnavailable {
+			t.Fatalf("first release err = %v (class=%v); want DependencyUnavailable", firstErr, class)
+		}
+		secondErr := release(context.Background())
+		if secondErr == nil {
+			t.Fatal("second release returned nil after first unlock failed")
+		}
+		if conn.lockCalls != 1 || conn.unlockCalls != 1 || conn.closeCalls != 1 || conn.releaseCalls != 1 {
+			t.Fatalf("calls lock=%d unlock=%d close=%d release=%d; want 1/1/1/1",
+				conn.lockCalls, conn.unlockCalls, conn.closeCalls, conn.releaseCalls)
+		}
+		if got := strings.Join(conn.events, ","); got != "lock,unlock,close,release" {
+			t.Fatalf("event order = %q; want lock,unlock,close,release", got)
+		}
+	})
+
+	t.Run("failed lock closes physical conn before releasing", func(t *testing.T) {
+		conn := &fakeSessionLockConn{lockErr: context.DeadlineExceeded}
+		if _, err := lockSessionOnConn(context.Background(), conn, 42); err == nil {
+			t.Fatal("lockSessionOnConn succeeded despite lock failure")
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.DeadlineExpired {
+			t.Fatalf("lock err = %v (class=%v); want DeadlineExpired", err, class)
+		}
+		if got := strings.Join(conn.events, ","); got != "lock,close,release" {
+			t.Fatalf("event order = %q; want lock,close,release", got)
+		}
+	})
+}

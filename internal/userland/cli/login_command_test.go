@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -1271,3 +1272,225 @@ func x509UnknownAuthorityErr() error {
 }
 
 var _ client.CredentialSource = cli.SessionCredentialSource{}
+
+// TestLoginAcquiresLockOnlyAroundPersist pins that both browser and device
+// login flows acquire the session lock immediately around SaveRecord (never
+// holding it across interactive browser wait or device polling), and release it.
+func TestLoginAcquiresLockOnlyAroundPersist(t *testing.T) {
+	t.Run("device login locks around persist only", func(t *testing.T) {
+		events := &eventLog{}
+		store := &commandStore{events: events}
+		lock := &commandLock{events: events}
+		oidc := &commandOIDC{
+			document: commandDocument(),
+			deviceFn: func(cli.DeviceAuthorizationRequest) (cli.DeviceAuthorizationResponse, error) {
+				events.add("device_authorize")
+				acquires, _ := lock.counts()
+				if acquires != 0 {
+					t.Errorf("lock acquired during DeviceAuthorize (acquires=%d)", acquires)
+				}
+				return cli.DeviceAuthorizationResponse{
+					DeviceCode:      deviceCanary,
+					UserCode:        "USER-CODE-1",
+					VerificationURI: commandIssuer + "/device",
+					ExpiresIn:       10 * time.Minute,
+					Interval:        5 * time.Second,
+				}, nil
+			},
+			tokenFn: func(cli.TokenRequest) (cli.TokenResponse, error) {
+				events.add("token")
+				acquires, _ := lock.counts()
+				if acquires != 0 {
+					t.Errorf("lock acquired during device Token poll (acquires=%d)", acquires)
+				}
+				return cli.TokenResponse{
+					AccessToken:  accessCanary,
+					RefreshToken: refreshCanary,
+					TokenType:    "Bearer",
+					ExpiresIn:    time.Hour,
+				}, nil
+			},
+		}
+		ports, _, errOut := testPorts(&scriptedTransport{})
+		code, _, _ := runWithRuntime(t, commandConfig(), []string{"login", "--device"}, ports,
+			commandRuntime(oidc, store, lock, commandClock{now: testNow()}, nil))
+		if code != cli.ExitSuccess {
+			t.Fatalf("device login exit=%d stderr=%q", code, errOut.String())
+		}
+		acquires, releases := lock.counts()
+		if acquires != 1 || releases != 1 {
+			t.Fatalf("lock counts = %d/%d; want 1/1", acquires, releases)
+		}
+		wantOrder := []string{"device_authorize", "token", "lock", "save", "unlock"}
+		got := events.snapshot()
+		if strings.Join(got, ",") != strings.Join(wantOrder, ",") {
+			t.Fatalf("event order = %v; want %v", got, wantOrder)
+		}
+	})
+
+	t.Run("browser login locks around persist only", func(t *testing.T) {
+		events := &eventLog{}
+		store := &commandStore{events: events}
+		lock := &commandLock{events: events}
+		fixture := newES256Fixture(t, 43)
+		jwks := es256JWKS(t, map[string]string{
+			"x": encodeCoordinate(fixture.x),
+			"y": encodeCoordinate(fixture.y),
+		})
+		var capturedState, capturedNonce string
+		browser := &commandBrowser{}
+		oidc := &commandOIDC{
+			document: commandDocument(),
+			jwksFn: func(string) (json.RawMessage, error) {
+				return jwks, nil
+			},
+			tokenFn: func(cli.TokenRequest) (cli.TokenResponse, error) {
+				events.add("token")
+				acquires, _ := lock.counts()
+				if acquires != 0 {
+					t.Errorf("lock acquired during browser Token exchange (acquires=%d)", acquires)
+				}
+				idToken := signES256IDToken(t, fixture.key, cli.IDTokenExpectations{
+					Issuer:   commandIssuer,
+					Audience: commandClient,
+					Nonce:    capturedNonce,
+					Now:      testNow(),
+				}, es256RawSignature)
+				return cli.TokenResponse{
+					AccessToken:  accessCanary,
+					RefreshToken: refreshCanary,
+					IDToken:      idToken,
+					TokenType:    "Bearer",
+					ExpiresIn:    time.Hour,
+				}, nil
+			},
+		}
+		loopback := &callbackHookLoopback{
+			onWait: func() (cli.CallbackParams, error) {
+				events.add("wait")
+				acquires, _ := lock.counts()
+				if acquires != 0 {
+					t.Errorf("lock acquired during browser callback wait (acquires=%d)", acquires)
+				}
+				opened := browser.opened()
+				if len(opened) != 1 {
+					return cli.CallbackParams{}, fmt.Errorf("expected 1 opened URL, got %d", len(opened))
+				}
+				parsed, err := url.Parse(opened[0])
+				if err != nil {
+					return cli.CallbackParams{}, err
+				}
+				capturedState = parsed.Query().Get("state")
+				capturedNonce = parsed.Query().Get("nonce")
+				return cli.CallbackParams{Code: "auth-code-1", State: capturedState}, nil
+			},
+		}
+		rt := commandRuntime(oidc, store, lock, commandClock{now: testNow()}, map[string]string{"DISPLAY": ":0"})
+		rt.Browser = browser
+		rt.Loopback = loopback
+		ports, _, errOut := testPorts(&scriptedTransport{})
+		code, _, _ := runWithRuntime(t, commandConfig(), []string{"login"}, ports, rt)
+		if code != cli.ExitSuccess {
+			t.Fatalf("browser login exit=%d stderr=%q", code, errOut.String())
+		}
+		acquires, releases := lock.counts()
+		if acquires != 1 || releases != 1 {
+			t.Fatalf("lock counts = %d/%d; want 1/1", acquires, releases)
+		}
+		wantOrder := []string{"wait", "token", "lock", "save", "unlock"}
+		got := events.snapshot()
+		if strings.Join(got, ",") != strings.Join(wantOrder, ",") {
+			t.Fatalf("event order = %v; want %v", got, wantOrder)
+		}
+	})
+
+	t.Run("unverified logout locks around deleteSessionRecord", func(t *testing.T) {
+		events := &eventLog{}
+		store := &commandStore{present: true, record: commandRecord(testNow().Add(time.Hour)), events: events}
+		lock := &commandLock{events: events}
+		oidc := &commandOIDC{document: commandDocument(), discoveryErr: errors.New("discovery down")}
+		ports, _, errOut := testPorts(&scriptedTransport{})
+		code, _, _ := runWithRuntime(t, commandConfig(), []string{"logout"}, ports,
+			commandRuntime(oidc, store, lock, commandClock{now: testNow()}, nil))
+		if code != cli.ExitFailure {
+			t.Fatalf("logout exit=%d; want failure", code)
+		}
+		if !strings.Contains(errOut.String(), "login required") {
+			t.Fatalf("stderr = %q; want login required", errOut.String())
+		}
+		if _, present := store.current(); present {
+			t.Fatal("unverified logout kept the session record")
+		}
+		acquires, releases := lock.counts()
+		if acquires != 1 || releases != 1 {
+			t.Fatalf("lock counts = %d/%d; want 1/1", acquires, releases)
+		}
+		wantOrder := []string{"load", "lock", "delete", "unlock"}
+		got := events.snapshot()
+		if strings.Join(got, ",") != strings.Join(wantOrder, ",") {
+			t.Fatalf("event order = %v; want %v", got, wantOrder)
+		}
+	})
+
+	t.Run("lock acquire omits artificial deadline and surfaces lock cause", func(t *testing.T) {
+		var sawDeadline bool
+		failingLock := &deadlineInspectLock{
+			onAcquire: func(ctx context.Context) error {
+				_, sawDeadline = ctx.Deadline()
+				return errors.New("lock dir not writable")
+			},
+		}
+		store := &commandStore{}
+		oidc := &commandOIDC{
+			document: commandDocument(),
+			deviceFn: func(cli.DeviceAuthorizationRequest) (cli.DeviceAuthorizationResponse, error) {
+				return cli.DeviceAuthorizationResponse{
+					DeviceCode:      deviceCanary,
+					UserCode:        "USER-CODE-2",
+					VerificationURI: commandIssuer + "/device",
+					ExpiresIn:       10 * time.Minute,
+					Interval:        5 * time.Second,
+				}, nil
+			},
+			tokenFn: func(cli.TokenRequest) (cli.TokenResponse, error) {
+				return cli.TokenResponse{
+					AccessToken:  accessCanary,
+					RefreshToken: refreshCanary,
+					TokenType:    "Bearer",
+					ExpiresIn:    time.Hour,
+				}, nil
+			},
+		}
+		ports, _, errOut := testPorts(&scriptedTransport{})
+		runtime := commandRuntime(oidc, store, &commandLock{}, commandClock{now: testNow()}, nil)
+		runtime.Lock = failingLock
+		code, _, _ := runWithRuntime(t, commandConfig(), []string{"login", "--device"}, ports, runtime)
+		if code != cli.ExitFailure {
+			t.Fatalf("login exit=%d; want failure", code)
+		}
+		if sawDeadline {
+			t.Fatal("persistLockedSessionRecord imposed a deadline on lock.Acquire, overriding --session-lock-timeout")
+		}
+		if !strings.Contains(errOut.String(), "lock dir not writable") {
+			t.Fatalf("stderr = %q; want underlying lock cause", errOut.String())
+		}
+	})
+}
+
+type deadlineInspectLock struct {
+	onAcquire func(context.Context) error
+}
+
+func (l *deadlineInspectLock) Acquire(ctx context.Context) (func() error, error) {
+	return nil, l.onAcquire(ctx)
+}
+
+type callbackHookLoopback struct {
+	onWait func() (cli.CallbackParams, error)
+}
+
+func (l *callbackHookLoopback) Listen(context.Context) (string, func(context.Context) (cli.CallbackParams, error), func() error, error) {
+	return "127.0.0.1:43211", func(context.Context) (cli.CallbackParams, error) {
+		return l.onWait()
+	}, func() error { return nil }, nil
+}

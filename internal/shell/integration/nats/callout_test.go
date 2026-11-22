@@ -602,6 +602,107 @@ func TestCalloutBoundsRequestWithDeadline(t *testing.T) {
 	}
 }
 
+type gatedCalloutConnection struct {
+	fakeCalloutConnection
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *gatedCalloutConnection) SubscribeCallout(ctx context.Context, subject string, handler func(context.Context, nats.CalloutRequest) error) (nats.Subscription, error) {
+	close(c.entered)
+	<-c.release
+	return c.fakeCalloutConnection.SubscribeCallout(ctx, subject, handler)
+}
+
+// TestCalloutConcurrentStartAndCloseIsRaceFree proves Start and Close synchronize
+// on callout.subscription without data races and never leak a subscription when
+// Close runs while Start is subscribing.
+func TestCalloutConcurrentStartAndCloseIsRaceFree(t *testing.T) {
+	seed, _ := nats.NewTestKey(t, nats.TestAccountPrefix)
+	scope := testScope()
+
+	t.Run("close during in-flight start closes returned subscription", func(t *testing.T) {
+		conn := &gatedCalloutConnection{
+			entered: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		callout, err := nats.NewCallout(nats.CalloutConfig{
+			Connection: conn,
+			IssuerSeed: seed,
+			Account:    "KODEMA",
+			Principal:  &fakePrincipalResolver{byToken: map[string]identity.Principal{testCredential: servicePrincipal(scope)}},
+			Authorizer: &fakeAuthorizer{decision: authorize.DecisionAllow},
+			Validity:   fakeValidity{until: testNow().Add(time.Hour)},
+			Clock:      &fakeClock{now: testNow()},
+		})
+		if err != nil {
+			t.Fatalf("NewCallout: %v", err)
+		}
+
+		startErr := make(chan error, 1)
+		go func() {
+			startErr <- callout.Start(context.Background())
+		}()
+
+		select {
+		case <-conn.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Start did not reach SubscribeCallout")
+		}
+
+		if err := callout.Close(context.Background()); err != nil {
+			close(conn.release)
+			t.Fatalf("Close during Start: %v", err)
+		}
+		close(conn.release)
+
+		requireClass(t, <-startErr, fault.DependencyUnavailable)
+		conn.mu.Lock()
+		closed := conn.closed
+		closeLen := conn.closeLen
+		conn.mu.Unlock()
+		if !closed || closeLen != 1 {
+			t.Fatalf("late subscription closed=%v closeLen=%d; want true, 1", closed, closeLen)
+		}
+	})
+
+	t.Run("concurrent start and close stress", func(t *testing.T) {
+		for range 16 {
+			conn := &fakeCalloutConnection{}
+			callout, err := nats.NewCallout(nats.CalloutConfig{
+				Connection: conn,
+				IssuerSeed: seed,
+				Account:    "KODEMA",
+				Principal:  &fakePrincipalResolver{byToken: map[string]identity.Principal{testCredential: servicePrincipal(scope)}},
+				Authorizer: &fakeAuthorizer{decision: authorize.DecisionAllow},
+				Validity:   fakeValidity{until: testNow().Add(time.Hour)},
+				Clock:      &fakeClock{now: testNow()},
+			})
+			if err != nil {
+				t.Fatalf("NewCallout: %v", err)
+			}
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			for range 4 {
+				wg.Add(2)
+				go func() {
+					defer wg.Done()
+					<-start
+					_ = callout.Start(context.Background())
+				}()
+				go func() {
+					defer wg.Done()
+					<-start
+					_ = callout.Close(context.Background())
+				}()
+			}
+			close(start)
+			wg.Wait()
+			_ = callout.Close(context.Background())
+		}
+	})
+}
+
 // ensure the test's null scope helper remains referenced.
 var _ = tenancy.Scope{}
 var _ = id.PrincipalID("")

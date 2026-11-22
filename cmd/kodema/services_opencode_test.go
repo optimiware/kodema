@@ -166,6 +166,92 @@ func TestServicesOpenCodeBrainModeFlagsValidation(t *testing.T) {
 			t.Fatalf("explicit --per-turn-proxy-routing=true was unexpectedly refused as usage error (stderr=%q)", stderr.String())
 		}
 	})
+
+	t.Run("malformed KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING is refused as exit-2 usage error", func(t *testing.T) {
+		t.Setenv("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "maybe")
+		var stderr lockedBuffer
+		args := append(append([]string(nil), base...),
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+		)
+		code := runServicesEntry(context.Background(), args, &lockedBuffer{}, &stderr)
+		if code != 2 {
+			t.Fatalf("exit code = %d; want 2 (stderr=%q)", code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING") {
+			t.Fatalf("stderr = %q; want KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING named", stderr.String())
+		}
+	})
+
+	t.Run("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING=1 enables per-turn routing", func(t *testing.T) {
+		t.Setenv("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "1")
+		var stderr lockedBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		args := append(append([]string(nil), base...),
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+			"--llm-proxy-listen", "127.0.0.1:0",
+			"--max-concurrency", "2",
+		)
+		code := runServicesEntry(ctx, args, &lockedBuffer{}, &stderr)
+		if code == 2 {
+			t.Fatalf("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING=1 was unexpectedly refused as usage error (stderr=%q)", stderr.String())
+		}
+	})
+
+	t.Run("explicit --per-turn-proxy-routing flag overrides malformed env", func(t *testing.T) {
+		t.Setenv("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "on")
+		var stderr lockedBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		args := append(append([]string(nil), base...),
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+			"--per-turn-proxy-routing=false",
+		)
+		code := runServicesEntry(ctx, args, &lockedBuffer{}, &stderr)
+		if code == 2 {
+			t.Fatalf("explicit --per-turn-proxy-routing=false was refused due to env (stderr=%q)", stderr.String())
+		}
+	})
+
+	t.Run("malformed KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING does not break non-opencode services", func(t *testing.T) {
+		t.Setenv("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "on")
+		var stderr lockedBuffer
+		args := []string{
+			"--kind", "merge_coordinator",
+			"--service", "svc-merge",
+			"--tenant", "t1",
+			"--project", "p1",
+			"--base-url", "http://127.0.0.1:8080",
+			"--credential-file", credential,
+		}
+		code := runServicesEntry(context.Background(), args, &lockedBuffer{}, &stderr)
+		if strings.Contains(stderr.String(), "KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING") {
+			t.Fatalf("non-opencode service failed on opencode env var: %q", stderr.String())
+		}
+		if code != 2 || !strings.Contains(stderr.String(), "merge coordinator requires") {
+			t.Fatalf("exit=%d stderr=%q; want merge coordinator flag check", code, stderr.String())
+		}
+	})
+
+	t.Run("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING accepts strconv.ParseBool values like t", func(t *testing.T) {
+		t.Setenv("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING", "t")
+		var stderr lockedBuffer
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		args := append(append([]string(nil), base...),
+			"--state-dir", t.TempDir(),
+			"--opencode-url", "http://127.0.0.1:4096",
+			"--llm-proxy-listen", "127.0.0.1:0",
+			"--max-concurrency", "2",
+		)
+		code := runServicesEntry(ctx, args, &lockedBuffer{}, &stderr)
+		if code == 2 {
+			t.Fatalf("KODEMA_OPENCODE_PER_TURN_PROXY_ROUTING=t was refused as usage error (stderr=%q)", stderr.String())
+		}
+	})
 }
 
 func TestServicesOpenCodePasswordFlagsAndEnvFallbacks(t *testing.T) {

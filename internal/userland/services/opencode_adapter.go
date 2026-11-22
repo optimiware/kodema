@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
@@ -23,9 +24,16 @@ import (
 const (
 	defaultOpenCodeMaxConcurrency   = 4
 	defaultOpenCodeAbortCallTimeout = 5 * time.Second
+	defaultOpenCodeMCPDetachRetries = 3
+	defaultOpenCodeMCPDetachBackoff = 25 * time.Millisecond
 	maxOpenCodePromptBlobBytes      = 256 << 10
 	maxOpenCodeResolveNoteBytes     = 1024
 )
+
+type orphanedMCPAttachment struct {
+	sessionID  string
+	serverName string
+}
 
 type openCodeTaskLockEntry struct {
 	sem  chan struct{}
@@ -62,12 +70,13 @@ type OpenCodeAdapter struct {
 
 	turnSlots chan struct{}
 
-	mu         sync.Mutex
-	active     map[string]*activeOpenCodeTurn    // "execID/actionID" -> turn
-	taskLocks  map[string]*openCodeTaskLockEntry // taskID -> refcounted 1-buffered semaphore
-	turnWG     sync.WaitGroup
-	abortWG    sync.WaitGroup
-	scanSignal chan struct{}
+	mu          sync.Mutex
+	active      map[string]*activeOpenCodeTurn    // "execID/actionID" -> turn
+	taskLocks   map[string]*openCodeTaskLockEntry // taskID -> refcounted 1-buffered semaphore
+	orphanedMCP map[orphanedMCPAttachment]struct{}
+	turnWG      sync.WaitGroup
+	abortWG     sync.WaitGroup
+	scanSignal  chan struct{}
 }
 
 type activeOpenCodeTurn struct {
@@ -78,7 +87,6 @@ type activeOpenCodeTurn struct {
 
 	mu           sync.Mutex
 	sessionID    string
-	aborted      bool
 	abortOnce    sync.Once
 	sandboxLease *OpenCodeSandboxLease
 	releaseOnce  sync.Once
@@ -133,9 +141,6 @@ func (t *activeOpenCodeTurn) abortSession(opencode OpenCodeClient) {
 		return
 	}
 	t.abortOnce.Do(func() {
-		t.mu.Lock()
-		t.aborted = true
-		t.mu.Unlock()
 		abortCtx, cancel := context.WithTimeout(context.Background(), defaultOpenCodeAbortCallTimeout)
 		defer cancel()
 		_ = opencode.AbortSession(abortCtx, sessionID)
@@ -231,6 +236,7 @@ func NewOpenCodeAdapter(config OpenCodeAdapterConfig) (*OpenCodeAdapter, error) 
 		turnSlots:           make(chan struct{}, maxConc),
 		active:              make(map[string]*activeOpenCodeTurn),
 		taskLocks:           make(map[string]*openCodeTaskLockEntry),
+		orphanedMCP:         make(map[orphanedMCPAttachment]struct{}),
 		scanSignal:          make(chan struct{}, 1),
 	}, nil
 }
@@ -314,7 +320,7 @@ func (a *OpenCodeAdapter) RunOnce(ctx context.Context) error {
 // into bounded background turn goroutines.
 func (a *OpenCodeAdapter) reconcileAsync(ctx context.Context) error {
 	if a.events != nil && a.stream == nil {
-		_ = a.drainEvents(ctx)
+		_ = drainEventSource(ctx, a.events)
 	}
 	items, err := a.scanAssignedRequests(ctx)
 	if err != nil {
@@ -432,21 +438,6 @@ func (a *OpenCodeAdapter) handleStreamEvent(evt api.StreamEvent) {
 	switch evt.Type {
 	case "action.requested":
 		a.triggerScan()
-	case "action.cancelled":
-		actionID := evt.SubjectID
-		var data struct {
-			ActionID    string `json:"action_id"`
-			ExecutionID string `json:"execution_id"`
-		}
-		if len(evt.Data) > 0 && json.Unmarshal(evt.Data, &data) == nil {
-			if data.ActionID != "" {
-				actionID = data.ActionID
-			}
-		}
-		a.cancelByAction(actionID)
-		if data.ExecutionID != "" && actionID == "" {
-			a.cancelByExecution(data.ExecutionID)
-		}
 	case "action.transition":
 		var data struct {
 			ActionID string `json:"action_id"`
@@ -530,59 +521,41 @@ func (a *OpenCodeAdapter) cancelTurnsAsync(matched []*activeOpenCodeTurn) {
 	}
 }
 
-func (a *OpenCodeAdapter) cancelByAction(actionID string) {
-	if actionID == "" {
-		return
-	}
+func (a *OpenCodeAdapter) cancelMatchingTurns(match func(*activeOpenCodeTurn) bool) {
 	var matched []*activeOpenCodeTurn
 	a.mu.Lock()
 	for _, t := range a.active {
-		if t.actionID == actionID {
+		if match(t) {
 			matched = append(matched, t)
 		}
 	}
 	a.mu.Unlock()
 	a.cancelTurnsAsync(matched)
+}
+
+func (a *OpenCodeAdapter) cancelByAction(actionID string) {
+	if actionID == "" {
+		return
+	}
+	a.cancelMatchingTurns(func(t *activeOpenCodeTurn) bool { return t.actionID == actionID })
 }
 
 func (a *OpenCodeAdapter) cancelByExecution(executionID string) {
 	if executionID == "" {
 		return
 	}
-	var matched []*activeOpenCodeTurn
-	a.mu.Lock()
-	for _, t := range a.active {
-		if t.executionID == executionID {
-			matched = append(matched, t)
-		}
-	}
-	a.mu.Unlock()
-	a.cancelTurnsAsync(matched)
+	a.cancelMatchingTurns(func(t *activeOpenCodeTurn) bool { return t.executionID == executionID })
 }
 
 func (a *OpenCodeAdapter) cancelByTask(taskID string) {
 	if taskID == "" {
 		return
 	}
-	var matched []*activeOpenCodeTurn
-	a.mu.Lock()
-	for _, t := range a.active {
-		if t.taskID == taskID {
-			matched = append(matched, t)
-		}
-	}
-	a.mu.Unlock()
-	a.cancelTurnsAsync(matched)
+	a.cancelMatchingTurns(func(t *activeOpenCodeTurn) bool { return t.taskID == taskID })
 }
 
 func (a *OpenCodeAdapter) abortAllActive() {
-	a.mu.Lock()
-	all := make([]*activeOpenCodeTurn, 0, len(a.active))
-	for _, t := range a.active {
-		all = append(all, t)
-	}
-	a.mu.Unlock()
-	a.cancelTurnsAsync(all)
+	a.cancelMatchingTurns(func(*activeOpenCodeTurn) bool { return true })
 }
 
 // executeTurn executes a single turn synchronously (used by RunOnce).
@@ -616,7 +589,7 @@ func (a *OpenCodeAdapter) executeTurn(ctx context.Context, scanned api.InboxItem
 
 func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *activeOpenCodeTurn, scanned api.InboxItem) error {
 	// 1. Revalidate current execution and action state before any side effect.
-	current, err := a.inspectExecution(turnCtx, scanned.ExecutionID)
+	current, err := inspectExecution(turnCtx, a.handler, scanned.ExecutionID)
 	if err != nil {
 		var publicErr *api.Error
 		if errors.As(err, &publicErr) && publicErr.Code == api.CodeNotFound {
@@ -800,8 +773,14 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 
 			if lease.Done != nil {
 				watchStop := make(chan struct{})
-				defer close(watchStop)
+				var watchWG sync.WaitGroup
+				defer func() {
+					close(watchStop)
+					watchWG.Wait()
+				}()
+				watchWG.Add(1)
 				go func() {
+					defer watchWG.Done()
 					select {
 					case <-lease.Done:
 						var cause error
@@ -872,6 +851,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		}
 		mcpServers = map[string]OpenCodeMCPServerConfig{mcpCfg.Name: mcpCfg}
 		if mcpClient, ok := a.opencode.(OpenCodeMCPClient); ok {
+			a.detachOrphanedMCP(turnRunCtx, mcpClient, mcpCfg.Name)
 			if attachErr := mcpClient.AttachMCPServer(turnRunCtx, sessionID, mcpCfg); attachErr != nil {
 				if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
 					turn.abortSession(a.opencode)
@@ -884,7 +864,7 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 				return fmt.Errorf("attach sandbox MCP server: %w", attachErr)
 			}
 			defer func() {
-				_ = mcpClient.DetachMCPServer(context.WithoutCancel(callCtx), sessionID, mcpCfg.Name)
+				a.detachMCPServerWithRetry(context.WithoutCancel(callCtx), mcpClient, sessionID, mcpCfg.Name)
 			}()
 		}
 	}
@@ -1277,21 +1257,51 @@ func (a *OpenCodeAdapter) acquireTaskLock(ctx context.Context, taskID string) (f
 	}
 }
 
-func (a *OpenCodeAdapter) drainEvents(ctx context.Context) error {
-	cursor := ""
-	seen := make(map[string]bool)
-	for {
-		page, err := a.events.Poll(ctx, cursor)
-		if err != nil {
-			return err
-		}
-		next := page.Next.NextCursor
-		if next == "" || next == cursor || seen[next] {
-			return nil
-		}
-		seen[next] = true
-		cursor = next
+func (a *OpenCodeAdapter) recordOrphanedMCP(sessionID, serverName string) {
+	if sessionID == "" || serverName == "" {
+		return
 	}
+	a.mu.Lock()
+	if a.orphanedMCP == nil {
+		a.orphanedMCP = make(map[orphanedMCPAttachment]struct{})
+	}
+	a.orphanedMCP[orphanedMCPAttachment{sessionID: sessionID, serverName: serverName}] = struct{}{}
+	a.mu.Unlock()
+}
+
+func (a *OpenCodeAdapter) clearOrphanedMCP(sessionID, serverName string) {
+	a.mu.Lock()
+	delete(a.orphanedMCP, orphanedMCPAttachment{sessionID: sessionID, serverName: serverName})
+	a.mu.Unlock()
+}
+
+func (a *OpenCodeAdapter) detachOrphanedMCP(ctx context.Context, mcpClient OpenCodeMCPClient, serverName string) {
+	a.mu.Lock()
+	var orphans []string
+	for entry := range a.orphanedMCP {
+		if entry.serverName == serverName {
+			orphans = append(orphans, entry.sessionID)
+		}
+	}
+	a.mu.Unlock()
+	for _, orphanSession := range orphans {
+		if err := mcpClient.DetachMCPServer(ctx, orphanSession, serverName); err == nil {
+			a.clearOrphanedMCP(orphanSession, serverName)
+		}
+	}
+}
+
+func (a *OpenCodeAdapter) detachMCPServerWithRetry(ctx context.Context, mcpClient OpenCodeMCPClient, sessionID, serverName string) {
+	for attempt := 0; attempt < defaultOpenCodeMCPDetachRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(defaultOpenCodeMCPDetachBackoff * time.Duration(attempt))
+		}
+		if err := mcpClient.DetachMCPServer(ctx, sessionID, serverName); err == nil {
+			a.clearOrphanedMCP(sessionID, serverName)
+			return
+		}
+	}
+	a.recordOrphanedMCP(sessionID, serverName)
 }
 
 func (a *OpenCodeAdapter) scanAssignedRequests(ctx context.Context) ([]api.InboxItem, error) {
@@ -1301,7 +1311,7 @@ func (a *OpenCodeAdapter) scanAssignedRequests(ctx context.Context) ([]api.Inbox
 	wantAssignment := "service/" + string(a.serviceID)
 
 	for {
-		decoded, err := a.invoke(ctx, OperationInbox, api.TaskInboxRequest{
+		decoded, err := invokePublicOperation(ctx, a.handler, OperationInbox, api.TaskInboxRequest{
 			ProjectID: string(a.project),
 			Kinds:     []string{requestInboxKind},
 			Page:      &api.Page{Limit: api.DefaultPageLimit, Cursor: cursor},
@@ -1327,22 +1337,8 @@ func (a *OpenCodeAdapter) scanAssignedRequests(ctx context.Context) ([]api.Inbox
 	return items, nil
 }
 
-func (a *OpenCodeAdapter) inspectExecution(ctx context.Context, executionID string) (api.ExecutionInspectResult, error) {
-	decoded, err := a.invoke(ctx, OperationInspect, api.ExecutionInspectRequest{
-		ExecutionID: executionID,
-	}, nil, "")
-	if err != nil {
-		return api.ExecutionInspectResult{}, err
-	}
-	res, ok := decoded.(api.ExecutionInspectResult)
-	if !ok {
-		return api.ExecutionInspectResult{}, fmt.Errorf("execution.inspect returned unexpected %T", decoded)
-	}
-	return res, nil
-}
-
 func (a *OpenCodeAdapter) readTask(ctx context.Context, taskID string) (api.TaskReadResult, error) {
-	decoded, err := a.invoke(ctx, OperationTaskRead, api.TaskReadRequest{
+	decoded, err := invokePublicOperation(ctx, a.handler, OperationTaskRead, api.TaskReadRequest{
 		TaskID: taskID,
 	}, nil, "")
 	if err != nil {
@@ -1356,7 +1352,7 @@ func (a *OpenCodeAdapter) readTask(ctx context.Context, taskID string) (api.Task
 }
 
 func (a *OpenCodeAdapter) kvGet(ctx context.Context, key string) (client.KVObject, error) {
-	decoded, err := a.invoke(ctx, OperationKVGet, api.KVGetRequest{
+	decoded, err := invokePublicOperation(ctx, a.handler, OperationKVGet, api.KVGetRequest{
 		ProjectID: string(a.project),
 		Key:       key,
 	}, nil, "")
@@ -1385,7 +1381,7 @@ func (a *OpenCodeAdapter) kvGet(ctx context.Context, key string) (client.KVObjec
 
 func (a *OpenCodeAdapter) kvPut(ctx context.Context, data []byte, contentType string) (api.KVPutResult, error) {
 	encoded := base64.StdEncoding.EncodeToString(data)
-	decoded, err := a.invoke(ctx, OperationKVPut, api.KVPutRequest{
+	decoded, err := invokePublicOperation(ctx, a.handler, OperationKVPut, api.KVPutRequest{
 		ProjectID:   string(a.project),
 		DataBase64:  &encoded,
 		ContentType: contentType,
@@ -1432,7 +1428,7 @@ func (a *OpenCodeAdapter) publishProgress(ctx context.Context, executionID, acti
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("opencode-progress:%s:%s:%s:%s", executionID, actionID, phase, sessionID)))
 	idemKey := "opencode-evt:" + hex.EncodeToString(sum[:])[:32]
-	_, _ = a.invoke(ctx, OperationEventPublish, api.EventPublishRequest{
+	_, _ = invokePublicOperation(ctx, a.handler, OperationEventPublish, api.EventPublishRequest{
 		ProjectID:     string(a.project),
 		Type:          "observation.custom",
 		SubjectID:     executionID,
@@ -1456,7 +1452,7 @@ func (a *OpenCodeAdapter) resolveRequest(
 	}
 	// Retry once by re-inspecting current execution/action versions so a
 	// concurrent version increment resolves immediately instead of stalling.
-	refreshed, inspectErr := a.inspectExecution(ctx, scanned.ExecutionID)
+	refreshed, inspectErr := inspectExecution(ctx, a.handler, scanned.ExecutionID)
 	if inspectErr != nil {
 		var publicErr *api.Error
 		if errors.As(inspectErr, &publicErr) && publicErr.Code == api.CodeNotFound {
@@ -1495,7 +1491,7 @@ func (a *OpenCodeAdapter) resolveRequestAttempt(
 		Outputs:               outputs,
 		Note:                  note,
 	}
-	_, err := a.invoke(ctx, OperationResolve, req, &expected, a.resolveIdempotencyKey(scanned, current, action))
+	_, err := invokePublicOperation(ctx, a.handler, OperationResolve, req, &expected, a.resolveIdempotencyKey(scanned, current, action))
 	if err == nil {
 		return nil
 	}
@@ -1521,36 +1517,6 @@ func (a *OpenCodeAdapter) resolveIdempotencyKey(scanned api.InboxItem, current a
 	}, ":")
 	sum := sha256.Sum256([]byte(scope))
 	return fmt.Sprintf("%s:v%d:%s", KindOpenCode, action.Version, hex.EncodeToString(sum[:])[:32])
-}
-
-func (a *OpenCodeAdapter) invoke(ctx context.Context, operation string, request any, expectedVersion *uint64, idempotencyKey string) (any, error) {
-	codec, ok := publicCodecs[operation]
-	if !ok {
-		return nil, fmt.Errorf("operation %q has no public codec", operation)
-	}
-	input, err := codec.EncodeRequest(request)
-	if err != nil {
-		return nil, fmt.Errorf("encode %s request: %w", operation, err)
-	}
-	result, err := a.handler.Invoke(ctx, api.Invocation{
-		Operation: operation,
-		Request: api.Request{
-			Input:           input,
-			ExpectedVersion: expectedVersion,
-			IdempotencyKey:  idempotencyKey,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	if result.Operation != operation {
-		return nil, fmt.Errorf("operation %q returned result for %q", operation, result.Operation)
-	}
-	decoded, err := codec.DecodeResult(result.Body)
-	if err != nil {
-		return nil, fmt.Errorf("decode %s result: %w", operation, err)
-	}
-	return decoded, nil
 }
 
 func turnKey(executionID, actionID string) string {
@@ -1706,5 +1672,13 @@ func truncateString(s string, maxBytes int) string {
 	if maxBytes <= 0 || len(s) <= maxBytes {
 		return s
 	}
-	return s[:maxBytes]
+	limit := maxBytes
+	minLimit := max(0, maxBytes-(utf8.UTFMax-1))
+	for limit > minLimit && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	if !utf8.RuneStart(s[limit]) {
+		return s[:maxBytes]
+	}
+	return s[:limit]
 }

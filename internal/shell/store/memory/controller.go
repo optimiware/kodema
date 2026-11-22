@@ -43,7 +43,7 @@ func (c controller) Read(ctx context.Context, table, id string) (store.Row, erro
 	if !controllerReadTable(table) {
 		return store.Row{}, faultInvalid(fmt.Sprintf("controller read table %q is not in the controller authority", table))
 	}
-	if !validIdentity(id) {
+	if !store.ValidIdentity(id) {
 		return store.Row{}, faultInvalid(fmt.Sprintf("row id %q is not a valid identity", id))
 	}
 	meta, ok := lookupTable(table)
@@ -90,7 +90,7 @@ func (c controller) Scan(ctx context.Context, scan store.ControllerScan) (store.
 	if err := ctx.Err(); err != nil {
 		return store.QueryPage{}, err
 	}
-	return buildScanPage(scan.ScanQuery, prepared, tenancy.Scope{}, candidates), nil
+	return buildScanPage(scan.ScanQuery, prepared, tenancy.Scope{}, candidates)
 }
 
 // Execute resolves the owning scope from the execution row inside the same
@@ -100,30 +100,22 @@ func (c controller) Scan(ctx context.Context, scan store.ControllerScan) (store.
 //
 // When the event/audit write path is enabled, the unit may also carry
 // execution-bound lifecycle event rows and audit rows committed atomically with
-// its state writes. The unit must itself lock the execution row; every event and
-// audit row must carry exactly the derived scope or the whole unit is refused
-// and nothing is staged; events and audit are INSERT-only and audit stays
-// write-only for this seam.
+// its state writes. The unit must itself guard the execution row with an
+// expected version; every event and audit row must carry exactly the derived
+// scope or the whole unit is refused and nothing is staged; events and audit
+// are INSERT-only and audit stays write-only for this seam.
 func (c controller) Execute(ctx context.Context, executionID string, unit store.Unit) (store.UnitResult, error) {
 	if err := ctx.Err(); err != nil {
 		return store.UnitResult{}, err
 	}
-	if !validIdentity(executionID) {
+	if !store.ValidIdentity(executionID) {
 		return store.UnitResult{}, faultInvalid(fmt.Sprintf("execution id %q is not a valid identity", executionID))
 	}
-
-	c.store.mu.Lock()
-	defer c.store.mu.Unlock()
-
-	execution, ok := c.store.state.row("executions", executionID)
-	if !ok {
-		return store.UnitResult{}, faultNotFound(fmt.Sprintf("execution %q was not found", executionID))
+	if unit.Receipt != nil || unit.ReceiptExpect != nil || unit.ReceiptMode != store.ReceiptInsert {
+		return store.UnitResult{}, faultForbidden("the controller cannot commit a receipt")
 	}
-	tenant, _ := execution["tenant_id"].(string)
-	project, _ := execution["project_id"].(string)
-	scope := tenancy.Scope{TenantID: id.TenantID(tenant), ProjectID: id.ProjectID(project)}
-	if err := scope.Validate(); err != nil {
-		return store.UnitResult{}, faultInternal("the execution row has no usable owning scope")
+	if !controllerEventCommit && (len(unit.Audit) > 0 || len(unit.Events) > 0) {
+		return store.UnitResult{}, faultForbidden("the controller cannot commit an audit row or event until the controller event write path is implemented")
 	}
 	for _, lock := range unit.Locks {
 		// The controller authority never performs a membership authority check,
@@ -139,6 +131,9 @@ func (c controller) Execute(ctx context.Context, executionID string, unit store.
 		if !controllerWriteTable(write.Table) {
 			return store.UnitResult{}, faultForbidden(fmt.Sprintf("controller write table %q is outside the controller authority", write.Table))
 		}
+		if write.Delete {
+			return store.UnitResult{}, faultForbidden("the controller has no delete authority")
+		}
 		if controllerInsertOnlyTable(write.Table) {
 			// The authority is INSERT-only. While the declaration-derived
 			// gate is off the adapter refuses every event/audit write.
@@ -150,22 +145,49 @@ func (c controller) Execute(ctx context.Context, executionID string, unit store.
 			}
 		}
 	}
-	// An execution-bound event/audit unit must itself lock the execution row.
-	// The lock proves the caller named the execution whose row the atomic
-	// section derives the owning scope from; without it the unit cannot be
-	// tied to a guarded execution and is refused before anything is staged.
-	if controllerEventCommit && (len(unit.Events) > 0 || len(unit.Audit) > 0) && !controllerExecutionLocked(unit, executionID) {
-		return store.UnitResult{}, faultForbidden("an event or audit unit requires a locked execution row")
+	// An execution-bound event/audit unit (including a raw insert-only write to
+	// events/audit) must carry a guarded execution lock with ExpectVersion so
+	// the commit is coupled to a verified execution state.
+	if controllerEventWrite(unit) && !controllerExecutionGuarded(unit, executionID) {
+		return store.UnitResult{}, faultForbidden("an event or audit unit requires a guarded execution row")
+	}
+
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+
+	execution, ok := c.store.state.row("executions", executionID)
+	if !ok {
+		return store.UnitResult{}, faultNotFound(fmt.Sprintf("execution %q was not found", executionID))
+	}
+	tenant, _ := execution["tenant_id"].(string)
+	project, _ := execution["project_id"].(string)
+	scope := tenancy.Scope{TenantID: id.TenantID(tenant), ProjectID: id.ProjectID(project)}
+	if err := scope.Validate(); err != nil {
+		return store.UnitResult{}, faultInternal("the execution row has no usable owning scope")
 	}
 	return c.store.executeLocked(scope, unit, true)
 }
 
-// controllerExecutionLocked reports whether the unit itself locks the execution
-// row whose scope the controller derived. A guard is permitted but not required:
-// the lock serializes the row and fails when it is absent or out of scope.
-func controllerExecutionLocked(unit store.Unit, executionID string) bool {
+// controllerEventWrite reports whether the unit carries an execution-bound
+// event/audit write: the lifecycle event or audit slices, or a raw insert-only
+// write to one of those tables.
+func controllerEventWrite(unit store.Unit) bool {
+	if len(unit.Events) > 0 || len(unit.Audit) > 0 {
+		return true
+	}
+	for _, write := range unit.Writes {
+		if controllerInsertOnlyTable(write.Table) {
+			return true
+		}
+	}
+	return false
+}
+
+// controllerExecutionGuarded reports whether the unit locks the execution row
+// with an explicit expected version.
+func controllerExecutionGuarded(unit store.Unit, executionID string) bool {
 	for _, lock := range unit.Locks {
-		if lock.Table != "executions" {
+		if lock.Table != "executions" || lock.ExpectVersion == 0 {
 			continue
 		}
 		if slices.Contains(lock.IDs, executionID) {

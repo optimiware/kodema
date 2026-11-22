@@ -65,4 +65,31 @@ func TestSafeStorageRejectsTenantDirectorySymlinkEscape(t *testing.T) {
 	if _, err := storage.RepositoryPath("tenant-a", "repo"); !errors.Is(err, git.ErrInvalidRepository) {
 		t.Fatalf("escaped tenant root error = %v; want ErrInvalidRepository", err)
 	}
+	if _, err := storage.EnsureRepository("tenant-a", "repo"); !errors.Is(err, git.ErrInvalidRepository) {
+		t.Fatalf("EnsureRepository escaped tenant root error = %v; want ErrInvalidRepository", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "repo")); !os.IsNotExist(statErr) {
+		t.Fatalf("EnsureRepository created directory outside tenant before validation: %v", statErr)
+	}
+}
+
+func TestSafeStorageEnforcesBoundTenant(t *testing.T) {
+	root := t.TempDir()
+	local, err := git.NewLocalStorage(root)
+	if err != nil {
+		t.Fatalf("NewLocalStorage: %v", err)
+	}
+	storage, err := NewSafeStorage(local, root, "tenant-a")
+	if err != nil {
+		t.Fatalf("NewSafeStorage: %v", err)
+	}
+	if _, err := storage.RepositoryPath("tenant-b", "repo"); !errors.Is(err, git.ErrInvalidRepository) {
+		t.Fatalf("RepositoryPath wrong tenant error = %v; want ErrInvalidRepository", err)
+	}
+	if _, err := storage.EnsureRepository("tenant-b", "repo"); !errors.Is(err, git.ErrInvalidRepository) {
+		t.Fatalf("EnsureRepository wrong tenant error = %v; want ErrInvalidRepository", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "tenant-b")); !os.IsNotExist(statErr) {
+		t.Fatalf("EnsureRepository created directory for wrong tenant: %v", statErr)
+	}
 }

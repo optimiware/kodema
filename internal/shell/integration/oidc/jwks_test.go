@@ -418,3 +418,64 @@ func TestJWKSConcurrentForcedRefreshesCoalesceAndRespectCallerContext(t *testing
 	requireFaultClass(t, <-soloErr, fault.DependencyUnavailable)
 	<-soloAborted
 }
+
+// TestJWKSCanceledSoloFlightDoesNotPoisonSubsequentHealthyCaller proves that
+// when the last waiting caller cancels an in-flight fetch, verifier.inflight is
+// cleared under the lock before canceling the flight so an immediate healthy
+// caller starts a fresh fetch instead of joining the doomed flight.
+func TestJWKSCanceledSoloFlightDoesNotPoisonSubsequentHealthyCaller(t *testing.T) {
+	key := primaryRSAKey(t)
+	now := testNow()
+	validBody := jwksJSON(t, rsaJWK("key-1", key))
+	token := makeJWT(t, "RS256", "key-1", testClaimsMap(now), rsaSHA256Signer(key))
+
+	firstEntered := make(chan struct{})
+	firstRelease := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+
+	config := defaultTestConfig()
+	config.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		if call == 1 {
+			close(firstEntered)
+			<-req.Context().Done()
+			// Keep the first flight goroutine alive until after the healthy
+			// second caller completes, ensuring the second caller could only
+			// succeed by starting a fresh flight.
+			<-firstRelease
+			return nil, req.Context().Err()
+		}
+		return jsonResponse(validBody, http.StatusOK), nil
+	})}
+	verifier := newVerifier(t, config)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	err1 := make(chan error, 1)
+	go func() {
+		_, err := verifyRequestContext(ctx1, verifier, token, now)
+		err1 <- err
+	}()
+
+	<-firstEntered
+	cancel1()
+	requireFaultClass(t, <-err1, fault.DependencyUnavailable)
+
+	// While flight 1 is still draining on firstRelease, a healthy caller must
+	// not join flight 1 and must succeed via a fresh flight.
+	if _, err := verifyRequest(verifier, token, now); err != nil {
+		close(firstRelease)
+		t.Fatalf("healthy caller after canceled solo flight failed: %v", err)
+	}
+	close(firstRelease)
+
+	mu.Lock()
+	totalCalls := calls
+	mu.Unlock()
+	if totalCalls != 2 {
+		t.Fatalf("JWKS HTTP calls = %d; want 2 (1 canceled + 1 fresh)", totalCalls)
+	}
+}

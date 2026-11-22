@@ -467,10 +467,9 @@ type subscription struct {
 	driver driverSubscription
 	cancel context.CancelFunc
 
-	once   sync.Once
-	mu     sync.Mutex
-	closed bool
-	err    error
+	once sync.Once
+	mu   sync.Mutex
+	err  error
 }
 
 var _ broker.Subscription = (*subscription)(nil)
@@ -484,9 +483,6 @@ func (s *subscription) Close(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	s.once.Do(func() {
-		s.mu.Lock()
-		s.closed = true
-		s.mu.Unlock()
 		s.cancel()
 		s.client.mu.Lock()
 		delete(s.client.subs, s)

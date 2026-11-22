@@ -27,7 +27,7 @@ func (s *Store) LookupCredential(ctx context.Context, kind store.CredentialKind,
 	if !kind.Valid() {
 		return store.CandidateScope{}, faultInvalid("credential kind is not frozen")
 	}
-	if !validIdentity(credentialID) {
+	if !store.ValidIdentity(credentialID) {
 		return store.CandidateScope{}, uniformCredentialRefusal()
 	}
 

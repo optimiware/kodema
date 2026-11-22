@@ -20,6 +20,7 @@ package identity
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -154,6 +155,20 @@ func (a *Adapter) applyRegister(ctx context.Context, unit resource.BindingUnit, 
 	return bindingCommitResult(unit, result)
 }
 
+// isRegisterConflict reports whether err can be a unique-key insert conflict on
+// the conditional resources insert. Context cancellations and non-conflict
+// errors must be returned unchanged rather than reclassified as not_found.
+func isRegisterConflict(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if class, ok := fault.ClassOf(err); ok {
+		return class == fault.VersionConflict
+	}
+	var state interface{ SQLState() string }
+	return errors.As(err, &state) && state.SQLState() == "23505"
+}
+
 // resolveRegisterConflict handles a registration unit that failed after
 // attempting the conditional resources insert. A lost unique-id race rolled the
 // whole unit back, so the adapter re-reads the winner row and re-applies the
@@ -161,9 +176,9 @@ func (a *Adapter) applyRegister(ctx context.Context, unit resource.BindingUnit, 
 // retries the conditional insert, and a row that stays invisible is the uniform
 // foreign-scope not_found. The resources-row conflict is never surfaced.
 func (a *Adapter) resolveRegisterConflict(ctx context.Context, unit resource.BindingUnit, commit store.Unit, cause error) (resource.BindingResult, error) {
-	// Only a possible insert conflict is resolved here. A typed refusal such as
-	// changed_idempotency_content or invalid_input is returned unchanged.
-	if class, ok := fault.ClassOf(cause); ok && class != fault.VersionConflict {
+	// Only a possible insert conflict is resolved here. Context cancellations
+	// and non-conflict errors are returned unchanged.
+	if !isRegisterConflict(cause) {
 		return resource.BindingResult{}, cause
 	}
 	existing, err := a.readResourceRow(ctx, unit.Owner, unit.Binding.ResourceID)
@@ -198,6 +213,9 @@ func (a *Adapter) resolveRegisterConflict(ctx context.Context, unit resource.Bin
 	if retryErr == nil {
 		return bindingCommitResult(unit, result)
 	}
+	if !isRegisterConflict(retryErr) {
+		return resource.BindingResult{}, retryErr
+	}
 	if existing, err := a.readResourceRow(ctx, unit.Owner, unit.Binding.ResourceID); err != nil {
 		return resource.BindingResult{}, err
 	} else if existing != nil {
@@ -211,7 +229,7 @@ func (a *Adapter) resolveRegisterConflict(ctx context.Context, unit resource.Bin
 	} else if found {
 		// The resources row stayed invisible, so the conflict is the binding
 		// identity. Keep its version_conflict; it is not the resources row.
-		return resource.BindingResult{}, cause
+		return resource.BindingResult{}, retryErr
 	}
 	return resource.BindingResult{}, fault.New(fault.NotFound, "resource is not visible in this scope")
 }

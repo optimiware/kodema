@@ -567,6 +567,7 @@ func TestBootstrapSecretsRefusesInvalidDescriptorValues(t *testing.T) {
 		{"ampersand", "db&sslmode=disable"},
 		{"slash", "db/path"},
 		{"space", "db example"},
+		{"glob_star", "db*.example"},
 		// DNS-name label rules shared with the production validator
 		// (internal/installation/url_validation.go validHostName): a trailing
 		// dot, a leading dot, an empty (double-dot) label and a hyphen at
@@ -594,6 +595,15 @@ func TestBootstrapSecretsRefusesInvalidDescriptorValues(t *testing.T) {
 		{"triple_colon", "[:::]"},
 		{"dot_only", "[.]"},
 		{"bare_ipv4", "[1.2.3.4]"},
+		{"bare_ipv4_10", "[10.0.0.1]"},
+		{"bare_ipv4_loopback", "[127.0.0.1]"},
+		{"hex_prefix_ipv4_no_colon", "[ab1.2.3.4]"},
+		{"ipv4_tail_single_leading_colon", "[:1.2.3.4]"},
+		{"ipv4_tail_too_many_groups", "[1:2:3:4:5:6:7:8:1.2.3.4]"},
+		{"ipv4_tail_too_many_compressed_groups", "[1:2:3:4:5:6::1.2.3.4]"},
+		{"ipv4_tail_group_too_wide", "[12345::1.2.3.4]"},
+		{"ipv4_tail_octet_out_of_range", "[::999.999.999.999]"},
+		{"ipv4_tail_octet_leading_zero", "[::ffff:010.0.0.1]"},
 		{"bare_single_colon", "[::1]:5432"},
 	} {
 		add("host_bracket_"+invalid.name, "host", setPostgres("host", invalid.value))
@@ -760,6 +770,9 @@ func TestBootstrapSecretsAcceptsBracketedIPv6Host(t *testing.T) {
 	for _, testCase := range []struct{ name, host, hostname string }{
 		{name: "loopback", host: "[::1]", hostname: "::1"},
 		{name: "documentation", host: "[2001:db8::1]", hostname: "2001:db8::1"},
+		{name: "ipv4_mapped", host: "[::ffff:10.0.0.1]", hostname: "::ffff:10.0.0.1"},
+		{name: "ipv4_compatible", host: "[::1.2.3.4]", hostname: "::1.2.3.4"},
+		{name: "ipv4_compressed_prefix", host: "[2001:db8::192.0.2.1]", hostname: "2001:db8::192.0.2.1"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			box := newSandbox(t)
@@ -912,6 +925,9 @@ func TestScriptsAvoidPortableBase64AndArrayTraps(t *testing.T) {
 		if bytes.Contains(body, []byte("base64 -w0")) {
 			t.Errorf("%s uses GNU-only `base64 -w0`; use `base64 | tr -d '\\n'`", path)
 		}
+		if bytes.Contains(body, []byte("base64 --decode")) {
+			t.Errorf("%s uses GNU-only `base64 --decode`; use `openssl base64 -d -A`", path)
+		}
 		return nil
 	})
 	if err != nil {
@@ -925,5 +941,37 @@ func TestScriptsAvoidPortableBase64AndArrayTraps(t *testing.T) {
 		if !strings.Contains(string(deploy), `${`+array+`[@]+"${`+array+`[@]}"}`) {
 			t.Errorf("scripts/deploy expands the possibly-empty %s array without a bash-4.3-safe guard", array)
 		}
+	}
+}
+
+// TestBootstrapSecretsRefusesMalformedKMSBase64 proves openssl base64 -d -A
+// cannot fail open on malformed KMS ciphertext responses and persist an empty
+// or truncated kek-v1.blob Secret.
+func TestBootstrapSecretsRefusesMalformedKMSBase64(t *testing.T) {
+	cases := []struct {
+		name       string
+		ciphertext string
+	}{
+		{"garbage", "!!!notbase64***"},
+		{"urlsafe_alphabet", "d3JhcHBlZC1rZWs-_w=="},
+		{"corrupted_tail", "d3JhcHBlZC1rZWs!"},
+		{"stripped_padding", "d3JhcHBlZC1rZWs"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			box := newSandbox(t).withEnv("SCW_CIPHERTEXT=" + tc.ciphertext)
+			code, output := box.run(t, false)
+			if code == 0 {
+				t.Fatalf("bootstrap-secrets accepted malformed KMS base64 %q:\n%s", tc.ciphertext, output)
+			}
+			if !strings.Contains(strings.ToLower(output), "invalid base64") {
+				t.Errorf("expected invalid base64 refusal; got:\n%s", output)
+			}
+			for _, line := range box.readKubectlArgv(t) {
+				if strings.Contains(line, "create\tsecret\tgeneric\tkodema-keys") {
+					t.Errorf("malformed KMS base64 created kodema-keys Secret: %s", line)
+				}
+			}
+		})
 	}
 }

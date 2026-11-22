@@ -194,57 +194,27 @@ func runExecutionList(ctx context.Context, config Config, args []string, ports P
 		return usage(ports.Err, publicMessage(err))
 	}
 
-	executions := []api.ExecutionSummary{}
-	var firstBody json.RawMessage
-	pages := 0
-	for {
-		input, err := json.Marshal(req)
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		invocation := api.Invocation{
-			Operation: "execution.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return usage(ports.Err, publicMessage(err))
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.ExecutionListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return failure(ports.Err, fmt.Errorf("invalid execution.list response: %w", err))
+	executions, firstBody, pages, err := fetchAllPages(ctx, ports, "execution.list",
+		func(cursor string) any {
+			pageReq := req
+			if cursor != "" {
+				pageReq.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		executions = append(executions, page.Executions...)
-		if page.NextCursor == "" {
-			break
-		}
-		req.Page = &api.Page{Cursor: page.NextCursor}
+			return pageReq
+		},
+		func(page api.ExecutionListResult) ([]api.ExecutionSummary, string) {
+			return page.Executions, page.NextCursor
+		},
+	)
+	if err != nil {
+		return failure(ports.Err, err)
 	}
 
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "execution.list", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
+		if executions == nil {
+			executions = []api.ExecutionSummary{}
 		}
-		body, err := json.Marshal(api.ExecutionListResult{Executions: executions})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "execution.list", Body: body}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "execution.list", firstBody, pages, api.ExecutionListResult{Executions: executions})
 	}
 
 	tw := tabwriter.NewWriter(ports.Out, 0, 0, 2, ' ', 0)

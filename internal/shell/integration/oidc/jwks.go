@@ -98,6 +98,9 @@ func (verifier *Verifier) keys(ctx context.Context, force bool) (map[string]veri
 		verifier.mu.Lock()
 		flight.waiters--
 		cancelFlight := flight.waiters == 0 && verifier.inflight == flight
+		if cancelFlight {
+			verifier.inflight = nil
+		}
 		verifier.mu.Unlock()
 		if cancelFlight {
 			flight.cancel()

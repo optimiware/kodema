@@ -22,6 +22,7 @@ package flow_test
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -320,6 +321,9 @@ func TestActivationFailureTerminalCommitsCleanupAtomically(t *testing.T) {
 		if commit.Failure.Reason != "subject_resolution" {
 			t.Fatalf("failure reason = %q, want subject_resolution", commit.Failure.Reason)
 		}
+		if !strings.Contains(commit.Failure.Detail, "unavailable") {
+			t.Fatalf("failure detail = %q, want unavailable detail", commit.Failure.Detail)
+		}
 		if !commit.InvalidateCredential {
 			t.Fatal("activation failure did not invalidate the execution credential")
 		}
@@ -347,6 +351,25 @@ func TestActivationFailureTerminalCommitsCleanupAtomically(t *testing.T) {
 		}
 		if next.Cleanup.WorkloadID != "" {
 			t.Fatalf("workspace-only cleanup named workload %q", next.Cleanup.WorkloadID)
+		}
+	})
+
+	t.Run("two-field unresolved subject reports deterministic first field detail", func(t *testing.T) {
+		twoField := definition.NewSubject(map[string]definition.SubjectValue{
+			"zeta":  {Kind: definition.SubjectReference, Reference: definition.Reference{Input: true, Key: "missing_z"}},
+			"alpha": {Kind: definition.SubjectReference, Reference: definition.Reference{Input: true, Key: "missing_a"}},
+		})
+		for range 20 {
+			exec := newExecution(requestAction("act-0", "review", 0, time.Hour, twoField, "decision"))
+			_, commit := mustReduce(t, exec, flow.ActivateFact{ExecutionID: exec.ID, ActionID: "act-0", At: at})
+			assertFailure(t, commit, kernel.FailurePreparation)
+			if commit.Failure.Reason != "subject_resolution" {
+				t.Fatalf("failure reason = %q, want subject_resolution", commit.Failure.Reason)
+			}
+			wantDetail := `subject field "alpha" references unavailable input "missing_a"`
+			if commit.Failure.Detail != wantDetail {
+				t.Fatalf("failure detail = %q, want %q", commit.Failure.Detail, wantDetail)
+			}
 		}
 	})
 }

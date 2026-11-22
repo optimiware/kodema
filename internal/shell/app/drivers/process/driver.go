@@ -156,7 +156,11 @@ func (d *Driver) Spawn(ctx context.Context, request process.SpawnRequest) (proce
 		return process.SpawnResult{Outcome: process.SpawnRefused, Group: request.Group, Detail: "process driver is closed"},
 			fault.New(fault.DependencyUnavailable, "process driver is closed")
 	}
-	if existing := d.groups[request.Group]; existing != nil {
+	existing := d.groups[request.Group]
+	if existing == nil {
+		existing = d.loadLocked(request.Group)
+	}
+	if existing != nil {
 		return d.reuseLocked(existing)
 	}
 

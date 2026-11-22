@@ -2,28 +2,24 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/userland/principal"
 )
 
 // DeriveOIDCPrincipalID derives the deterministic Kodema human principal ID
 // ("oidc-" + lowercase hex of sha256(issuer + "\x00" + subject)[:16]).
 func DeriveOIDCPrincipalID(issuer, subject string) (string, error) {
-	if issuer == "" {
-		return "", fmt.Errorf("OIDC issuer is empty")
+	pid, err := principal.ForOIDC(issuer, subject)
+	if err != nil {
+		return "", err
 	}
-	if subject == "" {
-		return "", fmt.Errorf("OIDC subject is empty")
-	}
-	sum := sha256.Sum256([]byte(issuer + "\x00" + subject))
-	return "oidc-" + hex.EncodeToString(sum[:16]), nil
+	return string(pid), nil
 }
 
 type whoamiView struct {
@@ -115,7 +111,7 @@ func runWhoami(ctx context.Context, config Config, args []string, ports Ports, d
 	return ExitSuccess
 }
 
-func renderWhoamiServerResult(out interface{ Write([]byte) (int, error) }, format OutputFormat, result api.Result, fallback whoamiView) error {
+func renderWhoamiServerResult(out io.Writer, format OutputFormat, result api.Result, fallback whoamiView) error {
 	if format == OutputJSON {
 		return renderResult(out, OutputJSON, result)
 	}
@@ -194,7 +190,7 @@ func renderWhoamiServerResult(out interface{ Write([]byte) (int, error) }, forma
 	return nil
 }
 
-func writeWhoamiTable(out interface{ Write([]byte) (int, error) }, view whoamiView) {
+func writeWhoamiTable(out io.Writer, view whoamiView) {
 	if view.Server != "" {
 		fmt.Fprintf(out, "server\t%s\n", view.Server)
 	}
@@ -332,16 +328,9 @@ type jwtDisplayClaims struct {
 // parseJWTClaims decodes the payload claims of a compact JWT to extract iss,
 // sub and optional human-readable display claims for local display.
 func parseJWTClaims(token string) (jwtDisplayClaims, bool) {
-	parts := strings.Split(strings.TrimSpace(token), ".")
-	if len(parts) != 3 || parts[1] == "" {
+	payload, ok := decodeJWTPayload(token)
+	if !ok {
 		return jwtDisplayClaims{}, false
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		payload, err = base64.URLEncoding.DecodeString(parts[1])
-		if err != nil {
-			return jwtDisplayClaims{}, false
-		}
 	}
 	var claims struct {
 		Issuer            string `json:"iss"`
@@ -441,23 +430,10 @@ func runMemberList(ctx context.Context, config Config, args []string, ports Port
 		return failure(ports.Err, err)
 	}
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "membership.list", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
-		}
 		if memberships == nil {
 			memberships = []api.MembershipView{}
 		}
-		combined, err := json.Marshal(api.MembershipListResult{Memberships: memberships})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "membership.list", Body: combined}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "membership.list", firstBody, pages, api.MembershipListResult{Memberships: memberships})
 	}
 
 	selfView, hasSelf := deriveOfflineWhoami(ctx, config, ports, deps, false)
@@ -535,7 +511,7 @@ func runMemberGrant(ctx context.Context, config Config, args []string, ports Por
 	if projectID == "" {
 		return usage(ports.Err, "member grant requires --project <id> or KODEMA_PROJECT")
 	}
-	roles := parseRoleList(roleFlags)
+	roles := parseCommaSeparatedList(roleFlags)
 	if len(roles) == 0 {
 		return usage(ports.Err, "member grant requires --role <role>[,<role>...]")
 	}
@@ -786,11 +762,11 @@ func resolveMemberPrincipal(
 	var subject string
 	switch {
 	case hasGithubFlag:
-		login := strings.ToLower(strings.TrimSpace(githubFlag))
-		if login == "" {
-			return resolvedPrincipal{}, usage(ports.Err, "--github requires a non-empty login")
+		var err error
+		subject, err = principal.SubjectForGitHub(githubFlag)
+		if err != nil {
+			return resolvedPrincipal{}, usage(ports.Err, err.Error())
 		}
-		subject = "github:" + login
 	case hasSubjectFlag:
 		subject = strings.TrimSpace(subjectFlag)
 		if subject == "" {
@@ -868,63 +844,16 @@ func resolveOIDCIssuer(ctx context.Context, config Config, ports Ports, deps Com
 }
 
 func fetchAllMemberships(ctx context.Context, ports Ports, projectID string) ([]api.MembershipView, json.RawMessage, int, error) {
-	var (
-		all       []api.MembershipView
-		firstBody json.RawMessage
-		pages     int
-		cursor    string
+	return fetchAllPages(ctx, ports, "membership.list",
+		func(cursor string) any {
+			req := api.MembershipListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
+			}
+			return req
+		},
+		func(page api.MembershipListResult) ([]api.MembershipView, string) {
+			return page.Memberships, page.NextCursor
+		},
 	)
-	for {
-		req := api.MembershipListRequest{ProjectID: projectID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		invocation := api.Invocation{
-			Operation: "membership.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return nil, nil, 0, err
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.MembershipListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, nil, 0, fmt.Errorf("invalid membership.list response: %w", err)
-			}
-		}
-		all = append(all, page.Memberships...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return all, firstBody, pages, nil
-}
-
-func parseRoleList(rawFlags []string) []string {
-	var roles []string
-	seen := make(map[string]bool)
-	for _, raw := range rawFlags {
-		for _, item := range strings.Split(raw, ",") {
-			trimmed := strings.TrimSpace(item)
-			if trimmed == "" || seen[trimmed] {
-				continue
-			}
-			seen[trimmed] = true
-			roles = append(roles, trimmed)
-		}
-	}
-	return roles
 }

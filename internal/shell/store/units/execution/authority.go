@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"reflect"
 	"strings"
 
 	"github.com/optimiware/kodema/internal/fault"
@@ -40,28 +42,9 @@ const (
 // version_conflict or deadline_expired.
 func (s *Store) authorityLocks(ctx context.Context, reads []authorize.AuthorityRead) ([]store.Lock, error) {
 	locks := make([]store.Lock, 0, len(reads))
-	index := make(map[string]int, len(reads))
+	index := make(map[string][]int, len(reads))
 	add := func(lock store.Lock) {
-		key := lockIdentity(lock)
-		if position, ok := index[key]; ok {
-			existing := locks[position]
-			if existing.ExpectVersion == 0 {
-				existing.ExpectVersion = lock.ExpectVersion
-			}
-			if existing.Expect == nil {
-				existing.Expect = lock.Expect
-			}
-			if existing.Deadline == nil {
-				existing.Deadline = lock.Deadline
-			}
-			if lock.TenantWide {
-				existing.TenantWide = true
-			}
-			locks[position] = existing
-			return
-		}
-		index[key] = len(locks)
-		locks = append(locks, lock)
+		locks = appendAuthorityLock(locks, index, lock)
 	}
 	for _, read := range reads {
 		if err := ctx.Err(); err != nil {
@@ -423,20 +406,84 @@ func (s *Store) readMembershipRow(ctx context.Context, scope tenancy.Scope, prin
 	return authorize.MembershipRow{RowID: rowID, Membership: &membership}, nil
 }
 
-// lockIdentity names one planned lock for duplicate merging. An absence guard
+// appendAuthorityLock merges lock into an existing compatible lock with the
+// same (table, TenantWide, IDs) or absence key, or appends it as a distinct
+// lock when any predicate, ExpectVersion, Deadline or TenantWide flag differs
+// incompatibly so no guard is ever silently dropped.
+func appendAuthorityLock(locks []store.Lock, index map[string][]int, lock store.Lock) []store.Lock {
+	key := lockIdentity(lock)
+	for _, position := range index[key] {
+		if merged, ok := mergeCompatibleLock(locks[position], lock); ok {
+			locks[position] = merged
+			return locks
+		}
+	}
+	index[key] = append(index[key], len(locks))
+	return append(locks, lock)
+}
+
+// mergeCompatibleLock combines two locks that already share the same
+// lockIdentity when their ExpectVersion, Deadline and Expect predicates do not
+// conflict. Conflicting locks return false and stay separate so the store
+// evaluates both guards.
+func mergeCompatibleLock(existing, incoming store.Lock) (store.Lock, bool) {
+	if existing.ExpectAbsent != incoming.ExpectAbsent || existing.TenantWide != incoming.TenantWide {
+		return store.Lock{}, false
+	}
+	if existing.ExpectAbsent {
+		return existing, true
+	}
+	if existing.ExpectVersion != 0 && incoming.ExpectVersion != 0 && existing.ExpectVersion != incoming.ExpectVersion {
+		return store.Lock{}, false
+	}
+	if existing.Deadline != nil && incoming.Deadline != nil && *existing.Deadline != *incoming.Deadline {
+		return store.Lock{}, false
+	}
+	for column, incomingVal := range incoming.Expect {
+		if existingVal, present := existing.Expect[column]; present && !reflect.DeepEqual(existingVal, incomingVal) {
+			return store.Lock{}, false
+		}
+	}
+	merged := existing
+	if merged.ExpectVersion == 0 {
+		merged.ExpectVersion = incoming.ExpectVersion
+	}
+	if merged.Deadline == nil && incoming.Deadline != nil {
+		guard := *incoming.Deadline
+		merged.Deadline = &guard
+	}
+	if len(existing.Expect) > 0 || len(incoming.Expect) > 0 {
+		combined := make(map[string]any, len(existing.Expect)+len(incoming.Expect))
+		maps.Copy(combined, existing.Expect)
+		maps.Copy(combined, incoming.Expect)
+		merged.Expect = combined
+	}
+	return merged, true
+}
+
+// lockIdentity names one planned lock for compatible merging. An absence guard
 // has no row id, so it is keyed by its canonical unique key; a present lock is
-// keyed by its table and row identity.
+// keyed by its table, TenantWide scope flag and row identities so a project
+// lock and a tenant-wide lock are never merged.
 func lockIdentity(lock store.Lock) string {
 	if lock.ExpectAbsent {
 		columns, _ := store.AbsenceKeyColumns(lock.Table)
 		parts := make([]string, 0, len(columns)+2)
 		parts = append(parts, lock.Table, "absent")
 		for _, name := range columns {
-			parts = append(parts, fmt.Sprintf("%v", lock.Key[name]))
+			if lock.Key[name] == nil {
+				parts = append(parts, "null")
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("v:%v", lock.Key[name]))
 		}
 		return strings.Join(parts, "\x00")
 	}
-	return lock.Table + "\x00" + strings.Join(lock.IDs, "\x00")
+	scopeFlag := "project"
+	if lock.TenantWide {
+		scopeFlag = "tenant_wide"
+	}
+	return lock.Table + "\x00" + scopeFlag + "\x00" + strings.Join(lock.IDs, "\x00")
 }
 
 // principalEnabledLock re-reads the enablement fact of one principal by its

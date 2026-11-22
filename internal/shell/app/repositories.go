@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,10 +23,16 @@ import (
 )
 
 const (
-	gitCompanionProvisionPath    = "/_kodema/repositories"
-	gitCompanionMaxResponseBytes = 64 << 10
-	gitCompanionDefaultTimeout   = 30 * time.Second
-	gitCompanionDefaultServiceID = "git"
+	gitCompanionProvisionPath         = "/_kodema/repositories"
+	gitCompanionMaxResponseBytes      = 64 << 10
+	gitCompanionDefaultTimeout        = 30 * time.Second
+	gitCompanionDefaultServiceID      = "git"
+	gitCompanionDialTimeout           = 30 * time.Second
+	gitCompanionDialKeepAlive         = 30 * time.Second
+	gitCompanionMaxIdleConns          = 100
+	gitCompanionIdleConnTimeout       = 90 * time.Second
+	gitCompanionTLSHandshakeTimeout   = 10 * time.Second
+	gitCompanionExpectContinueTimeout = 1 * time.Second
 )
 
 // GitCompanionConfig configures the Shell composition's optional HTTP boundary
@@ -122,9 +129,26 @@ type httpRepositoryProvisioner struct {
 	trustedOrigins []string
 	tokenFile      string
 	client         *http.Client
+	ownedTransport *http.Transport
 }
 
 var _ opsapp.RepositoryProvisioner = (*httpRepositoryProvisioner)(nil)
+
+func newGitCompanionTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout:   gitCompanionDialTimeout,
+			KeepAlive: gitCompanionDialKeepAlive,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          gitCompanionMaxIdleConns,
+		IdleConnTimeout:       gitCompanionIdleConnTimeout,
+		TLSHandshakeTimeout:   gitCompanionTLSHandshakeTimeout,
+		ExpectContinueTimeout: gitCompanionExpectContinueTimeout,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+}
 
 func newHTTPRepositoryProvisioner(cfg Config) (*httpRepositoryProvisioner, error) {
 	if cfg.GitCompanion == nil {
@@ -134,13 +158,9 @@ func newHTTPRepositoryProvisioner(cfg Config) (*httpRepositoryProvisioner, error
 		return nil, err
 	}
 	rt := cfg.GitCompanion.RoundTripper
+	var ownedTransport *http.Transport
 	if rt == nil {
-		var transport *http.Transport
-		if base, ok := http.DefaultTransport.(*http.Transport); ok {
-			transport = base.Clone()
-		} else {
-			transport = &http.Transport{}
-		}
+		transport := newGitCompanionTransport()
 		if caFile := strings.TrimSpace(cfg.GitCompanion.CAFile); caFile != "" {
 			pemData, err := os.ReadFile(caFile)
 			if err != nil {
@@ -150,15 +170,9 @@ func newHTTPRepositoryProvisioner(cfg Config) (*httpRepositoryProvisioner, error
 			if !pool.AppendCertsFromPEM(pemData) {
 				return nil, fault.New(fault.InvalidInput, "git companion CA file contains no valid PEM certificate")
 			}
-			tlsCfg := transport.TLSClientConfig
-			if tlsCfg == nil {
-				tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
-			} else {
-				tlsCfg = tlsCfg.Clone()
-			}
-			tlsCfg.RootCAs = pool
-			transport.TLSClientConfig = tlsCfg
+			transport.TLSClientConfig.RootCAs = pool
 		}
+		ownedTransport = transport
 		rt = transport
 	}
 	serviceID := strings.TrimSpace(cfg.GitCompanion.ServiceID)
@@ -178,6 +192,7 @@ func newHTTPRepositoryProvisioner(cfg Config) (*httpRepositoryProvisioner, error
 		serviceID:      serviceID,
 		trustedOrigins: origins,
 		tokenFile:      strings.TrimSpace(cfg.GitCompanion.TokenFile),
+		ownedTransport: ownedTransport,
 		client: &http.Client{
 			Transport: rt,
 			Timeout:   gitCompanionDefaultTimeout,
@@ -186,6 +201,15 @@ func newHTTPRepositoryProvisioner(cfg Config) (*httpRepositoryProvisioner, error
 			},
 		},
 	}, nil
+}
+
+// Close releases idle connections on the composition-owned HTTP transport.
+func (p *httpRepositoryProvisioner) Close(context.Context) error {
+	if p == nil || p.ownedTransport == nil {
+		return nil
+	}
+	p.ownedTransport.CloseIdleConnections()
+	return nil
 }
 
 func deriveDefaultGitTrustedOrigins(explicit []string, publicURL, workloadURL string) []string {

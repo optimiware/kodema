@@ -40,7 +40,7 @@ func (s *Store) ReadBinding(ctx context.Context, query verify.BindingQuery) (res
 	if query.Scope.TenantScoped() {
 		return resource.Binding{}, faultInvalid("a binding read requires a project scope")
 	}
-	tx, err := s.Begin(ctx, query.Scope)
+	tx, err := s.beginRead(ctx, query.Scope)
 	if err != nil {
 		return resource.Binding{}, err
 	}

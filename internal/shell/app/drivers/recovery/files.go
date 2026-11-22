@@ -241,27 +241,41 @@ func copyTree(ctx context.Context, source, destination string) (int, error) {
 	return count, nil
 }
 
-// copyFile copies one regular file and preserves its permission bits.
+// copyFile copies one regular file and preserves its permission bits without
+// following symlinks on either source or target.
 func copyFile(source, target string) error {
-	info, err := os.Stat(source)
+	input, err := os.OpenFile(source, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return err
-	}
-	input, err := os.Open(source)
-	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return fault.New(fault.Forbidden, "source file is a symlink")
+		}
 		return err
 	}
 	defer func() { _ = input.Close() }()
-	output, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+	info, err := input.Stat()
 	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fault.New(fault.Forbidden, "source file is not a regular file")
+	}
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, info.Mode().Perm())
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			if targetInfo, lstatErr := os.Lstat(target); lstatErr == nil && targetInfo.Mode()&os.ModeSymlink != 0 {
+				return fault.New(fault.Forbidden, "target file is a symlink")
+			}
+		}
 		return err
 	}
 	if _, err := io.Copy(output, input); err != nil {
 		_ = output.Close()
+		_ = os.Remove(target)
 		return err
 	}
 	if err := output.Sync(); err != nil {
 		_ = output.Close()
+		_ = os.Remove(target)
 		return err
 	}
 	return output.Close()

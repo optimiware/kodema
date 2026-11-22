@@ -267,23 +267,62 @@ func (driver *poolDriver) Begin(ctx context.Context) (transaction, error) {
 	return &poolTransaction{tx: tx}, nil
 }
 
+// sessionLockConn is the minimal acquired-connection surface needed to hold
+// and release one session-level advisory lock.
+type sessionLockConn interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	ClosePhysical(context.Context) error
+	Release()
+}
+
+type pgxSessionLockConn struct {
+	conn *pgxpool.Conn
+}
+
+func (c pgxSessionLockConn) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	return c.conn.Exec(ctx, sql, args...)
+}
+
+func (c pgxSessionLockConn) ClosePhysical(ctx context.Context) error {
+	return c.conn.Conn().Close(ctx)
+}
+
+func (c pgxSessionLockConn) Release() {
+	c.conn.Release()
+}
+
 // LockSession holds one session-level advisory lock on a dedicated connection.
 func (driver *poolDriver) LockSession(ctx context.Context, key int64) (func(context.Context) error, error) {
 	connection, err := driver.pool.Acquire(ctx)
 	if err != nil {
 		return nil, mapError(err)
 	}
+	return lockSessionOnConn(ctx, pgxSessionLockConn{conn: connection}, key)
+}
+
+func lockSessionOnConn(ctx context.Context, connection sessionLockConn, key int64) (func(context.Context) error, error) {
 	if _, err := connection.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
+		_ = connection.ClosePhysical(context.Background())
 		connection.Release()
 		return nil, mapError(err)
 	}
+	var (
+		once sync.Once
+		err  error
+	)
 	return func(releaseCtx context.Context) error {
-		if releaseCtx == nil {
-			releaseCtx = context.Background()
-		}
-		_, unlockErr := connection.Exec(releaseCtx, `SELECT pg_advisory_unlock($1)`, key)
-		connection.Release()
-		return mapError(unlockErr)
+		once.Do(func() {
+			if releaseCtx == nil {
+				releaseCtx = context.Background()
+			}
+			_, unlockErr := connection.Exec(releaseCtx, `SELECT pg_advisory_unlock($1)`, key)
+			if unlockErr != nil {
+				_ = connection.ClosePhysical(context.Background())
+			}
+			connection.Release()
+			err = mapError(unlockErr)
+		})
+		return err
 	}, nil
 }
 

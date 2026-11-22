@@ -1562,3 +1562,112 @@ func TestLLMProxyOpenCodeZenMultiProtocolHeadersRedactionAndUsage(t *testing.T) 
 		}
 	})
 }
+
+type chunkedResponseTransport struct {
+	chunks      [][]byte
+	contentType string
+}
+
+func (rt chunkedResponseTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{rt.contentType}},
+		Body:       &chunkedBodyReader{chunks: rt.chunks},
+	}, nil
+}
+
+type chunkedBodyReader struct {
+	chunks [][]byte
+	index  int
+}
+
+func (r *chunkedBodyReader) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.index])
+	r.chunks[r.index] = r.chunks[r.index][n:]
+	if len(r.chunks[r.index]) == 0 {
+		r.index++
+	}
+	return n, nil
+}
+
+func (r *chunkedBodyReader) Close() error { return nil }
+
+func TestLLMProxyRedactsSecretSplitAcrossResponseReads(t *testing.T) {
+	clock := newFakeClock()
+	scope := modelTestScope("project-1")
+	splitAt := len(llmProxyTestAnthropicSecret) / 2
+	firstHalf := llmProxyTestAnthropicSecret[:splitAt]
+	secondHalf := llmProxyTestAnthropicSecret[splitAt:]
+
+	cfg := &ModelsConfig{
+		Providers: []ModelProviderConfig{{
+			Scope:      scope,
+			Name:       "anthropic",
+			BaseURL:    "https://anthropic.example.test",
+			SecretName: llmProxyTestAnthropicSecretName,
+		}},
+		SecretRules: []secret.NameRule{{
+			Scope: scope,
+			Names: []id.SecretName{llmProxyTestAnthropicSecretName},
+		}},
+		Transport: chunkedResponseTransport{
+			contentType: "text/event-stream",
+			chunks: [][]byte{
+				[]byte("data: {\"ok\":true}\n\n"),
+				[]byte("data: {\"echo\":\"" + firstHalf),
+				[]byte(secondHalf + "\",\"tail\":\"sk-an"),
+			},
+		},
+	}
+	ctrl := modelTestExecutionContext("running", "container", "running", clock.Now().Add(time.Hour))
+	h := newLLMProxyTestHandler(t, cfg, map[string]identity.Principal{
+		llmProxyTestWorkloadToken: modelTestExecutionPrincipal(),
+	}, ctrl, nil, allowAllToolAuthority{}, clock, 50*time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/llm/anthropic/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-6","stream":true}`))
+	req.Header.Set("x-api-key", llmProxyTestWorkloadToken)
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, llmProxyTestAnthropicSecret) {
+		t.Fatalf("response leaked split provider secret: %q", body)
+	}
+	want := "data: {\"ok\":true}\n\ndata: {\"echo\":\"[REDACTED]\",\"tail\":\"sk-an"
+	if body != want {
+		t.Fatalf("redacted body = %q; want %q", body, want)
+	}
+}
+
+func TestStreamSecretRedactor(t *testing.T) {
+	t.Run("normal SSE chunks emit immediately with zero buffering", func(t *testing.T) {
+		r := newStreamSecretRedactor("sk-ant-secret-999")
+		chunk := []byte("data: {\"delta\":\"hello\"}\n\n")
+		if got := string(r.Process(chunk)); got != string(chunk) {
+			t.Fatalf("Process = %q; want immediate %q", got, chunk)
+		}
+		if tail := r.Flush(); len(tail) != 0 {
+			t.Fatalf("Flush = %q; want empty", tail)
+		}
+	})
+
+	t.Run("byte-by-byte stream redacts secret and flushes trailing false prefix", func(t *testing.T) {
+		const secret = "ababx"
+		r := newStreamSecretRedactor(secret)
+		input := "prefix abababx mid abab"
+		var out bytes.Buffer
+		for i := 0; i < len(input); i++ {
+			out.Write(r.Process([]byte{input[i]}))
+		}
+		out.Write(r.Flush())
+		if got, want := out.String(), "prefix ab[REDACTED] mid abab"; got != want {
+			t.Fatalf("got %q; want %q", got, want)
+		}
+	})
+}

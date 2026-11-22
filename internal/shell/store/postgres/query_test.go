@@ -79,7 +79,11 @@ func TestStoreReadBindingUsesResourceAndServiceIdentity(t *testing.T) {
 	}
 
 	conn := db.conn(t)
-	queries := queryCalls(conn.callsCopy())
+	calls := conn.callsCopy()
+	if len(calls) < 1 || calls[0].kind != "exec" || !strings.EqualFold(strings.TrimSpace(calls[0].sql), beginReadOnlySQL) {
+		t.Errorf("first ReadBinding call = %+v; want %s", calls[0], beginReadOnlySQL)
+	}
+	queries := queryCalls(calls)
 	if len(queries) != 1 {
 		t.Fatalf("ReadBinding issued %d queries; want 1", len(queries))
 	}
@@ -544,4 +548,32 @@ func TestReadRowRefusesUnknownTable(t *testing.T) {
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	_, err = ReadRow(context.Background(), tx, testProjectScope(), "not_a_table", "id-1")
 	assertFaultClass(t, err, fault.InvalidInput)
+}
+
+func TestScopedReadQueryPinsRootTablesToScope(t *testing.T) {
+	projectsMeta, _ := lookupTable("projects")
+	projectQuery, err := scopedReadQuery(projectsMeta, testProjectScope(), "project-2")
+	if err != nil {
+		t.Fatalf("scopedReadQuery projects: %v", err)
+	}
+	if !argContains(projectQuery.Args, testProjectID) {
+		t.Errorf("project-scoped projects read query args %v do not pin scope project %q", projectQuery.Args, testProjectID)
+	}
+
+	tenantProjectsQuery, err := scopedReadQuery(projectsMeta, testTenantScope(), "project-2")
+	if err != nil {
+		t.Fatalf("scopedReadQuery tenant-scoped projects: %v", err)
+	}
+	if len(tenantProjectsQuery.Args) != 2 {
+		t.Errorf("tenant-scoped projects read query args = %v; want [tenant_id, id]", tenantProjectsQuery.Args)
+	}
+
+	tenantsMeta, _ := lookupTable("tenants")
+	tenantQuery, err := scopedReadQuery(tenantsMeta, testProjectScope(), "tenant-2")
+	if err != nil {
+		t.Fatalf("scopedReadQuery tenants: %v", err)
+	}
+	if !argContains(tenantQuery.Args, testTenantID) {
+		t.Errorf("tenants read query args %v do not pin scope tenant %q", tenantQuery.Args, testTenantID)
+	}
 }

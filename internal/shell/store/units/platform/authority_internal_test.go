@@ -70,3 +70,64 @@ func TestAuthorityLocksEmptyTargetFailsClosed(t *testing.T) {
 		}
 	})
 }
+
+func TestAuthorityLocksVersionedChecksAndTaskLifecycleVersion(t *testing.T) {
+	s := memory.NewWithClock(func() time.Time { return time.Unix(0, 0).UTC() })
+	scope := tenancy.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+
+	// CheckTaskVersion must guard tasks.lifecycle_version via Expect, never
+	// ExpectVersion (tasks has no version column).
+	locks, err := authorityLocks(context.Background(), s, s, scope, []authorize.AuthorityRead{{
+		Operation:       "task.transition",
+		Check:           authorize.CheckTaskVersion,
+		Scope:           scope,
+		TargetID:        "task-1",
+		ExpectedVersion: 4,
+	}}, authorityFacts{})
+	if err != nil {
+		t.Fatalf("authorityLocks CheckTaskVersion: %v", err)
+	}
+	if len(locks) != 1 {
+		t.Fatalf("locks = %d; want 1", len(locks))
+	}
+	if locks[0].Table != tasksTable || len(locks[0].IDs) != 1 || locks[0].IDs[0] != "task-1" {
+		t.Fatalf("task lock identity = %+v; want tasks/[task-1]", locks[0])
+	}
+	if locks[0].ExpectVersion != 0 {
+		t.Fatalf("task lock ExpectVersion = %d; want 0 (versionless table)", locks[0].ExpectVersion)
+	}
+	if got := locks[0].Expect["lifecycle_version"]; got != uint64(4) {
+		t.Fatalf("task lock Expect[lifecycle_version] = %#v; want uint64(4)", got)
+	}
+
+	// All four versioned authority checks require non-empty TargetID and
+	// non-zero ExpectedVersion.
+	versionedChecks := []authorize.AuthorityCheck{
+		authorize.CheckBindingVersion,
+		authorize.CheckTaskVersion,
+		authorize.CheckExecutionVersion,
+		authorize.CheckPipelineVersion,
+	}
+	for _, check := range versionedChecks {
+		t.Run(string(check)+"/missing target", func(t *testing.T) {
+			_, err := authorityLocks(context.Background(), s, s, scope, []authorize.AuthorityRead{{
+				Check:           check,
+				Scope:           scope,
+				ExpectedVersion: 1,
+			}}, authorityFacts{})
+			if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+				t.Fatalf("error = %v (class %v); want invalid_input", err, class)
+			}
+		})
+		t.Run(string(check)+"/zero version", func(t *testing.T) {
+			_, err := authorityLocks(context.Background(), s, s, scope, []authorize.AuthorityRead{{
+				Check:    check,
+				Scope:    scope,
+				TargetID: "row-1",
+			}}, authorityFacts{})
+			if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+				t.Fatalf("error = %v (class %v); want invalid_input", err, class)
+			}
+		})
+	}
+}

@@ -3,6 +3,7 @@ package memory
 import (
 	"bytes"
 	"maps"
+	"math"
 	"time"
 
 	"github.com/optimiware/kodema/internal/shell/event"
@@ -236,12 +237,51 @@ func asUint64(value any) (uint64, bool) {
 	}
 }
 
+// asInt64 converts a signed or non-overflowing unsigned integer value to int64.
+func asInt64(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, true
+	case int32:
+		return int64(typed), true
+	case int16:
+		return int64(typed), true
+	case int8:
+		return int64(typed), true
+	case int:
+		return int64(typed), true
+	case uint64:
+		if typed > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), true
+	case uint32:
+		return int64(typed), true
+	case uint16:
+		return int64(typed), true
+	case uint8:
+		return int64(typed), true
+	case uint:
+		if uint64(typed) > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), true
+	default:
+		return 0, false
+	}
+}
+
 // valuesEqual compares one stored column with an expected guard value. Numeric
-// version columns are compared across integer widths; retained bytes compare
-// byte-exactly.
+// columns (including negative signed integers) are compared across integer
+// widths; retained bytes compare byte-exactly.
 func valuesEqual(stored, expected any) bool {
 	if stored == nil || expected == nil {
 		return stored == nil && expected == nil
+	}
+	if left, ok := asInt64(stored); ok {
+		if right, ok := asInt64(expected); ok {
+			return left == right
+		}
 	}
 	if left, ok := asUint64(stored); ok {
 		if right, ok := asUint64(expected); ok {

@@ -41,7 +41,6 @@ type jwksResponse struct {
 type signingMaterial struct {
 	privateKey   *ecdsa.PrivateKey
 	kid          string
-	jwk          jwkPublic
 	jwksJSON     []byte
 	cookieSecret []byte
 }
@@ -120,7 +119,6 @@ func buildSigningMaterial(priv *ecdsa.PrivateKey, cookieSecret []byte) (*signing
 	return &signingMaterial{
 		privateKey:   priv,
 		kid:          kid,
-		jwk:          pub,
 		jwksJSON:     encodedJWKS,
 		cookieSecret: append([]byte(nil), cookieSecret...),
 	}, nil
@@ -266,32 +264,48 @@ func readPrivateFile0600(path string) ([]byte, error) {
 	return data, nil
 }
 
-// createPrivateFileOnce0600 writes content to a 0600 sibling temporary file and
-// links it into place so concurrent initializers never clobber an existing file.
-func createPrivateFileOnce0600(path string, content []byte) (bool, error) {
-	parent := filepath.Dir(path)
+// writeTempPrivateFile0600 writes content to a 0600 sibling temporary file and
+// returns its path. Callers are responsible for removing the temporary path on
+// completion or failure.
+func writeTempPrivateFile0600(parent string, content []byte) (string, error) {
 	temp, err := os.CreateTemp(parent, ".kodema-auth-*")
 	if err != nil {
-		return false, fault.Wrap(fault.DependencyUnavailable, "create temporary state file", err)
+		return "", fault.Wrap(fault.DependencyUnavailable, "create temporary state file", err)
 	}
 	tempPath := temp.Name()
-	defer func() { _ = os.Remove(tempPath) }()
+	cleanup := func() { _ = os.Remove(tempPath) }
 
 	if err := temp.Chmod(0o600); err != nil {
 		_ = temp.Close()
-		return false, fault.Wrap(fault.DependencyUnavailable, "restrict temporary state file", err)
+		cleanup()
+		return "", fault.Wrap(fault.DependencyUnavailable, "restrict temporary state file", err)
 	}
 	if _, err := temp.Write(content); err != nil {
 		_ = temp.Close()
-		return false, fault.Wrap(fault.DependencyUnavailable, "write temporary state file", err)
+		cleanup()
+		return "", fault.Wrap(fault.DependencyUnavailable, "write temporary state file", err)
 	}
 	if err := temp.Sync(); err != nil {
 		_ = temp.Close()
-		return false, fault.Wrap(fault.DependencyUnavailable, "sync temporary state file", err)
+		cleanup()
+		return "", fault.Wrap(fault.DependencyUnavailable, "sync temporary state file", err)
 	}
 	if err := temp.Close(); err != nil {
-		return false, fault.Wrap(fault.DependencyUnavailable, "close temporary state file", err)
+		cleanup()
+		return "", fault.Wrap(fault.DependencyUnavailable, "close temporary state file", err)
 	}
+	return tempPath, nil
+}
+
+// createPrivateFileOnce0600 writes content to a 0600 sibling temporary file and
+// links it into place so concurrent initializers never clobber an existing file.
+func createPrivateFileOnce0600(path string, content []byte) (bool, error) {
+	tempPath, err := writeTempPrivateFile0600(filepath.Dir(path), content)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = os.Remove(tempPath) }()
+
 	if err := os.Link(tempPath, path); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return false, nil
@@ -305,29 +319,12 @@ func replacePrivateFile0600(path string, content []byte) error {
 	if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
 		return fault.New(fault.InvalidInput, "destination state file is not a regular file")
 	}
-	parent := filepath.Dir(path)
-	temp, err := os.CreateTemp(parent, ".kodema-auth-*")
+	tempPath, err := writeTempPrivateFile0600(filepath.Dir(path), content)
 	if err != nil {
-		return fault.Wrap(fault.DependencyUnavailable, "create temporary state file", err)
+		return err
 	}
-	tempPath := temp.Name()
 	defer func() { _ = os.Remove(tempPath) }()
 
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		return fault.Wrap(fault.DependencyUnavailable, "restrict temporary state file", err)
-	}
-	if _, err := temp.Write(content); err != nil {
-		_ = temp.Close()
-		return fault.Wrap(fault.DependencyUnavailable, "write temporary state file", err)
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return fault.Wrap(fault.DependencyUnavailable, "sync temporary state file", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fault.Wrap(fault.DependencyUnavailable, "close temporary state file", err)
-	}
 	if err := os.Rename(tempPath, path); err != nil {
 		return fault.Wrap(fault.DependencyUnavailable, "replace private state file", err)
 	}

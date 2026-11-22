@@ -65,7 +65,7 @@ func (reader *scalewayEndlessReader) Read(buffer []byte) (int, error) {
 // before the size check refused it.
 func TestReadScalewayResponseStopsAtTheBound(t *testing.T) {
 	reader := &scalewayEndlessReader{ceiling: scalewayMaxResponse * 4}
-	payload, err := readScalewayResponse(reader)
+	payload, err := readBoundedResponse(reader, scalewayMaxResponse, "scaleway key manager")
 	if err == nil {
 		t.Fatalf("endless body was accepted and returned %d bytes", len(payload))
 	}
@@ -84,7 +84,7 @@ func TestReadScalewayResponseStopsAtTheBound(t *testing.T) {
 // bound is accepted and one byte over is refused.
 func TestReadScalewayResponseExactBound(t *testing.T) {
 	exact := bytes.Repeat([]byte{'x'}, int(scalewayMaxResponse))
-	payload, err := readScalewayResponse(bytes.NewReader(exact))
+	payload, err := readBoundedResponse(bytes.NewReader(exact), scalewayMaxResponse, "scaleway key manager")
 	if err != nil {
 		t.Fatalf("exactly the bound was refused: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestReadScalewayResponseExactBound(t *testing.T) {
 	}
 
 	over := bytes.Repeat([]byte{'x'}, int(scalewayMaxResponse)+1)
-	payload, err = readScalewayResponse(bytes.NewReader(over))
+	payload, err = readBoundedResponse(bytes.NewReader(over), scalewayMaxResponse, "scaleway key manager")
 	if err == nil {
 		t.Fatalf("one byte over the bound was accepted with %d bytes", len(payload))
 	}

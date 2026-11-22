@@ -63,7 +63,6 @@ type statusPageData struct {
 	Subject     string
 	ContinueURL string
 	ContinueLbl string
-	IsError     bool
 }
 
 const sharedStyles = `

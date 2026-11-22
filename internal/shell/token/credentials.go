@@ -198,7 +198,7 @@ func (admin *CredentialAdmin) mutate(ctx context.Context, command ServiceCredent
 			}
 		}
 	}
-	reads := credentialAuthorityReads(op, command.Scope, command.Actor.ID)
+	reads := credentialAuthorityReads(op, command.Scope, command.Actor.ID, command.ServiceID)
 	if err := admin.confirm(ctx, reads); err != nil {
 		return IssueResult{}, err
 	}
@@ -253,7 +253,7 @@ func (admin *CredentialAdmin) Revoke(ctx context.Context, command ServiceCredent
 	if _, err := admin.readFact(ctx, command.Scope, command.ServiceID); err != nil {
 		return RevokeResult{}, err
 	}
-	reads := credentialAuthorityReads(op, command.Scope, command.Actor.ID)
+	reads := credentialAuthorityReads(op, command.Scope, command.Actor.ID, command.ServiceID)
 	if err := admin.confirm(ctx, reads); err != nil {
 		return RevokeResult{}, err
 	}
@@ -295,10 +295,10 @@ func (admin *CredentialAdmin) authorizeCommand(
 	if !scope.ProjectScoped() {
 		return authorize.Operation{}, fault.New(fault.InvalidInput, "service credential operations require a project scope")
 	}
-	if !scopeContains(actor.Scope, scope) {
+	if !actor.Scope.Contains(scope) {
 		return authorize.Operation{}, fault.New(fault.Forbidden, "actor scope does not match the command scope")
 	}
-	op, err := admit(actor, name)
+	op, err := authorize.AdmitPrincipalKind(actor, name)
 	if err != nil {
 		return authorize.Operation{}, err
 	}
@@ -315,13 +315,6 @@ func (admin *CredentialAdmin) authorizeCommand(
 	return op, nil
 }
 
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
-	}
-	return owner.ProjectID == "" || owner.ProjectID == target.ProjectID
-}
-
 func (admin *CredentialAdmin) confirmActor(ctx context.Context, actor authorize.Principal, op authorize.Operation, scope tenancy.Scope) error {
 	principal, err := identity.Current(ctx, admin.principals, identity.PrincipalRequest{
 		Scope:       scope,
@@ -333,58 +326,26 @@ func (admin *CredentialAdmin) confirmActor(ctx context.Context, actor authorize.
 	if principal.Kind != actor.Kind {
 		return fault.New(fault.Forbidden, "current principal kind does not match the authenticated actor")
 	}
-	if principal.Kind == identity.KindExecution {
-		if op.Requires.Execution == authorize.ExecNone {
-			return fault.New(fault.Forbidden, fmt.Sprintf("execution principal has no permission for %q", op.Name))
-		}
-		if principal.ExecutionID == "" || principal.ExecutionID != actor.ExecutionID {
-			return fault.New(fault.Forbidden, "execution principal identity does not match the authenticated actor")
-		}
-		return nil
-	}
 	if !op.Requires.Allows(principal) {
 		return fault.New(fault.Forbidden, fmt.Sprintf("principal does not currently hold the grant for %q", op.Name))
 	}
 	return nil
 }
 
-func admit(actor authorize.Principal, name authorize.OperationName) (authorize.Operation, error) {
-	if err := actor.Validate(); err != nil {
-		return authorize.Operation{}, err
-	}
-	op, ok := authorize.LookupOperation(name)
-	if !ok {
-		return authorize.Operation{}, fault.New(fault.InternalFailure, "credential administration operation is not registered")
-	}
-	switch actor.Kind {
-	case identity.KindHuman:
-		if !op.Requires.AdmitsKind(identity.KindHuman) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no human role")
-		}
-	case identity.KindService:
-		if !op.Requires.AdmitsKind(identity.KindService) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no service role")
-		}
-	case identity.KindExecution:
-		if !op.Requires.AdmitsKind(identity.KindExecution) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no execution permission")
-		}
-	default:
-		return authorize.Operation{}, fault.New(fault.Forbidden, "unknown principal kind")
-	}
-	return op, nil
-}
-
-func credentialAuthorityReads(op authorize.Operation, scope tenancy.Scope, principal id.PrincipalID) []authorize.AuthorityRead {
+func credentialAuthorityReads(op authorize.Operation, scope tenancy.Scope, principal id.PrincipalID, serviceID service.ServiceID) []authorize.AuthorityRead {
 	reads := make([]authorize.AuthorityRead, 0, len(op.Authority))
 	for _, check := range op.Authority {
-		reads = append(reads, authorize.AuthorityRead{
+		read := authorize.AuthorityRead{
 			Operation:   op.Name,
 			Required:    op.Requires,
 			Check:       check,
 			Scope:       scope,
 			PrincipalID: principal,
-		})
+		}
+		if check == authorize.CheckServiceEnabled {
+			read.TargetID = string(serviceID)
+		}
+		reads = append(reads, read)
 	}
 	return reads
 }

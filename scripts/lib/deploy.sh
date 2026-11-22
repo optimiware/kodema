@@ -94,6 +94,16 @@ key_adapter_for_cloud() {
   esac
 }
 
+resolve_cloud_project_or_account() {
+  local cloud="$1"
+  case "$cloud" in
+    scw) scw_resolve_project_id ;;
+    gcp) gcp_resolve_project_id ;;
+    aws) aws_resolve_account_id ;;
+    *) die "unknown cloud: ${cloud}" ;;
+  esac
+}
+
 deploy_state_root() {
   local default_state_home="${XDG_STATE_HOME:-${HOME}/.local/state}"
   printf '%s\n' "${KODEMA_DEPLOY_STATE_DIR:-${default_state_home}/kodema/deploy}"

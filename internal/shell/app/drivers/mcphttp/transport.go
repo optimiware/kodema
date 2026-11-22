@@ -444,7 +444,7 @@ func validateCredentials(credentials []Credential) ([]Credential, error) {
 		if _, err := id.ParseSecretName(string(credential.Secret)); err != nil {
 			return nil, invalidConfig("MCP credential secret name is invalid")
 		}
-		if credential.Header == "" || !validHeaderName(credential.Header) {
+		if credential.Header == "" || !validToken(credential.Header) {
 			return nil, invalidConfig("MCP credential header is not a valid HTTP field name")
 		}
 		canonicalHeader := textproto.CanonicalMIMEHeaderKey(credential.Header)
@@ -488,19 +488,6 @@ func reservedHeader(canonical string) bool {
 	default:
 		return false
 	}
-}
-
-// validHeaderName reports whether name is a non-empty RFC 7230 token.
-func validHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for index := 0; index < len(name); index++ {
-		if !isTokenCharacter(name[index]) {
-			return false
-		}
-	}
-	return true
 }
 
 // validToken reports whether value is a non-empty RFC 7230 token.

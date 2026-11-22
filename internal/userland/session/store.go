@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ErrCheckpointMissing reports an absent checkpoint reference. Storage
@@ -142,7 +143,7 @@ func (store *durableStore) Save(ctx context.Context, record Record) (Ref, error)
 				}
 			}
 		}
-		persisted.Outcome.Summary = store.redact(persisted.Outcome.Summary)
+		persisted.Outcome.Summary = truncateUTF8(store.redact(persisted.Outcome.Summary), maxOutcomeSummaryBytes)
 	} else if persisted.Retention.PlaceholderTranscript {
 		persisted.Messages = store.placeholderMessages(persisted.Messages)
 		persisted.Outcome.Summary = ""
@@ -302,6 +303,32 @@ func refVersionTag(value string) (string, bool) {
 		return "", false
 	}
 	return rest, true
+}
+
+// truncateUTF8 returns the longest valid UTF-8 prefix of value whose byte
+// length is at most maxBytes without splitting a multi-byte rune.
+func truncateUTF8(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	if maxBytes <= 0 {
+		return ""
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	// If value was invalid UTF-8 ending in an incomplete sequence at cut, walk
+	// back to a valid rune boundary.
+	for cut > 0 && !utf8.ValidString(value[:cut]) {
+		r, size := utf8.DecodeLastRuneInString(value[:cut])
+		if r == utf8.RuneError && size == 1 {
+			cut--
+		} else {
+			break
+		}
+	}
+	return value[:cut]
 }
 
 // redact replaces every credential-shaped value and every supplied secret.

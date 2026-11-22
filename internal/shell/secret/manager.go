@@ -104,7 +104,8 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 // Put inserts or replaces one current encrypted value and returns its readable
 // metadata. The plaintext is sealed before the commit and never serialized.
 func (manager *Manager) Put(ctx context.Context, command PutCommand) (Metadata, error) {
-	if err := manager.validatePut(command); err != nil {
+	contentHash, err := manager.validatePut(command)
+	if err != nil {
 		return Metadata{}, err
 	}
 	now := manager.clock.Now()
@@ -179,7 +180,7 @@ func (manager *Manager) Put(ctx context.Context, command PutCommand) (Metadata, 
 		ExpectVersion: expected,
 		Values:        secretRowValues(command.Name, createdAt, now, version, envelope, insert),
 	}
-	unit, err := manager.commitUnit(ctx, command.Scope, command.Actor, command.ActorKind, secretWriteOperation, command.CallerKey, command.Content, string(secretID), version, metadata, now)
+	unit, err := manager.commitUnit(ctx, command.Scope, command.Actor, command.ActorKind, secretWriteOperation, command.CallerKey, contentHash, string(secretID), version, metadata, now)
 	if err != nil {
 		return Metadata{}, err
 	}
@@ -214,7 +215,8 @@ func replayedMetadata(record receipt.Record) (Metadata, error) {
 // Delete removes one current value with a guarded delete. It never seals and
 // never writes a value row.
 func (manager *Manager) Delete(ctx context.Context, command DeleteCommand) error {
-	if err := manager.validateDelete(command); err != nil {
+	contentHash, err := manager.validateDelete(command)
+	if err != nil {
 		return err
 	}
 	now := manager.clock.Now()
@@ -253,7 +255,7 @@ func (manager *Manager) Delete(ctx context.Context, command DeleteCommand) error
 		Delete:        true,
 		ExpectVersion: command.ExpectedVersion,
 	}
-	unit, err := manager.commitUnit(ctx, command.Scope, command.Actor, command.ActorKind, secretDeleteOperation, command.CallerKey, command.Content, string(stored.Metadata.ID), command.ExpectedVersion, nil, now)
+	unit, err := manager.commitUnit(ctx, command.Scope, command.Actor, command.ActorKind, secretDeleteOperation, command.CallerKey, contentHash, string(stored.Metadata.ID), command.ExpectedVersion, nil, now)
 	if err != nil {
 		return err
 	}
@@ -300,54 +302,48 @@ func (manager *Manager) GetByName(ctx context.Context, scope tenancy.Scope, name
 	return stored.Metadata, nil
 }
 
-func (manager *Manager) validatePut(command PutCommand) error {
+func (manager *Manager) validatePut(command PutCommand) (string, error) {
 	if err := command.Scope.Validate(); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := id.ParseSecretName(string(command.Name)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "secret name is invalid", err)
+		return "", fault.Wrap(fault.InvalidInput, "secret name is invalid", err)
 	}
 	if err := DefaultBounds.CheckValue(len(command.Value)); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := id.ParsePrincipalID(string(command.Actor)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "secret actor is invalid", err)
+		return "", fault.Wrap(fault.InvalidInput, "secret actor is invalid", err)
 	}
 	if err := validateSecretActorKind(command.ActorKind); err != nil {
-		return err
+		return "", err
 	}
 	if command.CallerKey == "" {
-		return fault.New(fault.InvalidInput, "secret caller key is empty")
+		return "", fault.New(fault.InvalidInput, "secret caller key is empty")
 	}
-	if _, err := receipt.Fingerprint(command.Content); err != nil {
-		return err
-	}
-	return nil
+	return receipt.Fingerprint(command.Content)
 }
 
-func (manager *Manager) validateDelete(command DeleteCommand) error {
+func (manager *Manager) validateDelete(command DeleteCommand) (string, error) {
 	if err := command.Scope.Validate(); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := id.ParseSecretName(string(command.Name)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "secret name is invalid", err)
+		return "", fault.Wrap(fault.InvalidInput, "secret name is invalid", err)
 	}
 	if command.ExpectedVersion == 0 {
-		return fault.New(fault.InvalidInput, "secret delete expected version is zero")
+		return "", fault.New(fault.InvalidInput, "secret delete expected version is zero")
 	}
 	if _, err := id.ParsePrincipalID(string(command.Actor)); err != nil {
-		return fault.Wrap(fault.InvalidInput, "secret actor is invalid", err)
+		return "", fault.Wrap(fault.InvalidInput, "secret actor is invalid", err)
 	}
 	if err := validateSecretActorKind(command.ActorKind); err != nil {
-		return err
+		return "", err
 	}
 	if command.CallerKey == "" {
-		return fault.New(fault.InvalidInput, "secret caller key is empty")
+		return "", fault.New(fault.InvalidInput, "secret caller key is empty")
 	}
-	if _, err := receipt.Fingerprint(command.Content); err != nil {
-		return err
-	}
-	return nil
+	return receipt.Fingerprint(command.Content)
 }
 
 // validateSecretActorKind accepts only the two principal kinds a secret
@@ -371,7 +367,7 @@ func (manager *Manager) commitUnit(
 	actorKind identity.PrincipalKind,
 	operation string,
 	callerKey string,
-	content receipt.Content,
+	contentHash string,
 	subject string,
 	subjectVersion uint64,
 	result any,
@@ -389,10 +385,6 @@ func (manager *Manager) commitUnit(
 		CallerKey:   callerKey,
 	}
 	if err := key.Validate(); err != nil {
-		return store.Unit{}, err
-	}
-	fingerprint, err := receipt.Fingerprint(content)
-	if err != nil {
 		return store.Unit{}, err
 	}
 	receiptID, err := manager.ids.NewReceiptID()
@@ -435,7 +427,7 @@ func (manager *Manager) commitUnit(
 		Receipt: &receipt.Record{
 			ID:          receiptID,
 			Key:         key,
-			ContentHash: fingerprint,
+			ContentHash: contentHash,
 			Result:      resultBody,
 			At:          at,
 		},
@@ -609,7 +601,7 @@ func (manager *Manager) serviceGuard(ctx context.Context, scope tenancy.Scope, a
 	if state != serviceEnabledState {
 		return store.Lock{}, fault.New(fault.Forbidden, "acting service is not enabled")
 	}
-	if err := rowAllowsOperation(row.Values, operation, identity.KindService); err != nil {
+	if err := rowAllowsOperation(row.Values, operation); err != nil {
 		return store.Lock{}, err
 	}
 	version, ok := rowVersion(row.Values)
@@ -669,13 +661,10 @@ func rowTenantWide(row store.Row) bool {
 	return ok && text == ""
 }
 
-// rowAllowsOperation re-evaluates the registry's declared role set for the
-// actor's exact kind against the row read at the commit boundary. Human and
-// service grants are never unioned: a service cannot use a human-only role and
-// a human cannot use a service-only grant. Authorization remains the authority
-// decision; this read only refuses a role removed before the commit, and the
-// version guard then refuses any later change.
-func rowAllowsOperation(values map[string]any, operation string, kind identity.PrincipalKind) error {
+// rowAllowsOperation re-evaluates the registry's declared service role set
+// against the service-account row read at the commit boundary. Service grants
+// are never unioned with human grants: a service cannot use a human-only role.
+func rowAllowsOperation(values map[string]any, operation string) error {
 	registered, ok := authorize.LookupOperation(authorize.OperationName(operation))
 	if !ok {
 		return fault.New(fault.InternalFailure, "secret operation is not registered")
@@ -684,17 +673,8 @@ func rowAllowsOperation(values map[string]any, operation string, kind identity.P
 	if err != nil {
 		return err
 	}
-	switch kind {
-	case identity.KindHuman:
-		if registered.Requires.AllowsRoles(false, roles) {
-			return nil
-		}
-	case identity.KindService:
-		if registered.Requires.AllowsRoles(true, roles) {
-			return nil
-		}
-	default:
-		return fault.New(fault.InternalFailure, "secret operation actor kind is not frozen")
+	if registered.Requires.AllowsRoles(true, roles) {
+		return nil
 	}
 	return fault.New(fault.Forbidden, "acting principal's current roles do not grant the secret operation")
 }

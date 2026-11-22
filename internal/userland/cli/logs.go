@@ -174,13 +174,15 @@ func runLogsOnce(ctx context.Context, ports Ports, executionID, actionFlag, stre
 			return failure(ports.Err, fmt.Errorf("no action has started yet on execution %q", executionID))
 		}
 		actionID = selected.ActionID
+	} else if resolvedID, ok := resolveActionFromInspected(inspected, actionFlag); ok {
+		actionID = resolvedID
 	}
 
 	state := &logStreamState{actionID: actionID}
 	chunks, truncated, err := drainLogPages(ctx, ports, executionID, stream, format, false, state)
-	if err != nil && actionFlag != "" {
-		// Allow --action <name> convenience if the caller passed the YAML action
-		// name rather than the opaque action_id.
+	if err != nil && actionFlag != "" && len(inspected.Actions) == 0 {
+		// Fallback for minimal fixtures where the initial inspect returned no
+		// actions and a second inspect resolves --action <name> to action_id.
 		if resolvedID, ok := resolveActionName(ctx, ports, executionID, actionFlag); ok && resolvedID != actionID {
 			state = &logStreamState{actionID: resolvedID}
 			actionID = resolvedID
@@ -691,18 +693,29 @@ func resolveFollowAction(inspected inspectedExecution, explicit string) (inspect
 	return selected, ok, nil
 }
 
+// resolveActionFromInspected resolves an explicit action ID or YAML action name
+// against an already-fetched execution inspection, preferring exact ActionID matches.
+func resolveActionFromInspected(inspected inspectedExecution, target string) (string, bool) {
+	for _, action := range inspected.Actions {
+		if action.ActionID == target {
+			return action.ActionID, true
+		}
+	}
+	for _, action := range inspected.Actions {
+		if action.Name == target && action.ActionID != "" {
+			return action.ActionID, true
+		}
+	}
+	return "", false
+}
+
 // resolveActionName resolves an action YAML name to its ActionID via inspect.
 func resolveActionName(ctx context.Context, ports Ports, executionID, name string) (string, bool) {
 	inspected, err := fetchExecutionInspect(ctx, ports, executionID)
 	if err != nil {
 		return "", false
 	}
-	for _, action := range inspected.Actions {
-		if action.Name == name && action.ActionID != "" {
-			return action.ActionID, true
-		}
-	}
-	return "", false
+	return resolveActionFromInspected(inspected, name)
 }
 
 // checkLogsTerminal reports whether --follow has reached a terminal status.

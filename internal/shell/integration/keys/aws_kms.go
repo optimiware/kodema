@@ -116,29 +116,19 @@ func NewAWSKMS(config AWSKMSConfig) (*AWSKMS, error) {
 	if strings.HasPrefix(config.Region, "cn-") {
 		suffix = "amazonaws.com.cn"
 	}
-	kmsEndpoint, err := awsEndpoint(awsKMSService, config.KMSEndpoint, "https://kms."+config.Region+"."+suffix)
+	kmsEndpoint, err := parseHTTPSOrigin(config.KMSEndpoint, "https://kms."+config.Region+"."+suffix, awsKMSService+" endpoint")
 	if err != nil {
 		return nil, err
 	}
-	stsEndpoint, err := awsEndpoint(awsSTSService, config.STSEndpoint, "https://sts."+config.Region+"."+suffix)
+	stsEndpoint, err := parseHTTPSOrigin(config.STSEndpoint, "https://sts."+config.Region+"."+suffix, awsSTSService+" endpoint")
 	if err != nil {
 		return nil, err
 	}
 
-	client := &http.Client{}
-	if config.HTTPClient != nil {
-		copied := *config.HTTPClient
-		client = &copied
-	}
-	owned, err := awsOwnedTransport(client.Transport)
+	client, err := newKMSHTTPClient(config.HTTPClient, "aws kms client", awsRequestTimeout)
 	if err != nil {
 		return nil, err
 	}
-	client.Transport = owned
-	client.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-	client.Timeout = awsRequestTimeout
 
 	now := config.Now
 	if now == nil {

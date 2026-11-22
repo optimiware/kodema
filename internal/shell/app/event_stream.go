@@ -199,6 +199,7 @@ type projectEventStreamHandler struct {
 
 	brokerMu   sync.Mutex
 	brokerSubs map[tenancy.Scope]*sharedBrokerWakeup
+	closeWG    sync.WaitGroup
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -265,6 +266,7 @@ func (handler *projectEventStreamHandler) Close(ctx context.Context) error {
 	for _, sub := range subs {
 		_ = sub.Close(ctx)
 	}
+	handler.closeWG.Wait()
 	return nil
 }
 
@@ -273,6 +275,12 @@ func (handler *projectEventStreamHandler) acquireBrokerWakeup(ctx context.Contex
 		return func() {}
 	}
 	handler.brokerMu.Lock()
+	select {
+	case <-handler.done:
+		handler.brokerMu.Unlock()
+		return func() {}
+	default:
+	}
 	if entry, ok := handler.brokerSubs[scope]; ok {
 		entry.refs++
 		handler.brokerMu.Unlock()
@@ -324,11 +332,15 @@ func (handler *projectEventStreamHandler) releaseBrokerWakeupFunc(scope tenancy.
 				if entry.refs <= 0 {
 					toClose = entry.sub
 					delete(handler.brokerSubs, scope)
+					if toClose != nil {
+						handler.closeWG.Add(1)
+					}
 				}
 			}
 			handler.brokerMu.Unlock()
 			if toClose != nil {
 				go func() {
+					defer handler.closeWG.Done()
 					closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 					defer cancel()
 					_ = toClose.Close(closeCtx)

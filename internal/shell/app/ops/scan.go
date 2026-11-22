@@ -57,6 +57,80 @@ func pageOrDefault(page *api.Page) api.Page {
 	return *page
 }
 
+// scanFilteredPage scans table in scope in keyset order, applying accept to
+// each row until the requested page limit is filled and looking ahead for one
+// more matching row so NextCursor is set if and only if a further match exists.
+func scanFilteredPage[T any](
+	ctx context.Context,
+	scanner store.Scanner,
+	scope tenancy.Scope,
+	table string,
+	page api.Page,
+	accept func(store.Row) (T, bool, error),
+) ([]T, string, error) {
+	wantLimit := page.EffectiveLimit()
+	items := make([]T, 0, wantLimit)
+	after := page.Cursor
+	var nextCursor string
+	// Scan in full batches. Once the page is full, keep scanning until one
+	// more matching row shows that a next page exists.
+	batchLimit := store.MaxQueryLimit
+	for {
+		committed, err := scanner.Query(ctx, scope, store.ScanQuery{
+			Table:   table,
+			OrderBy: []store.Order{{Column: "id"}},
+			After:   after,
+			Limit:   batchLimit,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		kept := len(items)
+		reread := false
+		foundExtra := false
+		for index, row := range committed.Rows {
+			item, ok, err := accept(row)
+			if err != nil {
+				return nil, "", err
+			}
+			if !ok {
+				continue
+			}
+			if len(items) < wantLimit {
+				items = append(items, item)
+				if len(items) < wantLimit {
+					continue
+				}
+				if index < len(committed.Rows)-1 {
+					// The scanner has a cursor only for the end of a batch, so
+					// re-read this one ending on the row that fills the page.
+					items = items[:kept]
+					batchLimit = index + 1
+					reread = true
+					break
+				}
+				nextCursor = committed.Next
+			} else {
+				foundExtra = true
+				break
+			}
+		}
+		if foundExtra {
+			break
+		}
+		if reread {
+			continue
+		}
+		batchLimit = store.MaxQueryLimit
+		if !committed.HasMore {
+			nextCursor = ""
+			break
+		}
+		after = committed.Next
+	}
+	return items, nextCursor, nil
+}
+
 // nonNilStrings returns a non-nil string slice copy so JSON encoding always
 // emits [] rather than null.
 func nonNilStrings(values []string) []string {

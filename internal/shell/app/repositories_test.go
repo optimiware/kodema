@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -248,5 +249,81 @@ func TestHTTPRepositoryProvisionerMaps401ToDependencyUnavailable(t *testing.T) {
 	})
 	if class, ok := fault.ClassOf(err); !ok || class != fault.DependencyUnavailable {
 		t.Fatalf("ProvisionRepository on HTTP 401 err = %v (class=%v); want DependencyUnavailable", err, class)
+	}
+}
+
+func TestHTTPRepositoryProvisionerIgnoresEnvironmentProxies(t *testing.T) {
+	var proxyHits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		http.Error(w, "proxy must never be contacted", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("HTTPS_PROXY", proxy.URL)
+	t.Setenv("http_proxy", proxy.URL)
+	t.Setenv("https_proxy", proxy.URL)
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+
+	var companionHits atomic.Int32
+	companion := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		companionHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"repository":"shop/web","resource_id":"git-shop-web","default_branch":"main","created":true}`))
+	}))
+	defer companion.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "provision-token")
+	if err := os.WriteFile(tokenFile, []byte("secret-provision-token\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+
+	provisioner, err := newHTTPRepositoryProvisioner(Config{
+		GitCompanion: &GitCompanionConfig{
+			AdminURL:  companion.URL,
+			TokenFile: tokenFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("newHTTPRepositoryProvisioner: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := provisioner.Close(context.Background()); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	})
+
+	transport, ok := provisioner.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport = %T; want *http.Transport", provisioner.client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("git companion transport has non-nil Proxy; environment proxies must be ignored")
+	}
+	if transport.TLSClientConfig == nil || transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("TLSClientConfig = %+v; want MinVersion TLS 1.2", transport.TLSClientConfig)
+	}
+
+	res, err := provisioner.ProvisionRepository(context.Background(), opsapp.RepositoryProvisionRequest{
+		TenantID:      id.TenantID("tenant-a"),
+		ProjectID:     id.ProjectID("project-a"),
+		Repository:    "shop/web",
+		ResourceID:    "git-shop-web",
+		DefaultBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("ProvisionRepository: %v", err)
+	}
+	if !res.Created || res.Repository != "shop/web" {
+		t.Fatalf("ProvisionRepository result = %+v; want created shop/web", res)
+	}
+	if got := proxyHits.Load(); got != 0 {
+		t.Fatalf("proxy received %d requests; want 0", got)
+	}
+	if got := companionHits.Load(); got != 1 {
+		t.Fatalf("companion received %d requests; want 1", got)
 	}
 }

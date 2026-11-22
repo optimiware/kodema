@@ -245,7 +245,9 @@ type BrokerConfig struct {
 // retryable and must not treat a missed delivery as re-enabling a credential.
 type InvalidationHandler func(context.Context, token.Invalidation) error
 
-// Subscription is one open invalidation subscription.
+// Subscription is one open invalidation or event-wakeup subscription.
+// Callers must not invoke Close from inside the subscription's own delivery or
+// wakeup callback, because Close joins in-flight deliveries.
 type Subscription interface {
 	Close(context.Context) error
 }

@@ -197,25 +197,10 @@ func writeHook(path, content string) error {
 	if err := os.Rename(name, path); err != nil {
 		return fmt.Errorf("replace hook %q: %w", path, err)
 	}
-	if err := syncHookDirectory(directory); err != nil {
+	if err := syncDirectory(directory); err != nil {
 		return fmt.Errorf("sync hook directory: %w", err)
 	}
 	return nil
-}
-
-// syncHookDirectory fsyncs the hooks directory so a replaced hook script
-// survives a crash.
-func syncHookDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
 }
 
 // BareRepositoryConfig configures bare repository creation.

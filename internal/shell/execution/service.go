@@ -86,20 +86,6 @@ func requireProjectScope(scope tenancy.Scope) error {
 	return nil
 }
 
-// scopeContains reports whether the actor scope covers the target scope.
-func scopeContains(actor, target tenancy.Scope) bool {
-	if actor.TenantID == "" || target.TenantID == "" {
-		return false
-	}
-	if actor.TenantID != target.TenantID {
-		return false
-	}
-	if actor.ProjectID == "" {
-		return true
-	}
-	return actor.ProjectID == target.ProjectID
-}
-
 // authorizeOperation asks the shared authorizer for the operation grant and
 // refuses a deny. A previously calculated allow is never durable permission;
 // the commit unit still carries the registry authority reads.
@@ -131,7 +117,6 @@ func (s *Service) authorizeOutputs(
 	scope tenancy.Scope,
 	executionID id.ExecutionID,
 	actionID id.ActionID,
-	deadline time.Time,
 ) (authorize.Operation, error) {
 	registered, ok := authorize.LookupOperation(operation)
 	if !ok {
@@ -148,7 +133,6 @@ func (s *Service) authorizeOutputs(
 		ExecutionID: executionID,
 		ActionID:    actionID,
 		Permission:  authorize.ExecOwnOutputs,
-		Deadline:    deadline,
 	}
 	decision, err := authorize.AuthorizeExecution(admitted, operation, scope)
 	if err != nil {
@@ -400,7 +384,7 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (StartResult,
 	if err := requireProjectScope(command.Scope); err != nil {
 		return StartResult{}, err
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return StartResult{}, fault.New(fault.Forbidden, "execution start scope is outside the actor scope")
 	}
 	op, err := s.authorizeOperation(ctx, command.Actor, operationPipelineStart, command.Scope)
@@ -476,7 +460,7 @@ func (s *Service) Inspect(ctx context.Context, command InspectCommand) (View, er
 	if err := requireProjectScope(command.Scope); err != nil {
 		return View{}, err
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return View{}, fault.New(fault.Forbidden, "execution inspect scope is outside the actor scope")
 	}
 	op, err := s.authorizeInspect(ctx, command.Actor, operationInspect, command.Scope, command.ExecutionID)
@@ -508,7 +492,7 @@ func (s *Service) List(ctx context.Context, command ListCommand) (Page, error) {
 	if err := requireProjectScope(command.Scope); err != nil {
 		return Page{}, err
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return Page{}, fault.New(fault.Forbidden, "execution list scope is outside the actor scope")
 	}
 	op, err := s.authorizeOperation(ctx, command.Actor, operationList, command.Scope)
@@ -558,7 +542,7 @@ func (s *Service) Cancel(ctx context.Context, command CancelCommand) (Transition
 	if err := requireProjectScope(command.Scope); err != nil {
 		return TransitionResult{}, err
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return TransitionResult{}, fault.New(fault.Forbidden, "execution cancel scope is outside the actor scope")
 	}
 	op, err := s.authorizeOperation(ctx, command.Actor, operationCancel, command.Scope)
@@ -618,9 +602,9 @@ func (s *Service) Cancel(ctx context.Context, command CancelCommand) (Transition
 	}
 	// The owner emits execution.cancelled; the unit appends the projected
 	// cleanup progress and every cancelled action.transition.
-	events, err := appendLifecycleProjection(
+	events, err := event.AppendLifecycleProjection(
 		[]event.Envelope{envelope},
-		lifecyclePreImage(command.Scope, current),
+		event.NewExecutionPreImage(command.Scope, current),
 		*commit,
 		event.OwnedEvent{Type: event.TypeExecutionCancelled},
 	)
@@ -653,8 +637,15 @@ func (s *Service) StageOutputs(ctx context.Context, command OutputsCommand) (Tra
 	if err := requireProjectScope(command.Scope); err != nil {
 		return TransitionResult{}, err
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return TransitionResult{}, fault.New(fault.Forbidden, "execution output scope is outside the actor scope")
+	}
+	op, err := s.authorizeOutputs(
+		ctx, command.Actor, operationOutputs, command.Scope,
+		command.ExecutionID, command.ActionID,
+	)
+	if err != nil {
+		return TransitionResult{}, err
 	}
 	current, err := s.state.Load(ctx, command.Scope, command.ExecutionID)
 	if err != nil {
@@ -678,13 +669,6 @@ func (s *Service) StageOutputs(ctx context.Context, command OutputsCommand) (Tra
 		Outputs:     command.Outputs,
 		At:          at,
 	})
-	if err != nil {
-		return TransitionResult{}, err
-	}
-	op, err := s.authorizeOutputs(
-		ctx, command.Actor, operationOutputs, command.Scope,
-		command.ExecutionID, command.ActionID, action.Deadline,
-	)
 	if err != nil {
 		return TransitionResult{}, err
 	}
@@ -730,9 +714,9 @@ func (s *Service) StageOutputs(ctx context.Context, command OutputsCommand) (Tra
 	// action.transition is the complete publication for this commit. The
 	// projection is still derived from the same pre-image and excluded by the
 	// class the unit already emits.
-	events, err := appendLifecycleProjection(
+	events, err := event.AppendLifecycleProjection(
 		[]event.Envelope{envelope},
-		lifecyclePreImage(command.Scope, current),
+		event.NewExecutionPreImage(command.Scope, current),
 		*commit,
 		event.OwnedEvent{Type: event.TypeActionTransition, SubjectID: string(command.ActionID)},
 	)

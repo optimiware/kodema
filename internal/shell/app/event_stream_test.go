@@ -786,3 +786,78 @@ func TestProjectEventStream_ExecutionPrincipalRejectedBeforeScopeResolveAndShare
 		t.Fatal("shared broker wakeup did not close after last subscriber released")
 	}
 }
+
+type blockingBrokerWakeupSub struct {
+	started  chan struct{}
+	gate     chan struct{}
+	finished chan struct{}
+	once     sync.Once
+}
+
+func (s *blockingBrokerWakeupSub) Close(context.Context) error {
+	s.once.Do(func() {
+		close(s.started)
+		<-s.gate
+		close(s.finished)
+	})
+	return nil
+}
+
+type blockingBrokerWakeup struct {
+	sub *blockingBrokerWakeupSub
+}
+
+func (b *blockingBrokerWakeup) SubscribeEventWakeup(context.Context, tenancy.Scope, func()) (natsbroker.Subscription, error) {
+	return b.sub, nil
+}
+
+func TestProjectEventStreamCloseWaitsForInFlightBrokerRelease(t *testing.T) {
+	sub := &blockingBrokerWakeupSub{
+		started:  make(chan struct{}),
+		gate:     make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	handler := &projectEventStreamHandler{
+		hub:          newEventWakeupHub(),
+		brokerWakeup: &blockingBrokerWakeup{sub: sub},
+		brokerSubs:   make(map[tenancy.Scope]*sharedBrokerWakeup),
+		done:         make(chan struct{}),
+	}
+	scope := tenancy.Scope{TenantID: "tenant-1", ProjectID: "proj-1"}
+	release := handler.acquireBrokerWakeup(context.Background(), scope)
+	release()
+
+	select {
+	case <-sub.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("release goroutine did not start closing the broker subscription")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- handler.Close(context.Background())
+	}()
+
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before in-flight broker release finished (err=%v)", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(sub.gate)
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after broker release unblocked")
+	}
+
+	select {
+	case <-sub.finished:
+	default:
+		t.Fatal("Close returned while subscription Close was still running")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"unicode"
@@ -21,7 +22,6 @@ var (
 
 type markdownLinkRef struct {
 	Target string
-	Line   int
 }
 
 // markdownAnchors returns the GitHub-style heading anchors of a Markdown file.
@@ -84,9 +84,7 @@ func markdownLinks(path string) ([]markdownLinkRef, error) {
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	inFence := false
 	fenceMarker := ""
-	lineNumber := 0
 	for scanner.Scan() {
-		lineNumber++
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 		if marker, ok := fenceMarkerOf(trimmed); ok {
@@ -107,7 +105,7 @@ func markdownLinks(path string) ([]markdownLinkRef, error) {
 			if !ok {
 				continue
 			}
-			links = append(links, markdownLinkRef{Target: target, Line: lineNumber})
+			links = append(links, markdownLinkRef{Target: target})
 		}
 	}
 	return links, scanner.Err()
@@ -186,15 +184,7 @@ func isExternalLink(target string) bool {
 }
 
 func isMarkdownPath(path string) bool {
-	return strings.EqualFold(strings.ToLower(filepathExt(path)), ".md")
-}
-
-func filepathExt(path string) string {
-	index := strings.LastIndex(path, ".")
-	if index < 0 {
-		return ""
-	}
-	return path[index:]
+	return strings.EqualFold(filepath.Ext(path), ".md")
 }
 
 func splitLinkTarget(target string) (string, string) {

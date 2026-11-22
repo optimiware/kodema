@@ -407,10 +407,7 @@ func taskHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			if err != nil {
 				return api.Result{}, err
 			}
-			page := request.Page
-			if page == nil {
-				page = &api.Page{}
-			}
+			page := pageOrDefault(request.Page)
 			committed, err := deps.Tasks.History(ctx, task.HistoryCommand{
 				Actor:  call.Principal,
 				Scope:  call.Scope,
@@ -432,10 +429,7 @@ func taskHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			if err != nil {
 				return api.Result{}, err
 			}
-			page := request.Page
-			if page == nil {
-				page = &api.Page{}
-			}
+			page := pageOrDefault(request.Page)
 			committed, err := deps.Inbox.Query(ctx, inbox.QueryCommand{
 				Actor:  call.Principal,
 				Scope:  call.Scope,
@@ -547,13 +541,17 @@ func createTask(ctx context.Context, deps Dependencies, call ops.AuthorizedCall,
 		if err != nil {
 			return api.Result{}, err
 		}
+		metadata, err := metadataBytes(request.Metadata)
+		if err != nil {
+			return api.Result{}, err
+		}
 		committed, err := deps.Tasks.Create(ctx, task.CreateCommand{
 			Actor:         call.Principal,
 			Scope:         call.Scope,
 			ParentID:      id.TaskID(request.ParentID),
 			Title:         request.Title,
 			Description:   request.Description,
-			Metadata:      mustMetadata(request.Metadata),
+			Metadata:      metadata,
 			PipelineID:    pipelineIDOf(request.PipelineID),
 			Inputs:        inputsOf(request.Inputs),
 			Start:         true,
@@ -574,13 +572,17 @@ func createTask(ctx context.Context, deps Dependencies, call ops.AuthorizedCall,
 	if err != nil {
 		return api.Result{}, err
 	}
+	metadata, err := metadataBytes(request.Metadata)
+	if err != nil {
+		return api.Result{}, err
+	}
 	committed, err := deps.Tasks.Create(ctx, task.CreateCommand{
 		Actor:       call.Principal,
 		Scope:       call.Scope,
 		ParentID:    id.TaskID(request.ParentID),
 		Title:       request.Title,
 		Description: request.Description,
-		Metadata:    mustMetadata(request.Metadata),
+		Metadata:    metadata,
 		PipelineID:  pipelineIDOf(request.PipelineID),
 		Inputs:      inputsOf(request.Inputs),
 		Start:       false,
@@ -701,16 +703,6 @@ func inputsToWire(inputs map[id.InputKey]string) map[string]string {
 		converted[string(key)] = value
 	}
 	return converted
-}
-
-// mustMetadata encodes metadata that the public DTO already bounded. A failure
-// cannot happen for a string map; nil is returned defensively.
-func mustMetadata(metadata map[string]string) []byte {
-	encoded, err := metadataBytes(metadata)
-	if err != nil {
-		return nil
-	}
-	return encoded
 }
 
 // pipelineIDOf converts a public pipeline identity.

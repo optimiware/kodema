@@ -27,15 +27,22 @@ type Broker struct {
 	baseCtx context.Context
 	cancel  context.CancelFunc
 
-	mu                sync.Mutex
-	client            Client
-	closed            bool
-	subscriptions     map[*subscription]struct{}
-	liveSubscriptions map[*liveSubscription]struct{}
+	mu                  sync.Mutex
+	dialMu              sync.Mutex
+	client              Client
+	closed              bool
+	subscriptions       map[*subscription]struct{}
+	liveSubscriptions   map[*liveSubscription]struct{}
+	wakeupSubscriptions map[*wakeupSubscription]struct{}
 	// resubscribePending records that the current subscriptions were opened on
 	// a client that has since been discarded. The next ensureClient that
 	// establishes a client claims it and re-establishes them.
 	resubscribePending bool
+	// wakeupResubscribePending records that at least one event-wakeup
+	// subscription failed a transient re-subscribe and remains registered for
+	// retry on the next broker operation without disturbing healthy
+	// invalidation or live-log subscriptions.
+	wakeupResubscribePending bool
 	// resubscribeMu serializes discard transitions and re-establishment
 	// passes, so a subscription is never moved onto a client that was itself
 	// discarded meanwhile and concurrent ensureClient callers resume once.
@@ -77,6 +84,7 @@ func NewBroker(config BrokerConfig) (*Broker, error) {
 		cancel:              cancel,
 		subscriptions:       make(map[*subscription]struct{}),
 		liveSubscriptions:   make(map[*liveSubscription]struct{}),
+		wakeupSubscriptions: make(map[*wakeupSubscription]struct{}),
 	}, nil
 }
 
@@ -101,6 +109,11 @@ func (broker *Broker) Close(ctx context.Context) error {
 		liveSubscriptions = append(liveSubscriptions, subscription)
 	}
 	broker.liveSubscriptions = make(map[*liveSubscription]struct{})
+	wakeupSubscriptions := make([]*wakeupSubscription, 0, len(broker.wakeupSubscriptions))
+	for subscription := range broker.wakeupSubscriptions {
+		wakeupSubscriptions = append(wakeupSubscriptions, subscription)
+	}
+	broker.wakeupSubscriptions = make(map[*wakeupSubscription]struct{})
 	broker.mu.Unlock()
 
 	broker.cancel()
@@ -114,6 +127,12 @@ func (broker *Broker) Close(ctx context.Context) error {
 		subscription.shutdown()
 	}
 	for _, subscription := range liveSubscriptions {
+		subscription.wait()
+	}
+	for _, subscription := range wakeupSubscriptions {
+		subscription.shutdown()
+	}
+	for _, subscription := range wakeupSubscriptions {
 		subscription.wait()
 	}
 	if client != nil {
@@ -132,10 +151,12 @@ func (broker *Broker) isClosed() bool {
 }
 
 // ensureClient returns the shared client, dialing once through Connect if no
-// client is current. A successful establishment also resumes every subscription
-// that was left on a discarded client, so any caller (publication,
-// subscription, live stream) repairs the live subscriptions, not only the
-// publication that observed the outage.
+// client is current. Dialing is serialized by dialMu so broker.mu is never held
+// across a network dial and Close can run immediately. A successful
+// establishment also resumes every subscription that was left on a discarded
+// client, so any caller (publication, subscription, live stream, event wakeup)
+// repairs the live subscriptions, not only the publication that observed the
+// outage.
 func (broker *Broker) ensureClient(ctx context.Context) (Client, error) {
 	broker.mu.Lock()
 	if broker.closed {
@@ -143,25 +164,16 @@ func (broker *Broker) ensureClient(ctx context.Context) (Client, error) {
 		return nil, fault.New(fault.DependencyUnavailable, "broker adapter is closed")
 	}
 	client := broker.client
+	pending := broker.resubscribePending || broker.wakeupResubscribePending
+	broker.mu.Unlock()
+
 	if client == nil {
-		if err := ctx.Err(); err != nil {
-			broker.mu.Unlock()
-			return nil, fault.Wrap(fault.DeadlineExpired, "broker connection was canceled", err)
-		}
-		dialed, err := broker.connect(ctx)
+		var err error
+		client, pending, err = broker.dialClient(ctx)
 		if err != nil {
-			broker.mu.Unlock()
 			return nil, err
 		}
-		if dialed == nil {
-			broker.mu.Unlock()
-			return nil, fault.New(fault.DependencyUnavailable, "broker connect returned no client")
-		}
-		broker.client = dialed
-		client = dialed
 	}
-	pending := broker.resubscribePending
-	broker.mu.Unlock()
 
 	if pending {
 		broker.resumeSubscriptions(ctx)
@@ -169,11 +181,54 @@ func (broker *Broker) ensureClient(ctx context.Context) (Client, error) {
 	return client, nil
 }
 
+// dialClient serializes connection establishment under dialMu without holding
+// broker.mu across the network dial. If Close runs concurrently while dialing,
+// the newly dialed client is closed immediately and never installed.
+func (broker *Broker) dialClient(ctx context.Context) (Client, bool, error) {
+	broker.dialMu.Lock()
+	defer broker.dialMu.Unlock()
+
+	broker.mu.Lock()
+	if broker.closed {
+		broker.mu.Unlock()
+		return nil, false, fault.New(fault.DependencyUnavailable, "broker adapter is closed")
+	}
+	if broker.client != nil {
+		client := broker.client
+		pending := broker.resubscribePending || broker.wakeupResubscribePending
+		broker.mu.Unlock()
+		return client, pending, nil
+	}
+	broker.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, false, fault.Wrap(fault.DeadlineExpired, "broker connection was canceled", err)
+	}
+	dialed, err := broker.connect(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if dialed == nil {
+		return nil, false, fault.New(fault.DependencyUnavailable, "broker connect returned no client")
+	}
+
+	broker.mu.Lock()
+	if broker.closed {
+		broker.mu.Unlock()
+		_ = dialed.Close(context.Background())
+		return nil, false, fault.New(fault.DependencyUnavailable, "broker adapter is closed")
+	}
+	broker.client = dialed
+	pending := broker.resubscribePending || broker.wakeupResubscribePending
+	broker.mu.Unlock()
+	return dialed, pending, nil
+}
+
 // discardClient drops the suspect client after a failed publication and
 // records that its subscriptions need re-establishment. The reconnect is
 // attempted eagerly, but if the broker is still down the pending marker makes
 // the next successful ensureClient resume them instead of orphaning an open
-// invalidation or live-log subscription.
+// invalidation, live-log or event-wakeup subscription.
 func (broker *Broker) discardClient(ctx context.Context, suspect Client) {
 	broker.resubscribeMu.Lock()
 	broker.mu.Lock()
@@ -183,7 +238,7 @@ func (broker *Broker) discardClient(ctx context.Context, suspect Client) {
 		return
 	}
 	broker.client = nil
-	if len(broker.subscriptions) > 0 || len(broker.liveSubscriptions) > 0 {
+	if len(broker.subscriptions) > 0 || len(broker.liveSubscriptions) > 0 || len(broker.wakeupSubscriptions) > 0 {
 		broker.resubscribePending = true
 	}
 	broker.mu.Unlock()
@@ -207,19 +262,29 @@ func (broker *Broker) resumeSubscriptions(ctx context.Context) {
 	defer broker.resubscribeMu.Unlock()
 
 	broker.mu.Lock()
-	if broker.closed || !broker.resubscribePending || broker.client == nil {
+	if broker.closed || (!broker.resubscribePending && !broker.wakeupResubscribePending) || broker.client == nil {
 		broker.mu.Unlock()
 		return
 	}
+	resumeAll := broker.resubscribePending
 	broker.resubscribePending = false
+	broker.wakeupResubscribePending = false
 	client := broker.client
-	subscriptions := make([]*subscription, 0, len(broker.subscriptions))
-	for subscription := range broker.subscriptions {
-		subscriptions = append(subscriptions, subscription)
+	var subscriptions []*subscription
+	var liveSubscriptions []*liveSubscription
+	if resumeAll {
+		subscriptions = make([]*subscription, 0, len(broker.subscriptions))
+		for subscription := range broker.subscriptions {
+			subscriptions = append(subscriptions, subscription)
+		}
+		liveSubscriptions = make([]*liveSubscription, 0, len(broker.liveSubscriptions))
+		for liveSubscription := range broker.liveSubscriptions {
+			liveSubscriptions = append(liveSubscriptions, liveSubscription)
+		}
 	}
-	liveSubscriptions := make([]*liveSubscription, 0, len(broker.liveSubscriptions))
-	for liveSubscription := range broker.liveSubscriptions {
-		liveSubscriptions = append(liveSubscriptions, liveSubscription)
+	wakeupSubscriptions := make([]*wakeupSubscription, 0, len(broker.wakeupSubscriptions))
+	for wakeupSubscription := range broker.wakeupSubscriptions {
+		wakeupSubscriptions = append(wakeupSubscriptions, wakeupSubscription)
 	}
 	broker.mu.Unlock()
 
@@ -235,6 +300,22 @@ func (broker *Broker) resumeSubscriptions(ctx context.Context) {
 		}
 		liveSubscription.reestablish(ctx, client)
 	}
+	wakeupRetryNeeded := false
+	for _, wakeupSubscription := range wakeupSubscriptions {
+		if broker.isClosed() {
+			return
+		}
+		if !wakeupSubscription.reestablish(client) {
+			wakeupRetryNeeded = true
+		}
+	}
+	if wakeupRetryNeeded {
+		broker.mu.Lock()
+		if !broker.closed && len(broker.wakeupSubscriptions) > 0 {
+			broker.wakeupResubscribePending = true
+		}
+		broker.mu.Unlock()
+	}
 }
 
 // unregister removes a closed subscription from the live set.
@@ -248,6 +329,13 @@ func (broker *Broker) unregister(subscription *subscription) {
 func (broker *Broker) unregisterLive(subscription *liveSubscription) {
 	broker.mu.Lock()
 	delete(broker.liveSubscriptions, subscription)
+	broker.mu.Unlock()
+}
+
+// unregisterWakeup removes a closed event wakeup subscription from the live set.
+func (broker *Broker) unregisterWakeup(subscription *wakeupSubscription) {
+	broker.mu.Lock()
+	delete(broker.wakeupSubscriptions, subscription)
 	broker.mu.Unlock()
 }
 

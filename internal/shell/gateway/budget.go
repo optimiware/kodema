@@ -379,127 +379,47 @@ func (tracker *BudgetTracker) CheckAndAcquire(ctx context.Context, req BudgetChe
 		}
 	}
 
-	if req.ActionID != "" && actionLimit.MaxTokens > 0 && actionTokens >= actionLimit.MaxTokens {
-		ev := BudgetExceededEvent{
+	checkScope := func(scopeKind string, enabled, costActive bool, usedTokens int64, usedCostUSD float64, limits BudgetLimits) error {
+		if !enabled {
+			return nil
+		}
+		var limitKind, message string
+		switch {
+		case limits.MaxTokens > 0 && usedTokens >= limits.MaxTokens:
+			limitKind = "tokens"
+			message = fmt.Sprintf("%s LLM token budget exceeded (%d/%d tokens used)", scopeKind, usedTokens, limits.MaxTokens)
+		case costActive && costExceeded(usedCostUSD, limits.MaxCostUSD):
+			limitKind = "cost_usd"
+			message = fmt.Sprintf("%s LLM cost budget exceeded ($%.4f/$%.4f USD used)", scopeKind, finiteNonNegativeFloat(usedCostUSD), limits.MaxCostUSD)
+		default:
+			return nil
+		}
+		tracker.emitExceeded(ctx, BudgetExceededEvent{
 			Scope:       req.Scope,
 			PrincipalID: req.PrincipalID,
 			ExecutionID: req.ExecutionID,
 			ActionID:    req.ActionID,
 			TaskID:      execCtx.TaskID,
 			Model:       req.Model,
-			ScopeKind:   "action",
-			LimitKind:   "tokens",
-			UsedTokens:  actionTokens,
-			MaxTokens:   actionLimit.MaxTokens,
-			UsedCostUSD: actionCostUSD,
-			MaxCostUSD:  actionLimit.MaxCostUSD,
-		}
-		tracker.emitExceeded(ctx, ev)
+			ScopeKind:   scopeKind,
+			LimitKind:   limitKind,
+			UsedTokens:  usedTokens,
+			MaxTokens:   limits.MaxTokens,
+			UsedCostUSD: usedCostUSD,
+			MaxCostUSD:  limits.MaxCostUSD,
+		})
 		release()
-		return noop, fault.New(fault.BudgetExceeded,
-			fmt.Sprintf("action LLM token budget exceeded (%d/%d tokens used)", actionTokens, actionLimit.MaxTokens))
-	}
-	if actionCostActive && costExceeded(actionCostUSD, actionLimit.MaxCostUSD) {
-		ev := BudgetExceededEvent{
-			Scope:       req.Scope,
-			PrincipalID: req.PrincipalID,
-			ExecutionID: req.ExecutionID,
-			ActionID:    req.ActionID,
-			TaskID:      execCtx.TaskID,
-			Model:       req.Model,
-			ScopeKind:   "action",
-			LimitKind:   "cost_usd",
-			UsedTokens:  actionTokens,
-			MaxTokens:   actionLimit.MaxTokens,
-			UsedCostUSD: actionCostUSD,
-			MaxCostUSD:  actionLimit.MaxCostUSD,
-		}
-		tracker.emitExceeded(ctx, ev)
-		release()
-		return noop, fault.New(fault.BudgetExceeded,
-			fmt.Sprintf("action LLM cost budget exceeded ($%.4f/$%.4f USD used)", finiteNonNegativeFloat(actionCostUSD), actionLimit.MaxCostUSD))
+		return fault.New(fault.BudgetExceeded, message)
 	}
 
-	if execLimit.MaxTokens > 0 && execTokens >= execLimit.MaxTokens {
-		ev := BudgetExceededEvent{
-			Scope:       req.Scope,
-			PrincipalID: req.PrincipalID,
-			ExecutionID: req.ExecutionID,
-			ActionID:    req.ActionID,
-			TaskID:      execCtx.TaskID,
-			Model:       req.Model,
-			ScopeKind:   "execution",
-			LimitKind:   "tokens",
-			UsedTokens:  execTokens,
-			MaxTokens:   execLimit.MaxTokens,
-			UsedCostUSD: execCostUSD,
-			MaxCostUSD:  execLimit.MaxCostUSD,
-		}
-		tracker.emitExceeded(ctx, ev)
-		release()
-		return noop, fault.New(fault.BudgetExceeded,
-			fmt.Sprintf("execution LLM token budget exceeded (%d/%d tokens used)", execTokens, execLimit.MaxTokens))
+	if err := checkScope("action", req.ActionID != "", actionCostActive, actionTokens, actionCostUSD, actionLimit); err != nil {
+		return noop, err
 	}
-	if execCostActive && costExceeded(execCostUSD, execLimit.MaxCostUSD) {
-		ev := BudgetExceededEvent{
-			Scope:       req.Scope,
-			PrincipalID: req.PrincipalID,
-			ExecutionID: req.ExecutionID,
-			ActionID:    req.ActionID,
-			TaskID:      execCtx.TaskID,
-			Model:       req.Model,
-			ScopeKind:   "execution",
-			LimitKind:   "cost_usd",
-			UsedTokens:  execTokens,
-			MaxTokens:   execLimit.MaxTokens,
-			UsedCostUSD: execCostUSD,
-			MaxCostUSD:  execLimit.MaxCostUSD,
-		}
-		tracker.emitExceeded(ctx, ev)
-		release()
-		return noop, fault.New(fault.BudgetExceeded,
-			fmt.Sprintf("execution LLM cost budget exceeded ($%.4f/$%.4f USD used)", finiteNonNegativeFloat(execCostUSD), execLimit.MaxCostUSD))
+	if err := checkScope("execution", true, execCostActive, execTokens, execCostUSD, execLimit); err != nil {
+		return noop, err
 	}
-
-	if execCtx.TaskID != "" && taskLimit.MaxTokens > 0 && taskTokens >= taskLimit.MaxTokens {
-		ev := BudgetExceededEvent{
-			Scope:       req.Scope,
-			PrincipalID: req.PrincipalID,
-			ExecutionID: req.ExecutionID,
-			ActionID:    req.ActionID,
-			TaskID:      execCtx.TaskID,
-			Model:       req.Model,
-			ScopeKind:   "task",
-			LimitKind:   "tokens",
-			UsedTokens:  taskTokens,
-			MaxTokens:   taskLimit.MaxTokens,
-			UsedCostUSD: taskCostUSD,
-			MaxCostUSD:  taskLimit.MaxCostUSD,
-		}
-		tracker.emitExceeded(ctx, ev)
-		release()
-		return noop, fault.New(fault.BudgetExceeded,
-			fmt.Sprintf("task LLM token budget exceeded (%d/%d tokens used)", taskTokens, taskLimit.MaxTokens))
-	}
-	if taskCostActive && costExceeded(taskCostUSD, taskLimit.MaxCostUSD) {
-		ev := BudgetExceededEvent{
-			Scope:       req.Scope,
-			PrincipalID: req.PrincipalID,
-			ExecutionID: req.ExecutionID,
-			ActionID:    req.ActionID,
-			TaskID:      execCtx.TaskID,
-			Model:       req.Model,
-			ScopeKind:   "task",
-			LimitKind:   "cost_usd",
-			UsedTokens:  taskTokens,
-			MaxTokens:   taskLimit.MaxTokens,
-			UsedCostUSD: taskCostUSD,
-			MaxCostUSD:  taskLimit.MaxCostUSD,
-		}
-		tracker.emitExceeded(ctx, ev)
-		release()
-		return noop, fault.New(fault.BudgetExceeded,
-			fmt.Sprintf("task LLM cost budget exceeded ($%.4f/$%.4f USD used)", finiteNonNegativeFloat(taskCostUSD), taskLimit.MaxCostUSD))
+	if err := checkScope("task", execCtx.TaskID != "", taskCostActive, taskTokens, taskCostUSD, taskLimit); err != nil {
+		return noop, err
 	}
 
 	return release, nil

@@ -322,8 +322,9 @@ func TestAbsenceGuardOrdersWithOtherLocks(t *testing.T) {
 		t.Fatalf("granted guard positions = [%d %d]; want [1 0] (smaller key first)", plan[0].position, plan[1].position)
 	}
 
-	// A NULL project sorts before any project value.
-	plan, err = planLocks(tenantScope(), []store.Lock{
+	// A NULL project sorts before any project value. A project-scoped unit may
+	// guard both its own project key and its own tenant-wide (NULL project) key.
+	plan, err = planLocks(projectScope(), []store.Lock{
 		absenceMembershipLock(testProjectID, testPrincipalID),
 		absenceMembershipLock("", testPrincipalID),
 	})

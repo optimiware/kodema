@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -94,7 +95,7 @@ func runAuthServeEntry(ctx context.Context, args []string, _ io.Writer, stderr i
 	clientID := flags.String("client-id", envOr("KODEMA_AUTH_CLIENT_ID", authapp.DefaultClientID), "primary public OAuth client id")
 	audience := flags.String("audience", envOr("KODEMA_AUTH_AUDIENCE", authapp.DefaultAudience), "API audience claim value")
 
-	redirectURIs := stringList(splitCommaOrSpace(os.Getenv("KODEMA_AUTH_REDIRECT_URIS")))
+	var redirectURIs stringList
 	flags.Var(&redirectURIs, "redirect-uri", "explicitly allowed redirect URI (repeatable)")
 
 	localPersonas := flags.String("local-personas", envOr("KODEMA_AUTH_LOCAL_PERSONAS", ""), "comma-separated local personas (for example admin,engineer,reviewer)")
@@ -151,6 +152,11 @@ func runAuthServeEntry(ctx context.Context, args []string, _ io.Writer, stderr i
 		return 2
 	}
 
+	resolvedRedirectURIs := splitCommaOrSpace(os.Getenv("KODEMA_AUTH_REDIRECT_URIS"))
+	if len(redirectURIs) > 0 {
+		resolvedRedirectURIs = append([]string(nil), redirectURIs...)
+	}
+
 	config := authapp.Config{
 		Issuer:          *issuer,
 		ListenAddress:   *listen,
@@ -161,7 +167,7 @@ func runAuthServeEntry(ctx context.Context, args []string, _ io.Writer, stderr i
 		ProjectClaim:    *projectClaim,
 		ClientID:        *clientID,
 		Audience:        *audience,
-		RedirectURIs:    append([]string(nil), redirectURIs...),
+		RedirectURIs:    resolvedRedirectURIs,
 		LocalPersonas:   splitComma(*localPersonas),
 		AccessCode:      accessCode,
 		AccessTokenTTL:  *tokenTTL,
@@ -240,14 +246,19 @@ func envBoolStrict(name string, fallback bool) (bool, error) {
 	if !ok {
 		return fallback, nil
 	}
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "":
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return fallback, nil
-	case "1", "true", "yes":
+	}
+	if parsed, err := strconv.ParseBool(trimmed); err == nil {
+		return parsed, nil
+	}
+	switch strings.ToLower(trimmed) {
+	case "yes":
 		return true, nil
-	case "0", "false", "no":
+	case "no":
 		return false, nil
 	default:
-		return false, fmt.Errorf("%s must be true or false", name)
+		return false, fmt.Errorf("%s must be a boolean (true/false, 1/0, t/f, yes/no)", name)
 	}
 }

@@ -101,26 +101,43 @@ func AuthorizeExecution(admitted AdmittedExecution, name OperationName, scope te
 // project-scoped principal inside its own tenant, while every other tenant
 // operation requires a tenant-wide owner scope.
 func operationScopeContains(name OperationName, owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
+	if owner.TenantID == "" || target.TenantID == "" || owner.TenantID != target.TenantID {
 		return false
 	}
 	if name == "principal.whoami" || name == "project.list" {
 		return true
 	}
-	return scopeContains(owner, target)
+	return owner.Contains(target)
 }
 
-// scopeContains reports whether the owner scope covers the target scope. A
-// tenant-scoped owner covers every project in its tenant; a project-scoped
-// owner covers only that same project and never the whole tenant.
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
+// AdmitPrincipalKind validates actor, looks up name in the declared operation
+// registry and pins that actor's kind can satisfy the registry grant. It never
+// treats actor's role snapshot as current authority.
+func AdmitPrincipalKind(actor Principal, name OperationName) (Operation, error) {
+	if err := actor.Validate(); err != nil {
+		return Operation{}, err
 	}
-	if owner.ProjectID == "" {
-		return true
+	op, ok := LookupOperation(name)
+	if !ok {
+		return Operation{}, fault.New(fault.InternalFailure, fmt.Sprintf("operation %q is not registered", name))
 	}
-	return owner.ProjectID == target.ProjectID
+	switch actor.Kind {
+	case identity.KindHuman:
+		if !op.Requires.AdmitsKind(identity.KindHuman) {
+			return Operation{}, fault.New(fault.Forbidden, "the operation grants no human role")
+		}
+	case identity.KindService:
+		if !op.Requires.AdmitsKind(identity.KindService) {
+			return Operation{}, fault.New(fault.Forbidden, "the operation grants no service role")
+		}
+	case identity.KindExecution:
+		if !op.Requires.AdmitsKind(identity.KindExecution) {
+			return Operation{}, fault.New(fault.Forbidden, "the operation grants no execution permission")
+		}
+	default:
+		return Operation{}, fault.New(fault.Forbidden, "unknown principal kind")
+	}
+	return op, nil
 }
 
 // operationScopeMatches refuses a target scope whose shape differs from the

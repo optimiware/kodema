@@ -9,8 +9,6 @@ package process
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +19,7 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/shell/runtime"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 const (
@@ -213,7 +212,7 @@ func New(config Config) (*Adapter, error) {
 	}
 	clock := config.Clock
 	if clock == nil {
-		clock = realClock{}
+		clock = adapterutil.RealClock{}
 	}
 	return &Adapter{
 		root:          root,
@@ -262,7 +261,7 @@ func GroupName(workload id.WorkloadID) (GroupID, error) {
 	if _, err := id.ParseWorkloadID(string(workload)); err != nil {
 		return "", fault.Wrap(fault.InvalidInput, "workload id is invalid", err)
 	}
-	return GroupID("kodema-process-" + stableDigest(string(workload))), nil
+	return GroupID("kodema-process-" + adapterutil.StableDigest(string(workload))), nil
 }
 
 // ResourceRoot returns the adapter-owned resource root for one workload
@@ -284,37 +283,9 @@ func WorkspaceDir(workspaceRoot string, workspace id.WorkspaceID) (string, error
 	return filepath.Join(workspaceRoot, string(workspace)), nil
 }
 
-// stableDigest returns a short deterministic, path-safe digest of a stable
-// identity.
-func stableDigest(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])[:24]
-}
-
 // pathWithin reports whether child is parent or below it.
 func pathWithin(parent, child string) bool {
 	return child == parent || strings.HasPrefix(child, parent+string(os.PathSeparator))
-}
-
-// realClock is the production clock. It never appears in unit tests.
-type realClock struct{}
-
-// Now returns the current wall-clock time.
-func (realClock) Now() time.Time { return time.Now() }
-
-// Sleep waits for the duration or until the context ends.
-func (realClock) Sleep(ctx context.Context, duration time.Duration) error {
-	if duration <= 0 {
-		return ctx.Err()
-	}
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 var _ runtime.Client = (*Adapter)(nil)

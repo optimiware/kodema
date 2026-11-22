@@ -315,8 +315,8 @@ func (stream *httpEventStream) dial(ctx context.Context, isReconnect bool) (erro
 	}
 
 	response, err := stream.transport.RoundTripper.RoundTrip(req)
-	stopDialCancel()
 	if err != nil {
+		stopDialCancel()
 		reqCancel()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr, false
@@ -324,10 +324,12 @@ func (stream *httpEventStream) dial(ctx context.Context, isReconnect bool) (erro
 		return fault.New(fault.DependencyUnavailable, "the event stream endpoint is unavailable"), true
 	}
 	if response == nil {
+		stopDialCancel()
 		reqCancel()
 		return fault.New(fault.InternalFailure, "the HTTP transport returned no response"), false
 	}
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
+		stopDialCancel()
 		reqCancel()
 		if response.Body != nil {
 			_ = response.Body.Close()
@@ -335,12 +337,14 @@ func (stream *httpEventStream) dial(ctx context.Context, isReconnect bool) (erro
 		return fault.New(fault.InternalFailure, "redirect responses are never followed"), false
 	}
 	if response.StatusCode != http.StatusOK {
-		reqCancel()
+		defer reqCancel()
+		defer stopDialCancel()
 		_, failure, retryable := stream.transport.decode("event.subscribe", response, false, false)
 		return failure, retryable
 	}
 	mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	if mediaErr != nil || !strings.EqualFold(mediaType, api.EventStreamMediaType) {
+		stopDialCancel()
 		reqCancel()
 		if response.Body != nil {
 			_ = response.Body.Close()
@@ -348,10 +352,12 @@ func (stream *httpEventStream) dial(ctx context.Context, isReconnect bool) (erro
 		return fault.New(fault.InternalFailure, "the event stream response is not text/event-stream"), false
 	}
 	if response.Body == nil {
+		stopDialCancel()
 		reqCancel()
 		return fault.New(fault.InternalFailure, "the event stream response has no body"), false
 	}
 	stream.recordCursor(strings.TrimSpace(response.Header.Get("X-Kodema-Event-Cursor")))
+	stopDialCancel()
 	if err := stream.setBody(response.Body, reqCancel); err != nil {
 		return err, false
 	}

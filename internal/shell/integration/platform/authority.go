@@ -47,7 +47,6 @@ type Config struct {
 // Authority is the concrete authorize.HostedAuthority adapter.
 type Authority struct {
 	source Source
-	logf   func(format string, args ...any)
 }
 
 // NewAuthority validates the configuration and builds an authority.
@@ -59,7 +58,7 @@ func NewAuthority(config Config) (authorize.HostedAuthority, error) {
 	if config.Source == nil {
 		return nil, fault.New(fault.InvalidInput, "hosted authority source is nil")
 	}
-	return &Authority{source: config.Source, logf: config.Logf}, nil
+	return &Authority{source: config.Source}, nil
 }
 
 // Check validates the declared request, reads one current snapshot and returns

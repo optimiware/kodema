@@ -75,7 +75,7 @@ func runServiceCreate(ctx context.Context, config Config, args []string, ports P
 	if projectID == "" {
 		return usage(ports.Err, "service create requires --project <id> or KODEMA_PROJECT")
 	}
-	roles := parseRoleList(roleFlags)
+	roles := parseCommaSeparatedList(roleFlags)
 	if roles == nil {
 		roles = []string{}
 	}
@@ -167,23 +167,10 @@ func runServiceList(ctx context.Context, config Config, args []string, ports Por
 		return failure(ports.Err, err)
 	}
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "service.list", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
-		}
 		if services == nil {
 			services = []api.ServiceSummaryView{}
 		}
-		combined, err := json.Marshal(api.ServiceListResult{Services: services})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "service.list", Body: combined}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "service.list", firstBody, pages, api.ServiceListResult{Services: services})
 	}
 
 	tw := tabwriter.NewWriter(ports.Out, 0, 0, 2, ' ', 0)
@@ -237,7 +224,7 @@ func runServiceUpdate(ctx context.Context, config Config, args []string, ports P
 	if err := config.Validate(); err != nil {
 		return usage(ports.Err, err.Error())
 	}
-	roles := parseRoleList(roleFlags)
+	roles := parseCommaSeparatedList(roleFlags)
 	if roles == nil {
 		roles = []string{}
 	}
@@ -620,49 +607,18 @@ func parseTTLSeconds(ttlFlag, ttlSecondsFlag string) (int, error) {
 }
 
 func fetchAllServices(ctx context.Context, ports Ports, projectID string) ([]api.ServiceSummaryView, json.RawMessage, int, error) {
-	var (
-		all       []api.ServiceSummaryView
-		firstBody json.RawMessage
-		pages     int
-		cursor    string
-	)
-	for {
-		req := api.ServiceListRequest{ProjectID: projectID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		invocation := api.Invocation{
-			Operation: "service.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return nil, nil, pages, err
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.ServiceListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, nil, pages, fmt.Errorf("invalid service.list response: %w", err)
+	return fetchAllPages(ctx, ports, "service.list",
+		func(cursor string) any {
+			req := api.ServiceListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		all = append(all, page.Services...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return all, firstBody, pages, nil
+			return req
+		},
+		func(page api.ServiceListResult) ([]api.ServiceSummaryView, string) {
+			return page.Services, page.NextCursor
+		},
+	)
 }
 
 func lookupServiceVersion(ctx context.Context, config Config, ports Ports, deps CommandDeps, projectFlag, serviceID, label string) (uint64, int) {
@@ -879,64 +835,27 @@ func runSecretList(ctx context.Context, config Config, args []string, ports Port
 		return failure(ports.Err, fmt.Errorf("no public client is configured"))
 	}
 
-	var (
-		secrets   = []api.SecretMetadataView{}
-		firstBody json.RawMessage
-		pages     int
-		cursor    string
-	)
-	for {
-		req := api.SecretMetadataListRequest{ProjectID: projectID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		invocation := api.Invocation{
-			Operation: "secret.metadata.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return usage(ports.Err, publicMessage(err))
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.SecretMetadataListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return failure(ports.Err, fmt.Errorf("invalid secret.metadata.list response: %w", err))
+	secrets, firstBody, pages, err := fetchAllPages(ctx, ports, "secret.metadata.list",
+		func(cursor string) any {
+			req := api.SecretMetadataListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		secrets = append(secrets, page.Secrets...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
+			return req
+		},
+		func(page api.SecretMetadataListResult) ([]api.SecretMetadataView, string) {
+			return page.Secrets, page.NextCursor
+		},
+	)
+	if err != nil {
+		return failure(ports.Err, err)
 	}
 
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "secret.metadata.list", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
+		if secrets == nil {
+			secrets = []api.SecretMetadataView{}
 		}
-		combined, err := json.Marshal(api.SecretMetadataListResult{Secrets: secrets})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "secret.metadata.list", Body: combined}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "secret.metadata.list", firstBody, pages, api.SecretMetadataListResult{Secrets: secrets})
 	}
 
 	tw := tabwriter.NewWriter(ports.Out, 0, 0, 2, ' ', 0)

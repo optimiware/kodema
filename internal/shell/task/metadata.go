@@ -1,22 +1,18 @@
 package task
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"slices"
 
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/shell/pipeline"
 )
 
-// Task metadata and conversation bounds. Metadata is one opaque JSON object of
-// string values and is never interpreted; the conversation is the admitted
-// message history snapshot.
-const (
-	maxMetadataBytes     = 16 << 10
-	maxConversationBytes = 64 << 10
-)
+// Task conversation bound. Metadata bounds and parsing live in
+// pipeline.ParseTaskMetadata; the conversation is the admitted message history
+// snapshot.
+const maxConversationBytes = 64 << 10
 
 // emptyConversationJSON is the present conversation snapshot of a task-bound
 // admission with zero messages. It is the valid JSON empty array, the same
@@ -25,58 +21,10 @@ const (
 // from the nil task-free case, which materializes no file.
 const emptyConversationJSON = "[]"
 
-// parseMetadata validates and parses one opaque task metadata object. Invalid
-// JSON, a non-object, a non-string value, a duplicate key, trailing bytes and
-// oversize input are refused as invalid_input.
+// parseMetadata validates and parses one opaque task metadata object through
+// the shared pipeline.ParseTaskMetadata decoder.
 func parseMetadata(raw []byte) (map[string]string, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	if len(raw) > maxMetadataBytes {
-		return nil, fault.New(fault.InvalidInput, fmt.Sprintf("task metadata is %d bytes; at most %d are allowed", len(raw), maxMetadataBytes))
-	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	token, err := decoder.Token()
-	if err != nil {
-		return nil, fault.Wrap(fault.InvalidInput, "task metadata must be a JSON object of string values", err)
-	}
-	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
-		return nil, fault.New(fault.InvalidInput, "task metadata must be a JSON object of string values")
-	}
-	metadata := make(map[string]string)
-	for decoder.More() {
-		keyToken, err := decoder.Token()
-		if err != nil {
-			return nil, fault.Wrap(fault.InvalidInput, "task metadata must be a JSON object of string values", err)
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return nil, fault.New(fault.InvalidInput, "task metadata must be a JSON object of string values")
-		}
-		if _, duplicate := metadata[key]; duplicate {
-			return nil, fault.New(fault.InvalidInput, fmt.Sprintf("task metadata key %q is duplicated", key))
-		}
-		valueToken, err := decoder.Token()
-		if err != nil {
-			return nil, fault.Wrap(fault.InvalidInput, "task metadata must be a JSON object of string values", err)
-		}
-		value, ok := valueToken.(string)
-		if !ok {
-			return nil, fault.New(fault.InvalidInput, fmt.Sprintf("task metadata value for %q must be a string", key))
-		}
-		metadata[key] = value
-	}
-	if _, err := decoder.Token(); err != nil {
-		return nil, fault.Wrap(fault.InvalidInput, "task metadata must be a JSON object of string values", err)
-	}
-	if token, err := decoder.Token(); err != io.EOF {
-		if err != nil {
-			return nil, fault.Wrap(fault.InvalidInput, "task metadata must be a JSON object of string values", err)
-		}
-		_ = token
-		return nil, fault.New(fault.InvalidInput, "task metadata has more than one JSON value")
-	}
-	return metadata, nil
+	return pipeline.ParseTaskMetadata(raw)
 }
 
 // marshalMetadata re-encodes stored metadata for a fresh admission. Metadata is

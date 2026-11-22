@@ -86,6 +86,12 @@ func TestValidateTrustedOrigins(t *testing.T) {
 		"https://",
 		"ftp://git.example.com/shop",
 		"https://git.example.com/ shop",
+		"https://git.example.com:+443/shop",
+		"https://git.example.com:0443/shop",
+		"https://git.example.com:-443/shop",
+		"https://git.example.com:0/shop",
+		"https://git.example.com:65536/shop",
+		"https://git.example.com:/shop",
 	}
 	for _, origin := range invalid {
 		if err := resource.ValidateTrustedOrigins([]string{origin}); err == nil {

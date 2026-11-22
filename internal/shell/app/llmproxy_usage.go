@@ -36,7 +36,6 @@ type llmNestedBody struct {
 type llmUsageCounts struct {
 	PromptTokens             *int `json:"prompt_tokens"`
 	CompletionTokens         *int `json:"completion_tokens"`
-	TotalTokens              *int `json:"total_tokens"`
 	InputTokens              *int `json:"input_tokens"`
 	OutputTokens             *int `json:"output_tokens"`
 	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`

@@ -45,6 +45,7 @@ type plannedWrite struct {
 	// phase already acquired it in the declared lock order, so the write phase
 	// must not issue it a second time.
 	advisory      *store.Statement
+	advisoryKey   string
 	advisoryTaken bool
 	deadline      *store.DeadlineGuard
 	scope         tenancy.Scope
@@ -64,7 +65,7 @@ func planWrite(scope tenancy.Scope, write store.Write) (plannedWrite, error) {
 	if err := scope.Validate(); err != nil {
 		return plannedWrite{}, err
 	}
-	if !validIdentity(write.ID) {
+	if !store.ValidIdentity(write.ID) {
 		return plannedWrite{}, faultInvalid(fmt.Sprintf("row id %q is not a valid identity", write.ID))
 	}
 	// The tenant and project root rows carry their own identity, so the row id
@@ -122,8 +123,9 @@ func planWrite(scope tenancy.Scope, write store.Write) (plannedWrite, error) {
 		return plannedWrite{}, err
 	}
 	var advisory *store.Statement
+	var advisoryKey string
 	if write.Insert {
-		advisory, err = absenceInsertAdvisory(scope, write)
+		advisory, advisoryKey, err = absenceInsertAdvisory(scope, write)
 		if err != nil {
 			return plannedWrite{}, err
 		}
@@ -136,6 +138,7 @@ func planWrite(scope tenancy.Scope, write store.Write) (plannedWrite, error) {
 		rank:          writeRank(write.Table),
 		statement:     statement,
 		advisory:      advisory,
+		advisoryKey:   advisoryKey,
 		deadline:      write.Deadline,
 		scope:         scope,
 		expectVersion: write.ExpectVersion,
@@ -418,6 +421,12 @@ func checkWriteDeadline(ctx context.Context, tx store.Transaction, planned plann
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		if reclassify != nil {
 			return reclassify(ctx, tx, planned.table, planned.id)
 		}
@@ -426,6 +435,12 @@ func checkWriteDeadline(ctx context.Context, tx store.Transaction, planned plann
 	var stamp sql.NullTime
 	if err := rows.Scan(&stamp); err != nil {
 		return fault.Wrap(fault.InternalFailure, "scan deadline guard", err)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -623,7 +638,7 @@ func planLocks(scope tenancy.Scope, locks []store.Lock) (plannedLocks, error) {
 	planned := make([]plannedLock, 0, len(locks))
 	for position, lock := range locks {
 		if lock.ExpectAbsent {
-			entry, err := planAbsenceLock(lock, position)
+			entry, err := planAbsenceLock(scope, lock, position)
 			if err != nil {
 				return plannedLocks{}, err
 			}
@@ -652,7 +667,7 @@ func planLocks(scope tenancy.Scope, locks []store.Lock) (plannedLocks, error) {
 		}
 		ids := append([]string(nil), lock.IDs...)
 		for _, id := range ids {
-			if !validIdentity(id) {
+			if !store.ValidIdentity(id) {
 				return plannedLocks{}, faultInvalid(fmt.Sprintf("lock id %q is not a valid identity", id))
 			}
 		}
@@ -696,20 +711,36 @@ func planLocks(scope tenancy.Scope, locks []store.Lock) (plannedLocks, error) {
 	return plannedLocks{entries: planned}, nil
 }
 
-// sortPlannedLocks orders the lock phase by the declared table rank. Two
-// absence guards on the same table sort by their canonical unique key
-// (declared column order, NULL before any value); every other tie keeps the
-// caller's relative order, so an insert advisory never jumps ahead of the guard
-// it shares a key with.
+// sortPlannedLocks orders the lock phase deterministically by declared table
+// rank. Within one table, advisory locks (absence guards and insert
+// advisories) sort before present-row locks, ordered by canonical unique key
+// (with absence guards before insert advisories on an equal key); present-row
+// locks sort by row id before falling back to caller position so two units
+// locking multiple rows of the same table cannot deadlock in opposite order.
 func sortPlannedLocks(planned []plannedLock) {
 	sort.SliceStable(planned, func(left, right int) bool {
-		if planned[left].rank != planned[right].rank {
-			return planned[left].rank < planned[right].rank
+		l, r := planned[left], planned[right]
+		if l.rank != r.rank {
+			return l.rank < r.rank
 		}
-		if planned[left].absence && planned[right].absence && planned[left].absenceKey != planned[right].absenceKey {
-			return planned[left].absenceKey < planned[right].absenceKey
+		lAdvisory := l.absence || l.insertAdvisory
+		rAdvisory := r.absence || r.insertAdvisory
+		if lAdvisory != rAdvisory {
+			return lAdvisory
 		}
-		return planned[left].position < planned[right].position
+		if lAdvisory && rAdvisory {
+			if l.absenceKey != r.absenceKey {
+				return l.absenceKey < r.absenceKey
+			}
+			if l.absence != r.absence {
+				return l.absence
+			}
+			return l.position < r.position
+		}
+		if l.id != r.id {
+			return l.id < r.id
+		}
+		return l.position < r.position
 	})
 }
 
@@ -729,6 +760,7 @@ func addInsertAdvisories(plans plannedLocks, writes []plannedWrite) plannedLocks
 			rank:           writes[index].rank,
 			position:       base + index,
 			table:          writes[index].table,
+			absenceKey:     writes[index].advisoryKey,
 			insertAdvisory: true,
 			advisory:       *writes[index].advisory,
 		})

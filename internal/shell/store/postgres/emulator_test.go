@@ -184,6 +184,8 @@ func (conn *emuConn) exec(sql string, args []any) (store.Result, error) {
 	switch {
 	case strings.HasPrefix(lower, "set transaction"):
 		return store.Result{RowsAffected: 1}, nil
+	case strings.HasPrefix(lower, "select pg_advisory_xact_lock"):
+		return store.Result{RowsAffected: 1}, nil
 	case strings.HasPrefix(lower, "select set_config"):
 		if strings.Contains(lower, "kodema.tenant_id") {
 			conn.scopeSet = true

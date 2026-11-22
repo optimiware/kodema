@@ -245,11 +245,7 @@ main() {
     init)
       require_cmd tofu
       if [[ -z "$project_or_account" ]]; then
-        case "$cloud" in
-          scw) project_or_account="$(scw_resolve_project_id)" ;;
-          gcp) project_or_account="$(gcp_resolve_project_id)" ;;
-          aws) project_or_account="$(aws_resolve_account_id)" ;;
-        esac
+        project_or_account="$(resolve_cloud_project_or_account "$cloud")"
       fi
       if [[ -z "$state_bucket" ]]; then
         state_bucket="${KODEMA_STATE_BUCKET:-}"
@@ -269,11 +265,7 @@ main() {
     plan)
       require_cmd tofu
       if [[ -z "$project_or_account" ]]; then
-        case "$cloud" in
-          scw) project_or_account="$(scw_resolve_project_id)" ;;
-          gcp) project_or_account="$(gcp_resolve_project_id)" ;;
-          aws) project_or_account="$(aws_resolve_account_id)" ;;
-        esac
+        project_or_account="$(resolve_cloud_project_or_account "$cloud")"
       fi
       build_tofu_var_args "$cloud" "$cluster" "$project_or_account" "$region" "$var_file"
       if [[ "$cloud" == "scw" ]]; then
@@ -301,11 +293,7 @@ main() {
         rm -f "$plan_file"
       else
         if [[ -z "$project_or_account" ]]; then
-          case "$cloud" in
-            scw) project_or_account="$(scw_resolve_project_id)" ;;
-            gcp) project_or_account="$(gcp_resolve_project_id)" ;;
-            aws) project_or_account="$(aws_resolve_account_id)" ;;
-          esac
+          project_or_account="$(resolve_cloud_project_or_account "$cloud")"
         fi
         build_tofu_var_args "$cloud" "$cluster" "$project_or_account" "$region" "$var_file"
         local apply_flags=("-input=false")
@@ -330,11 +318,7 @@ main() {
       fi
       require_cmd tofu
       if [[ -z "$project_or_account" ]]; then
-        case "$cloud" in
-          scw) project_or_account="$(scw_resolve_project_id)" ;;
-          gcp) project_or_account="$(gcp_resolve_project_id)" ;;
-          aws) project_or_account="$(aws_resolve_account_id)" ;;
-        esac
+        project_or_account="$(resolve_cloud_project_or_account "$cloud")"
       fi
       if [[ "$skip_helm_uninstall" != "true" && -f "$kubeconfig_file" && -f "$descriptor_file" ]] && command -v helm >/dev/null 2>&1; then
         local release_ns
@@ -498,9 +482,18 @@ MIGRATE_POD
         extra_values=(--values "$KODEMA_HELM_EXTRA_VALUES")
       fi
 
-      local release_ns tmp_charts_dir stack_chart
+      local release_ns stack_chart
       release_ns="$(jq -r '.release_namespace' "$descriptor_file")"
       tmp_charts_dir="$(mktemp -d "${work_dir}/charts.XXXXXX")"
+      cleanup_tmp_charts_dir() {
+        if [[ -n "${tmp_charts_dir:-}" ]]; then
+          rm -rf -- "$tmp_charts_dir"
+          tmp_charts_dir=""
+        fi
+      }
+      trap cleanup_tmp_charts_dir EXIT
+      trap 'cleanup_tmp_charts_dir; exit 130' INT
+      trap 'cleanup_tmp_charts_dir; exit 143' TERM
       cp -R "${KODEMA_REPO_ROOT}/deploy/charts/." "$tmp_charts_dir/"
       stack_chart="${tmp_charts_dir}/kodema-stack"
 
@@ -512,7 +505,6 @@ MIGRATE_POD
           --namespace "$release_ns" \
           --values "$values_file" \
           ${extra_values[@]+"${extra_values[@]}"} >/dev/null
-        rm -rf "$tmp_charts_dir"
         log_info "Helm template validation succeeded for ${cloud}/${cluster}"
         return 0
       fi
@@ -520,13 +512,11 @@ MIGRATE_POD
       local configured_repo configured_digest configured_env
       configured_repo="$(jq -r '.kodema.image.repository // empty' "$values_file")"
       if [[ "$configured_repo" == "registry.example.com/kodema" && "$allow_placeholder_image" != "true" ]]; then
-        rm -rf "$tmp_charts_dir"
         die "refusing live Helm install with placeholder image '${configured_repo}' (export KODEMA_IMAGE_REPOSITORY and KODEMA_IMAGE_DIGEST, or pass --allow-placeholder-image)"
       fi
 
       configured_digest="$(jq -r '.kodema.image.digest // empty' "$values_file")"
       if [[ -z "${KODEMA_IMAGE_DIGEST:-}" || ! "${KODEMA_IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ || ! "$configured_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-        rm -rf "$tmp_charts_dir"
         die "refusing live Helm install without a valid KODEMA_IMAGE_DIGEST (want sha256:<64 lowercase hex>)"
       fi
 
@@ -543,15 +533,12 @@ MIGRATE_POD
           has_file_oidc="true"
         fi
         if [[ "$has_env_oidc" != "true" && "$has_file_oidc" != "true" ]]; then
-          rm -rf "$tmp_charts_dir"
           die "refusing live production Helm install without OIDC configuration (set KODEMA_OIDC_ISSUER, KODEMA_OIDC_AUDIENCE, and KODEMA_OIDC_TENANT_CLAIM, or supply them via KODEMA_HELM_EXTRA_VALUES)"
         fi
       fi
 
-      [[ -f "$kubeconfig_file" ]] || {
-        rm -rf "$tmp_charts_dir"
+      [[ -f "$kubeconfig_file" ]] ||
         die "kubeconfig not found at ${kubeconfig_file} (run 'scripts/deploy ${cloud} kubeconfig --cluster ${cluster}' first)"
-      }
       # KODEMA_HELM_NO_WAIT=1 returns once the release is applied, for iterating
       # on a cluster whose workload is known not to be ready yet.
       local -a wait_args=(--wait)
@@ -565,7 +552,6 @@ MIGRATE_POD
         ${extra_values[@]+"${extra_values[@]}"} \
         ${wait_args[@]+"${wait_args[@]}"} \
         --timeout 10m
-      rm -rf "$tmp_charts_dir"
       ;;
 
     status)

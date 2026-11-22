@@ -58,9 +58,6 @@ func validPayload(payload string) bool {
 	if payload == "" || len(payload) > MaxRefBytes {
 		return false
 	}
-	if payload == "." || payload == ".." {
-		return false
-	}
 	for index := 0; index < len(payload); index++ {
 		character := payload[index]
 		switch {
@@ -252,32 +249,11 @@ func (message Message) Validate() error {
 	return nil
 }
 
-// validToolFunctionName reports whether name is the OpenAI-compatible
-// 1–64-character [A-Za-z0-9_-] function-name grammar.
-func validToolFunctionName(name string) bool {
-	if name == "" || len(name) > MaxToolNameBytes {
-		return false
-	}
-	for index := 0; index < len(name); index++ {
-		character := name[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// validCallID reports whether value is a bounded ASCII call identity.
-func validCallID(value string) bool {
-	if value == "" || len(value) > 128 {
-		return false
-	}
-	if value == "." || value == ".." {
+// validASCIIIdentifier reports whether value is a 1..maxLen string composed
+// solely of ASCII [A-Za-z0-9_-]. Dots are excluded by the character set, so an
+// identifier can never be confused with a path component.
+func validASCIIIdentifier(value string, maxLen int) bool {
+	if value == "" || len(value) > maxLen {
 		return false
 	}
 	for index := 0; index < len(value); index++ {
@@ -292,6 +268,17 @@ func validCallID(value string) bool {
 		}
 	}
 	return true
+}
+
+// validToolFunctionName reports whether name is the OpenAI-compatible
+// 1–64-character [A-Za-z0-9_-] function-name grammar.
+func validToolFunctionName(name string) bool {
+	return validASCIIIdentifier(name, MaxToolNameBytes)
+}
+
+// validCallID reports whether value is a bounded ASCII call identity.
+func validCallID(value string) bool {
+	return validASCIIIdentifier(value, 128)
 }
 
 // boundedJSONObject reports whether value is a bounded JSON object.
@@ -387,32 +374,17 @@ func (record Record) Validate() error {
 	if len(record.Outcome.Status) > 64 {
 		return fmt.Errorf("checkpoint outcome status is %d bytes; at most 64 are allowed", len(record.Outcome.Status))
 	}
-	if len(record.Outcome.Summary) > 4096 {
-		return fmt.Errorf("checkpoint outcome summary is %d bytes; at most 4096 are allowed", len(record.Outcome.Summary))
+	if len(record.Outcome.Summary) > maxOutcomeSummaryBytes {
+		return fmt.Errorf("checkpoint outcome summary is %d bytes; at most %d are allowed", len(record.Outcome.Summary), maxOutcomeSummaryBytes)
 	}
 	return nil
 }
 
+const maxOutcomeSummaryBytes = 4096
+
 // validRecordID reports whether value is a bounded ASCII identity.
 func validRecordID(value string) bool {
-	if value == "" || len(value) > 128 {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
+	return validASCIIIdentifier(value, 128)
 }
 
 // Store persists and restores checkpoints. A missing context is a typed

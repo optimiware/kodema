@@ -953,7 +953,7 @@ func TestRemoveFenceSurvivesPartialMaterializationRemoval(t *testing.T) {
 	if hostFileExists(t, startAttemptPath(fx.root, workload)) {
 		t.Fatal("the simulated partial removal did not delete the start-attempt marker")
 	}
-	if !hostFileExists(t, preparationPath(fx.root, workload)) {
+	if !hostFileExists(t, preparationRecordPath(fx.root, workload)) {
 		t.Fatal("the simulated partial removal deleted the preparation record")
 	}
 
@@ -1396,7 +1396,7 @@ func TestPrepareAppliesBoundedResourcesAndEnforcesInstallationMax(t *testing.T) 
 		if !strings.Contains(err.Error(), "exceeds installation maximum") {
 			t.Fatalf("error = %v; want installation maximum diagnostic", err)
 		}
-		if hostFileExists(t, preparationPath(fx.root, fx.request.Identity.WorkloadID)) {
+		if hostFileExists(t, preparationRecordPath(fx.root, fx.request.Identity.WorkloadID)) {
 			t.Fatal("refused memory request wrote a preparation marker")
 		}
 

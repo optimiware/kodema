@@ -9,8 +9,6 @@ package kube
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"os"
 	"strings"
@@ -22,6 +20,7 @@ import (
 	"github.com/optimiware/kodema/internal/kernel/definition"
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/shell/runtime"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 )
 
 // Pinned manifest vocabulary shared by the generated manifests and the pod
@@ -525,7 +524,7 @@ func New(config Config) (*Adapter, error) {
 	}
 	clock := config.Clock
 	if clock == nil {
-		clock = realClock{}
+		clock = adapterutil.RealClock{}
 	}
 	return &Adapter{
 		cluster:          config.Cluster,
@@ -636,34 +635,5 @@ func WorkspaceClaimName(workspace id.WorkspaceID) (string, error) {
 	if _, err := id.ParseWorkspaceID(string(workspace)); err != nil {
 		return "", fault.Wrap(fault.InvalidInput, "workspace id is invalid", err)
 	}
-	return "kodema-workspace-" + stableDigest(string(workspace)), nil
-}
-
-// stableDigest returns a short deterministic, DNS-safe digest of a stable
-// identity. Object names are derived only from persisted identities, never from
-// GenerateName, so a retry finds the same object.
-func stableDigest(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])[:24]
-}
-
-// realClock is the production clock. It never appears in unit tests.
-type realClock struct{}
-
-// Now returns the current wall-clock time.
-func (realClock) Now() time.Time { return time.Now() }
-
-// Sleep waits for the duration or until the context ends.
-func (realClock) Sleep(ctx context.Context, duration time.Duration) error {
-	if duration <= 0 {
-		return ctx.Err()
-	}
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	return "kodema-workspace-" + adapterutil.StableDigest(string(workspace)), nil
 }

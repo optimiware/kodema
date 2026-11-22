@@ -189,13 +189,8 @@ func evaluateMembership(read AuthorityRead, service bool, rows MembershipRows) (
 		}
 	}
 
-	var tenantWide, project *tenancy.Membership
-	if tenantRow.Membership != nil {
-		tenantWide = tenantRow.Membership
-	}
-	if projectRow.Membership != nil {
-		project = projectRow.Membership
-	}
+	tenantWide := tenantRow.Membership
+	project := projectRow.Membership
 
 	var roles []tenancy.Role
 	var ok bool

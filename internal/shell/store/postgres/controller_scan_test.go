@@ -32,7 +32,7 @@ func TestControllerScanWithoutFiltersRendersNoEmptyWhere(t *testing.T) {
 	if !ok {
 		t.Fatal("schema has no events table")
 	}
-	rendered, err := buildControllerScanStatement(meta, store.ScanQuery{Table: "events", Limit: 10})
+	rendered, err := buildScanStatement(meta, nil, store.ScanQuery{Table: "events", Limit: 10})
 	if err != nil {
 		t.Fatalf("render unfiltered controller scan: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestScopedScanBuildersNeverRenderEmptyWhere(t *testing.T) {
 		if !ok {
 			t.Fatalf("schema has no %q table", table.Name)
 		}
-		rendered, err := buildScanStatement(meta, scope, store.ScanQuery{Table: table.Name, Limit: 1})
+		rendered, err := buildScanStatement(meta, &scope, store.ScanQuery{Table: table.Name, Limit: 1})
 		if err != nil {
 			t.Fatalf("render scan for %q: %v", table.Name, err)
 		}

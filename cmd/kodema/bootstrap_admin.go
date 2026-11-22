@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/optimiware/kodema/internal/id"
 	shellapp "github.com/optimiware/kodema/internal/shell/app"
@@ -184,19 +183,7 @@ func bootstrapAdminKeyed(ctx context.Context, getenv productionEnv, tenant id.Te
 	if err != nil {
 		return zero, err
 	}
-	verifier, err := oidc.NewVerifier(oidc.Config{
-		Issuer: values["KODEMA_OIDC_ISSUER"], Audience: values["KODEMA_OIDC_AUDIENCE"], ClockSkew: time.Minute,
-		JWKSURL:            values["KODEMA_OIDC_JWKS_URL"],
-		Algorithms:         []string{oidc.AlgorithmRS256, oidc.AlgorithmES256},
-		HTTPClient:         client,
-		MaxJWKSBytes:       1 << 20,
-		MaxTokenBytes:      1 << 20,
-		CacheTTL:           10 * time.Minute,
-		MinRefreshInterval: 10 * time.Second,
-		SubjectClaim:       strings.TrimSpace(getenv("KODEMA_OIDC_SUBJECT_CLAIM")),
-		TenantClaim:        values["KODEMA_OIDC_TENANT_CLAIM"],
-		ProjectClaim:       strings.TrimSpace(getenv("KODEMA_OIDC_PROJECT_CLAIM")),
-	})
+	verifier, err := oidc.NewVerifier(oidcConfigFromEnv(getenv, client))
 	if err != nil {
 		return zero, err
 	}

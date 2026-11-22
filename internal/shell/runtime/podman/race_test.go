@@ -7,12 +7,14 @@ package podman
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel"
 	"github.com/optimiware/kodema/internal/kernel/engine"
 )
@@ -313,5 +315,45 @@ func TestConcurrentRefreshKeepsTokenWhole(t *testing.T) {
 	}
 	if calls := fx.libpod.callsFor("StartContainer"); calls != 0 {
 		t.Fatalf("concurrent refresh restarted %d containers", calls)
+	}
+}
+
+func TestKeyedLocksCleanUpAfterConcurrentUse(t *testing.T) {
+	fx := newFixture(t)
+
+	const keys = 16
+	const workersPerKey = 8
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for keyIdx := range keys {
+		workloadID := id.WorkloadID(fmt.Sprintf("workload-lock-%d", keyIdx))
+		workspaceID := id.WorkspaceID(fmt.Sprintf("workspace-lock-%d", keyIdx))
+		for range workersPerKey {
+			wait.Add(1)
+			go func() {
+				defer wait.Done()
+				<-start
+				unlockWorkload := fx.adapter.lockFor(workloadID)
+				unlockWorkspace := fx.adapter.lockForWorkspace(workspaceID)
+				unlockWorkspace()
+				unlockWorkload()
+			}()
+		}
+	}
+	close(start)
+	wait.Wait()
+
+	fx.adapter.mu.Lock()
+	workloadLocks := len(fx.adapter.locks)
+	fx.adapter.mu.Unlock()
+	if workloadLocks != 0 {
+		t.Fatalf("adapter.locks retained %d entries after all unlocks; want 0", workloadLocks)
+	}
+
+	fx.adapter.workspaceMu.Lock()
+	workspaceLocks := len(fx.adapter.workspaceLocks)
+	fx.adapter.workspaceMu.Unlock()
+	if workspaceLocks != 0 {
+		t.Fatalf("adapter.workspaceLocks retained %d entries after all unlocks; want 0", workspaceLocks)
 	}
 }

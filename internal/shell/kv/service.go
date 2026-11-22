@@ -100,7 +100,7 @@ func (service *Service) Put(ctx context.Context, command PutCommand) (PutResult,
 	if !command.Actor.Enabled {
 		return PutResult{}, fault.New(fault.Forbidden, "acting principal is disabled")
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return PutResult{}, fault.New(fault.Forbidden, "acting principal scope does not cover target project")
 	}
 	if len(command.Data) > MaxValueBytes {
@@ -182,7 +182,7 @@ func (service *Service) Get(ctx context.Context, command GetCommand) (Object, er
 	if !command.Actor.Enabled {
 		return Object{}, fault.New(fault.Forbidden, "acting principal is disabled")
 	}
-	if !scopeContains(command.Actor.Scope, command.Scope) {
+	if !command.Actor.Scope.Contains(command.Scope) {
 		return Object{}, fault.New(fault.Forbidden, "acting principal scope does not cover target project")
 	}
 	key, err := ParseKey(string(command.Key))
@@ -207,16 +207,6 @@ func validateProjectScope(scope tenancy.Scope) error {
 		return fault.New(fault.InvalidInput, "kv operations require a project scope")
 	}
 	return nil
-}
-
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
-	}
-	if owner.ProjectID == "" {
-		return true
-	}
-	return owner.ProjectID == target.ProjectID
 }
 
 // authorityLocks re-reads the acting principal's current durable authority

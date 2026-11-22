@@ -45,14 +45,14 @@ type proxyTurnBinding struct {
 // service credentials and execution/action attribution headers to OpenCode's
 // LLM requests.
 type OpenCodeLLMProxy struct {
-	kodemaBase  *url.URL
-	creds       client.CredentialSource
-	localAPIKey string
-	client      *http.Client
-	clock       Clock
+	defaultListenAddr string
+	kodemaBase        *url.URL
+	creds             client.CredentialSource
+	localAPIKey       string
+	client            *http.Client
+	clock             Clock
 
-	listener net.Listener
-	server   *http.Server
+	server *http.Server
 
 	mu    sync.RWMutex
 	turns map[string]*proxyTurnBinding // "exec/action" -> binding
@@ -105,9 +105,10 @@ func NewOpenCodeLLMProxy(config OpenCodeLLMProxyConfig) (*OpenCodeLLMProxy, erro
 		rt = defaultNoProxyTransport()
 	}
 	p := &OpenCodeLLMProxy{
-		kodemaBase:  parsed,
-		creds:       config.Credentials,
-		localAPIKey: localKey,
+		defaultListenAddr: strings.TrimSpace(config.ListenAddr),
+		kodemaBase:        parsed,
+		creds:             config.Credentials,
+		localAPIKey:       localKey,
 		client: &http.Client{
 			Transport: rt,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -137,6 +138,10 @@ func (p *OpenCodeLLMProxy) LocalAPIKey() string {
 // loopback bound IP) and serves traffic in the background. Call Close to stop
 // cleanly.
 func (p *OpenCodeLLMProxy) Start(listenAddr string) (string, error) {
+	listenAddr = strings.TrimSpace(listenAddr)
+	if listenAddr == "" {
+		listenAddr = p.defaultListenAddr
+	}
 	if listenAddr == "" {
 		listenAddr = "127.0.0.1:0"
 	}
@@ -159,9 +164,6 @@ func (p *OpenCodeLLMProxy) Start(listenAddr string) (string, error) {
 		_ = ln.Close()
 		return "", fmt.Errorf("opencode LLM proxy bound non-loopback address %q", ln.Addr().String())
 	}
-	p.mu.Lock()
-	p.listener = ln
-	p.mu.Unlock()
 	go func() {
 		_ = p.server.Serve(ln)
 	}()

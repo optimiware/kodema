@@ -94,7 +94,7 @@ func newGCPTokenSource(endpoint string, now func() time.Time) (*gcpTokenSource, 
 				DialContext:       (&net.Dialer{Timeout: gcpMetadataDialTimeout}).DialContext,
 				DisableKeepAlives: true,
 			},
-			CheckRedirect: gcpRefuseRedirect,
+			CheckRedirect: refuseRedirect,
 			Timeout:       gcpMetadataRequestTimeout,
 		},
 		now: now,
@@ -110,7 +110,7 @@ func gcpMetadataOrigin(value string) (string, error) {
 	if origin == "" {
 		origin = gcpMetadataEndpoint
 	}
-	parsed, err := gcpParseOrigin(origin, "gcp metadata endpoint")
+	parsed, err := parseOrigin(origin, "gcp metadata endpoint")
 	if err != nil {
 		return "", err
 	}
@@ -217,7 +217,7 @@ func (source *gcpTokenSource) read(ctx context.Context) (string, time.Duration, 
 	if response.Header.Get("Metadata-Flavor") != gcpMetadataFlavor {
 		return "", 0, fault.New(fault.DependencyUnavailable, "gcp metadata response does not identify the metadata server")
 	}
-	payload, err := gcpReadResponse(response.Body, gcpMetadataMaxResponse, "gcp metadata server")
+	payload, err := readBoundedResponse(response.Body, gcpMetadataMaxResponse, "gcp metadata server")
 	if err != nil {
 		// See the entry comment of Decrypt: a body read interrupted by
 		// cancellation is cancellation, not an unavailable dependency.
@@ -232,7 +232,7 @@ func (source *gcpTokenSource) read(ctx context.Context) (string, time.Duration, 
 		TokenType   string `json:"token_type"`
 	}
 	if err := json.Unmarshal(payload, &decoded); err != nil ||
-		!gcpValidAccessToken(decoded.AccessToken) ||
+		!isPrintableASCIIToken(decoded.AccessToken) ||
 		!strings.EqualFold(decoded.TokenType, "Bearer") ||
 		decoded.ExpiresIn <= 0 {
 		return "", 0, fault.New(fault.DependencyUnavailable, "gcp metadata server returned no usable access token")
@@ -242,21 +242,4 @@ func (source *gcpTokenSource) read(ctx context.Context) (string, time.Duration, 
 		lifetime = time.Duration(decoded.ExpiresIn) * time.Second
 	}
 	return decoded.AccessToken, lifetime, nil
-}
-
-// gcpValidAccessToken reports whether token can be a bearer credential. It
-// becomes an HTTP header field, so it must be printable ASCII without a space:
-// a control character, a space or any non-ASCII byte is refused here rather
-// than left to net/http's later header validation. The response bound already
-// limits its length.
-func gcpValidAccessToken(token string) bool {
-	if token == "" {
-		return false
-	}
-	for index := 0; index < len(token); index++ {
-		if token[index] <= ' ' || token[index] >= 0x7f {
-			return false
-		}
-	}
-	return true
 }

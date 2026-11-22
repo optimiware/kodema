@@ -280,7 +280,7 @@ func (management *Management) Read(ctx context.Context, command ReadCommand) (De
 // List authorizes, rechecks current membership and returns the scoped
 // definitions.
 func (management *Management) List(ctx context.Context, command ListCommand) ([]Definition, error) {
-	const operation authorize.OperationName = "pipeline.read"
+	const operation authorize.OperationName = "pipeline.list"
 	if err := management.authorize(ctx, command.Actor, operation, command.Scope); err != nil {
 		return nil, err
 	}
@@ -497,7 +497,7 @@ func (management *Management) confirm(ctx context.Context, reads []authorize.Aut
 }
 
 func (management *Management) authorize(ctx context.Context, actor authorize.Principal, operation authorize.OperationName, scope tenancy.Scope) error {
-	if !scopeContains(actor.Scope, scope) {
+	if !actor.Scope.Contains(scope) {
 		return fault.New(fault.Forbidden, "actor scope does not match command scope")
 	}
 	decision, err := management.authorizer.Authorize(ctx, actor, operation, scope)
@@ -508,13 +508,6 @@ func (management *Management) authorize(ctx context.Context, actor authorize.Pri
 		return fault.New(fault.Forbidden, fmt.Sprintf("principal is not authorized for %q", operation))
 	}
 	return nil
-}
-
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
-	}
-	return owner.ProjectID == "" || owner.ProjectID == target.ProjectID
 }
 
 func registryRequires(operation authorize.OperationName) (authorize.Requires, error) {

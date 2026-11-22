@@ -187,7 +187,6 @@ func buildDurableTestEnvironment(ctx context.Context, builder *builder) (*enviro
 		controller: test.ControllerURL,
 		publisher:  test.PublisherURL,
 		auth:       test.AuthURL,
-		closePools: true,
 	})
 	if err != nil {
 		return nil, err

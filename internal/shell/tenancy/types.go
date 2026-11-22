@@ -104,6 +104,19 @@ func (scope Scope) ProjectScoped() bool {
 	return scope.ProjectID != ""
 }
 
+// Contains reports whether scope covers target. A tenant-scoped scope covers
+// every project in its tenant; a project-scoped scope covers only that exact
+// project. An empty tenant id on either side never matches.
+func (scope Scope) Contains(target Scope) bool {
+	if scope.TenantID == "" || target.TenantID == "" {
+		return false
+	}
+	if scope.TenantID != target.TenantID {
+		return false
+	}
+	return scope.ProjectID == "" || scope.ProjectID == target.ProjectID
+}
+
 // Validate checks that the scope names a usable tenant and, when present, a
 // usable project. Failures use the declared invalid_input class.
 func (scope Scope) Validate() error {

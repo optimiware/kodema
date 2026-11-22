@@ -24,7 +24,6 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel"
 	"github.com/optimiware/kodema/internal/kernel/flow"
-	"github.com/optimiware/kodema/internal/shell/event"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
@@ -79,60 +78,4 @@ func (service *Service) cancelReductionWithReason(
 			fmt.Sprintf("cancel reduction for execution %q returned no commit", aggregate.ID))
 	}
 	return aggregate, commit, nil
-}
-
-// cancellationPreImage builds the version-guarded pre-image of the aggregate
-// the reduction was derived from. Actions stay in declaration order.
-func cancellationPreImage(scope tenancy.Scope, aggregate kernel.Execution) event.ExecutionPreImage {
-	actions := make([]event.ActionPreImage, len(aggregate.Actions))
-	for position, action := range aggregate.Actions {
-		actions[position] = event.ActionPreImage{
-			ActionID: action.ID,
-			Index:    action.Index,
-			Kind:     action.Kind,
-			State:    action.State,
-			Version:  action.Version,
-		}
-	}
-	return event.ExecutionPreImage{
-		Scope:       scope,
-		ExecutionID: aggregate.ID,
-		Version:     aggregate.Version,
-		State:       aggregate.State,
-		Actions:     actions,
-	}
-}
-
-// appendCancellationProjection returns the unit's own events followed by the
-// cancel commit's lifecycle projection. Neither task event is a projected
-// class, so no event is excluded. A projection refusal is returned unchanged,
-// so the caller fails the operation closed before the port.
-func appendCancellationProjection(
-	own []event.Envelope,
-	scope tenancy.Scope,
-	aggregate kernel.Execution,
-	commit flow.Commit,
-) ([]event.Envelope, error) {
-	projected, err := event.ProjectLifecycle(cancellationPreImage(scope, aggregate), commit)
-	if err != nil {
-		return nil, err
-	}
-	remainder := event.ExcludeOwned(projected)
-	events := append([]event.Envelope(nil), own...)
-	for _, spec := range remainder {
-		envelope, err := event.NewEnvelope(
-			spec.ID, spec.Source, spec.Scope, spec.At,
-			event.EnvelopeInput{
-				Type:           spec.Type,
-				SubjectID:      spec.SubjectID,
-				SubjectVersion: spec.SubjectVersion,
-				Data:           spec.Data,
-			},
-		)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, envelope)
-	}
-	return events, nil
 }

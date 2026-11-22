@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -61,10 +60,7 @@ func runOutputPush(ctx context.Context, config Config, args []string, ports Port
 	if len(positionals) != 0 {
 		return usage(ports.Err, "output push takes no arguments")
 	}
-	getenv := deps.Login.Environment
-	if getenv == nil {
-		getenv = os.Getenv
-	}
+	getenv := resolveEnv(deps)
 	if execution = strings.TrimSpace(execution); execution == "" {
 		execution = strings.TrimSpace(getenv("KODEMA_EXECUTION"))
 	}

@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
-	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -92,7 +90,7 @@ func (kms *AWSKMS) send(ctx context.Context, service string, request *http.Reque
 	defer func() { _ = response.Body.Close() }()
 	// Read at most one byte over the bound so an oversized body is recognised
 	// instead of truncated into a parse failure.
-	body, err := io.ReadAll(io.LimitReader(response.Body, awsMaxResponse+1))
+	body, oversized, err := readBoundedBody(response.Body, awsMaxResponse)
 	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
 			return awsReply{}, contextErr
@@ -104,12 +102,10 @@ func (kms *AWSKMS) send(ctx context.Context, service string, request *http.Reque
 	if contextErr := ctx.Err(); contextErr != nil {
 		return awsReply{}, contextErr
 	}
-	reply := awsReply{status: response.StatusCode, errorType: response.Header.Get("X-Amzn-Errortype")}
-	if int64(len(body)) > awsMaxResponse {
-		reply.oversized = true
-		return reply, nil
+	reply := awsReply{status: response.StatusCode, errorType: response.Header.Get("X-Amzn-Errortype"), oversized: oversized}
+	if !oversized {
+		reply.body = body
 	}
-	reply.body = body
 	return reply, nil
 }
 
@@ -145,71 +141,4 @@ func awsErrorType(reply awsReply) string {
 		name = after
 	}
 	return strings.TrimSpace(name)
-}
-
-// awsEndpoint validates one service origin under the Scaleway BaseURL rule: the
-// client never downgrades to cleartext, never carries an embedded credential,
-// query or fragment, and trims only a trailing path separator.
-func awsEndpoint(service, value, fallback string) (string, error) {
-	endpoint := strings.TrimRight(value, "/")
-	if endpoint == "" {
-		return fallback, nil
-	}
-	if strings.ContainsAny(endpoint, " \t\r\n") {
-		return "", fault.New(fault.InvalidInput, service+" endpoint contains whitespace")
-	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil {
-		return "", fault.New(fault.InvalidInput, service+" endpoint is not a valid URL")
-	}
-	if parsed.Scheme != "https" || parsed.Host == "" {
-		return "", fault.New(fault.InvalidInput, service+" endpoint must be an explicit https URL")
-	}
-	if parsed.User != nil {
-		return "", fault.New(fault.InvalidInput, service+" endpoint must not carry userinfo")
-	}
-	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
-		return "", fault.New(fault.InvalidInput, service+" endpoint must not carry a query or fragment")
-	}
-	return endpoint, nil
-}
-
-// awsOwnedTransport returns the private transport New installs, under the
-// Scaleway client's rules: a nil transport gets that client's explicit defaults
-// with no proxy function; a caller-supplied *http.Transport is cloned so its
-// explicit TLS, dial and HTTP/2 settings are preserved and its proxy is
-// cleared. An opaque RoundTripper, a typed nil and the shared
-// http.DefaultTransport are refused rather than silently trusted.
-func awsOwnedTransport(transport http.RoundTripper) (*http.Transport, error) {
-	if transport == nil {
-		return newScalewayTransport(), nil
-	}
-	caller, ok := transport.(*http.Transport)
-	if !ok {
-		return nil, fault.New(fault.InvalidInput, "aws kms client must use an explicit HTTP transport")
-	}
-	if caller == nil {
-		return nil, fault.New(fault.InvalidInput, "aws kms client supplies a nil HTTP transport")
-	}
-	if http.DefaultTransport != nil && caller == http.DefaultTransport {
-		return nil, fault.New(fault.InvalidInput, "aws kms client must not use the shared default HTTP transport")
-	}
-	owned := caller.Clone()
-	owned.Proxy = nil
-	return owned, nil
-}
-
-// awsPrintableToken reports whether value is a non-empty run of printable
-// ASCII without a space: the only shape a token or credential that becomes a
-// header or form value may have.
-func awsPrintableToken(value string) bool {
-	if value == "" {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		if value[index] <= ' ' || value[index] >= 0x7f {
-			return false
-		}
-	}
-	return true
 }

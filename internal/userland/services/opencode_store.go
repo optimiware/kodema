@@ -209,42 +209,7 @@ func (store *FileOpenCodeStateStore) withLock(path string, fn func() error) erro
 }
 
 func (store *FileOpenCodeStateStore) writeJSON(dir, path string, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(dir, ".opencode-state-*")
-	if err != nil {
-		return fmt.Errorf("create opencode state temp file: %w", err)
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-	if err := temp.Chmod(0o600); err != nil {
-		temp.Close()
-		return err
-	}
-	if _, err := temp.Write(data); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return fmt.Errorf("replace opencode state record: %w", err)
-	}
-	syncFn := store.syncDir
-	if syncFn == nil {
-		syncFn = syncDirectory
-	}
-	if err := syncFn(dir); err != nil {
-		return fmt.Errorf("sync opencode state directory: %w", err)
-	}
-	return nil
+	return writeAtomicJSON(dir, ".opencode-state-*", path, value, store.syncDir)
 }
 
 func validateOpenCodeScope(tenant id.TenantID, project id.ProjectID) error {

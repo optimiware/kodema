@@ -2,7 +2,6 @@ package opsapp
 
 import (
 	"context"
-	"strconv"
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/fault"
@@ -52,10 +51,7 @@ func eventHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			if err != nil {
 				return api.Result{}, err
 			}
-			page := request.Page
-			if page == nil {
-				page = &api.Page{}
-			}
+			page := pageOrDefault(request.Page)
 			after, err := decodeEventCursor(page.Cursor)
 			if err != nil {
 				return api.Result{}, err
@@ -139,14 +135,9 @@ func decodeEventCursor(cursor string) (uint64, error) {
 	if cursor == "" {
 		return 0, nil
 	}
-	sortKey, err := api.DecodeCursor(cursor)
+	sequence, err := api.DecodeEventCursor(cursor)
 	if err != nil {
 		return 0, wireRefusal(err)
-	}
-	// 63 bits: the store sequence is a signed 64-bit column.
-	sequence, err := strconv.ParseUint(sortKey, 10, 63)
-	if err != nil || strconv.FormatUint(sequence, 10) != sortKey {
-		return 0, fault.New(fault.InvalidInput, "event cursor does not carry a canonical decimal sequence")
 	}
 	return sequence, nil
 }
@@ -154,7 +145,7 @@ func decodeEventCursor(cursor string) (uint64, error) {
 // encodeEventCursor encodes the capability's sequence as the opaque public
 // cursor. The next cursor is always present, including at sequence zero.
 func encodeEventCursor(sequence uint64) (string, error) {
-	encoded, err := api.EncodeCursor(strconv.FormatUint(sequence, 10))
+	encoded, err := api.EncodeEventCursor(sequence)
 	if err != nil {
 		return "", wireRefusal(err)
 	}

@@ -269,21 +269,9 @@ func buildProduction(options serverOptions, getenv productionEnv, kube driverkub
 			ControllerURL:    values["KODEMA_CONTROLLER_DATABASE_URL"],
 			PublisherURL:     values["KODEMA_PUBLISHER_DATABASE_URL"],
 			AuthURL:          values["KODEMA_AUTH_DATABASE_URL"],
-			OIDC: oidc.Config{
-				OIDCConfig:         identity.OIDCConfig{Issuer: values["KODEMA_OIDC_ISSUER"], Audience: values["KODEMA_OIDC_AUDIENCE"], ClockSkew: time.Minute},
-				JWKSURL:            values["KODEMA_OIDC_JWKS_URL"],
-				Algorithms:         []string{oidc.AlgorithmRS256, oidc.AlgorithmES256},
-				HTTPClient:         oidcClient,
-				MaxJWKSBytes:       1 << 20,
-				MaxTokenBytes:      1 << 20,
-				CacheTTL:           10 * time.Minute,
-				MinRefreshInterval: 10 * time.Second,
-				SubjectClaim:       strings.TrimSpace(getenv("KODEMA_OIDC_SUBJECT_CLAIM")),
-				TenantClaim:        values["KODEMA_OIDC_TENANT_CLAIM"],
-				ProjectClaim:       strings.TrimSpace(getenv("KODEMA_OIDC_PROJECT_CLAIM")),
-			},
-			Registry:  registry.Config{Transport: http.DefaultTransport, Credentials: registryCredentials},
-			Discovery: discovery,
+			OIDC:             oidcConfigFromEnv(getenv, oidcClient),
+			Registry:         registry.Config{Transport: http.DefaultTransport, Credentials: registryCredentials},
+			Discovery:        discovery,
 		},
 	}
 	// One runtime adapter and one workspace claim template per tenant. The
@@ -500,14 +488,7 @@ func resolveGitCompanionConfig(getenv productionEnv) (*shellapp.GitCompanionConf
 	if tokenFile == "" {
 		return nil, fmt.Errorf("KODEMA_GIT_ADMIN_URL requires KODEMA_GIT_PROVISION_TOKEN_FILE")
 	}
-	var trustedOrigins []string
-	if rawOrigins := strings.TrimSpace(getenv("KODEMA_GIT_TRUSTED_ORIGINS")); rawOrigins != "" {
-		for _, part := range strings.Split(rawOrigins, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				trustedOrigins = append(trustedOrigins, trimmed)
-			}
-		}
-	}
+	trustedOrigins := splitComma(getenv("KODEMA_GIT_TRUSTED_ORIGINS"))
 	return &shellapp.GitCompanionConfig{
 		AdminURL:       adminURL,
 		PublicGitURL:   strings.TrimSpace(getenv("KODEMA_GIT_PUBLIC_URL")),
@@ -759,7 +740,34 @@ func oidcHTTPClient(caFile string) (*http.Client, error) {
 			return nil, fmt.Errorf("OIDC CA bundle has no usable certificate")
 		}
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
 	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	return &http.Client{Transport: transport, Timeout: 15 * time.Second}, nil
+}
+
+// oidcConfigFromEnv builds the OIDC verifier configuration shared by the
+// production server, durable test server and bootstrap-admin command.
+func oidcConfigFromEnv(getenv productionEnv, httpClient *http.Client) oidc.Config {
+	return oidc.Config{
+		OIDCConfig: identity.OIDCConfig{
+			Issuer:    strings.TrimSpace(getenv("KODEMA_OIDC_ISSUER")),
+			Audience:  strings.TrimSpace(getenv("KODEMA_OIDC_AUDIENCE")),
+			ClockSkew: time.Minute,
+		},
+		JWKSURL:            strings.TrimSpace(getenv("KODEMA_OIDC_JWKS_URL")),
+		Algorithms:         []string{oidc.AlgorithmRS256, oidc.AlgorithmES256},
+		HTTPClient:         httpClient,
+		MaxJWKSBytes:       1 << 20,
+		MaxTokenBytes:      1 << 20,
+		CacheTTL:           10 * time.Minute,
+		MinRefreshInterval: 10 * time.Second,
+		SubjectClaim:       strings.TrimSpace(getenv("KODEMA_OIDC_SUBJECT_CLAIM")),
+		TenantClaim:        strings.TrimSpace(getenv("KODEMA_OIDC_TENANT_CLAIM")),
+		ProjectClaim:       strings.TrimSpace(getenv("KODEMA_OIDC_PROJECT_CLAIM")),
+	}
 }

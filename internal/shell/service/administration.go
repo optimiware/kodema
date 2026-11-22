@@ -167,36 +167,6 @@ type StatusCommand struct {
 	Content         receipt.Content     `json:"content"`
 }
 
-// admit validates the presented principal and pins that its kind can satisfy
-// the registry grant. It never treats the principal's role snapshot as current
-// authority.
-func admit(actor authorize.Principal, name authorize.OperationName) (authorize.Operation, error) {
-	if err := actor.Validate(); err != nil {
-		return authorize.Operation{}, err
-	}
-	op, ok := authorize.LookupOperation(name)
-	if !ok {
-		return authorize.Operation{}, fault.New(fault.InternalFailure, "service administration operation is not registered")
-	}
-	switch actor.Kind {
-	case identity.KindHuman:
-		if !op.Requires.AdmitsKind(identity.KindHuman) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no human role")
-		}
-	case identity.KindService:
-		if !op.Requires.AdmitsKind(identity.KindService) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no service role")
-		}
-	case identity.KindExecution:
-		if !op.Requires.AdmitsKind(identity.KindExecution) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no execution permission")
-		}
-	default:
-		return authorize.Operation{}, fault.New(fault.Forbidden, "unknown principal kind")
-	}
-	return op, nil
-}
-
 // authorizeCommand runs the matrix authorization first, then confirms the
 // current principal. The current read is authority evidence for this command,
 // never durable permission.
@@ -212,10 +182,10 @@ func (admin *Admin) authorizeCommand(
 	if !scope.ProjectScoped() {
 		return authorize.Operation{}, fault.New(fault.InvalidInput, "service administration requires a project scope")
 	}
-	if !scopeContains(actor.Scope, scope) {
+	if !actor.Scope.Contains(scope) {
 		return authorize.Operation{}, fault.New(fault.Forbidden, "actor scope does not match the command scope")
 	}
-	op, err := admit(actor, name)
+	op, err := authorize.AdmitPrincipalKind(actor, name)
 	if err != nil {
 		return authorize.Operation{}, err
 	}
@@ -232,17 +202,10 @@ func (admin *Admin) authorizeCommand(
 	return op, nil
 }
 
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
-	}
-	return owner.ProjectID == "" || owner.ProjectID == target.ProjectID
-}
-
 // confirmActor re-reads the actor's current principal so a previously calculated
 // allow never substitutes for current enablement and role. Execution principals
-// are refused because every service-administration operation grants no execution
-// permission.
+// are refused before confirmActor because every service-administration operation
+// grants no execution permission.
 func (admin *Admin) confirmActor(ctx context.Context, actor authorize.Principal, op authorize.Operation, scope tenancy.Scope) error {
 	principal, err := identity.Current(ctx, admin.principals, identity.PrincipalRequest{
 		Scope:       scope,
@@ -253,15 +216,6 @@ func (admin *Admin) confirmActor(ctx context.Context, actor authorize.Principal,
 	}
 	if principal.Kind != actor.Kind {
 		return fault.New(fault.Forbidden, "current principal kind does not match the authenticated actor")
-	}
-	if principal.Kind == identity.KindExecution {
-		if op.Requires.Execution == authorize.ExecNone {
-			return fault.New(fault.Forbidden, fmt.Sprintf("execution principal has no permission for %q", op.Name))
-		}
-		if principal.ExecutionID == "" || principal.ExecutionID != actor.ExecutionID {
-			return fault.New(fault.Forbidden, "execution principal identity does not match the authenticated actor")
-		}
-		return nil
 	}
 	if !op.Requires.Allows(principal) {
 		return fault.New(fault.Forbidden, fmt.Sprintf("principal does not currently hold the grant for %q", op.Name))

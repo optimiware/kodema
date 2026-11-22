@@ -187,12 +187,8 @@ type OIDCConfig struct {
 // Validate checks an explicit HTTPS issuer, a non-empty audience and a
 // non-negative clock skew. Plain HTTP issuers are refused.
 func (config OIDCConfig) Validate() error {
-	const scheme = "https://"
-	if !strings.HasPrefix(config.Issuer, scheme) || len(config.Issuer) == len(scheme) {
-		return fault.New(fault.InvalidInput, "OIDC issuer must be an explicit https URL")
-	}
-	if strings.ContainsAny(config.Issuer, " \t\r\n") {
-		return fault.New(fault.InvalidInput, "OIDC issuer contains whitespace")
+	if err := validateHTTPSURL("OIDC issuer", config.Issuer); err != nil {
+		return err
 	}
 	if config.Audience == "" {
 		return fault.New(fault.InvalidInput, "OIDC audience is empty")

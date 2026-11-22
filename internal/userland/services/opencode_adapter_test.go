@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
@@ -811,5 +813,42 @@ func TestOpenCodeAdapterLiveSSECancellationAndProxyRegistrationAfterTaskLock(t *
 	}
 	if !ocClient.abortHasDeadl {
 		t.Fatal("AbortSession context must have a bounded deadline")
+	}
+}
+
+func TestTruncateStringUTF8Safe(t *testing.T) {
+	// 3-byte euro sign (€) and 4-byte emoji (🚀) straddling the cut boundary.
+	sample := "abc€🚀z"
+	for maxBytes := 1; maxBytes <= len(sample)+2; maxBytes++ {
+		got := truncateString(sample, maxBytes)
+		if len(got) > maxBytes {
+			t.Fatalf("truncateString(%q, %d) len = %d > %d", sample, maxBytes, len(got), maxBytes)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("truncateString(%q, %d) produced invalid UTF-8: %x", sample, maxBytes, []byte(got))
+		}
+	}
+	if got := truncateString("abc€", 5); got != "abc" {
+		t.Fatalf("truncateString(\"abc€\", 5) = %q; want \"abc\"", got)
+	}
+	if got := truncateString("€a", 2); got != "" {
+		t.Fatalf("truncateString(\"€a\", 2) = %q; want \"\"", got)
+	}
+	// Invalid UTF-8 continuation runs must bound back-up to utf8.UTFMax-1 and
+	// fall back to a plain byte cut instead of wiping out the string.
+	badBytes := strings.Repeat("\x80", 600)
+	if got := truncateString(badBytes, 512); len(got) != 512 {
+		t.Fatalf("truncateString(600 continuation bytes, 512) len = %d; want 512", len(got))
+	}
+
+	// Verify commandDetail and classifyOpenCodeHTTPError stay valid UTF-8 at the 512-byte cap.
+	overLimit := strings.Repeat("a", 510) + "€tail"
+	detail := commandDetail(GitCommandResult{Stderr: []byte(overLimit)})
+	if len(detail) > 512 || !utf8.ValidString(detail) {
+		t.Fatalf("commandDetail invalid UTF-8 or over cap: len=%d valid=%v", len(detail), utf8.ValidString(detail))
+	}
+	httpErr := classifyOpenCodeHTTPError("send message", 500, []byte(overLimit))
+	if !utf8.ValidString(httpErr.Error()) {
+		t.Fatalf("classifyOpenCodeHTTPError produced invalid UTF-8: %q", httpErr.Error())
 	}
 }

@@ -663,7 +663,6 @@ var backendResponseHeaders = map[string]bool{
 type backendResponse struct {
 	target http.ResponseWriter
 	header http.Header
-	status int
 	wrote  bool
 }
 
@@ -683,7 +682,6 @@ func (response *backendResponse) WriteHeader(status int) {
 		status = http.StatusOK
 	}
 	response.wrote = true
-	response.status = status
 	target := response.target.Header()
 	for key, values := range response.header {
 		if !backendResponseHeaders[http.CanonicalHeaderKey(key)] {

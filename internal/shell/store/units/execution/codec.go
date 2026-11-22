@@ -81,17 +81,6 @@ func decodeAnswerProvenance(raw []byte) (string, []byte, error) {
 	return envelope.Note, envelope.Provenance, nil
 }
 
-// decodeSnapshot rebuilds the immutable kernel snapshot from the shared
-// snapshot document. A malformed document is an internal_failure, never an
-// empty snapshot: admitted bytes are never silently dropped.
-func decodeSnapshot(data []byte) (*definition.Snapshot, error) {
-	admitted, err := snapshotdoc.Decode(data)
-	if err != nil {
-		return nil, err
-	}
-	return definitionSnapshot(admitted)
-}
-
 // definitionSnapshot maps the shared admitted snapshot into the Kernel's
 // immutable definition snapshot. The admitted action definitions come from the
 // document because the schema has no action-definition columns.

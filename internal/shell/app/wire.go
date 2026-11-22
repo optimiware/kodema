@@ -7,7 +7,6 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
 	kernelengine "github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/shell/app/bridges"
@@ -291,13 +290,8 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 	// PrepareRequest; the wrapper intercepts only that post-commit delivery.
 	deliverer := &activationDeliverer{inner: runtimeDeliverer}
 	derivation, err := bridges.NewDerivationKeyResolver(bridges.DerivationKeyConfig{
-		Cipher: environment.cipher,
-		Associated: secret.AssociatedData{
-			InstallationID: cfg.InstallationID,
-			SecretID:       secret.SecretID("tenant-derivation-key"),
-			Name:           id.SecretName("TENANT_DERIVATION_KEY"),
-			KeyVersion:     secret.MinKeyVersion,
-		},
+		Cipher:     environment.cipher,
+		Associated: tenantDerivationAssociated(cfg.InstallationID, secret.MinKeyVersion),
 	})
 	if err != nil {
 		return nil, err
@@ -505,7 +499,7 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 		return nil, err
 	}
 
-	bindingAuth, err := newBindingAuthenticator(principals, clock)
+	bindingAuth, err := newBindingAuthenticator(principals)
 	if err != nil {
 		return nil, err
 	}
@@ -623,12 +617,7 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 	tenantKeys := tenantKeySource{
 		cipher:     environment.cipher,
 		keyVersion: environment.keyVersion,
-		associated: secret.AssociatedData{
-			InstallationID: cfg.InstallationID,
-			SecretID:       secret.SecretID("tenant-derivation-key"),
-			Name:           id.SecretName("TENANT_DERIVATION_KEY"),
-			KeyVersion:     environment.keyVersion,
-		},
+		associated: tenantDerivationAssociated(cfg.InstallationID, environment.keyVersion),
 	}
 	var repositoryProvisioner opsapp.RepositoryProvisioner
 	if cfg.GitCompanion != nil {
@@ -636,6 +625,7 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 		if err != nil {
 			return nil, err
 		}
+		builder.addStop("git-companion-transport", provisioner.Close)
 		repositoryProvisioner = provisioner
 	}
 	bindings, err := opsapp.Bindings(opsapp.Dependencies{

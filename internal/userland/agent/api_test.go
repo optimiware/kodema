@@ -110,6 +110,7 @@ package agent_test
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -367,6 +368,26 @@ func TestRuntimeHasNoAutonomousAuthority(t *testing.T) {
 	for _, forbidden := range []string{"approval", "decision", "authorization", "authority", "credential", "token", "secret"} {
 		if strings.Contains(text, forbidden) {
 			t.Errorf("checkpoint JSON contains %q: %s", forbidden, text)
+		}
+	}
+}
+
+func TestModelRequestRejectsNaNTemperature(t *testing.T) {
+	base := func(temp float64) agent.ModelRequest {
+		return agent.ModelRequest{
+			Model:       "gpt-test",
+			Messages:    []agent.Message{{Role: "user", Content: "hi"}},
+			Temperature: &temp,
+		}
+	}
+	for _, valid := range []float64{0, 0.7, 2} {
+		if err := base(valid).Validate(); err != nil {
+			t.Errorf("temperature %v rejected: %v", valid, err)
+		}
+	}
+	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -0.01, 2.01} {
+		if err := base(invalid).Validate(); err == nil {
+			t.Errorf("temperature %v accepted; want validation error", invalid)
 		}
 	}
 }

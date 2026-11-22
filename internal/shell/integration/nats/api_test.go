@@ -412,7 +412,13 @@ func (client *fakeClient) PublishCore(_ context.Context, subject nats.Subject, p
 	return publishErr
 }
 
-func (client *fakeClient) Subscribe(_ context.Context, subject nats.Subject, handler func(context.Context, []byte) error) (nats.Subscription, error) {
+func (client *fakeClient) Subscribe(ctx context.Context, subject nats.Subject, handler func(context.Context, []byte) error) (nats.Subscription, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	if client.closed {
@@ -421,10 +427,13 @@ func (client *fakeClient) Subscribe(_ context.Context, subject nats.Subject, han
 	if client.subscribeErr != nil {
 		return nil, client.subscribeErr
 	}
+	handlerCtx, cancel := context.WithCancel(ctx)
 	subscription := &fakeSubscription{
-		subject: subject,
-		handler: handler,
-		closeCh: make(chan struct{}),
+		subject:    subject,
+		handler:    handler,
+		handlerCtx: handlerCtx,
+		cancel:     cancel,
+		closeCh:    make(chan struct{}),
 	}
 	client.subs = append(client.subs, subscription)
 	return subscription, nil
@@ -480,8 +489,10 @@ func (client *fakeClient) failJetStream(err error) {
 
 // fakeSubscription is one subscription opened by the fake client.
 type fakeSubscription struct {
-	subject nats.Subject
-	handler func(context.Context, []byte) error
+	subject    nats.Subject
+	handler    func(context.Context, []byte) error
+	handlerCtx context.Context
+	cancel     context.CancelFunc
 
 	mu         sync.Mutex
 	closed     bool
@@ -496,7 +507,11 @@ func (subscription *fakeSubscription) Close(context.Context) error {
 		close(subscription.closeCh)
 	}
 	subscription.closeCalls++
+	cancel := subscription.cancel
 	subscription.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	return nil
 }
 
@@ -504,9 +519,15 @@ func (subscription *fakeSubscription) deliver(ctx context.Context, payload []byt
 	subscription.mu.Lock()
 	closed := subscription.closed
 	handler := subscription.handler
+	handlerCtx := subscription.handlerCtx
 	subscription.mu.Unlock()
 	if closed {
 		return errSubscriptionGone
+	}
+	if ctx == nil || ctx.Err() == nil {
+		if handlerCtx != nil {
+			ctx = handlerCtx
+		}
 	}
 	return handler(ctx, payload)
 }

@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -293,6 +294,28 @@ func (o Observation) StopConfirmed() bool {
 	return o.Kind == ObservationExited && o.Stop != nil && o.Stop.IsConfirmed()
 }
 
+// Equal reports whether two observations carry the same kind, proof, exit
+// status, stop barrier and out-of-memory evidence.
+func (o Observation) Equal(other Observation) bool {
+	if o.Kind != other.Kind || o.Proof != other.Proof ||
+		o.OOMKilled != other.OOMKilled || o.MemoryLimit != other.MemoryLimit {
+		return false
+	}
+	if (o.ExitCode == nil) != (other.ExitCode == nil) {
+		return false
+	}
+	if o.ExitCode != nil && *o.ExitCode != *other.ExitCode {
+		return false
+	}
+	if (o.Stop == nil) != (other.Stop == nil) {
+		return false
+	}
+	if o.Stop != nil && *o.Stop != *other.Stop {
+		return false
+	}
+	return true
+}
+
 // Valid reports whether the observation is internally consistent.
 func (o Observation) Valid() bool {
 	switch o.Kind {
@@ -385,6 +408,16 @@ const (
 // JSON null; an empty non-nil map is JSON {}. Values are staged until a
 // runtime-confirmed successful settlement promotes them.
 type Outputs map[id.OutputKey]string
+
+// Clone returns a copy of the output map, preserving nil vs empty.
+func (o Outputs) Clone() Outputs {
+	if o == nil {
+		return nil
+	}
+	cloned := make(Outputs, len(o))
+	maps.Copy(cloned, o)
+	return cloned
+}
 
 // Validate checks the output bounds against the declared keys.
 func (o Outputs) Validate(declared []id.OutputKey) error {
@@ -721,4 +754,14 @@ type Execution struct {
 	Failure *Failure
 	// Cleanup is independent of State.
 	Cleanup Cleanup
+}
+
+// ActionIndex returns the index of the action with actionID, or -1 when absent.
+func (e Execution) ActionIndex(actionID id.ActionID) int {
+	for index, action := range e.Actions {
+		if action.ID == actionID {
+			return index
+		}
+	}
+	return -1
 }

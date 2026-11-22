@@ -25,7 +25,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"maps"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -74,7 +73,7 @@ func reduceActivate(execution kernel.Execution, fact ActivateFact) (kernel.Execu
 		return execution, nil, refuseInvalid("flow: execution %q is terminal and cannot activate new work", execution.ID)
 	}
 
-	target := actionIndex(execution, fact.ActionID)
+	target := execution.ActionIndex(fact.ActionID)
 	if target < 0 {
 		return execution, nil, refuseInvalid("flow: action %q does not exist", fact.ActionID)
 	}
@@ -152,6 +151,14 @@ func reduceActivate(execution kernel.Execution, fact ActivateFact) (kernel.Execu
 // and every pending successor cancellation travel in one commit.
 func activationFailure(execution kernel.Execution, action kernel.Action, at time.Time, cause error) (kernel.Execution, *Commit, error) {
 	nextCurrent := -1
+	detail := ""
+	if cause != nil {
+		if msg, ok := fault.MessageOf(cause); ok {
+			detail = msg
+		} else {
+			detail = cause.Error()
+		}
+	}
 	commit := &Commit{
 		ExecutionID:              execution.ID,
 		ExpectedExecutionVersion: execution.Version,
@@ -166,7 +173,7 @@ func activationFailure(execution kernel.Execution, action kernel.Action, at time
 		Failure: &kernel.Failure{
 			Kind:   kernel.FailurePreparation,
 			Reason: "subject_resolution",
-			Detail: cause.Error(),
+			Detail: detail,
 		},
 		At: at,
 	}
@@ -187,56 +194,19 @@ func activationFailure(execution kernel.Execution, action kernel.Action, at time
 // settled outputs of earlier succeeded actions only. A forward or self
 // reference, a missing input or a missing earlier output fails resolution.
 func resolveSubject(execution kernel.Execution, target int, subject definition.Subject) (definition.Subject, error) {
-	fields := subject.Fields()
-	resolved := make(map[string]definition.SubjectValue, len(fields))
 	var inputs map[string]string
 	if execution.Snapshot != nil {
 		inputs = execution.Snapshot.Inputs()
 	}
-	for name, value := range fields {
-		if err := value.Validate(); err != nil {
-			return definition.Subject{}, fmt.Errorf("subject field %q is malformed", name)
+	succeeded := make(map[id.ActionName]map[id.OutputKey]string, target)
+	for index := range target {
+		earlier := execution.Actions[index]
+		if earlier.State != kernel.ActionSucceeded {
+			continue
 		}
-		switch value.Kind {
-		case definition.SubjectLiteral:
-			resolved[name] = definition.SubjectValue{Kind: definition.SubjectLiteral, Literal: value.Literal}
-		case definition.SubjectReference:
-			reference := value.Reference
-			if reference.Input {
-				raw, ok := inputs[reference.Key]
-				if !ok {
-					return definition.Subject{}, fmt.Errorf("subject field %q references missing input %q", name, reference.Key)
-				}
-				resolved[name] = definition.SubjectValue{Kind: definition.SubjectLiteral, Literal: raw}
-				continue
-			}
-			source := -1
-			for index, action := range execution.Actions {
-				if index >= target {
-					break
-				}
-				if string(action.Name) == reference.Action {
-					source = index
-					break
-				}
-			}
-			if source < 0 {
-				return definition.Subject{}, fmt.Errorf("subject field %q references %q, which is not an earlier action", name, reference.Action)
-			}
-			earlier := execution.Actions[source]
-			if earlier.State != kernel.ActionSucceeded {
-				return definition.Subject{}, fmt.Errorf("subject field %q references action %q, which has not succeeded", name, reference.Action)
-			}
-			raw, ok := earlier.Outputs[id.OutputKey(reference.Key)]
-			if !ok {
-				return definition.Subject{}, fmt.Errorf("subject field %q references missing output %q of action %q", name, reference.Key, reference.Action)
-			}
-			resolved[name] = definition.SubjectValue{Kind: definition.SubjectLiteral, Literal: raw}
-		default:
-			return definition.Subject{}, fmt.Errorf("subject field %q has unsupported kind %q", name, value.Kind)
-		}
+		succeeded[earlier.Name] = earlier.Outputs
 	}
-	return definition.NewSubject(resolved), nil
+	return definition.ResolveSubject(subject, inputs, succeeded)
 }
 
 // newLaunchIntent allocates the stable workload identity and idempotency key
@@ -273,7 +243,7 @@ func reduceObserve(execution kernel.Execution, fact ObserveFact) (kernel.Executi
 	if !fact.Observation.Valid() {
 		return execution, nil, refuseInvalid("flow: observation is not internally consistent")
 	}
-	target := actionIndex(execution, fact.ActionID)
+	target := execution.ActionIndex(fact.ActionID)
 	if target < 0 {
 		return execution, nil, refuseInvalid("flow: action %q does not exist", fact.ActionID)
 	}
@@ -285,7 +255,7 @@ func reduceObserve(execution kernel.Execution, fact ObserveFact) (kernel.Executi
 	if execution.State.Terminal() {
 		// A duplicate observation of the settled evidence converges; any other
 		// observation would rewrite terminal history and is refused.
-		if observationsEqual(action.Container.Observation, fact.Observation) {
+		if action.Container.Observation.Equal(fact.Observation) {
 			return execution, nil, nil
 		}
 		return execution, nil, refuseChanged("flow: observation conflicts with the settled state of action %q", action.ID)
@@ -299,7 +269,7 @@ func reduceObserve(execution kernel.Execution, fact ObserveFact) (kernel.Executi
 	// owed; every other observation would rewrite the evidence that justified
 	// retirement and is refused.
 	if action.Container.Launch.State == kernel.LaunchRetiring {
-		if observationsEqual(action.Container.Observation, fact.Observation) {
+		if action.Container.Observation.Equal(fact.Observation) {
 			return execution, nil, nil
 		}
 		return execution, nil, refuseChanged("flow: observation conflicts with the retiring identity of action %q", action.ID)
@@ -388,7 +358,7 @@ func promotedOutput(action kernel.Action) OutputChange {
 	if !action.StagedOutputsSet && action.StagedOutputs == nil {
 		return OutputChange{Action: OutputNone}
 	}
-	return OutputChange{Action: OutputPromote, Values: cloneOutputs(action.StagedOutputs)}
+	return OutputChange{Action: OutputPromote, Values: action.StagedOutputs.Clone()}
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +369,7 @@ func reduceOutput(execution kernel.Execution, fact OutputFact) (kernel.Execution
 	if err := checkExecutionID(execution, fact.ExecutionID); err != nil {
 		return execution, nil, err
 	}
-	target := actionIndex(execution, fact.ActionID)
+	target := execution.ActionIndex(fact.ActionID)
 	if target < 0 {
 		return execution, nil, refuseInvalid("flow: action %q does not exist", fact.ActionID)
 	}
@@ -440,7 +410,7 @@ func reduceOutput(execution kernel.Execution, fact OutputFact) (kernel.Execution
 		ActionID:                 action.ID,
 		ExpectedActionVersion:    action.Version,
 		NextActionState:          kernel.ActionRunning,
-		Output:                   OutputChange{Action: OutputStage, Values: cloneOutputs(fact.Outputs)},
+		Output:                   OutputChange{Action: OutputStage, Values: fact.Outputs.Clone()},
 		At:                       fact.At,
 	}
 	next := project(execution, *commit)
@@ -455,7 +425,7 @@ func reduceAnswer(execution kernel.Execution, fact AnswerFact) (kernel.Execution
 	if err := checkExecutionID(execution, fact.ExecutionID); err != nil {
 		return execution, nil, err
 	}
-	target := actionIndex(execution, fact.ActionID)
+	target := execution.ActionIndex(fact.ActionID)
 	if target < 0 {
 		return execution, nil, refuseInvalid("flow: action %q does not exist", fact.ActionID)
 	}
@@ -517,7 +487,7 @@ func reduceAnswer(execution kernel.Execution, fact AnswerFact) (kernel.Execution
 	if answer.Decision == kernel.DecisionPass {
 		commit.NextActionState = kernel.ActionSucceeded
 		commit.NextCurrentAction = &nextCurrent
-		commit.Output = OutputChange{Action: OutputPromote, Values: cloneOutputs(answer.Outputs)}
+		commit.Output = OutputChange{Action: OutputPromote, Values: answer.Outputs.Clone()}
 		if allOtherActionsSucceeded(execution, target) {
 			commit.NextExecutionState = kernel.ExecutionSucceeded
 			commit.InvalidateCredential = true
@@ -658,7 +628,7 @@ func reduceExpire(execution kernel.Execution, fact ExpireFact) (kernel.Execution
 	if err := checkExecutionID(execution, fact.ExecutionID); err != nil {
 		return execution, nil, err
 	}
-	target := actionIndex(execution, fact.ActionID)
+	target := execution.ActionIndex(fact.ActionID)
 	if target < 0 {
 		return execution, nil, refuseInvalid("flow: action %q does not exist", fact.ActionID)
 	}
@@ -809,7 +779,7 @@ func reduceRetired(execution kernel.Execution, fact RetiredFact) (kernel.Executi
 	if execution.State.Terminal() {
 		return execution, nil, refuseChanged("flow: retired fact conflicts with the settled state %q of execution %q", execution.State, execution.ID)
 	}
-	target := actionIndex(execution, fact.ActionID)
+	target := execution.ActionIndex(fact.ActionID)
 	if target < 0 {
 		return execution, nil, refuseInvalid("flow: action %q does not exist", fact.ActionID)
 	}
@@ -862,15 +832,6 @@ func checkExecutionID(execution kernel.Execution, executionID id.ExecutionID) er
 		return refuseInvalid("flow: fact execution %q does not match execution %q", executionID, execution.ID)
 	}
 	return nil
-}
-
-func actionIndex(execution kernel.Execution, actionID id.ActionID) int {
-	for index, action := range execution.Actions {
-		if action.ID == actionID {
-			return index
-		}
-	}
-	return -1
 }
 
 // runningActionIndex returns the single active action index, or -1. Two running
@@ -995,7 +956,7 @@ func project(execution kernel.Execution, commit Commit) kernel.Execution {
 		next.CurrentAction = *commit.NextCurrentAction
 	}
 	if commit.ActionID != "" {
-		index := actionIndex(next, commit.ActionID)
+		index := next.ActionIndex(commit.ActionID)
 		if index >= 0 {
 			action := &next.Actions[index]
 			if action.Container != nil {
@@ -1016,10 +977,10 @@ func project(execution kernel.Execution, commit Commit) kernel.Execution {
 			}
 			switch commit.Output.Action {
 			case OutputStage:
-				action.StagedOutputs = cloneOutputs(commit.Output.Values)
+				action.StagedOutputs = commit.Output.Values.Clone()
 				action.StagedOutputsSet = true
 			case OutputPromote:
-				action.Outputs = cloneOutputs(commit.Output.Values)
+				action.Outputs = commit.Output.Values.Clone()
 				action.StagedOutputs = nil
 				action.StagedOutputsSet = false
 			case OutputDiscard:
@@ -1062,7 +1023,7 @@ func project(execution kernel.Execution, commit Commit) kernel.Execution {
 		}
 	}
 	for _, update := range commit.PendingCancellations {
-		index := actionIndex(next, update.ActionID)
+		index := next.ActionIndex(update.ActionID)
 		if index < 0 {
 			continue
 		}
@@ -1084,15 +1045,6 @@ func refuseChanged(format string, args ...any) error {
 	return fault.New(fault.ChangedIdempotencyContent, fmt.Sprintf(format, args...))
 }
 
-func cloneOutputs(values kernel.Outputs) kernel.Outputs {
-	if values == nil {
-		return nil
-	}
-	cloned := make(kernel.Outputs, len(values))
-	maps.Copy(cloned, values)
-	return cloned
-}
-
 func outputsEqual(left, right kernel.Outputs) bool {
 	if (left == nil) != (right == nil) {
 		return false
@@ -1111,7 +1063,7 @@ func outputsEqual(left, right kernel.Outputs) bool {
 
 func cloneAnswer(answer kernel.Answer) kernel.Answer {
 	cloned := answer
-	cloned.Outputs = cloneOutputs(answer.Outputs)
+	cloned.Outputs = answer.Outputs.Clone()
 	cloned.Provenance = append([]byte(nil), answer.Provenance...)
 	return cloned
 }
@@ -1170,24 +1122,4 @@ func workloadExitFailure(code int, oomKilled bool, memoryLimit string) *kernel.F
 		Reason: "workload_exited",
 		Detail: fmt.Sprintf("workload exited with status %d", code),
 	}
-}
-
-func observationsEqual(recorded, candidate kernel.Observation) bool {
-	if recorded.Kind != candidate.Kind || recorded.Proof != candidate.Proof ||
-		recorded.OOMKilled != candidate.OOMKilled || recorded.MemoryLimit != candidate.MemoryLimit {
-		return false
-	}
-	if (recorded.ExitCode == nil) != (candidate.ExitCode == nil) {
-		return false
-	}
-	if recorded.ExitCode != nil && *recorded.ExitCode != *candidate.ExitCode {
-		return false
-	}
-	if (recorded.Stop == nil) != (candidate.Stop == nil) {
-		return false
-	}
-	if recorded.Stop != nil && *recorded.Stop != *candidate.Stop {
-		return false
-	}
-	return true
 }

@@ -29,31 +29,10 @@ type PipelineID string
 
 // ParsePipelineID validates and converts a pipeline identity.
 func ParsePipelineID(value string) (PipelineID, error) {
-	if !validPipelineID(value) {
+	if !id.Valid(value) {
 		return "", fault.New(fault.InvalidInput, fmt.Sprintf("invalid pipeline id %q", value))
 	}
 	return PipelineID(value), nil
-}
-
-func validPipelineID(value string) bool {
-	if value == "" || len(value) > id.MaxIDLength {
-		return false
-	}
-	if value == "." || value == ".." {
-		return false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		switch {
-		case character >= 'a' && character <= 'z':
-		case character >= 'A' && character <= 'Z':
-		case character >= '0' && character <= '9':
-		case character == '-', character == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // InputKind is the declared type of one admission input.

@@ -89,7 +89,6 @@ type llmProxyDependencies struct {
 }
 
 type resolvedProvider struct {
-	scope              tenancy.Scope
 	name               string
 	baseURL            *url.URL
 	secretName         id.SecretName
@@ -210,7 +209,6 @@ func newLLMProxyHandler(deps llmProxyDependencies) (http.Handler, func(context.C
 			maxReq = DefaultLLMProxyMaxRequestBytes
 		}
 		providers[providerScopeKey{scope: entry.Scope, name: entry.Name}] = resolvedProvider{
-			scope:              entry.Scope,
 			name:               entry.Name,
 			baseURL:            baseURL,
 			secretName:         entry.SecretName,
@@ -535,6 +533,7 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 	// The status is already sent, so a truncated stream aborts the response
 	// instead of ending it as a clean EOF.
 	buffer := make([]byte, 32*1024)
+	redactor := newStreamSecretRedactor(providerSecret)
 	var total int64
 	for {
 		n, readErr := response.Body.Read(buffer)
@@ -554,22 +553,21 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 				}
 				panic(http.ErrAbortHandler)
 			}
-			chunk := buffer[:n]
-			if providerSecret != "" && bytes.Contains(chunk, []byte(providerSecret)) {
-				chunk = bytes.ReplaceAll(chunk, []byte(providerSecret), []byte("[REDACTED]"))
-			}
-			if usageTracker != nil {
-				usageTracker.Observe(chunk)
-			}
-			if _, writeErr := writer.Write(chunk); writeErr != nil {
-				if trackUsage {
-					responseModel, _, _ := usageTracker.Finish()
-					handler.recordUsage(ctx, scope, admitted, provider.name, requestedModel, responseModel, gateway.UsageUncertain, api.ChatUsage{})
+			chunk := redactor.Process(buffer[:n])
+			if len(chunk) > 0 {
+				if usageTracker != nil {
+					usageTracker.Observe(chunk)
 				}
-				return
-			}
-			if canFlush {
-				flusher.Flush()
+				if _, writeErr := writer.Write(chunk); writeErr != nil {
+					if trackUsage {
+						responseModel, _, _ := usageTracker.Finish()
+						handler.recordUsage(ctx, scope, admitted, provider.name, requestedModel, responseModel, gateway.UsageUncertain, api.ChatUsage{})
+					}
+					return
+				}
+				if canFlush {
+					flusher.Flush()
+				}
 			}
 		}
 		if readErr == io.EOF {
@@ -582,6 +580,21 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 					handler.recordUsage(ctx, scope, admitted, provider.name, requestedModel, responseModel, gateway.UsageUncertain, api.ChatUsage{})
 				}
 				panic(http.ErrAbortHandler)
+			}
+			if tail := redactor.Flush(); len(tail) > 0 {
+				if usageTracker != nil {
+					usageTracker.Observe(tail)
+				}
+				if _, writeErr := writer.Write(tail); writeErr != nil {
+					if trackUsage {
+						responseModel, _, _ := usageTracker.Finish()
+						handler.recordUsage(ctx, scope, admitted, provider.name, requestedModel, responseModel, gateway.UsageUncertain, api.ChatUsage{})
+					}
+					return
+				}
+				if canFlush {
+					flusher.Flush()
+				}
 			}
 			if trackUsage {
 				if response.StatusCode >= 200 && response.StatusCode <= 299 {
@@ -601,6 +614,79 @@ func (handler *llmProxyHandler) ServeHTTP(writer http.ResponseWriter, request *h
 			panic(http.ErrAbortHandler)
 		}
 	}
+}
+
+var llmProxyRedactedBytes = []byte("[REDACTED]")
+
+// streamSecretRedactor redacts occurrences of a provider secret across
+// arbitrary chunk read boundaries while holding back at most the longest
+// trailing suffix that is a non-empty proper prefix of the secret. Normal
+// chunks that do not end in a prefix of the secret are emitted immediately.
+type streamSecretRedactor struct {
+	secret  []byte
+	pending []byte
+}
+
+func newStreamSecretRedactor(providerSecret string) *streamSecretRedactor {
+	if providerSecret == "" {
+		return &streamSecretRedactor{}
+	}
+	return &streamSecretRedactor{secret: []byte(providerSecret)}
+}
+
+func (r *streamSecretRedactor) Process(chunk []byte) []byte {
+	if len(r.secret) == 0 || len(chunk) == 0 {
+		return chunk
+	}
+	var input []byte
+	hadPending := len(r.pending) > 0
+	if hadPending {
+		input = make([]byte, len(r.pending)+len(chunk))
+		copy(input, r.pending)
+		copy(input[len(r.pending):], chunk)
+		r.pending = r.pending[:0]
+	} else {
+		input = chunk
+	}
+
+	var out []byte
+	matched := false
+	for {
+		idx := bytes.Index(input, r.secret)
+		if idx < 0 {
+			break
+		}
+		matched = true
+		out = append(out, input[:idx]...)
+		out = append(out, llmProxyRedactedBytes...)
+		input = input[idx+len(r.secret):]
+	}
+
+	hold := 0
+	maxHold := min(len(input), len(r.secret)-1)
+	for k := maxHold; k >= 1; k-- {
+		if bytes.Equal(input[len(input)-k:], r.secret[:k]) {
+			hold = k
+			break
+		}
+	}
+	emit := input[:len(input)-hold]
+	if hold > 0 {
+		r.pending = append(r.pending[:0], input[len(input)-hold:]...)
+	}
+	if !matched {
+		return emit
+	}
+	return append(out, emit...)
+}
+
+func (r *streamSecretRedactor) Flush() []byte {
+	if len(r.pending) == 0 {
+		return nil
+	}
+	tail := append([]byte(nil), r.pending...)
+	r.pending = r.pending[:0]
+	return tail
 }
 
 func (handler *llmProxyHandler) recordUsage(

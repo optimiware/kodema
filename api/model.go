@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"math"
 )
 
 // ModelSubsetVersion pins the OpenAI-compatible completion subset. The subset
@@ -402,7 +403,7 @@ func (request ChatCompletionRequest) Validate() error {
 	if request.MaxTokens < 0 || request.MaxTokens > MaxCompletionTokens {
 		return invalid("max_tokens %d is outside 0..%d", request.MaxTokens, MaxCompletionTokens)
 	}
-	if request.Temperature != nil && (*request.Temperature < 0 || *request.Temperature > 2) {
+	if request.Temperature != nil && (math.IsNaN(*request.Temperature) || *request.Temperature < 0 || *request.Temperature > 2) {
 		return invalid("temperature must be within 0..2")
 	}
 	return nil

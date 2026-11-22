@@ -9,7 +9,6 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/shell/authorize"
 	"github.com/optimiware/kodema/internal/shell/event"
-	"github.com/optimiware/kodema/internal/shell/identity"
 	"github.com/optimiware/kodema/internal/shell/receipt"
 	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
@@ -86,37 +85,8 @@ const (
 	operationBindingUpdate   authorize.OperationName = "resource.binding.update"
 	operationBindingDelete   authorize.OperationName = "resource.binding.delete"
 	operationBindingRead     authorize.OperationName = "resource.binding.read"
+	operationBindingList     authorize.OperationName = "resource.binding.list"
 )
-
-// admit validates the presented principal and pins that its kind can satisfy
-// the registry grant. It never treats the principal's role snapshot as current
-// authority.
-func admit(actor authorize.Principal, name authorize.OperationName) (authorize.Operation, error) {
-	if err := actor.Validate(); err != nil {
-		return authorize.Operation{}, err
-	}
-	op, ok := authorize.LookupOperation(name)
-	if !ok {
-		return authorize.Operation{}, fault.New(fault.InternalFailure, "resource binding operation is not registered")
-	}
-	switch actor.Kind {
-	case identity.KindHuman:
-		if !op.Requires.AdmitsKind(identity.KindHuman) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no human role")
-		}
-	case identity.KindService:
-		if !op.Requires.AdmitsKind(identity.KindService) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no service role")
-		}
-	case identity.KindExecution:
-		if !op.Requires.AdmitsKind(identity.KindExecution) {
-			return authorize.Operation{}, fault.New(fault.Forbidden, "the operation grants no execution permission")
-		}
-	default:
-		return authorize.Operation{}, fault.New(fault.Forbidden, "unknown principal kind")
-	}
-	return op, nil
-}
 
 // authorityReads builds the current-authority reads for one registry operation.
 // Every read names the operation and its required grant; versioned checks carry
@@ -138,10 +108,7 @@ func authorityReads(
 			PrincipalID: principal,
 		}
 		switch check {
-		case authorize.CheckBindingVersion,
-			authorize.CheckTaskVersion,
-			authorize.CheckExecutionVersion,
-			authorize.CheckPipelineVersion:
+		case authorize.CheckBindingVersion:
 			read.TargetID = target
 			read.ExpectedVersion = expected
 		case authorize.CheckResourceOwnership:
@@ -150,22 +117,6 @@ func authorityReads(
 		reads = append(reads, read)
 	}
 	return reads
-}
-
-// withinScope reports whether target is inside the actor's verified scope. A
-// tenant-scoped actor covers every project of its tenant; a project-scoped
-// actor covers exactly its own project and never widens to the tenant.
-func withinScope(actor, target tenancy.Scope) bool {
-	if actor.TenantID == "" || target.TenantID == "" {
-		return false
-	}
-	if actor.TenantID != target.TenantID {
-		return false
-	}
-	if actor.ProjectID == "" {
-		return true
-	}
-	return actor.ProjectID == target.ProjectID
 }
 
 // requireProjectScope validates the binding scope and pins it inside the actor
@@ -178,7 +129,7 @@ func requireProjectScope(actor, scope tenancy.Scope) error {
 	if !scope.ProjectScoped() {
 		return fault.New(fault.InvalidInput, "resource bindings are project-scoped")
 	}
-	if !withinScope(actor, scope) {
+	if !actor.Contains(scope) {
 		return fault.New(fault.Forbidden, "resource binding scope is outside the actor scope")
 	}
 	return nil
@@ -282,7 +233,7 @@ func publishEffect() event.PostCommitEffect {
 // RegisterBinding commits one new binding at version 1. It never provisions
 // resource bytes or stores access rules.
 func (s *Service) RegisterBinding(ctx context.Context, command RegisterBindingCommand) (BindingResult, error) {
-	op, err := admit(command.Actor, operationBindingRegister)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationBindingRegister)
 	if err != nil {
 		return BindingResult{}, err
 	}
@@ -338,7 +289,7 @@ func (s *Service) RegisterBinding(ctx context.Context, command RegisterBindingCo
 
 // UpdateBinding commits one versioned binding change.
 func (s *Service) UpdateBinding(ctx context.Context, command UpdateBindingCommand) (BindingResult, error) {
-	op, err := admit(command.Actor, operationBindingUpdate)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationBindingUpdate)
 	if err != nil {
 		return BindingResult{}, err
 	}
@@ -397,7 +348,7 @@ func (s *Service) UpdateBinding(ctx context.Context, command UpdateBindingComman
 
 // DeleteBinding commits one versioned binding removal.
 func (s *Service) DeleteBinding(ctx context.Context, command DeleteBindingCommand) (BindingDeleteResult, error) {
-	op, err := admit(command.Actor, operationBindingDelete)
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationBindingDelete)
 	if err != nil {
 		return BindingDeleteResult{}, err
 	}
@@ -447,8 +398,12 @@ func (s *Service) DeleteBinding(ctx context.Context, command DeleteBindingComman
 // ReadBinding reads one binding inside the caller's current project scope and
 // refuses an adapter result that escapes that scope.
 func (s *Service) ReadBinding(ctx context.Context, command ReadBindingCommand) (Binding, error) {
-	if _, err := admit(command.Actor, operationBindingRead); err != nil {
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationBindingRead)
+	if err != nil {
 		return Binding{}, err
+	}
+	if !op.Requires.Allows(command.Actor) {
+		return Binding{}, fault.New(fault.Forbidden, "actor is not authorized for resource.binding.read")
 	}
 	if err := requireProjectScope(command.Actor.Scope, command.Scope); err != nil {
 		return Binding{}, err
@@ -476,8 +431,12 @@ func (s *Service) ReadBinding(ctx context.Context, command ReadBindingCommand) (
 // QueryBindings returns one authoritative, stably paginated binding page and
 // refuses any adapter row that escapes the caller's current project scope.
 func (s *Service) QueryBindings(ctx context.Context, command QueryBindingsCommand) (BindingPage, error) {
-	if _, err := admit(command.Actor, operationBindingRead); err != nil {
+	op, err := authorize.AdmitPrincipalKind(command.Actor, operationBindingList)
+	if err != nil {
 		return BindingPage{}, err
+	}
+	if !op.Requires.Allows(command.Actor) {
+		return BindingPage{}, fault.New(fault.Forbidden, "actor is not authorized for resource.binding.list")
 	}
 	if err := requireProjectScope(command.Actor.Scope, command.Scope); err != nil {
 		return BindingPage{}, err

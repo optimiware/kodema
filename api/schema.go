@@ -126,6 +126,7 @@ func schemaForType(typ reflect.Type, seen map[reflect.Type]bool) map[string]any 
 	switch typ.Kind() {
 	case reflect.Struct:
 		seen[typ] = true
+		defer delete(seen, typ)
 		properties := make(map[string]any)
 		required := make([]string, 0, typ.NumField())
 		for index := 0; index < typ.NumField(); index++ {
@@ -169,6 +170,8 @@ func schemaForType(typ reflect.Type, seen map[reflect.Type]bool) map[string]any 
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return map[string]any{"type": "integer"}
+	case reflect.Float32, reflect.Float64:
+		return map[string]any{"type": "number"}
 	default:
 		return map[string]any{"type": "object"}
 	}

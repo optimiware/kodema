@@ -52,7 +52,9 @@ cleanup() {
   status=$?
   if [[ $status -ne 0 ]]; then
     log "failed; the last server output follows"
-    podman logs --tail 30 "${KODEMA_LOCAL_PREFIX}-server" >&2 2>/dev/null || true
+    if podman container exists "${KODEMA_LOCAL_PREFIX}-server" 2>/dev/null; then
+      podman logs --tail 30 "${KODEMA_LOCAL_PREFIX}-server" >&2 || true
+    fi
   fi
   "${repo_root}/deploy/podman/down.sh" --purge >"${work}/down.log" 2>&1 ||
     { log "the installation could not be removed:"; tail -n 5 "${work}/down.log" >&2; }

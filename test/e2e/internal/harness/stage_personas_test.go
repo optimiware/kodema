@@ -206,6 +206,24 @@ func TestStagePersonasRefusesNonListMemberships(t *testing.T) {
 	}
 }
 
+// TestStagePersonasReportsErrorCodeOnMembershipListFailure proves non-200
+// membership.list responses report the API error code via error_code instead
+// of falling back to "(no code)".
+func TestStagePersonasReportsErrorCodeOnMembershipListFailure(t *testing.T) {
+	run := runStagePersonas(t, map[string]string{
+		"FAKE_CURL_MEMBERSHIPS_BAD": "forbidden",
+	}, nil, func(*testing.T, *stagePersonasSetup) {})
+	if run.err == nil {
+		t.Fatalf("stage-personas accepted a 403 membership.list response:\n%s", run.output)
+	}
+	if !strings.Contains(run.output, "HTTP 403 (forbidden)") {
+		t.Fatalf("output = %q; want HTTP 403 (forbidden)", run.output)
+	}
+	if len(*run.grants) != 0 {
+		t.Fatalf("stage-personas granted memberships after a 403 membership.list failure")
+	}
+}
+
 // TestStagePersonasWritesPrivateEvidence proves the optional evidence record is
 // private and carries no credential material.
 func TestStagePersonasWritesPrivateEvidence(t *testing.T) {
@@ -362,6 +380,11 @@ case "$method $url" in
       string)
         printf '%s' '{"operation":"membership.list","body":{"memberships":"none"}}' >"$out"
         printf 200
+        exit 0
+        ;;
+      forbidden)
+        printf '%s' '{"code":"forbidden","message":"admin role required"}' >"$out"
+        printf 403
         exit 0
         ;;
     esac

@@ -749,3 +749,121 @@ func TestPersistSyncsStateDirectory(t *testing.T) {
 		t.Fatalf("state directory sync count = %d; want at least 2", synced.Load())
 	}
 }
+
+func TestSpawnAfterDriverReconstructionReusesPersistedGroup(t *testing.T) {
+	t.Run("completed group is reused without spawning again", func(t *testing.T) {
+		stateDir := t.TempDir()
+		first, err := New(Config{StateDir: stateDir})
+		if err != nil {
+			t.Fatalf("New first: %v", err)
+		}
+		request := helperRequest(t, "group-restart-completed", "write")
+		if _, err := first.Spawn(context.Background(), request); err != nil {
+			t.Fatalf("first Spawn: %v", err)
+		}
+		waitStatus(t, first, request.Group, func(status process.GroupStatus) bool {
+			return status.GroupGone && status.LeaderExited
+		})
+		if err := first.Close(context.Background()); err != nil {
+			t.Fatalf("first Close: %v", err)
+		}
+
+		second, err := New(Config{StateDir: stateDir})
+		if err != nil {
+			t.Fatalf("New second: %v", err)
+		}
+		defer func() { _ = second.Close(context.Background()) }()
+		var starts atomic.Int32
+		second.start = func(cmd *exec.Cmd) error {
+			starts.Add(1)
+			return cmd.Start()
+		}
+
+		result, err := second.Spawn(context.Background(), request)
+		if err != nil {
+			t.Fatalf("second Spawn: %v", err)
+		}
+		if result.Outcome != process.SpawnStarted {
+			t.Fatalf("second Spawn outcome = %q; want started", result.Outcome)
+		}
+		if got := starts.Load(); got != 0 {
+			t.Fatalf("reconstructed driver started %d new processes; want 0", got)
+		}
+	})
+
+	t.Run("running group is reused without spawning again", func(t *testing.T) {
+		stateDir := t.TempDir()
+		first, err := New(Config{StateDir: stateDir})
+		if err != nil {
+			t.Fatalf("New first: %v", err)
+		}
+		request := helperRequest(t, "group-restart-running", "sleep")
+		t.Cleanup(func() {
+			_ = first.SignalGroup(context.Background(), request.Group)
+			_ = first.Close(context.Background())
+		})
+		if _, err := first.Spawn(context.Background(), request); err != nil {
+			t.Fatalf("first Spawn: %v", err)
+		}
+		waitStatus(t, first, request.Group, func(status process.GroupStatus) bool {
+			return status.Present || status.MembersAlive
+		})
+
+		second, err := New(Config{StateDir: stateDir})
+		if err != nil {
+			t.Fatalf("New second: %v", err)
+		}
+		defer func() { _ = second.Close(context.Background()) }()
+		var starts atomic.Int32
+		second.start = func(cmd *exec.Cmd) error {
+			starts.Add(1)
+			return cmd.Start()
+		}
+
+		result, err := second.Spawn(context.Background(), request)
+		if err != nil {
+			t.Fatalf("second Spawn: %v", err)
+		}
+		if result.Outcome != process.SpawnStarted {
+			t.Fatalf("second Spawn outcome = %q; want started", result.Outcome)
+		}
+		if got := starts.Load(); got != 0 {
+			t.Fatalf("reconstructed driver started %d new processes; want 0", got)
+		}
+	})
+
+	t.Run("persisted spawning intent returns uncertain without double-spawning", func(t *testing.T) {
+		stateDir := t.TempDir()
+		group := process.GroupID("group-restart-spawning")
+		encoded, err := json.Marshal(record{Group: group, State: stateSpawning})
+		if err != nil {
+			t.Fatalf("marshal record: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(stateDir, string(group)+stateSuffix), encoded, 0o600); err != nil {
+			t.Fatalf("seed record: %v", err)
+		}
+
+		driver, err := New(Config{StateDir: stateDir})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = driver.Close(context.Background()) }()
+		var starts atomic.Int32
+		driver.start = func(cmd *exec.Cmd) error {
+			starts.Add(1)
+			return cmd.Start()
+		}
+
+		request := helperRequest(t, string(group), "write")
+		result, err := driver.Spawn(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Spawn: %v", err)
+		}
+		if result.Outcome != process.SpawnUncertain {
+			t.Fatalf("Spawn outcome = %q; want uncertain", result.Outcome)
+		}
+		if got := starts.Load(); got != 0 {
+			t.Fatalf("driver started %d processes despite persisted spawning intent; want 0", got)
+		}
+	})
+}

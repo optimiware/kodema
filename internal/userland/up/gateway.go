@@ -58,7 +58,12 @@ func NewGateway(cfg GatewayConfig) (*Gateway, error) {
 		}
 	}
 
-	rt := http.DefaultTransport.(*http.Transport).Clone()
+	var rt *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		rt = base.Clone()
+	} else {
+		rt = &http.Transport{}
+	}
 	rt.ForceAttemptHTTP2 = true
 	rt.ResponseHeaderTimeout = 0 // allow long-lived SSE and git streams
 	if cfg.UpstreamRootCAs != nil {

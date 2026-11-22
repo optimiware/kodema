@@ -101,9 +101,13 @@ func TestOutboxMarkPublishedIsExactAndIdempotent(t *testing.T) {
 	commitEvents(t, s, projectScope(), "event-1")
 
 	err := s.MarkPublished(context.Background(), id.EventID("event-1"), event.Sequence(2))
-	assertFault(t, err, fault.VersionConflict)
+	assertFault(t, err, fault.NotFound)
 	err = s.MarkPublished(context.Background(), id.EventID("missing"), event.Sequence(1))
 	assertFault(t, err, fault.NotFound)
+	err = s.MarkPublished(context.Background(), id.EventID("bad event id"), event.Sequence(1))
+	assertFault(t, err, fault.InvalidInput)
+	err = s.MarkPublished(context.Background(), id.EventID("event-1"), event.Sequence(0))
+	assertFault(t, err, fault.InvalidInput)
 
 	if err := s.MarkPublished(context.Background(), id.EventID("event-1"), event.Sequence(1)); err != nil {
 		t.Fatalf("MarkPublished: %v", err)
@@ -114,6 +118,23 @@ func TestOutboxMarkPublishedIsExactAndIdempotent(t *testing.T) {
 	}
 	if got := pendingIDs(t, s, 0, 10); len(got) != 0 {
 		t.Fatalf("pending after acknowledgement = %v; want none", got)
+	}
+}
+
+func TestOutboxPendingClampsLimitToMaxQueryLimit(t *testing.T) {
+	s := New()
+	ids := make([]string, store.MaxQueryLimit+5)
+	for index := range ids {
+		ids[index] = "event-clamp-" + string(rune('a'+(index/26/26)%26)) + string(rune('a'+(index/26)%26)) + string(rune('a'+index%26))
+	}
+	commitEvents(t, s, projectScope(), ids...)
+
+	pending, err := s.Pending(context.Background(), 0, store.MaxQueryLimit+100)
+	if err != nil {
+		t.Fatalf("Pending above MaxQueryLimit: %v", err)
+	}
+	if len(pending) != store.MaxQueryLimit {
+		t.Fatalf("clamped pending len = %d; want %d", len(pending), store.MaxQueryLimit)
 	}
 }
 

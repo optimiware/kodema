@@ -73,8 +73,8 @@ func runProjectCreate(ctx context.Context, config Config, args []string, ports P
 		Name:            name,
 		CopyMembersFrom: strings.TrimSpace(copyMembersFlag),
 	}
-	if seen["--creator-role"] || seen["--creator-roles"] {
-		roles := parseRoleList(creatorRolesFlags)
+	if seen["--creator-role"] {
+		roles := parseCommaSeparatedList(creatorRolesFlags)
 		if roles == nil {
 			roles = []string{}
 		}
@@ -166,23 +166,10 @@ func runProjectList(ctx context.Context, config Config, args []string, ports Por
 		return failure(ports.Err, err)
 	}
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "project.list", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
-		}
 		if projects == nil {
 			projects = []api.ProjectView{}
 		}
-		combined, err := json.Marshal(api.ProjectListResult{Projects: projects})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "project.list", Body: combined}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "project.list", firstBody, pages, api.ProjectListResult{Projects: projects})
 	}
 
 	tw := tabwriter.NewWriter(ports.Out, 0, 0, 2, ' ', 0)
@@ -197,49 +184,18 @@ func runProjectList(ctx context.Context, config Config, args []string, ports Por
 }
 
 func fetchAllProjects(ctx context.Context, ports Ports, tenantID string) ([]api.ProjectView, json.RawMessage, int, error) {
-	var (
-		all       []api.ProjectView
-		firstBody json.RawMessage
-		pages     int
-		cursor    string
-	)
-	for {
-		req := api.ProjectListRequest{TenantID: tenantID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		invocation := api.Invocation{
-			Operation: "project.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return nil, nil, pages, err
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.ProjectListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, nil, pages, fmt.Errorf("invalid project.list response: %w", err)
+	return fetchAllPages(ctx, ports, "project.list",
+		func(cursor string) any {
+			req := api.ProjectListRequest{TenantID: tenantID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		all = append(all, page.Projects...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return all, firstBody, pages, nil
+			return req
+		},
+		func(page api.ProjectListResult) ([]api.ProjectView, string) {
+			return page.Projects, page.NextCursor
+		},
+	)
 }
 
 // runRepo dispatches `kodema repo <create|list>`.
@@ -414,23 +370,10 @@ func runRepoList(ctx context.Context, config Config, args []string, ports Ports,
 		return failure(ports.Err, err)
 	}
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "repository.list", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
-		}
 		if repos == nil {
 			repos = []api.RepositoryView{}
 		}
-		combined, err := json.Marshal(api.RepositoryListResult{Repositories: repos})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "repository.list", Body: combined}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "repository.list", firstBody, pages, api.RepositoryListResult{Repositories: repos})
 	}
 
 	tw := tabwriter.NewWriter(ports.Out, 0, 0, 2, ' ', 0)
@@ -452,47 +395,16 @@ func runRepoList(ctx context.Context, config Config, args []string, ports Ports,
 }
 
 func fetchAllRepositories(ctx context.Context, ports Ports, projectID string) ([]api.RepositoryView, json.RawMessage, int, error) {
-	var (
-		all       []api.RepositoryView
-		firstBody json.RawMessage
-		pages     int
-		cursor    string
-	)
-	for {
-		req := api.RepositoryListRequest{ProjectID: projectID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		invocation := api.Invocation{
-			Operation: "repository.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return nil, nil, pages, err
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.RepositoryListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, nil, pages, fmt.Errorf("invalid repository.list response: %w", err)
+	return fetchAllPages(ctx, ports, "repository.list",
+		func(cursor string) any {
+			req := api.RepositoryListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		all = append(all, page.Repositories...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return all, firstBody, pages, nil
+			return req
+		},
+		func(page api.RepositoryListResult) ([]api.RepositoryView, string) {
+			return page.Repositories, page.NextCursor
+		},
+	)
 }

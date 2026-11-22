@@ -287,19 +287,23 @@ func (request CredentialRequest) Validate() error {
 	if _, err := id.ParsePrincipalID(string(request.PrincipalID)); err != nil {
 		return fault.Wrap(fault.InvalidInput, "credential request principal id is invalid", err)
 	}
+	return validateTarget("credential request", request.ExecutionID, request.ServiceID)
+}
+
+func validateTarget(label string, executionID id.ExecutionID, serviceID service.ServiceID) error {
 	switch {
-	case request.ExecutionID != "" && request.ServiceID != "":
-		return fault.New(fault.InvalidInput, "credential request names both an execution and a service")
-	case request.ExecutionID != "":
-		if _, err := id.ParseExecutionID(string(request.ExecutionID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "credential request execution id is invalid", err)
+	case executionID != "" && serviceID != "":
+		return fault.New(fault.InvalidInput, label+" names both an execution and a service")
+	case executionID != "":
+		if _, err := id.ParseExecutionID(string(executionID)); err != nil {
+			return fault.Wrap(fault.InvalidInput, label+" execution id is invalid", err)
 		}
-	case request.ServiceID != "":
-		if _, err := service.ParseServiceID(string(request.ServiceID)); err != nil {
-			return fault.Wrap(fault.InvalidInput, "credential request service id is invalid", err)
+	case serviceID != "":
+		if _, err := service.ParseServiceID(string(serviceID)); err != nil {
+			return fault.Wrap(fault.InvalidInput, label+" service id is invalid", err)
 		}
 	default:
-		return fault.New(fault.InvalidInput, "credential request names neither an execution nor a service")
+		return fault.New(fault.InvalidInput, label+" names neither an execution nor a service")
 	}
 	return nil
 }

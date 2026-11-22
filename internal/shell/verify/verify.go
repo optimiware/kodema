@@ -313,7 +313,7 @@ func authorizeCallingService(input Attempt, binding resource.Binding) error {
 	if !input.Service.Enabled {
 		return fault.New(fault.Forbidden, "calling service is disabled")
 	}
-	if !scopeContains(input.Service.Scope, input.Scope) {
+	if !input.Service.Scope.Contains(input.Scope) {
 		return fault.New(fault.Forbidden, "calling service is outside the verification scope")
 	}
 	if binding.EnforcingService != service.ServiceID(input.Service.ID) {
@@ -341,7 +341,7 @@ func authorizeActor(input Attempt, actor identity.Principal) error {
 	if !actor.Enabled {
 		return fault.New(fault.Forbidden, "actor is currently disabled")
 	}
-	if !scopeContains(actor.Scope, input.Scope) {
+	if !actor.Scope.Contains(input.Scope) {
 		return fault.New(fault.Forbidden, "actor is outside the verification scope")
 	}
 	if input.Approval != (request.Assignment{}) {
@@ -369,13 +369,8 @@ func (verifier *Verifier) scopedRoles(ctx context.Context, scope tenancy.Scope, 
 	if err != nil {
 		return nil, nil, err
 	}
-	var tenantWide, project *tenancy.Membership
-	if rows.TenantWide.Membership != nil {
-		tenantWide = rows.TenantWide.Membership
-	}
-	if rows.Project.Membership != nil {
-		project = rows.Project.Membership
-	}
+	tenantWide := rows.TenantWide.Membership
+	project := rows.Project.Membership
 	roles, applicable := tenancy.EffectiveRoles(scope, tenantWide, project)
 	if !applicable || len(roles) == 0 {
 		return nil, nil, fault.New(fault.Forbidden, "actor has no current membership roles in the verification scope")
@@ -467,7 +462,7 @@ func matchesDecisionApproval(input Attempt, actor identity.Principal, decisionCt
 		}
 		return decision.TaskID != "" && decisionCtx.ActorTaskID != "" && decisionCtx.ActorTaskID == decision.TaskID
 	case identity.KindService:
-		if !actor.Enabled || !scopeContains(actor.Scope, input.Scope) {
+		if !actor.Enabled || !actor.Scope.Contains(input.Scope) {
 			return false
 		}
 		return decisionCtx.ServiceAssigned
@@ -504,7 +499,7 @@ func subjectMatchesApproval(operation resource.Operation, required, recorded Sub
 		if got.Value == want.Value {
 			continue
 		}
-		if name == "expected_base" && want.Kind == KindString && isUnbornGitBase(want.Value) && isUnbornGitBase(got.Value) {
+		if name == "expected_base" && want.Kind == KindString && request.IsUnbornGitOID(want.Value) && request.IsUnbornGitOID(got.Value) {
 			continue
 		}
 		return false
@@ -512,32 +507,10 @@ func subjectMatchesApproval(operation resource.Operation, required, recorded Sub
 	return true
 }
 
-const (
-	gitZeroOIDSHA1   = "0000000000000000000000000000000000000000"
-	gitZeroOIDSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
-)
-
-func isUnbornGitBase(value string) bool {
-	return value == "" || value == gitZeroOIDSHA1 || value == gitZeroOIDSHA256
-}
-
 // declaresOperation reports whether the binding declares the attempted resource
 // operation.
 func declaresOperation(binding resource.Binding, operation resource.Operation) bool {
 	return slices.Contains(binding.Operations, operation)
-}
-
-// scopeContains reports whether the owner scope covers the target scope. A
-// tenant-scoped owner covers every project in its tenant; a project-scoped
-// owner covers only that same project.
-func scopeContains(owner, target tenancy.Scope) bool {
-	if owner.TenantID != target.TenantID {
-		return false
-	}
-	if owner.ProjectID == "" {
-		return true
-	}
-	return owner.ProjectID == target.ProjectID
 }
 
 // authorityReads builds the actor.verify current-authority reads in registry

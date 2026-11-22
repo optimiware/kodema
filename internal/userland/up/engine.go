@@ -29,7 +29,6 @@ const (
 // macOS (OrbStack, Docker Desktop, Colima, Podman Machine) and Linux (Podman,
 // Docker Engine) without requiring matching host CLIs or putting secrets in argv.
 type EngineClient struct {
-	socketPath string
 	httpClient *http.Client
 }
 
@@ -99,7 +98,7 @@ func NewEngineClient(socketPath string, custom *http.Client) (*EngineClient, err
 			Timeout:   defaultEngineHTTPTimeout,
 		}
 	}
-	return &EngineClient{socketPath: trimmed, httpClient: client}, nil
+	return &EngineClient{httpClient: client}, nil
 }
 
 // EnsureNetwork creates a labelled bridge network if it does not already exist.
@@ -211,9 +210,30 @@ func (c *EngineClient) EnsureImageWithProgress(ctx context.Context, imageRef str
 		return fmt.Errorf("pull image %q: %w", imageRef, err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("pull image %q failed (HTTP %d)", imageRef, resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxEngineResponseBytes))
+		return fmt.Errorf("pull image %q failed (HTTP %d): %s", imageRef, resp.StatusCode, engineErrMsg(body))
+	}
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var frame struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := dec.Decode(&frame); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("pull image %q: %w", imageRef, err)
+		}
+		if msg := strings.TrimSpace(frame.Error); msg != "" {
+			return fmt.Errorf("pull image %q failed: %s", imageRef, msg)
+		}
+		if msg := strings.TrimSpace(frame.ErrorDetail.Message); msg != "" {
+			return fmt.Errorf("pull image %q failed: %s", imageRef, msg)
+		}
 	}
 	fmt.Fprintf(progress, "pulled image %s\n", imageRef)
 	return nil

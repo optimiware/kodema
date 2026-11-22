@@ -70,7 +70,7 @@ func (publisher *AsyncPublisher) PublishLive(ctx context.Context, scope tenancy.
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := validateScope(scope); err != nil {
+	if err := ValidateScope(scope); err != nil {
 		return err
 	}
 	if err := validateChunk(chunk, publisher.limits.MaxChunkBytes); err != nil {

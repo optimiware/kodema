@@ -87,24 +87,41 @@ func absenceInsertKeyText(scope tenancy.Scope, table string, values map[string]a
 	return absenceKeyText(table, key)
 }
 
-// absenceInsertAdvisory returns the advisory-lock statement one INSERT must
-// issue before its row, or nil for a table with no registered absence key.
-func absenceInsertAdvisory(scope tenancy.Scope, write store.Write) (*store.Statement, error) {
+// absenceInsertAdvisory returns the advisory-lock statement and canonical key
+// one INSERT must issue before its row, or nil for a table with no registered
+// absence key.
+func absenceInsertAdvisory(scope tenancy.Scope, write store.Write) (*store.Statement, string, error) {
 	if _, registered := store.AbsenceKeyColumns(write.Table); !registered {
-		return nil, nil
+		return nil, "", nil
 	}
 	key, err := absenceInsertKeyText(scope, write.Table, write.Values)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return &store.Statement{SQL: advisoryLockSQL, Args: []any{key}}, nil
+	return &store.Statement{SQL: advisoryLockSQL, Args: []any{key}}, key, nil
+}
+
+// checkAbsenceKeyScope confines an absence guard's key to the commit unit's
+// scope. The tenant must match the unit's tenant, and a non-nil project key
+// requires a project-scoped unit for that exact project; a project-scoped unit
+// may still guard its own tenant-wide (project_id: nil) key.
+func checkAbsenceKeyScope(scope tenancy.Scope, key map[string]any) error {
+	if tenant, ok := key["tenant_id"]; ok && tenant != string(scope.TenantID) {
+		return faultForbidden("absence guard tenant does not match the commit unit scope")
+	}
+	if project, ok := key["project_id"]; ok && project != nil {
+		if !scope.ProjectScoped() || project != string(scope.ProjectID) {
+			return faultForbidden("absence guard project does not match the commit unit scope")
+		}
+	}
+	return nil
 }
 
 // planAbsenceLock validates one absence guard and renders its advisory lock and
 // NULL-safe existence check. It performs no I/O and refuses every malformed
 // guard Unit.Validate refuses, so LockRows cannot silently ignore a guard that
 // ExecuteUnit would validate.
-func planAbsenceLock(lock store.Lock, position int) (plannedLock, error) {
+func planAbsenceLock(scope tenancy.Scope, lock store.Lock, position int) (plannedLock, error) {
 	meta, ok := lookupTable(lock.Table)
 	if !ok {
 		return plannedLock{}, faultInvalid(fmt.Sprintf("unknown table %q", lock.Table))
@@ -159,6 +176,9 @@ func planAbsenceLock(lock store.Lock, position int) (plannedLock, error) {
 			return plannedLock{}, faultInvalid(fmt.Sprintf("absence key column %q of table %q has unsupported type %q", name, lock.Table, column.Type))
 		}
 		key[name] = text
+	}
+	if err := checkAbsenceKeyScope(scope, key); err != nil {
+		return plannedLock{}, err
 	}
 	canonical, err := absenceKeyText(lock.Table, key)
 	if err != nil {

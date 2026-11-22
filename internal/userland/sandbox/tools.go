@@ -1,7 +1,6 @@
 package sandbox
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -444,14 +443,21 @@ func (s *Server) toolGrep(raw json.RawMessage) ToolCallResult {
 		}
 
 		displayPath := relFromRoot
-		scanner := bufio.NewScanner(bytes.NewReader(data))
-		// Allow scanning lines up to MaxFileBytes (bounded).
-		maxBuf := min(int(s.cfg.MaxFileBytes)+1, 4<<20)
-		scanner.Buffer(make([]byte, 0, 64<<10), maxBuf)
 		lineNo := 0
-		for scanner.Scan() {
+		for rest := data; len(rest) > 0; {
 			lineNo++
-			line := scanner.Text()
+			var rawLine []byte
+			if idx := bytes.IndexByte(rest, '\n'); idx >= 0 {
+				rawLine = rest[:idx]
+				rest = rest[idx+1:]
+			} else {
+				rawLine = rest
+				rest = nil
+			}
+			if len(rawLine) > 0 && rawLine[len(rawLine)-1] == '\r' {
+				rawLine = rawLine[:len(rawLine)-1]
+			}
+			line := string(rawLine)
 			if !re.MatchString(line) {
 				continue
 			}
@@ -542,9 +548,11 @@ func (s *Server) toolBash(ctx context.Context, raw json.RawMessage) ToolCallResu
 	}()
 
 	done := make(chan struct{})
+	watchDone := make(chan struct{})
 	var timedOut atomic.Bool
 	var cancelled atomic.Bool
 	go func() {
+		defer close(watchDone)
 		select {
 		case <-cmdCtx.Done():
 			if errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
@@ -559,6 +567,10 @@ func (s *Server) toolBash(ctx context.Context, raw json.RawMessage) ToolCallResu
 
 	waitErr := cmd.Wait()
 	close(done)
+	<-watchDone
+
+	didTimeout := timedOut.Load()
+	didCancel := cancelled.Load()
 
 	exitCode := 0
 	if waitErr != nil {
@@ -572,9 +584,9 @@ func (s *Server) toolBash(ctx context.Context, raw json.RawMessage) ToolCallResu
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "exit_code: %d\n", exitCode)
-	if timedOut.Load() {
+	if didTimeout {
 		fmt.Fprintf(&b, "timed_out: true (limit %s)\n", timeout)
-	} else if cancelled.Load() {
+	} else if didCancel {
 		fmt.Fprintf(&b, "cancelled: true\n")
 	}
 	stdoutStr, stdoutTrunc := stdoutBuf.Result()
@@ -601,7 +613,7 @@ func (s *Server) toolBash(ctx context.Context, raw json.RawMessage) ToolCallResu
 	}
 
 	res := textResult(strings.TrimRight(b.String(), "\n"))
-	if timedOut.Load() || cancelled.Load() || exitCode != 0 {
+	if didTimeout || didCancel || exitCode != 0 {
 		res.IsError = true
 	}
 	return res

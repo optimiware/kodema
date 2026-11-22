@@ -255,23 +255,10 @@ func runPipelineList(ctx context.Context, config Config, args []string, ports Po
 		return failure(ports.Err, err)
 	}
 	if format == OutputJSON {
-		if pages == 1 {
-			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "pipeline.list", Body: firstBody}); err != nil {
-				return failure(ports.Err, err)
-			}
-			return ExitSuccess
-		}
 		if pipelines == nil {
 			pipelines = []api.PipelineSummaryView{}
 		}
-		combined, err := json.Marshal(api.PipelineListResult{Pipelines: pipelines})
-		if err != nil {
-			return failure(ports.Err, err)
-		}
-		if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: "pipeline.list", Body: combined}); err != nil {
-			return failure(ports.Err, err)
-		}
-		return ExitSuccess
+		return renderPaginatedJSON(ports, "pipeline.list", firstBody, pages, api.PipelineListResult{Pipelines: pipelines})
 	}
 
 	tw := tabwriter.NewWriter(ports.Out, 0, 0, 2, ' ', 0)
@@ -286,49 +273,18 @@ func runPipelineList(ctx context.Context, config Config, args []string, ports Po
 }
 
 func fetchAllPipelines(ctx context.Context, ports Ports, projectID string) ([]api.PipelineSummaryView, json.RawMessage, int, error) {
-	var (
-		all       []api.PipelineSummaryView
-		firstBody json.RawMessage
-		pages     int
-		cursor    string
-	)
-	for {
-		req := api.PipelineListRequest{ProjectID: projectID}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		input, err := json.Marshal(req)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		invocation := api.Invocation{
-			Operation: "pipeline.list",
-			Request:   api.Request{Input: input},
-		}
-		if err := invocation.Validate(); err != nil {
-			return nil, nil, pages, err
-		}
-		result, err := ports.Client.Invoke(ctx, invocation)
-		if err != nil {
-			return nil, nil, pages, err
-		}
-		pages++
-		if pages == 1 {
-			firstBody = result.Body
-		}
-		var page api.PipelineListResult
-		if len(result.Body) > 0 {
-			if err := json.Unmarshal(result.Body, &page); err != nil {
-				return nil, nil, pages, fmt.Errorf("invalid pipeline.list response: %w", err)
+	return fetchAllPages(ctx, ports, "pipeline.list",
+		func(cursor string) any {
+			req := api.PipelineListRequest{ProjectID: projectID}
+			if cursor != "" {
+				req.Page = &api.Page{Cursor: cursor}
 			}
-		}
-		all = append(all, page.Pipelines...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
-	}
-	return all, firstBody, pages, nil
+			return req
+		},
+		func(page api.PipelineListResult) ([]api.PipelineSummaryView, string) {
+			return page.Pipelines, page.NextCursor
+		},
+	)
 }
 
 // resolvePipelineIDByName searches pipeline.list in projectID for a stored

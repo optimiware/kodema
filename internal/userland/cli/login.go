@@ -38,6 +38,27 @@ func persistSessionRecord(ctx context.Context, store SessionRecordStore, record 
 	return store.SaveRecord(writeCtx, record)
 }
 
+// persistLockedSessionRecord acquires the session lock immediately around
+// persisting a newly minted session record so the lock is never held across
+// interactive browser callbacks or device polling. The acquire context is
+// detached from caller cancellation without an artificial shorter deadline so
+// the lock's configured timeout (--session-lock-timeout) is honored.
+func persistLockedSessionRecord(ctx context.Context, lock SessionLock, store SessionRecordStore, record SessionRecord) error {
+	release, err := lock.Acquire(context.WithoutCancel(ctx))
+	if err != nil {
+		return fault.Wrap(fault.DependencyUnavailable, fmt.Sprintf("the session lock could not be acquired: %v", err), err)
+	}
+	if release != nil {
+		defer func() {
+			_ = release()
+		}()
+	}
+	if err := persistSessionRecord(ctx, store, record); err != nil {
+		return wrapPersistSessionError(err)
+	}
+	return nil
+}
+
 // deleteSessionRecord removes one stale record even if the caller's context
 // died; it is the ambiguous-rotation and logout cleanup path.
 func deleteSessionRecord(ctx context.Context, store SessionRecordStore) error {
@@ -227,8 +248,8 @@ func loginBrowser(ctx context.Context, deps LoginDeps, document api.DiscoveryDoc
 	if err != nil {
 		return SessionRecord{}, err
 	}
-	if err := persistSessionRecord(ctx, deps.Store, record); err != nil {
-		return SessionRecord{}, wrapPersistSessionError(err)
+	if err := persistLockedSessionRecord(ctx, deps.Lock, deps.Store, record); err != nil {
+		return SessionRecord{}, err
 	}
 	return record, nil
 }
@@ -301,8 +322,8 @@ func loginDevice(ctx context.Context, deps LoginDeps, document api.DiscoveryDocu
 		if err != nil {
 			return SessionRecord{}, err
 		}
-		if err := persistSessionRecord(ctx, deps.Store, record); err != nil {
-			return SessionRecord{}, wrapPersistSessionError(err)
+		if err := persistLockedSessionRecord(ctx, deps.Lock, deps.Store, record); err != nil {
+			return SessionRecord{}, err
 		}
 		return record, nil
 	}

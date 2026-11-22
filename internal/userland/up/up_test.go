@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1603,6 +1604,8 @@ func TestUpThatFailsStopsItsGatewayAndShowsTheServerLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gwCtx, stopGW := context.WithCancel(context.Background())
+	defer stopGW()
 	_, err = Up(context.Background(), UpConfig{
 		Instance:   "test",
 		ListenAddr: fmt.Sprintf("127.0.0.1:%d", testPort),
@@ -1614,10 +1617,11 @@ func TestUpThatFailsStopsItsGatewayAndShowsTheServerLog(t *testing.T) {
 			PingSocket:     func(context.Context, string) (RuntimeKind, error) { return KindPodman, nil },
 		},
 		EngineHTTP: engine.client,
-		SpawnGateway: func(string) (int, error) {
+		SpawnGateway: func(stateDir string) (int, error) {
 			if err := gateway.Start(); err != nil {
 				return 0, err
 			}
+			go func() { _ = ServeStackGateway(gwCtx, stateDir) }()
 			return gateway.Process.Pid, nil
 		},
 		Provision: func(context.Context, provisionConfig) (string, error) {
@@ -2482,4 +2486,181 @@ func TestUpLLMProxyConfiguration(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestEnsureImageWithProgressStreamErrors(t *testing.T) {
+	newClient := func(pullStatus int, pullBody string) *EngineClient {
+		t.Helper()
+		httpCli := &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/json") {
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(`{"message":"no such image"}`)),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: pullStatus,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(pullBody)),
+				}, nil
+			}),
+		}
+		eng, err := NewEngineClient("/mock.sock", httpCli)
+		if err != nil {
+			t.Fatalf("NewEngineClient: %v", err)
+		}
+		return eng
+	}
+
+	t.Run("detects NDJSON error frame", func(t *testing.T) {
+		eng := newClient(http.StatusOK, "{\"status\":\"Pulling\"}\n{\"error\":\"pull access denied\"}\n")
+		err := eng.EnsureImageWithProgress(context.Background(), "example.com/private:latest", io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "pull access denied") {
+			t.Fatalf("err = %v; want error containing 'pull access denied'", err)
+		}
+	})
+
+	t.Run("detects NDJSON errorDetail.message frame", func(t *testing.T) {
+		eng := newClient(http.StatusOK, "{\"status\":\"Pulling\"}\n{\"errorDetail\":{\"message\":\"manifest unknown\"}}\n")
+		err := eng.EnsureImageWithProgress(context.Background(), "example.com/missing:tag", io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "manifest unknown") {
+			t.Fatalf("err = %v; want error containing 'manifest unknown'", err)
+		}
+	})
+
+	t.Run("propagates malformed NDJSON error", func(t *testing.T) {
+		eng := newClient(http.StatusOK, "{\"status\":\"Pulling\"}\n{truncated")
+		err := eng.EnsureImageWithProgress(context.Background(), "example.com/corrupt:tag", io.Discard)
+		if err == nil {
+			t.Fatal("expected decode error for malformed pull stream")
+		}
+	})
+
+	t.Run("succeeds on clean multi-frame NDJSON", func(t *testing.T) {
+		var progress strings.Builder
+		eng := newClient(http.StatusOK, "{\"status\":\"Pulling\"}\n{\"status\":\"Downloaded\"}\n")
+		if err := eng.EnsureImageWithProgress(context.Background(), "example.com/ok:latest", &progress); err != nil {
+			t.Fatalf("EnsureImageWithProgress: %v", err)
+		}
+		if !strings.Contains(progress.String(), "pulled image example.com/ok:latest") {
+			t.Fatalf("progress = %q", progress.String())
+		}
+	})
+}
+
+func TestWaitGatewayReadyAndSIGKILLEscalation(t *testing.T) {
+	t.Run("fails fast when gateway process exits", func(t *testing.T) {
+		// Spawn a short-lived process and reap it so its PID is guaranteed dead.
+		short := exec.Command("sh", "-c", "exit 1")
+		if err := short.Run(); err != nil {
+			// expected exit 1
+		}
+		deadPID := short.Process.Pid
+		probes := 0
+		err := waitGatewayReady(context.Background(), deadPID, "https://127.0.0.1:8443/auth/healthz", "/ca.crt", "/state/gateway.log", 20, 50*time.Millisecond, func(context.Context, string, string) bool {
+			probes++
+			return false
+		})
+		if err == nil || !strings.Contains(err.Error(), "gateway.log") {
+			t.Fatalf("err = %v; want error referencing gateway.log", err)
+		}
+		if probes != 1 {
+			t.Fatalf("probes = %d; want fail-fast after 1 probe", probes)
+		}
+	})
+
+	t.Run("fails fast when detached daemon crashes without leaving zombie", func(t *testing.T) {
+		pid, err := spawnDetachedDaemon(exec.Command("sh", "-c", "exit 1"))
+		if err != nil {
+			t.Fatalf("spawnDetachedDaemon: %v", err)
+		}
+		probes := 0
+		err = waitGatewayReady(context.Background(), pid, "https://127.0.0.1:8443/auth/healthz", "/ca.crt", "/state/gateway.log", 20, 25*time.Millisecond, func(context.Context, string, string) bool {
+			probes++
+			return false
+		})
+		if err == nil || !strings.Contains(err.Error(), "exited before becoming ready") {
+			t.Fatalf("err = %v; want crash-detection error", err)
+		}
+		if probes >= 20 {
+			t.Fatalf("probes = %d; expected fail-fast crash detection before exhausting attempts", probes)
+		}
+	})
+
+	t.Run("gatewayProcessConfirmed refuses SIGKILL when ps is unavailable", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if gatewayProcessConfirmed(os.Getpid()) {
+			t.Fatal("gatewayProcessConfirmed returned true when ps is unavailable")
+		}
+	})
+
+	t.Run("timeout returns error referencing gateway.log", func(t *testing.T) {
+		err := waitGatewayReady(context.Background(), os.Getpid(), "https://127.0.0.1:8443/auth/healthz", "/ca.crt", "/state/gateway.log", 2, 5*time.Millisecond, func(context.Context, string, string) bool {
+			return false
+		})
+		if err == nil || !strings.Contains(err.Error(), "gateway.log") {
+			t.Fatalf("err = %v; want timeout error referencing gateway.log", err)
+		}
+	})
+
+	t.Run("respects context cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := waitGatewayReady(ctx, os.Getpid(), "https://127.0.0.1:8443/auth/healthz", "/ca.crt", "/state/gateway.log", 10, time.Second, func(context.Context, string, string) bool {
+			return false
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v; want context.Canceled", err)
+		}
+	})
+
+	t.Run("stopExistingGateway escalates to SIGKILL when SIGTERM is ignored", func(t *testing.T) {
+		stateDir := t.TempDir()
+		// Ignore SIGTERM so only SIGKILL terminates this process.
+		stubborn := exec.Command("sh", "-c", `trap "" TERM; while :; do sleep 1; done`, "--gateway-only")
+		if err := stubborn.Start(); err != nil {
+			t.Fatalf("start stubborn process: %v", err)
+		}
+		defer func() { _ = stubborn.Process.Kill() }()
+		if err := os.WriteFile(filepath.Join(stateDir, "gateway.pid"), []byte(strconv.Itoa(stubborn.Process.Pid)+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Give sh a moment to install its TERM trap before sending SIGTERM.
+		time.Sleep(50 * time.Millisecond)
+
+		stopExistingGatewayWithGrace(stateDir, 150*time.Millisecond)
+
+		done := make(chan error, 1)
+		go func() { done <- stubborn.Wait() }()
+		select {
+		case <-done:
+			ws, ok := stubborn.ProcessState.Sys().(syscall.WaitStatus)
+			if !ok || ws.Signal() != syscall.SIGKILL {
+				t.Fatalf("process ended with %v; want SIGKILL escalation", stubborn.ProcessState)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("stubborn gateway survived SIGKILL escalation")
+		}
+	})
+}
+
+func TestNewGatewayNonHTTPDefaultTransportFallback(t *testing.T) {
+	orig := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("custom transport")
+	})
+	defer func() { http.DefaultTransport = orig }()
+
+	gw, err := NewGateway(GatewayConfig{
+		ServerUpstream: "https://127.0.0.1:8443",
+		AuthHandler:    http.NewServeMux(),
+	})
+	if err != nil {
+		t.Fatalf("NewGateway with custom http.DefaultTransport failed: %v", err)
+	}
+	if gw == nil {
+		t.Fatal("NewGateway returned nil")
+	}
 }

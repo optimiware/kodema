@@ -549,6 +549,42 @@ func TestEmailOversizeAndMalformedMessagesRefused(t *testing.T) {
 				"\r\nbody\r\n",
 			want: services.ErrEmailAttachment,
 		},
+		{
+			name: "duplicate content type with hidden multipart",
+			message: "Message-ID: <p26-dup-multipart@example.test>\r\n" +
+				"Subject: smuggled multipart\r\n" +
+				"Content-Type: text/plain; charset=utf-8\r\n" +
+				"Content-Type: multipart/mixed; boundary=\"b\"\r\n" +
+				"\r\nbody\r\n",
+			want: services.ErrEmailAttachment,
+		},
+		{
+			name: "duplicate content type html then multipart returns attachment",
+			message: "Message-ID: <p26-html-multipart@example.test>\r\n" +
+				"Subject: html then multipart\r\n" +
+				"Content-Type: text/html\r\n" +
+				"Content-Type: multipart/alternative; boundary=\"b\"\r\n" +
+				"\r\nbody\r\n",
+			want: services.ErrEmailAttachment,
+		},
+		{
+			name: "duplicate text/plain content type headers",
+			message: "Message-ID: <p26-dup-plain@example.test>\r\n" +
+				"Subject: duplicate plain\r\n" +
+				"Content-Type: text/plain\r\n" +
+				"Content-Type: text/plain; charset=utf-8\r\n" +
+				"\r\nbody\r\n",
+			want: services.ErrEmailMalformed,
+		},
+		{
+			name: "duplicate text/plain and text/html content type headers",
+			message: "Message-ID: <p26-dup-html@example.test>\r\n" +
+				"Subject: plain and html\r\n" +
+				"Content-Type: text/plain\r\n" +
+				"Content-Type: text/html\r\n" +
+				"\r\nbody\r\n",
+			want: services.ErrEmailMalformed,
+		},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

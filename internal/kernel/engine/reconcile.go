@@ -21,7 +21,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -86,7 +85,7 @@ func (e *Engine) Reconcile(ctx context.Context, executionID id.ExecutionID) (ker
 
 		progress, stop, err := e.advance(ctx, execution)
 		if err != nil {
-			if class, ok := fault.ClassOf(err); ok && class == fault.VersionConflict {
+			if isVersionConflict(err) {
 				// A concurrent transition won the same commit boundary. Re-read
 				// and re-evaluate instead of replaying the stale payload.
 				continue
@@ -489,15 +488,6 @@ func firstPending(execution kernel.Execution) int {
 	return -1
 }
 
-func actionIndex(execution kernel.Execution, actionID id.ActionID) int {
-	for index, action := range execution.Actions {
-		if action.ID == actionID {
-			return index
-		}
-	}
-	return -1
-}
-
 // pendingCancellations cancels every pending action except the primary one, so
 // a failure or cancellation never leaves a successor pending.
 func pendingCancellations(execution kernel.Execution, primary id.ActionID) []flow.ActionUpdate {
@@ -513,35 +503,6 @@ func pendingCancellations(execution kernel.Execution, primary id.ActionID) []flo
 		})
 	}
 	return updates
-}
-
-func observationsEqual(recorded, candidate kernel.Observation) bool {
-	if recorded.Kind != candidate.Kind || recorded.Proof != candidate.Proof ||
-		recorded.OOMKilled != candidate.OOMKilled || recorded.MemoryLimit != candidate.MemoryLimit {
-		return false
-	}
-	if (recorded.ExitCode == nil) != (candidate.ExitCode == nil) {
-		return false
-	}
-	if recorded.ExitCode != nil && *recorded.ExitCode != *candidate.ExitCode {
-		return false
-	}
-	if (recorded.Stop == nil) != (candidate.Stop == nil) {
-		return false
-	}
-	if recorded.Stop != nil && *recorded.Stop != *candidate.Stop {
-		return false
-	}
-	return true
-}
-
-func cloneOutputs(values kernel.Outputs) kernel.Outputs {
-	if values == nil {
-		return nil
-	}
-	cloned := make(kernel.Outputs, len(values))
-	maps.Copy(cloned, values)
-	return cloned
 }
 
 func unsupportedCapability(name string) error {

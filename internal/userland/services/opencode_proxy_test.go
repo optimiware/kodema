@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -393,4 +394,65 @@ func TestOpenCodeLLMProxyMidStreamAbort(t *testing.T) {
 	if readErr == nil {
 		t.Fatal("expected aborted mid-stream read error after turn cancel, got clean EOF")
 	}
+}
+
+func TestOpenCodeLLMProxyStartUsesConfiguredListenAddr(t *testing.T) {
+	t.Run("Start empty uses config ListenAddr", func(t *testing.T) {
+		probe, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("probe Listen: %v", err)
+		}
+		wantAddr := probe.Addr().String()
+		_ = probe.Close()
+
+		proxy, err := NewOpenCodeLLMProxy(OpenCodeLLMProxyConfig{
+			ListenAddr:  "  " + wantAddr + "  ",
+			KodemaURL:   "http://127.0.0.1:18080",
+			Credentials: staticTestCred("kodsvc.tok"),
+		})
+		if err != nil {
+			t.Fatalf("NewOpenCodeLLMProxy: %v", err)
+		}
+		gotURL, err := proxy.Start("")
+		if err != nil {
+			t.Fatalf("Start(\"\"): %v", err)
+		}
+		defer func() { _ = proxy.Close(context.Background()) }()
+		if gotURL != "http://"+wantAddr {
+			t.Fatalf("Start(\"\") URL = %q; want %q", gotURL, "http://"+wantAddr)
+		}
+	})
+
+	t.Run("Start empty rejects non-loopback config ListenAddr", func(t *testing.T) {
+		proxy, err := NewOpenCodeLLMProxy(OpenCodeLLMProxyConfig{
+			ListenAddr:  "0.0.0.0:0",
+			KodemaURL:   "http://127.0.0.1:18080",
+			Credentials: staticTestCred("kodsvc.tok"),
+		})
+		if err != nil {
+			t.Fatalf("NewOpenCodeLLMProxy: %v", err)
+		}
+		if _, err := proxy.Start(""); err == nil {
+			t.Fatal("Start(\"\") accepted non-loopback configured ListenAddr")
+		}
+	})
+
+	t.Run("explicit Start arg overrides config ListenAddr", func(t *testing.T) {
+		proxy, err := NewOpenCodeLLMProxy(OpenCodeLLMProxyConfig{
+			ListenAddr:  "0.0.0.0:0",
+			KodemaURL:   "http://127.0.0.1:18080",
+			Credentials: staticTestCred("kodsvc.tok"),
+		})
+		if err != nil {
+			t.Fatalf("NewOpenCodeLLMProxy: %v", err)
+		}
+		gotURL, err := proxy.Start("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Start(\"127.0.0.1:0\"): %v", err)
+		}
+		defer func() { _ = proxy.Close(context.Background()) }()
+		if !strings.HasPrefix(gotURL, "http://127.0.0.1:") {
+			t.Fatalf("unexpected bound URL %q", gotURL)
+		}
+	})
 }

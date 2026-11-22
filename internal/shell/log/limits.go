@@ -13,7 +13,6 @@ import (
 
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
-	"github.com/optimiware/kodema/internal/shell/tenancy"
 )
 
 // Clock is the injected authoritative time source for retention.
@@ -118,11 +117,6 @@ func validateChunk(chunk Chunk, maxChunkBytes int) error {
 		return fault.New(fault.InvalidInput, fmt.Sprintf("log chunk is %d bytes; at most %d are allowed", len(chunk.Data), maxChunkBytes))
 	}
 	return nil
-}
-
-// validateScope checks the explicit ownership scope of one log operation.
-func validateScope(scope tenancy.Scope) error {
-	return ValidateScope(scope)
 }
 
 // redactionMarker replaces every configured sensitive value. It carries no

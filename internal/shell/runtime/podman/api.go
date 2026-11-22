@@ -25,6 +25,7 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/kernel/engine"
 	"github.com/optimiware/kodema/internal/shell/runtime"
+	"github.com/optimiware/kodema/internal/shell/runtime/internal/adapterutil"
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
@@ -284,10 +285,42 @@ type Adapter struct {
 	toolboxMu   sync.Mutex
 
 	mu    sync.Mutex
-	locks map[id.WorkloadID]*sync.Mutex
+	locks map[id.WorkloadID]*keyedLock
 
 	workspaceMu    sync.Mutex
-	workspaceLocks map[id.WorkspaceID]*sync.Mutex
+	workspaceLocks map[id.WorkspaceID]*keyedLock
+}
+
+// keyedLock is one reference-counted per-key mutex whose map entry is removed
+// once the last holder releases it.
+type keyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func acquireKeyedLock[K comparable](mu *sync.Mutex, locks *map[K]*keyedLock, key K) func() {
+	mu.Lock()
+	if *locks == nil {
+		*locks = make(map[K]*keyedLock)
+	}
+	lock := (*locks)[key]
+	if lock == nil {
+		lock = &keyedLock{}
+		(*locks)[key] = lock
+	}
+	lock.refs++
+	mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(*locks, key)
+		}
+		mu.Unlock()
+	}
 }
 
 // New validates one adapter configuration. An incomplete configuration is
@@ -340,23 +373,22 @@ func New(config Config) (*Adapter, error) {
 	}
 	clock := config.Clock
 	if clock == nil {
-		clock = realClock{}
+		clock = adapterutil.RealClock{}
 	}
 	return &Adapter{
-		libpod:        config.Libpod,
-		files:         config.Files,
-		root:          root,
-		kodemaURL:     config.KodemaURL,
-		workloadCAPEM: workloadCAPEM,
-		gitURL:        gitURL,
-		resources:     resources,
-		toolboxFile:   toolboxFile,
-		toolboxDir:    toolboxDir,
-		cleanup:       config.Cleanup,
-		clock:         clock,
-		locks:         map[id.WorkloadID]*sync.Mutex{},
-
-		workspaceLocks: map[id.WorkspaceID]*sync.Mutex{},
+		libpod:         config.Libpod,
+		files:          config.Files,
+		root:           root,
+		kodemaURL:      config.KodemaURL,
+		workloadCAPEM:  workloadCAPEM,
+		gitURL:         gitURL,
+		resources:      resources,
+		toolboxFile:    toolboxFile,
+		toolboxDir:     toolboxDir,
+		cleanup:        config.Cleanup,
+		clock:          clock,
+		locks:          map[id.WorkloadID]*keyedLock{},
+		workspaceLocks: map[id.WorkspaceID]*keyedLock{},
 	}, nil
 }
 
@@ -451,33 +483,20 @@ func toolboxDigest(path string) (string, error) {
 
 func toolboxDigestName(sum []byte) string { return hex.EncodeToString(sum)[:24] }
 
-// lockFor returns the per-workload mutex that serializes lifecycle effects on
-// one stable identity inside this process. It never substitutes for the durable
-// removal fence.
-func (a *Adapter) lockFor(workload id.WorkloadID) *sync.Mutex {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	lock := a.locks[workload]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		a.locks[workload] = lock
-	}
-	return lock
+// lockFor acquires the per-workload mutex that serializes lifecycle effects on
+// one stable identity inside this process and returns its unlock function. It
+// never substitutes for the durable removal fence.
+func (a *Adapter) lockFor(workload id.WorkloadID) func() {
+	return acquireKeyedLock(&a.mu, &a.locks, workload)
 }
 
-// lockForWorkspace returns the per-workspace mutex shared by every operation
-// that attaches, detaches or observes one retained workspace volume. Lifecycle
-// operations acquire the workload lock first and this lock second, so the
-// ordering is consistent and a release can never interleave with a start.
-func (a *Adapter) lockForWorkspace(workspace id.WorkspaceID) *sync.Mutex {
-	a.workspaceMu.Lock()
-	defer a.workspaceMu.Unlock()
-	lock := a.workspaceLocks[workspace]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		a.workspaceLocks[workspace] = lock
-	}
-	return lock
+// lockForWorkspace acquires the per-workspace mutex shared by every operation
+// that attaches, detaches or observes one retained workspace volume, returning
+// its unlock function. Lifecycle operations acquire the workload lock first and
+// this lock second, so the ordering is consistent and a release can never
+// interleave with a start.
+func (a *Adapter) lockForWorkspace(workspace id.WorkspaceID) func() {
+	return acquireKeyedLock(&a.workspaceMu, &a.workspaceLocks, workspace)
 }
 
 // Version reports the pinned libpod API surface without contacting the daemon.
@@ -516,7 +535,7 @@ func ContainerName(workload id.WorkloadID) (string, error) {
 	if _, err := id.ParseWorkloadID(string(workload)); err != nil {
 		return "", fault.Wrap(fault.InvalidInput, "workload id is invalid", err)
 	}
-	return "kodema-workload-" + stableDigest(string(workload)), nil
+	return "kodema-workload-" + adapterutil.StableDigest(string(workload)), nil
 }
 
 // WorkspaceVolumeName returns the deterministic name of one retained workspace
@@ -526,7 +545,7 @@ func WorkspaceVolumeName(workspace id.WorkspaceID) (string, error) {
 	if _, err := id.ParseWorkspaceID(string(workspace)); err != nil {
 		return "", fault.Wrap(fault.InvalidInput, "workspace id is invalid", err)
 	}
-	return "kodema-workspace-" + stableDigest(string(workspace)), nil
+	return "kodema-workspace-" + adapterutil.StableDigest(string(workspace)), nil
 }
 
 // CacheVolumeName returns the deterministic Podman named volume for one
@@ -543,33 +562,4 @@ func CacheVolumeName(key string) (string, error) {
 		}
 	}
 	return "kodema-cache-" + key, nil
-}
-
-// stableDigest returns a short deterministic, DNS-safe digest of a stable
-// identity. Names are derived only from persisted identities, never from
-// randomness, so a retry finds the same object.
-func stableDigest(value string) string {
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])[:24]
-}
-
-// realClock is the production clock. It never appears in unit tests.
-type realClock struct{}
-
-// Now returns the current wall-clock time.
-func (realClock) Now() time.Time { return time.Now() }
-
-// Sleep waits for the duration or until the context ends.
-func (realClock) Sleep(ctx context.Context, duration time.Duration) error {
-	if duration <= 0 {
-		return ctx.Err()
-	}
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }

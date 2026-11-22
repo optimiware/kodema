@@ -384,9 +384,9 @@ func TestToolCompositionUsesCurrentAuthorityAndConsumerPolicy(t *testing.T) {
 // mustToolBinding builds the request-local binding authenticator around a
 // static base resolver. withPrincipal always binds the presented principal, so
 // the base is never consulted by these tests.
-func mustToolBinding(t *testing.T, principal identity.Principal, clock Clock) *bindingAuthenticator {
+func mustToolBinding(t *testing.T, principal identity.Principal, _ Clock) *bindingAuthenticator {
 	t.Helper()
-	authenticator, err := newBindingAuthenticator(staticToolPrincipals{principal: principal}, clock)
+	authenticator, err := newBindingAuthenticator(staticToolPrincipals{principal: principal})
 	if err != nil {
 		t.Fatalf("newBindingAuthenticator: %v", err)
 	}

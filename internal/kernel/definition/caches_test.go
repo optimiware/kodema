@@ -1,6 +1,7 @@
 package definition_test
 
 import (
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -110,5 +111,75 @@ func TestValidateCachesAndBudget(t *testing.T) {
 	}
 	if got.Actions[0].Container.Budget == nil || got.Actions[0].Container.Budget.MaxTokens != 4000 {
 		t.Fatalf("snapshot action budget mutated: %+v", got.Actions[0].Container.Budget)
+	}
+}
+
+func TestValidateContainerCachesAndBudgetWrapWithoutDoublePrefix(t *testing.T) {
+	basePipeline := func(mutate func(*definition.Container)) definition.Pipeline {
+		container := &definition.Container{
+			Image:    "registry.example.com/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Commands: []string{"echo ok"},
+		}
+		mutate(container)
+		return definition.Pipeline{
+			Actions: []definition.Action{{
+				Name:      id.ActionName("build"),
+				Timeout:   time.Minute,
+				Container: container,
+			}},
+		}
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*definition.Container)
+	}{
+		{
+			name: "invalid cache name",
+			mutate: func(c *definition.Container) {
+				c.Caches = []string{"Bad/Cache"}
+			},
+		},
+		{
+			name: "invalid budget",
+			mutate: func(c *definition.Container) {
+				c.Budget = &definition.Budget{MaxTokens: -5}
+			},
+		},
+		{
+			name: "invalid resources",
+			mutate: func(c *definition.Container) {
+				c.Resources = &definition.Resources{Memory: "not-a-quantity"}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := definition.Validate(basePipeline(tc.mutate))
+			if err == nil {
+				t.Fatalf("definition.Validate(%s) succeeded; want invalid_input", tc.name)
+			}
+			if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+				t.Fatalf("class = %q (%v); want invalid_input", class, ok)
+			}
+			msg, ok := fault.MessageOf(err)
+			if !ok {
+				t.Fatalf("MessageOf(%v) = false; want true", err)
+			}
+			if !strings.HasPrefix(msg, `action "build": `) {
+				t.Fatalf("message = %q; want prefix %q", msg, `action "build": `)
+			}
+			if strings.Contains(msg, string(fault.InvalidInput)+":") {
+				t.Fatalf("message %q double-prefixes %q", msg, fault.InvalidInput)
+			}
+			cause := errors.Unwrap(err)
+			if cause == nil {
+				t.Fatalf("errors.Unwrap(%v) = nil; want wrapped cause", err)
+			}
+			if class, ok := fault.ClassOf(cause); !ok || class != fault.InvalidInput {
+				t.Fatalf("cause class = %q (%v); want invalid_input", class, ok)
+			}
+		})
 	}
 }

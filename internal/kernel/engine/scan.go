@@ -13,6 +13,8 @@ package engine
 import (
 	"context"
 	"errors"
+
+	"github.com/optimiware/kodema/internal/id"
 )
 
 // Scan reconciles every due and unfinished execution reported by the state
@@ -25,6 +27,7 @@ import (
 func (e *Engine) Scan(ctx context.Context) error {
 	now := e.now()
 	var failures []error
+	seen := make(map[id.ExecutionID]struct{})
 	for _, kind := range ScanKinds() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -37,6 +40,10 @@ func (e *Engine) Scan(ctx context.Context) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if _, ok := seen[executionID]; ok {
+				continue
+			}
+			seen[executionID] = struct{}{}
 			if _, err := e.Reconcile(ctx, executionID); err != nil {
 				failures = append(failures, err)
 			}

@@ -212,3 +212,78 @@ func TestRetentionSweeperRefusesAnUnusableClockOrScope(t *testing.T) {
 		t.Fatal("NewRetentionSweeper accepted a nil store")
 	}
 }
+
+type cancellingRetentionStore struct {
+	*fakeRetentionStore
+	onCandidates func(class RetentionClass)
+	onDelete     func(candidate RetentionCandidate)
+}
+
+func (store *cancellingRetentionStore) Candidates(ctx context.Context, scope RetentionScope, class RetentionClass, before time.Time) ([]RetentionCandidate, error) {
+	if store.onCandidates != nil {
+		store.onCandidates(class)
+	}
+	return store.fakeRetentionStore.Candidates(ctx, scope, class, before)
+}
+
+func (store *cancellingRetentionStore) Delete(ctx context.Context, scope RetentionScope, class RetentionClass, candidate RetentionCandidate, before time.Time) (bool, error) {
+	if store.onDelete != nil {
+		store.onDelete(candidate)
+	}
+	return store.fakeRetentionStore.Delete(ctx, scope, class, candidate, before)
+}
+
+func TestRetentionSweeperStopsPromptlyOnContextCancellation(t *testing.T) {
+	t.Run("stops before querying next class", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		base, scopes := sweeperTestStore()
+		store := &cancellingRetentionStore{
+			fakeRetentionStore: base,
+			onCandidates: func(RetentionClass) {
+				cancel()
+			},
+		}
+		sweeper, err := NewRetentionSweeper(RetentionPolicy{}, store)
+		if err != nil {
+			t.Fatalf("NewRetentionSweeper: %v", err)
+		}
+		_, err = sweeper.Sweep(ctx, scopes, retentionSweepNow)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Sweep error = %v; want context.Canceled", err)
+		}
+		if len(store.queries) != 1 {
+			t.Fatalf("store.Candidates called %d times after cancellation; want 1", len(store.queries))
+		}
+		if len(store.deleted) != 0 {
+			t.Fatalf("store.Delete called %v after cancellation; want none", store.deleted)
+		}
+	})
+
+	t.Run("stops before deleting next candidate", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		scope := RetentionScope{TenantID: "tenant-1", ProjectID: "project-1"}
+		base := newFakeRetentionStore()
+		base.candidates[retentionKey(scope, RetentionLogs)] = []RetentionCandidate{
+			{ID: "log-1", CreatedAt: retentionSweepNow.Add(-31 * 24 * time.Hour)},
+			{ID: "log-2", CreatedAt: retentionSweepNow.Add(-32 * 24 * time.Hour)},
+			{ID: "log-3", CreatedAt: retentionSweepNow.Add(-33 * 24 * time.Hour)},
+		}
+		store := &cancellingRetentionStore{
+			fakeRetentionStore: base,
+			onDelete: func(RetentionCandidate) {
+				cancel()
+			},
+		}
+		sweeper, err := NewRetentionSweeper(RetentionPolicy{}, store)
+		if err != nil {
+			t.Fatalf("NewRetentionSweeper: %v", err)
+		}
+		_, err = sweeper.Sweep(ctx, []RetentionScope{scope}, retentionSweepNow)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Sweep error = %v; want context.Canceled", err)
+		}
+		if len(store.deleted) != 1 {
+			t.Fatalf("store.Delete called for %v after cancellation; want only first candidate", store.deleted)
+		}
+	})
+}

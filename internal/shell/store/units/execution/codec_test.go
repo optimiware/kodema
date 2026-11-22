@@ -14,6 +14,16 @@ import (
 	"github.com/optimiware/kodema/internal/shell/workspace"
 )
 
+// decodeSnapshot rebuilds the immutable kernel snapshot from the shared
+// snapshot document.
+func decodeSnapshot(data []byte) (*definition.Snapshot, error) {
+	admitted, err := snapshotdoc.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	return definitionSnapshot(admitted)
+}
+
 func TestDecodeSnapshotMapsTheSharedDocument(t *testing.T) {
 	yamlBytes := []byte{0x00, 0xff, 'n', 'a', 'm', 'e', ':', ' ', 'x', '\n'}
 	snapshot, err := pipeline.NewSnapshot(pipeline.SnapshotInput{

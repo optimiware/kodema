@@ -97,11 +97,7 @@ main() {
   fi
 
   if [[ -z "$project_or_account" ]]; then
-    case "$cloud" in
-      scw) project_or_account="$(scw_resolve_project_id)" ;;
-      gcp) project_or_account="$(gcp_resolve_project_id)" ;;
-      aws) project_or_account="$(aws_resolve_account_id)" ;;
-    esac
+    project_or_account="$(resolve_cloud_project_or_account "$cloud")"
   fi
 
   validate_cloud "$cloud"

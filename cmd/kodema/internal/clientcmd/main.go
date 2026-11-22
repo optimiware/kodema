@@ -164,6 +164,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, deps cliD
 	if strings.TrimSpace(config.SessionFile) != "" {
 		sessionFile = config.SessionFile
 	}
+	if trimmedSession := strings.TrimSpace(sessionFile); trimmedSession != "" {
+		absSession, err := filepath.Abs(trimmedSession)
+		if err != nil {
+			fmt.Fprintf(stderr, "kodema: cannot resolve session path: %v\n", err)
+			return cli.ExitFailure
+		}
+		sessionFile = absSession
+		if strings.TrimSpace(config.SessionFile) != "" {
+			config.SessionFile = absSession
+		}
+	}
 	if deps.lockTimeout > 0 {
 		lockTimeout = deps.lockTimeout
 	}
@@ -615,12 +626,6 @@ func (systemClock) Sleep(ctx context.Context, duration time.Duration) error {
 	}
 }
 
-// newHTTPOIDCClient builds the production OAuth/OIDC adapter over a transport
-// with default TLS verification and no proxy for loopback endpoints.
-func newHTTPOIDCClient() cli.OIDCClient {
-	return newHTTPOIDCClientWithRootCAs(nil)
-}
-
 // newHTTPOIDCClientWithRootCAs builds the production OAuth/OIDC adapter with
 // optional custom root CAs.
 func newHTTPOIDCClientWithRootCAs(rootCAs *x509.CertPool) cli.OIDCClient {
@@ -634,16 +639,19 @@ func newOIDCTransport() http.RoundTripper {
 	return newOIDCTransportWithRootCAs(nil)
 }
 
-// newOIDCTransportWithRootCAs builds the OIDC transport with optional custom
-// root CAs while always keeping certificate verification enabled.
-func newOIDCTransportWithRootCAs(rootCAs *x509.CertPool) http.RoundTripper {
+// newVerifiedTransport clones the default HTTP transport, keeps certificate
+// verification enabled (InsecureSkipVerify is never set), and optionally wires
+// custom root CAs and a proxy function.
+func newVerifiedTransport(rootCAs *x509.CertPool, proxy func(*http.Request) (*url.URL, error)) *http.Transport {
 	var transport *http.Transport
 	if base, ok := http.DefaultTransport.(*http.Transport); ok {
 		transport = base.Clone()
 	} else {
 		transport = &http.Transport{}
 	}
-	transport.Proxy = oidcProxy
+	if proxy != nil {
+		transport.Proxy = proxy
+	}
 	configuration := transport.TLSClientConfig
 	if configuration == nil {
 		configuration = &tls.Config{}
@@ -659,27 +667,16 @@ func newOIDCTransportWithRootCAs(rootCAs *x509.CertPool) http.RoundTripper {
 	return transport
 }
 
+// newOIDCTransportWithRootCAs builds the OIDC transport with optional custom
+// root CAs while always keeping certificate verification enabled.
+func newOIDCTransportWithRootCAs(rootCAs *x509.CertPool) http.RoundTripper {
+	return newVerifiedTransport(rootCAs, oidcProxy)
+}
+
 // newAPITransport clones the default HTTP transport for REST and MCP calls,
 // wiring optional custom root CAs while never disabling certificate verification.
 func newAPITransport(rootCAs *x509.CertPool) http.RoundTripper {
-	var transport *http.Transport
-	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		transport = base.Clone()
-	} else {
-		transport = &http.Transport{}
-	}
-	configuration := transport.TLSClientConfig
-	if configuration == nil {
-		configuration = &tls.Config{}
-	} else {
-		configuration = configuration.Clone()
-	}
-	configuration.InsecureSkipVerify = false
-	if rootCAs != nil {
-		configuration.RootCAs = rootCAs
-	}
-	transport.TLSClientConfig = configuration
-	return transport
+	return newVerifiedTransport(rootCAs, nil)
 }
 
 // oidcProxy never proxies a loopback or localhost request.
@@ -712,12 +709,8 @@ func (systemBrowser) Open(ctx context.Context, target string) error {
 	command := exec.CommandContext(ctx, name, argv...)
 	command.Env = browserEnvironment()
 	command.Stdout = io.Discard
-	var diagnostics bytes.Buffer
-	command.Stderr = &diagnostics
-	if err := command.Start(); err != nil {
-		return err
-	}
-	return command.Wait()
+	command.Stderr = io.Discard
+	return command.Run()
 }
 
 // browserEnvironment returns the explicit, never-nil launcher environment.
