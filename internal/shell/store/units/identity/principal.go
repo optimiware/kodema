@@ -87,6 +87,67 @@ func (a *Adapter) ReadPrincipal(ctx context.Context, request shellidentity.Princ
 	}
 }
 
+// HasProjectMembership reports whether principalID currently holds at least one
+// active project-scoped human membership (with at least one role) inside
+// tenantID. It scans only projects owned by tenantID and confirms any matching
+// project through ReadPrincipal so an identity colliding with a service or
+// execution row in that project is never accepted as a human membership.
+func (a *Adapter) HasProjectMembership(ctx context.Context, tenantID id.TenantID, principalID id.PrincipalID) (bool, error) {
+	tenantScope := tenancy.Scope{TenantID: tenantID}
+	if err := tenantScope.Validate(); err != nil {
+		return false, err
+	}
+	if _, err := id.ParsePrincipalID(string(principalID)); err != nil {
+		return false, fault.Wrap(fault.InvalidInput, "principal id is invalid", err)
+	}
+	var after string
+	for {
+		page, err := a.scanner.Query(ctx, tenantScope, store.ScanQuery{
+			Table:   "projects",
+			OrderBy: []store.Order{{Column: "id"}},
+			After:   after,
+			Limit:   store.MaxQueryLimit,
+		})
+		if err != nil {
+			return false, err
+		}
+		for _, row := range page.Rows {
+			projectID, err := rowString(row, "id")
+			if err != nil {
+				return false, err
+			}
+			projectScope := tenancy.Scope{
+				TenantID:  tenantID,
+				ProjectID: id.ProjectID(projectID),
+			}
+			_, membership, found, err := a.membershipRowInScope(ctx, projectScope, principalID)
+			if err != nil {
+				return false, err
+			}
+			if !found || len(membership.Roles) == 0 {
+				continue
+			}
+			current, err := a.ReadPrincipal(ctx, shellidentity.PrincipalRequest{
+				Scope:       projectScope,
+				PrincipalID: principalID,
+			})
+			if err != nil {
+				if class, ok := fault.ClassOf(err); ok && class == fault.NotFound {
+					continue
+				}
+				return false, err
+			}
+			if current.Kind == shellidentity.KindHuman && current.Enabled && len(current.Roles) > 0 {
+				return true, nil
+			}
+		}
+		if !page.HasMore {
+			return false, nil
+		}
+		after = page.Next
+	}
+}
+
 // decodeExecutionPrincipal builds an execution principal from its execution
 // row. An execution is enabled only while its container is running.
 func decodeExecutionPrincipal(request shellidentity.PrincipalRequest, row store.Row) (shellidentity.Principal, error) {
