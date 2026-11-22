@@ -6,7 +6,7 @@
 // temporary files; nothing is printed, so the seed never reaches stdout, argv
 // or a log.
 //
-// The encoding matches internal/shell/integration/nats/nkey.go: an account
+// The encoding matches internal/adapter/integration/nats/nkey.go: an account
 // NKey prefix (0), the Ed25519 seed/public bytes, the XMODEM CRC16 checksum and
 // unpadded base32. It also matches the reference nkeys implementation; the
 // known-vector test pins that compatibility without importing the nkeys module

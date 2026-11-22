@@ -427,7 +427,7 @@ write_private_file() {
 
 # principal_id <issuer> <subject> prints the stable verified human principal id:
 # "oidc-" plus the first 16 SHA-256 bytes of issuer, NUL and subject, exactly as
-# internal/shell/integration/oidc.PrincipalIDFor derives it.
+# internal/adapter/integration/oidc.PrincipalIDFor derives it.
 principal_id() {
 	local issuer=$1 subject=$2
 	[ -n "$issuer" ] || return 1
