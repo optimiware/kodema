@@ -61,6 +61,9 @@ type deps struct {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "_frame" {
+		os.Exit(runFrame(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr, defaultDeps()))

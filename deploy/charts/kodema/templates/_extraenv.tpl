@@ -12,9 +12,10 @@ hatch and it never carries a secret:
     silently replace the production composition (profile, TLS dir, database URL,
     ...);
   * development tokens (KODEMA_DEV_*), cloud credentials (SCW_/AWS_/GOOGLE_) and
-    credential-shaped names are refused. The only exception is a name ending in
-    _FILE (for example KODEMA_OIDC_CA_FILE): that is a mounted path, not a
-    credential value;
+    credential-shaped names are refused. The only exceptions are a name ending in
+    _FILE (for example KODEMA_OIDC_CA_FILE, a mounted path) or _ENDPOINT (for
+    example KODEMA_DISCOVERY_TOKEN_ENDPOINT, a public OAuth/OIDC discovery URL),
+    never a credential value;
   * a value containing URL userinfo with a password (scheme://user:password@host)
     is refused, because it would render a literal password into the manifest.
 
@@ -25,7 +26,7 @@ composition.
 {{- define "kodema.validateExtraEnv" -}}
 {{- $allowlist := "^(KODEMA_OIDC_(ISSUER|AUDIENCE|JWKS_URL|TENANT_CLAIM|SUBJECT_CLAIM|PROJECT_CLAIM|CA_FILE)|KODEMA_DISCOVERY_(ISSUER|CLIENT_ID|AUDIENCE|AUTHORIZATION_ENDPOINT|TOKEN_ENDPOINT|DEVICE_AUTHORIZATION_ENDPOINT|REVOCATION_ENDPOINT|SCOPES|API_URL)|KODEMA_TENANT_NAMESPACE|KODEMA_WORKLOAD_((CPU|MEMORY)_(REQUEST|LIMIT)|MAX_(CPU|MEMORY)_LIMIT))$" }}
 {{- /* Keep in sync with chartDirectEnvNames in internal/installation. */ -}}
-{{- $fixed := list "KODEMA_PROFILE" "KODEMA_RUNTIME" "KODEMA_INSTALLATION_ID" "KODEMA_PUBLIC_URL" "KODEMA_MCP_PATH" "KODEMA_DATA_DIR" "KODEMA_DATABASE_URL" "KODEMA_CONTROLLER_DATABASE_URL" "KODEMA_PUBLISHER_DATABASE_URL" "KODEMA_AUTH_DATABASE_URL" "KODEMA_NATS_URL" "KODEMA_NATS_CA_FILE" "KODEMA_NATS_CERT_FILE" "KODEMA_NATS_KEY_FILE" "KODEMA_NATS_USER" "KODEMA_NATS_PASSWORD" "KODEMA_NATS_CALLOUT_USER" "KODEMA_NATS_CALLOUT_PASSWORD" "KODEMA_NATS_CALLOUT_ISSUER_SEED" "KODEMA_NATS_CALLOUT_ACCOUNT" "KODEMA_KEY_ADAPTER" "KODEMA_KEY_REF" "KODEMA_KEY_CURRENT_VERSION" "KODEMA_KEY_BLOBS_DIR" "KODEMA_KEYFILE" "KODEMA_TLS_DIR" "KODEMA_TENANT" "KODEMA_TENANTS" "KODEMA_GIT_STORAGE_ROOT" "KODEMA_WORKSPACE_PVC_STORAGE_CLASS" "KODEMA_WORKSPACE_PVC_SIZE" "KODEMA_WORKSPACE_PVC_ACCESS_MODE" "KODEMA_WORKLOAD_CA_SECRET" "KODEMA_TOOLBOX_IMAGE" "KODEMA_WORKLOAD_GIT_URL" }}
+{{- $fixed := list "KODEMA_PROFILE" "KODEMA_RUNTIME" "KODEMA_INSTALLATION_ID" "KODEMA_PUBLIC_URL" "KODEMA_MCP_PATH" "KODEMA_DATA_DIR" "KODEMA_DATABASE_URL" "KODEMA_CONTROLLER_DATABASE_URL" "KODEMA_PUBLISHER_DATABASE_URL" "KODEMA_AUTH_DATABASE_URL" "KODEMA_NATS_URL" "KODEMA_NATS_CA_FILE" "KODEMA_NATS_CERT_FILE" "KODEMA_NATS_KEY_FILE" "KODEMA_NATS_USER" "KODEMA_NATS_PASSWORD" "KODEMA_NATS_CALLOUT_USER" "KODEMA_NATS_CALLOUT_PASSWORD" "KODEMA_NATS_CALLOUT_ISSUER_SEED" "KODEMA_NATS_CALLOUT_ACCOUNT" "KODEMA_KEY_ADAPTER" "KODEMA_KEY_REF" "KODEMA_KEY_CURRENT_VERSION" "KODEMA_KEY_BLOBS_DIR" "KODEMA_KEYFILE" "KODEMA_TLS_DIR" "KODEMA_TENANT" "KODEMA_TENANTS" "KODEMA_GIT_STORAGE_ROOT" "KODEMA_GIT_ADMIN_URL" "KODEMA_GIT_PROVISION_TOKEN_FILE" "KODEMA_GIT_CA_FILE" "KODEMA_GIT_PUBLIC_URL" "KODEMA_GIT_TRUSTED_ORIGINS" "KODEMA_GIT_SERVICE_ID" "KODEMA_WORKSPACE_PVC_STORAGE_CLASS" "KODEMA_WORKSPACE_PVC_SIZE" "KODEMA_WORKSPACE_PVC_ACCESS_MODE" "KODEMA_WORKLOAD_CA_SECRET" "KODEMA_TOOLBOX_IMAGE" "KODEMA_WORKLOAD_GIT_URL" "KODEMA_SECRET_RULES_FILE" "KODEMA_MODELS_FILE" }}
 {{- if not (has .Values.environment (list "test" "production")) }}
 {{- fail (printf "environment %q is unsupported in-cluster; only \"production\" and \"test\" boot inside Kubernetes (development uses in-memory state, --dev-token and plain HTTP)" .Values.environment) }}
 {{- end }}
@@ -67,8 +68,8 @@ namespace per tenant. values.schema.json states the same rules.
 {{- if regexMatch "^(SCW|AWS|GOOGLE)_" $name }}
 {{- fail (printf "config.extraEnv.%s must not set a cloud credential; credentials come only from the kodema-kms-credentials Secret (scw-kms) or the ServiceAccount's workload identity (aws-kms, gcp-kms)" $name) }}
 {{- end }}
-{{- if and (regexMatch "(?i)(token|secret|password|passwd|credential|private|key)" $name) (not (regexMatch "_FILE$" $name)) }}
-{{- fail (printf "config.extraEnv.%s looks like a credential name; only a mounted *_FILE path may contain such a word, never a value" $name) }}
+{{- if and (regexMatch "(?i)(token|secret|password|passwd|credential|private|key)" $name) (not (regexMatch "_FILE$" $name)) (not (regexMatch "_ENDPOINT$" $name)) }}
+{{- fail (printf "config.extraEnv.%s looks like a credential name; only a mounted *_FILE path or public *_ENDPOINT URL may contain such a word, never a value" $name) }}
 {{- end }}
 {{- if not (regexMatch $allowlist $name) }}
 {{- fail (printf "config.extraEnv.%s is not an allowlisted optional server variable; see deploy/charts/kodema/values.yaml" $name) }}

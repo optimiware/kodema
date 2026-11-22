@@ -305,6 +305,18 @@ func buildDevelopmentEnvironment(ctx context.Context, builder *builder) (*enviro
 			return nil, err
 		}
 		workspace = decorated
+		if cacheProvisioner, ok := overrides.ClaimProvisioner.(CacheClaimProvisioner); ok {
+			decoratedRuntime, err := newCacheProvisioningRuntime(
+				runtimeAdapter,
+				cacheProvisioner,
+				cachePVCConfigFromWorkspace(*cfg.WorkspacePVC),
+				builder.logger,
+			)
+			if err != nil {
+				return nil, err
+			}
+			runtimeAdapter = decoratedRuntime
+		}
 	}
 	builder.addStop("runtime-driver", runtimeStop)
 

@@ -109,6 +109,105 @@ func TestToolboxPreparationSurvivesControllerUpgrade(t *testing.T) {
 	}
 }
 
+func TestAllowUnpinnedToolboxValidationAndRecovery(t *testing.T) {
+	t.Run("default refuses tagged toolbox image", func(t *testing.T) {
+		fake, clock, _ := testSetup(t)
+		cfg := testConfig(fake, clock)
+		cfg.ToolboxImage = "ghcr.io/optimiware/kodema:v0.1.0"
+		_, err := New(cfg)
+		if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("New(unpinned without AllowUnpinnedToolbox) class = (%v, %v) err=%v; want invalid_input", class, ok, err)
+		}
+	})
+
+	t.Run("AllowUnpinnedToolbox accepts well-formed repository:tag and digest refs", func(t *testing.T) {
+		valid := []string{
+			"kodema:dev",
+			"ghcr.io/optimiware/kodema:test",
+			"localhost:5000/org/kodema:v1.2.3-rc_1",
+			"registry.example/kodema@sha256:" + strings.Repeat("a", 64),
+			"registry.example/kodema:v1@sha256:" + strings.Repeat("b", 64),
+		}
+		for _, image := range valid {
+			fake, clock, _ := testSetup(t)
+			cfg := testConfig(fake, clock)
+			cfg.ToolboxImage = image
+			cfg.AllowUnpinnedToolbox = true
+			if _, err := New(cfg); err != nil {
+				t.Errorf("New(%q, AllowUnpinnedToolbox=true) = %v; want nil", image, err)
+			}
+		}
+	})
+
+	t.Run("AllowUnpinnedToolbox refuses malformed refs and bad digests", func(t *testing.T) {
+		invalid := []string{
+			"kodema",
+			"localhost:5000/kodema",
+			"kodema:",
+			":latest",
+			" kodema:latest",
+			"kodema:latest ",
+			"kodema:bad tag",
+			"kodema:v1\n",
+			"kodema:.badstart",
+			"kodema:-badstart",
+			"kodema:bad/tag",
+			"/kodema:latest",
+			"org//kodema:latest",
+			"org/kodema/:latest",
+			"org/bad:port/kodema:latest",
+			"registry.example/kodema@sha256:short",
+			"registry.example/kodema@md5:" + strings.Repeat("a", 32),
+		}
+		for _, image := range invalid {
+			fake, clock, _ := testSetup(t)
+			cfg := testConfig(fake, clock)
+			cfg.ToolboxImage = image
+			cfg.AllowUnpinnedToolbox = true
+			_, err := New(cfg)
+			if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+				t.Errorf("New(%q, AllowUnpinnedToolbox=true) class = (%v, %v) err=%v; want invalid_input", image, class, ok, err)
+			}
+		}
+	})
+
+	t.Run("tag-referenced toolbox plan survives controller restart when AllowUnpinnedToolbox is enabled", func(t *testing.T) {
+		fake, clock, _ := testSetup(t)
+		cfg := testConfig(fake, clock)
+		cfg.ToolboxImage = "ghcr.io/optimiware/kodema:test-1"
+		cfg.AllowUnpinnedToolbox = true
+		first, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := testPrepareRequest()
+		prepareTestWorkload(t, first, req)
+
+		cfg.ToolboxImage = "ghcr.io/optimiware/kodema:test-2"
+		restarted, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepareTestWorkload(t, restarted, req)
+		startTestWorkload(t, restarted, req.Identity, req.WorkspaceID)
+		spec := fake.jobsSnapshot()[0].Spec
+		if spec.ToolboxImage != "ghcr.io/optimiware/kodema:test-1" {
+			t.Fatalf("recovered ToolboxImage = %q; want %q", spec.ToolboxImage, "ghcr.io/optimiware/kodema:test-1")
+		}
+
+		// A strict adapter (AllowUnpinnedToolbox=false) still refuses the stored unpinned plan.
+		strictCfg := testConfig(fake, clock)
+		strictCfg.ToolboxImage = "registry.example/kodema@sha256:" + strings.Repeat("c", 64)
+		strictAdapter, err := New(strictCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := strictAdapter.Prepare(context.Background(), req); err == nil {
+			t.Fatal("strict adapter accepted stored unpinned toolbox plan")
+		}
+	})
+}
+
 func TestPrepareCreatesImmutableConfigMapAndMutableSecret(t *testing.T) {
 	fake, _, adapter := testSetup(t)
 	request := testPrepareRequest()

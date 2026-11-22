@@ -46,6 +46,12 @@ const (
 	// LabelRetained marks a workspace claim whose retention must survive a
 	// stale release.
 	LabelRetained = container.LabelRetained
+	// LabelCacheKey carries the scoped cache key on a persistent named cache
+	// PersistentVolumeClaim.
+	LabelCacheKey = container.LabelCacheKey
+	// LabelCache carries the informational cache slug on a persistent named
+	// cache PersistentVolumeClaim when the slug is a valid Kubernetes label.
+	LabelCache = container.LabelCache
 	// LabelPreparation carries the deterministic preparation declaration
 	// digest on the immutable activation ConfigMap.
 	LabelPreparation = container.LabelPreparation
@@ -118,6 +124,11 @@ type Config struct {
 	// ToolboxImage is the installation's digest-pinned Kodema image. Empty
 	// retains the plain shell launch for adapters that do not supply tools.
 	ToolboxImage string
+	// AllowUnpinnedToolbox permits a repository:tag toolbox image reference
+	// (without a sha256 digest) in non-production profiles such as the durable
+	// test profile. Production leaves this false and strictly enforces a
+	// digest-pinned reference.
+	AllowUnpinnedToolbox bool
 	// GitURL is the optional HTTPS Git endpoint for this adapter's tenant.
 	GitURL string
 	// ImagePullSecrets names the tenant-local pull Secrets the Job references.
@@ -315,23 +326,32 @@ type Claim struct {
 	ResourceVersion   string
 }
 
-// LogStreamCombined names the one interleaved pod log (stdout and stderr
-// together). Stock clusters cannot split the two, so this is the only stream a
-// Cluster is asked for.
-const LogStreamCombined = "combined"
+const (
+	// LogStreamCombined names the one raw interleaved pod log (stdout and
+	// stderr together).
+	LogStreamCombined = "combined"
+	// LogStreamSplit reads the same portable pod log endpoint and
+	// demultiplexes framed stdout and stderr records in a single pass, falling
+	// back to stdout for unframed lines.
+	LogStreamSplit = "split"
+)
 
-// PodLogRequest selects one bounded read of the combined pod log.
+// PodLogRequest selects one bounded read of the pod log.
 type PodLogRequest struct {
-	Stream string
-	Offset int64
-	Limit  int
+	Stream       string
+	Offset       int64
+	StderrOffset int64
+	Limit        int
 }
 
-// PodLogPage is one bounded combined-log read result.
+// PodLogPage is one bounded pod-log read result.
 type PodLogPage struct {
-	Data       []byte
-	NextOffset int64
-	Truncated  bool
+	Data             []byte
+	NextOffset       int64
+	Truncated        bool
+	StderrData       []byte
+	StderrNextOffset int64
+	StderrTruncated  bool
 }
 
 // Cluster is the only external effect surface of the adapter.
@@ -374,6 +394,7 @@ type preparedCache struct {
 	name      string
 	key       string
 	claimName string
+	subPath   string
 }
 
 type preparedWorkload struct {
@@ -410,19 +431,20 @@ type containerDeclaration struct {
 // Adapter implements runtime.Client and engine.Workspace for the Kubernetes Job
 // family.
 type Adapter struct {
-	cluster          Cluster
-	namespace        string
-	tenant           id.TenantID
-	kodemaURL        string
-	toolboxImage     string
-	gitURL           string
-	policy           Policy
-	resourcePolicy   container.ResourcePolicy
-	cleanup          CleanupPolicy
-	workloadCA       WorkloadCAConfig
-	imagePullSecrets []string
-	cacheClaimName   string
-	clock            Clock
+	cluster              Cluster
+	namespace            string
+	tenant               id.TenantID
+	kodemaURL            string
+	toolboxImage         string
+	allowUnpinnedToolbox bool
+	gitURL               string
+	policy               Policy
+	resourcePolicy       container.ResourcePolicy
+	cleanup              CleanupPolicy
+	workloadCA           WorkloadCAConfig
+	imagePullSecrets     []string
+	cacheClaimName       string
+	clock                Clock
 
 	mu       sync.Mutex
 	prepared map[id.WorkloadID]preparedWorkload
@@ -486,7 +508,7 @@ func New(config Config) (*Adapter, error) {
 	if config.CacheClaimName != "" && !validDNS1123Subdomain(config.CacheClaimName) {
 		return nil, fault.New(fault.InvalidInput, "kubernetes adapter cache claim name is not a DNS-1123 subdomain")
 	}
-	if err := validateToolbox(config.ToolboxImage, config.GitURL); err != nil {
+	if err := validateToolbox(config.ToolboxImage, config.GitURL, config.AllowUnpinnedToolbox); err != nil {
 		return nil, err
 	}
 	clock := config.Clock
@@ -494,20 +516,21 @@ func New(config Config) (*Adapter, error) {
 		clock = container.RealClock{}
 	}
 	return &Adapter{
-		cluster:          config.Cluster,
-		namespace:        config.Namespace,
-		tenant:           config.TenantID,
-		kodemaURL:        config.KodemaURL,
-		toolboxImage:     config.ToolboxImage,
-		gitURL:           config.GitURL,
-		policy:           config.Policy,
-		resourcePolicy:   resourcePolicy,
-		cleanup:          config.Cleanup,
-		workloadCA:       config.WorkloadCA,
-		imagePullSecrets: append([]string(nil), config.ImagePullSecrets...),
-		cacheClaimName:   config.CacheClaimName,
-		clock:            clock,
-		prepared:         map[id.WorkloadID]preparedWorkload{},
+		cluster:              config.Cluster,
+		namespace:            config.Namespace,
+		tenant:               config.TenantID,
+		kodemaURL:            config.KodemaURL,
+		toolboxImage:         config.ToolboxImage,
+		allowUnpinnedToolbox: config.AllowUnpinnedToolbox,
+		gitURL:               config.GitURL,
+		policy:               config.Policy,
+		resourcePolicy:       resourcePolicy,
+		cleanup:              config.Cleanup,
+		workloadCA:           config.WorkloadCA,
+		imagePullSecrets:     append([]string(nil), config.ImagePullSecrets...),
+		cacheClaimName:       config.CacheClaimName,
+		clock:                clock,
+		prepared:             map[id.WorkloadID]preparedWorkload{},
 	}, nil
 }
 
@@ -595,4 +618,10 @@ func CheckRequirements(required []string) error {
 // attaches exactly this claim after a restart.
 func WorkspaceClaimName(workspace id.WorkspaceID) (string, error) {
 	return container.WorkspaceResourceName(workspace)
+}
+
+// CacheClaimName returns the deterministic PersistentVolumeClaim name for one
+// scoped named cache key.
+func CacheClaimName(key string) (string, error) {
+	return container.CacheResourceName(key)
 }

@@ -104,6 +104,14 @@ kodema:
       accessMode: "ReadWriteOnce"
     workloadCA:
       secretName: "kodema-workload-ca"
+    # Workload secret-name allow-list (KODEMA_SECRET_RULES_FILE) and LLM proxy /
+    # model gateway (KODEMA_MODELS_FILE). Both stay fail-closed/off by default in
+    # production; see deploy/charts/kodema/values.yaml for inline rules,
+    # defaultProviders, budgets, and existingConfigMap options.
+    # secretRules:
+    #   rules: []
+    # models:
+    #   defaultProviders: false
   secrets:
     database:
       existingSecret: kodema-database

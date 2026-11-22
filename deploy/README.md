@@ -229,8 +229,8 @@ The chart also has two optional blocks, off by default: `gitService` (one
   both refuse a name the chart renders itself (a duplicate env entry would
   override the production composition), `KODEMA_DEV_*` development tokens,
   `SCW_`/`AWS_`/`GOOGLE_` cloud credentials, credential-shaped names (except a
-  mounted `*_FILE` path), object values (`valueFrom`) and a value containing
-  URL `user:password@` userinfo. Never put a secret in it.
+  mounted `*_FILE` path or public `*_ENDPOINT` URL), object values (`valueFrom`)
+  and a value containing URL `user:password@` userinfo. Never put a secret in it.
 - **Private registries (W31).** The production entry reads an optional Docker
   `config.json` credential file from the trusted path in
   `KODEMA_REGISTRY_CONFIG_FILE` and uses it for immutable tag-to-digest

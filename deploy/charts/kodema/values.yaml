@@ -14,7 +14,9 @@ environment: "production"
 image:
   repository: registry.example.com/kodema
   tag: "0.8.2"
-  # Production requires the published manifest digest, also used by the workload toolbox.
+  # Production requires the published manifest digest, also used by the workload
+  # toolbox. In environment: "test", an empty digest falls back KODEMA_TOOLBOX_IMAGE
+  # to repository:tag so the workload toolbox works out of the box.
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -65,9 +67,10 @@ config:
   # A name the chart renders itself is refused (a duplicate env entry would
   # override the production composition), as are KODEMA_DEV_* development
   # tokens, SCW_/AWS_/GOOGLE_ cloud credentials and credential-shaped names
-  # (except a mounted *_FILE path). Values are literal strings: objects
-  # (valueFrom) are refused, and so is a URL carrying user:password@ userinfo.
-  # Never put a secret here; credentials come from Secrets.
+  # (except a mounted *_FILE path or public *_ENDPOINT URL). Values are literal
+  # strings: objects (valueFrom) are refused, and so is a URL carrying
+  # user:password@ userinfo. Never put a secret here; credentials come from
+  # Secrets.
   extraEnv: {}
   workspacePVC:
     # Empty selects the cluster's default StorageClass (e.g. local-path on k3s).
@@ -77,6 +80,33 @@ config:
     accessMode: "ReadWriteOnce"
   workloadCA:
     secretName: "kodema-workload-ca"
+  # Workload secret-name allow-list rendered into KODEMA_SECRET_RULES_FILE.
+  # Production stays fail-closed by default (no ConfigMap, no env var) and
+  # refuses allowAll: true. In environment: "test", allowAllInTest: true
+  # generates an allow_all rule for every declared tenant unless explicit rules
+  # or existingConfigMap are provided (set allowAllInTest: false to stay
+  # fail-closed in test). existingConfigMap and inline rules are mutually
+  # exclusive.
+  secretRules:
+    existingConfigMap: ""
+    key: "secret-rules.json"
+    allowAllInTest: true
+    rules: []
+  # Streaming LLM proxy and configured model gateway rendered into
+  # KODEMA_MODELS_FILE. Off by default (no ConfigMap, no env var). Never put
+  # raw API keys here: secretName references Kodema's encrypted DB secrets.
+  # Set defaultProviders: true to enable the built-in openai, anthropic, and
+  # opencode providers for every declared tenant (explicit entries in providers
+  # override matching built-ins). existingConfigMap is mutually exclusive with
+  # inline settings. Production refuses http:// provider/model URLs.
+  models:
+    existingConfigMap: ""
+    key: "models.json"
+    defaultProviders: false
+    providers: []
+    models: []
+    budgets: {}
+    secretRules: []
 
 secrets:
   database:
@@ -239,6 +269,17 @@ gitService:
   enabled: false
   # Public API base URL the Git service calls. Empty uses config.publicURL.
   baseURL: ""
+  # Optional client-facing Git HTTP base URL for HTTP repository provisioning
+  # (supports {tenant}). Defaults to config.workloadGitURL or the per-tenant
+  # ClusterIP Service URL.
+  publicURL: ""
+  # Optional enforcing service ID for repository bindings created via
+  # repository.create (supports {tenant}; defaults to "git" in the server).
+  serviceID: ""
+  # Optional trusted origins for repository bindings created via
+  # repository.create (each entry supports {tenant}). Empty defaults to the
+  # deduplicated publicURL and workloadGitURL.
+  trustedOrigins: []
   # TLS-terminating proxy image, pinned by digest. A tag can be repointed, so
   # the template refuses anything that is not repository@sha256:<64 hex>.
   tlsProxyImage: "docker.io/library/caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee"
@@ -254,9 +295,9 @@ gitService:
   # Example:
   # tenants:
   #   - tenant: tenant-a
-  #     # Repository name to registered resource id. One git serve --resource
-  #     # flag is rendered per entry; a repository without a mapping is refused
-  #     # by the service.
+  #     # Optional static repository name to registered resource id mappings,
+  #     # rendered as repeated git serve --resource flags. Omit or leave empty
+  #     # when serving repositories dynamically from admin/conf/git.conf.
   #     repositories:
   #       - name: shop/web
   #         resource: resource-id
@@ -264,6 +305,13 @@ gitService:
   #     # authenticates only through the public API with this credential.
   #     credential:
   #       existingSecret: kodema-git-tenant-a
+  #       key: token
+  #     # Optional bearer token Secret for HTTP repository provisioning
+  #     # (`git serve --provision-token-file`). When set on one or more tenants,
+  #     # the control plane mounts the Secret read-only and configures
+  #     # KODEMA_GIT_ADMIN_URL / KODEMA_GIT_PROVISION_TOKEN_FILE / KODEMA_GIT_CA_FILE.
+  #     provisionToken:
+  #       existingSecret: kodema-git-provision-tenant-a
   #       key: token
   #     # kubernetes.io/tls Secret carrying tls.crt and tls.key.
   #     tls:

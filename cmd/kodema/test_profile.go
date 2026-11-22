@@ -327,7 +327,7 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 		if tenants.list {
 			testConfig.Tenants = make([]shellapp.ProductionTenant, 0, len(tenants.entries))
 			for _, entry := range tenants.entries {
-				adapter, err := newTenantAdapterWithPolicy(getenv, cluster, entry, kubeOptions, kubePolicy)
+				adapter, err := newTenantAdapterWithPolicy(getenv, cluster, entry, kubeOptions, kubePolicy, true)
 				if err != nil {
 					return productionBuild{}, err
 				}
@@ -341,7 +341,7 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 			}
 		} else {
 			entry := tenants.entries[0]
-			adapter, err := newTenantAdapterWithPolicy(getenv, cluster, entry, kubeOptions, kubePolicy)
+			adapter, err := newTenantAdapterWithPolicy(getenv, cluster, entry, kubeOptions, kubePolicy, true)
 			if err != nil {
 				return productionBuild{}, err
 			}

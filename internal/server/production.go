@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"log/slog"
 	"sync"
 
 	"github.com/optimiware/kodema/internal/adapter/integration/keys"
@@ -129,13 +130,14 @@ func buildProductionEnvironment(ctx context.Context, builder *builder) (*environ
 	}
 	controller := stores.controller
 
-	runtimeAdapter, workspaceAdapter, err := wireKubernetesRuntime(
+	runtimeAdapter, workspaceAdapter, err := wireKubernetesRuntimeWithLogger(
 		controller,
 		production.Runtime,
 		production.Workspace,
 		production.Tenants,
 		production.ClaimProvisioner,
 		cfg.WorkspacePVC,
+		builder.logger,
 	)
 	if err != nil {
 		return nil, err
@@ -188,8 +190,10 @@ func productionKeyProvider(adapter installation.KeyAdapter, production *Producti
 
 // wireKubernetesRuntime builds the single-tenant or multi-tenant Kubernetes
 // runtime and workspace adapters, wrapping workspace retention with fresh-only
-// PVC claim provisioning when claimProvisioner is configured. Both production
-// and the Kubernetes form of the durable test profile share this wiring.
+// PVC claim provisioning (and runtime preparation with persistent cache PVC
+// provisioning when claimProvisioner implements CacheClaimProvisioner). Both
+// production and the Kubernetes form of the durable test profile share this
+// wiring.
 func wireKubernetesRuntime(
 	controller store.Controller,
 	runtimeAdapter kernelengine.Runtime,
@@ -198,12 +202,29 @@ func wireKubernetesRuntime(
 	claimProvisioner ClaimProvisioner,
 	workspacePVC *WorkspacePVC,
 ) (kernelengine.Runtime, kernelengine.Workspace, error) {
+	return wireKubernetesRuntimeWithLogger(
+		controller,
+		runtimeAdapter,
+		workspaceAdapter,
+		tenants,
+		claimProvisioner,
+		workspacePVC,
+		nil,
+	)
+}
+
+func wireKubernetesRuntimeWithLogger(
+	controller store.Controller,
+	runtimeAdapter kernelengine.Runtime,
+	workspaceAdapter kernelengine.Workspace,
+	tenants []ProductionTenant,
+	claimProvisioner ClaimProvisioner,
+	workspacePVC *WorkspacePVC,
+	logger *slog.Logger,
+) (kernelengine.Runtime, kernelengine.Workspace, error) {
+	cacheProvisioner, canProvisionCaches := claimProvisioner.(CacheClaimProvisioner)
 	if len(tenants) > 0 {
 		scopes, err := newControllerExecutionScopes(controller)
-		if err != nil {
-			return nil, nil, err
-		}
-		runtimeAdapter, err = newTenantRuntime(scopes, tenants)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -224,7 +245,23 @@ func wireKubernetesRuntime(
 					return nil, nil, err
 				}
 				routedTenants[index].Workspace = wrapped
+				if canProvisionCaches {
+					wrappedRuntime, err := newCacheProvisioningRuntime(
+						tenant.Runtime,
+						cacheProvisioner,
+						cachePVCConfigFromWorkspace(*tenant.WorkspacePVC),
+						logger,
+					)
+					if err != nil {
+						return nil, nil, err
+					}
+					routedTenants[index].Runtime = wrappedRuntime
+				}
 			}
+		}
+		runtimeAdapter, err = newTenantRuntime(scopes, routedTenants)
+		if err != nil {
+			return nil, nil, err
 		}
 		workspaceAdapter, err = newTenantWorkspace(activation, routedTenants)
 		if err != nil {
@@ -233,6 +270,10 @@ func wireKubernetesRuntime(
 		return runtimeAdapter, workspaceAdapter, nil
 	}
 	if claimProvisioner != nil {
+		if workspacePVC == nil {
+			return nil, nil, fault.New(fault.InvalidInput,
+				"kubernetes workspace claim template is missing")
+		}
 		activation, err := newWorkspaceActivation(controller)
 		if err != nil {
 			return nil, nil, err
@@ -240,6 +281,17 @@ func wireKubernetesRuntime(
 		workspaceAdapter, err = newKubeProvisioningWorkspace(workspaceAdapter, claimProvisioner, activation, *workspacePVC)
 		if err != nil {
 			return nil, nil, err
+		}
+		if canProvisionCaches {
+			runtimeAdapter, err = newCacheProvisioningRuntime(
+				runtimeAdapter,
+				cacheProvisioner,
+				cachePVCConfigFromWorkspace(*workspacePVC),
+				logger,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 	return runtimeAdapter, workspaceAdapter, nil

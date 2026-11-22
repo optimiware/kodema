@@ -2,6 +2,57 @@
 {{- if and .Values.config (hasKey .Values.config "optionalCapabilities") }}
 {{- fail "config.optionalCapabilities is unsupported and ignored by the chart; remove it from values" }}
 {{- end }}
+{{- $secretRulesJSON := include "kodema.secretRulesJSON" . | trim }}
+{{- $sr := dict }}
+{{- if and .Values.config (hasKey .Values.config "secretRules") (kindIs "map" .Values.config.secretRules) }}
+{{- $sr = .Values.config.secretRules }}
+{{- end }}
+{{- $secretRulesExisting := toString ($sr.existingConfigMap | default "") }}
+{{- $secretRulesKey := toString ($sr.key | default "secret-rules.json") }}
+{{- $secretRulesConfigMap := "" }}
+{{- if $secretRulesExisting }}
+{{- $secretRulesConfigMap = $secretRulesExisting }}
+{{- else if $secretRulesJSON }}
+{{- $secretRulesConfigMap = "kodema-secret-rules" }}
+{{- end }}
+{{- $modelsJSON := include "kodema.modelsJSON" . | trim }}
+{{- $modelsCfg := dict }}
+{{- if and .Values.config (hasKey .Values.config "models") (kindIs "map" .Values.config.models) }}
+{{- $modelsCfg = .Values.config.models }}
+{{- end }}
+{{- $modelsExisting := toString ($modelsCfg.existingConfigMap | default "") }}
+{{- $modelsKey := toString ($modelsCfg.key | default "models.json") }}
+{{- $modelsConfigMap := "" }}
+{{- if $modelsExisting }}
+{{- $modelsConfigMap = $modelsExisting }}
+{{- else if $modelsJSON }}
+{{- $modelsConfigMap = "kodema-models" }}
+{{- end }}
+{{- $git := .Values.gitService | default dict }}
+{{- $gitPort := int ($git.port | default 8443) }}
+{{- $gitDefaultURL := printf "https://kodema-git-{tenant}.%s.svc.cluster.local:%d" .Release.Namespace $gitPort }}
+{{- $workloadGitURL := .Values.config.workloadGitURL | default $gitDefaultURL }}
+{{- $gitProvisionTenants := list }}
+{{- if and .Values.gitService .Values.gitService.enabled }}
+{{- range $entry := .Values.gitService.tenants }}
+{{- if and (hasKey $entry "provisionToken") (not (kindIs "invalid" $entry.provisionToken)) }}
+{{- if not (kindIs "map" $entry.provisionToken) }}
+{{- fail (printf "gitService tenant %q provisionToken must be an object with existingSecret and key" (toString $entry.tenant)) }}
+{{- end }}
+{{- if not (and (hasKey $entry.provisionToken "existingSecret") (kindIs "string" $entry.provisionToken.existingSecret) (ne $entry.provisionToken.existingSecret "")) }}
+{{- fail (printf "gitService tenant %q provisionToken.existingSecret must be a non-empty Secret name" (toString $entry.tenant)) }}
+{{- end }}
+{{- if not (and (hasKey $entry.provisionToken "key") (kindIs "string" $entry.provisionToken.key) (ge (len $entry.provisionToken.key) 1) (le (len $entry.provisionToken.key) 253) (regexMatch "^[A-Za-z0-9._-]+$" $entry.provisionToken.key)) }}
+{{- fail (printf "gitService tenant %q provisionToken.key must match ^[A-Za-z0-9._-]+$" (toString $entry.tenant)) }}
+{{- end }}
+{{- $gitProvisionTenants = append $gitProvisionTenants $entry }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $hasGitProvision := gt (len $gitProvisionTenants) 0 }}
+{{- if and $hasGitProvision (not (and .Values.secrets .Values.secrets.tls .Values.secrets.tls.existingSecret)) }}
+{{- fail "gitService provisionToken requires secrets.tls.existingSecret so KODEMA_GIT_CA_FILE can trust the installation CA" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,6 +83,15 @@ spec:
       labels:
         app.kubernetes.io/name: kodema
         app.kubernetes.io/component: control-plane
+      {{- if or $secretRulesJSON $modelsJSON }}
+      annotations:
+        {{- if $secretRulesJSON }}
+        checksum/secret-rules: {{ $secretRulesJSON | sha256sum | quote }}
+        {{- end }}
+        {{- if $modelsJSON }}
+        checksum/models: {{ $modelsJSON | sha256sum | quote }}
+        {{- end }}
+      {{- end }}
     spec:
       serviceAccountName: {{ if .Values.serviceAccount }}{{ .Values.serviceAccount.name | default "kodema" }}{{ else }}kodema{{ end }}
       securityContext:
@@ -154,11 +214,10 @@ spec:
             - name: KODEMA_PUBLIC_URL
               value: {{ .Values.config.publicURL | quote }}
             - name: KODEMA_TOOLBOX_IMAGE
-              value: {{ if .Values.image.digest }}{{ printf "%s@%s" .Values.image.repository .Values.image.digest | quote }}{{ else }}""{{ end }}
-            {{- $git := .Values.gitService | default dict }}
+              value: {{ if .Values.image.digest }}{{ printf "%s@%s" .Values.image.repository .Values.image.digest | quote }}{{ else if $isTest }}{{ printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) | quote }}{{ else }}""{{ end }}
             {{- if or .Values.config.workloadGitURL $git.enabled }}
             - name: KODEMA_WORKLOAD_GIT_URL
-              value: {{ .Values.config.workloadGitURL | default (printf "https://kodema-git-{tenant}.%s.svc.cluster.local:%d" .Release.Namespace (int ($git.port | default 8443))) | quote }}
+              value: {{ $workloadGitURL | quote }}
             {{- end }}
             - name: KODEMA_MCP_PATH
               value: {{ .Values.config.mcpPath | default "/mcp" | quote }}
@@ -266,6 +325,14 @@ spec:
             - name: KODEMA_WORKLOAD_CA_SECRET
               value: {{ .Values.config.workloadCA.secretName | quote }}
             {{- end }}
+            {{- if $secretRulesConfigMap }}
+            - name: KODEMA_SECRET_RULES_FILE
+              value: {{ printf "/etc/kodema/secret-rules/%s" $secretRulesKey | quote }}
+            {{- end }}
+            {{- if $modelsConfigMap }}
+            - name: KODEMA_MODELS_FILE
+              value: {{ printf "/etc/kodema/models/%s" $modelsKey | quote }}
+            {{- end }}
             # Retained-commit keep refs. Every Git tenant PVC is mounted
             # under one root; the keeper enumerates each tenant's bare
             # repositories from storage on every sweep, so a new repository
@@ -274,6 +341,34 @@ spec:
             {{- if and .Values.gitService .Values.gitService.enabled }}
             - name: KODEMA_GIT_STORAGE_ROOT
               value: "/var/lib/kodema/git-repos"
+            {{- end }}
+            {{- if $hasGitProvision }}
+            {{- $gitPublicURL := $git.publicURL | default .Values.config.workloadGitURL | default $gitDefaultURL }}
+            {{- $gitTrustedOrigins := list }}
+            {{- if $git.trustedOrigins }}
+            {{- range $origin := $git.trustedOrigins }}
+            {{- $gitTrustedOrigins = append $gitTrustedOrigins (toString $origin) }}
+            {{- end }}
+            {{- else }}
+            {{- $gitTrustedOrigins = append $gitTrustedOrigins $gitPublicURL }}
+            {{- if ne $workloadGitURL $gitPublicURL }}
+            {{- $gitTrustedOrigins = append $gitTrustedOrigins $workloadGitURL }}
+            {{- end }}
+            {{- end }}
+            - name: KODEMA_GIT_ADMIN_URL
+              value: {{ $gitDefaultURL | quote }}
+            - name: KODEMA_GIT_PROVISION_TOKEN_FILE
+              value: "/etc/kodema/git-provision/{tenant}/token"
+            - name: KODEMA_GIT_CA_FILE
+              value: "/etc/kodema/tls/ca.crt"
+            - name: KODEMA_GIT_PUBLIC_URL
+              value: {{ $gitPublicURL | quote }}
+            - name: KODEMA_GIT_TRUSTED_ORIGINS
+              value: {{ join "," $gitTrustedOrigins | quote }}
+            {{- if $git.serviceID }}
+            - name: KODEMA_GIT_SERVICE_ID
+              value: {{ $git.serviceID | quote }}
+            {{- end }}
             {{- end }}
           # A static cloud KMS credential lives in its own Secret, apart from
           # the binary KEK blobs in the keys Secret (a blob cannot be an env var
@@ -355,6 +450,16 @@ spec:
               mountPath: /etc/kodema/tls
               readOnly: true
             {{- end }}
+            {{- if $secretRulesConfigMap }}
+            - name: secret-rules
+              mountPath: /etc/kodema/secret-rules
+              readOnly: true
+            {{- end }}
+            {{- if $modelsConfigMap }}
+            - name: models
+              mountPath: /etc/kodema/models
+              readOnly: true
+            {{- end }}
             {{- if and .Values.gitService .Values.gitService.enabled }}
             {{- range $entry := .Values.gitService.tenants }}
             # Only the tenant's served repository directory, never the receive
@@ -362,6 +467,11 @@ spec:
             - name: git-repos-{{ $entry.tenant }}
               mountPath: /var/lib/kodema/git-repos/{{ $entry.tenant }}
               subPath: repos/{{ $entry.tenant }}
+            {{- end }}
+            {{- range $entry := $gitProvisionTenants }}
+            - name: git-provision-{{ $entry.tenant }}
+              mountPath: /etc/kodema/git-provision/{{ $entry.tenant }}
+              readOnly: true
             {{- end }}
             {{- end }}
             - name: tmp
@@ -396,6 +506,16 @@ spec:
           secret:
             secretName: {{ .Values.secrets.tls.existingSecret }}
         {{- end }}
+        {{- if $secretRulesConfigMap }}
+        - name: secret-rules
+          configMap:
+            name: {{ $secretRulesConfigMap | quote }}
+        {{- end }}
+        {{- if $modelsConfigMap }}
+        - name: models
+          configMap:
+            name: {{ $modelsConfigMap | quote }}
+        {{- end }}
         {{- if and .Values.gitService .Values.gitService.enabled }}
         {{- range $entry := .Values.gitService.tenants }}
         # RWO on a single-worker stage lets the control plane and the tenant's
@@ -405,6 +525,14 @@ spec:
         - name: git-repos-{{ $entry.tenant }}
           persistentVolumeClaim:
             claimName: kodema-git-{{ $entry.tenant }}-data
+        {{- end }}
+        {{- range $entry := $gitProvisionTenants }}
+        - name: git-provision-{{ $entry.tenant }}
+          secret:
+            secretName: {{ $entry.provisionToken.existingSecret | quote }}
+            items:
+              - key: {{ $entry.provisionToken.key | quote }}
+                path: token
         {{- end }}
         {{- end }}
         - name: tmp

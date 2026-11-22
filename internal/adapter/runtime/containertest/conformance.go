@@ -46,6 +46,7 @@ type Options struct {
 type LaunchedWorkload struct {
 	WorkingDir      string
 	Command         []string
+	FrameStreams    bool
 	Env             map[string]string
 	EnvList         []string
 	Labels          map[string]string
@@ -583,7 +584,11 @@ func runLauncherTests(t *testing.T, factory Factory) {
 		if w.WorkingDir != workspace.WorkspaceRoot {
 			t.Fatalf("WorkingDir = %q; want %q", w.WorkingDir, workspace.WorkspaceRoot)
 		}
-		want := workspace.Entrypoint(container.WorkloadScriptPath, workspace.Launch{Toolbox: true, Outputs: false})
+		want := workspace.Entrypoint(container.WorkloadScriptPath, workspace.Launch{
+			Toolbox:      true,
+			Outputs:      false,
+			FrameStreams: w.FrameStreams,
+		})
 		if !slices.Equal(w.Command, want) {
 			t.Fatalf("Command = %q; want %q", w.Command, want)
 		}
@@ -606,7 +611,11 @@ func runLauncherTests(t *testing.T, factory Factory) {
 		if w.WorkingDir != workspace.WorkspaceRoot {
 			t.Fatalf("WorkingDir = %q; want %q", w.WorkingDir, workspace.WorkspaceRoot)
 		}
-		want := workspace.Entrypoint(container.WorkloadScriptPath, workspace.Launch{Toolbox: true, Outputs: true})
+		want := workspace.Entrypoint(container.WorkloadScriptPath, workspace.Launch{
+			Toolbox:      true,
+			Outputs:      true,
+			FrameStreams: w.FrameStreams,
+		})
 		if !slices.Equal(w.Command, want) {
 			t.Fatalf("Command = %q; want %q", w.Command, want)
 		}
@@ -906,6 +915,63 @@ func runLogTests(t *testing.T, factory Factory) {
 		}
 		if len(batch.Chunks) != 0 {
 			t.Fatalf("emitted %d chunks without a redaction source", len(batch.Chunks))
+		}
+	})
+
+	t.Run("separates stdout and stderr with independent redaction and cursors", func(t *testing.T) {
+		fx := factory(t, Options{WithToolbox: true})
+		req := fx.Request()
+		mustPrepare(t, fx, context.Background(), req)
+		mustStart(t, fx, context.Background(), req)
+		fx.SeedRunning(t, req.Identity)
+
+		fx.AppendLog(t, req.Identity, reconcile.LogStdout, []byte("out-1 s3cr3t\n"))
+		fx.AppendLog(t, req.Identity, reconcile.LogStderr, []byte("err-1 tok-abc\n"))
+		fx.AppendLog(t, req.Identity, reconcile.LogStdout, []byte("out-2-tail"))
+		fx.AppendLog(t, req.Identity, reconcile.LogStderr, []byte("err-2-tail"))
+
+		var gotOut, gotErr []byte
+		cursor := int64(0)
+		for step := range 200 {
+			batch, err := fx.Client().Logs(context.Background(), reconcile.LogsRequest{
+				Identity:    req.Identity,
+				AfterOffset: cursor,
+				Limit:       12,
+			})
+			if err != nil {
+				t.Fatalf("step %d Logs: %v", step, err)
+			}
+			for _, chunk := range batch.Chunks {
+				if len(chunk.Data) > 12 {
+					t.Fatalf("step %d chunk len %d > limit 12", step, len(chunk.Data))
+				}
+				switch chunk.Stream {
+				case reconcile.LogStdout:
+					gotOut = append(gotOut, chunk.Data...)
+				case reconcile.LogStderr:
+					gotErr = append(gotErr, chunk.Data...)
+				default:
+					t.Fatalf("step %d unexpected stream %q", step, chunk.Stream)
+				}
+			}
+			if batch.NextOffset == cursor {
+				break
+			}
+			cursor = batch.NextOffset
+		}
+
+		wantOut := "out-1 " + container.Redacted + "\nout-2-tail"
+		wantErr := "err-1 " + container.Redacted + "\nerr-2-tail"
+		if string(gotOut) != wantOut {
+			t.Fatalf("stdout = %q; want %q", gotOut, wantOut)
+		}
+		if string(gotErr) != wantErr {
+			t.Fatalf("stderr = %q; want %q", gotErr, wantErr)
+		}
+		for _, leak := range []string{"s3cr3t", "tok-abc"} {
+			if strings.Contains(string(gotOut), leak) || strings.Contains(string(gotErr), leak) {
+				t.Fatalf("split streams leaked %q: stdout=%q stderr=%q", leak, gotOut, gotErr)
+			}
 		}
 	})
 }

@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/adapter/store/memory"
 	"github.com/optimiware/kodema/internal/apps/git"
 	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	"github.com/optimiware/kodema/internal/apps/git/app/actors"
@@ -342,5 +345,399 @@ func TestRepositoryAndProjectOnboardingEndToEndRESTAndMCP(t *testing.T) {
 		`{"input":{"name":"token/mismatch"},"idempotency_key":"rest-tok-mismatch"}`)
 	if status != http.StatusServiceUnavailable || !strings.Contains(string(raw), `"dependency_unavailable"`) {
 		t.Fatalf("REST repository.create with mismatched git provision token status=%d body=%s; want 503 dependency_unavailable", status, raw)
+	}
+}
+
+type hostRoutingRoundTripper struct {
+	routes map[string]*url.URL
+	base   http.RoundTripper
+}
+
+func (rt *hostRoutingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	target, ok := rt.routes[req.URL.Host]
+	if !ok {
+		return nil, fault.New(fault.NotFound, "no route for host "+req.URL.Host)
+	}
+	cloned := req.Clone(req.Context())
+	cloned.URL.Scheme = target.Scheme
+	cloned.URL.Host = target.Host
+	cloned.Host = target.Host
+	return rt.base.RoundTrip(cloned)
+}
+
+// TestMultiTenantRepositoryOnboardingEndToEndRESTAndMCP wires a single Shell
+// composition with {tenant} templates across AdminURL, PublicGitURL, ServiceID,
+// TrustedOrigins, and TokenFile to two independent Userland Git companions
+// (tenant-a and tenant-b) with distinct provision tokens, verifying per-tenant
+// token isolation, routing, service IDs, trusted origins, and clone URLs across
+// REST and MCP repository creation and listing.
+func TestMultiTenantRepositoryOnboardingEndToEndRESTAndMCP(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	hookBinary := filepath.Join(tmp, "kodema-hook")
+	if err := os.WriteFile(hookBinary, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write hook binary: %v", err)
+	}
+
+	type tenantGitFixture struct {
+		tenantID   string
+		projectID  string
+		adminToken string
+		projToken  string
+		secret     string
+		gitServer  *gitapp.Server
+		gitHTTP    *httptest.Server
+		host       string
+	}
+
+	fixtures := []*tenantGitFixture{
+		{
+			tenantID:   "tenant-a",
+			projectID:  "proj-a",
+			adminToken: "token-tenant-a-admin",
+			projToken:  "token-tenant-a-proj-admin",
+			secret:     "tenant-a-only-provision-secret",
+		},
+		{
+			tenantID:   "tenant-b",
+			projectID:  "proj-b",
+			adminToken: "token-tenant-b-admin",
+			projToken:  "token-tenant-b-proj-admin",
+			secret:     "tenant-b-only-provision-secret",
+		},
+	}
+
+	routes := make(map[string]*url.URL, len(fixtures))
+	for _, f := range fixtures {
+		tenantDir := filepath.Join(tmp, f.tenantID)
+		if err := os.MkdirAll(tenantDir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", tenantDir, err)
+		}
+		storageRoot := filepath.Join(tenantDir, "git-repos")
+		journalDir := filepath.Join(tenantDir, "git-journal")
+		gitTokenFile := filepath.Join(tenantDir, "git-provision-token")
+		if err := os.WriteFile(gitTokenFile, []byte(f.secret+"\n"), 0o600); err != nil {
+			t.Fatalf("write git token for %s: %v", f.tenantID, err)
+		}
+		shellTenantDir := filepath.Join(tmp, "shell-provision", f.tenantID)
+		if err := os.MkdirAll(shellTenantDir, 0o700); err != nil {
+			t.Fatalf("mkdir shell token dir for %s: %v", f.tenantID, err)
+		}
+		if err := os.WriteFile(filepath.Join(shellTenantDir, "token"), []byte(f.secret+"\n"), 0o600); err != nil {
+			t.Fatalf("write shell token for %s: %v", f.tenantID, err)
+		}
+
+		if _, err := gitapp.ProvisionTenant(ctx, gitapp.ProvisionConfig{
+			TenantID:         id.TenantID(f.tenantID),
+			StorageRoot:      storageRoot,
+			JournalDirectory: journalDir,
+			HookBinary:       hookBinary,
+		}); err != nil {
+			t.Fatalf("gitapp.ProvisionTenant(%s): %v", f.tenantID, err)
+		}
+		registry, err := actors.NewRegistry(actors.Config{TenantID: id.TenantID(f.tenantID)})
+		if err != nil {
+			t.Fatalf("actors.NewRegistry(%s): %v", f.tenantID, err)
+		}
+		t.Cleanup(func() { _ = registry.Close() })
+
+		gitServer, err := gitapp.New(gitapp.Config{
+			TenantID:           id.TenantID(f.tenantID),
+			StorageRoot:        storageRoot,
+			JournalDirectory:   journalDir,
+			HookBinary:         hookBinary,
+			ProvisionTokenFile: gitTokenFile,
+			ResourceIDs:        map[string]string{"admin": "git-admin"},
+			Verify:             noopGitVerifier{},
+			Actors:             noopGitReadVerifier{},
+			ActorHandles:       registry,
+			HookActors:         registry,
+		})
+		if err != nil {
+			t.Fatalf("gitapp.New(%s): %v", f.tenantID, err)
+		}
+		t.Cleanup(func() { _ = gitServer.Close() })
+		gitHTTP := httptest.NewServer(gitServer.Handler())
+		t.Cleanup(gitHTTP.Close)
+
+		parsed, err := url.Parse(gitHTTP.URL)
+		if err != nil {
+			t.Fatalf("parse gitHTTP.URL: %v", err)
+		}
+		f.gitServer = gitServer
+		f.gitHTTP = gitHTTP
+		f.host = "kodema-git-" + f.tenantID + ".kodema-system.svc.cluster.local:8443"
+		routes[f.host] = parsed
+	}
+
+	expiry := time.Now().Add(time.Hour)
+	allRoles := []tenancy.Role{tenancy.RoleAdmin, tenancy.RoleEngineer, tenancy.RoleReviewer, tenancy.RoleOperator, tenancy.RoleViewer}
+	memStore := memory.New()
+	sharedAdapters := &shellapp.Adapters{
+		Store:       memStore,
+		Scanner:     memStore,
+		Controller:  memStore.Controller(),
+		Outbox:      memStore,
+		Credentials: memStore,
+	}
+	devTokens := []shellapp.DevToken{
+		{
+			Credential: "token-tenant-a-admin",
+			Principal: identity.Principal{
+				ID:      "admin-a",
+				Kind:    identity.KindHuman,
+				Scope:   tenancy.Scope{TenantID: "tenant-a"},
+				Roles:   allRoles,
+				Enabled: true,
+				Version: 1,
+			},
+			ExpiresAt: expiry,
+		},
+		{
+			Credential: "token-tenant-a-proj-admin",
+			Principal: identity.Principal{
+				ID:      "admin-a",
+				Kind:    identity.KindHuman,
+				Scope:   tenancy.Scope{TenantID: "tenant-a", ProjectID: "proj-a"},
+				Roles:   allRoles,
+				Enabled: true,
+				Version: 1,
+			},
+			ExpiresAt: expiry,
+		},
+		{
+			Credential: "token-tenant-b-admin",
+			Principal: identity.Principal{
+				ID:      "admin-b",
+				Kind:    identity.KindHuman,
+				Scope:   tenancy.Scope{TenantID: "tenant-b"},
+				Roles:   allRoles,
+				Enabled: true,
+				Version: 1,
+			},
+			ExpiresAt: expiry,
+		},
+		{
+			Credential: "token-tenant-b-proj-admin",
+			Principal: identity.Principal{
+				ID:      "admin-b",
+				Kind:    identity.KindHuman,
+				Scope:   tenancy.Scope{TenantID: "tenant-b", ProjectID: "proj-b"},
+				Roles:   allRoles,
+				Enabled: true,
+				Version: 1,
+			},
+			ExpiresAt: expiry,
+		},
+	}
+
+	// Seed tenant-a into the shared memory store via Bootstrap, then start the
+	// served Shell composition bootstrapping tenant-b into the same store so
+	// both tenants are active with full tenant-admin memberships.
+	seedApp, err := shellapp.New(ctx, shellapp.Config{
+		Profile:        shellapp.ProfileDevelopment,
+		InstallationID: "inst-mt-e2e",
+		DataDir:        filepath.Join(tmp, "shell-data"),
+		Installation: installation.Config{
+			Environment: installation.EnvironmentDevelopment,
+			State:       installation.StateMemory,
+			Messaging:   installation.MessagingMemory,
+			Runtime:     installation.RuntimeProcess,
+			Keys:        installation.KeyEphemeral,
+			PublicURL:   "https://127.0.0.1:8443",
+		},
+		Adapters: sharedAdapters,
+		Dev: &shellapp.DevelopmentConfig{
+			Bootstrap: &shellapp.Bootstrap{
+				TenantID:       "tenant-a",
+				TenantName:     "Tenant A",
+				ProjectID:      "proj-a",
+				ProjectName:    "Project A",
+				AdminPrincipal: "admin-a",
+				AdminRoles:     []string{"admin", "engineer", "reviewer", "operator", "viewer"},
+			},
+			Tokens: devTokens,
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed tenant-a shellapp.New: %v", err)
+	}
+	if err := seedApp.Close(ctx); err != nil {
+		t.Fatalf("seed tenant-a shellapp.Close: %v", err)
+	}
+
+	app, err := shellapp.New(ctx, shellapp.Config{
+		Profile:        shellapp.ProfileDevelopment,
+		InstallationID: "inst-mt-e2e",
+		DataDir:        filepath.Join(tmp, "shell-data"),
+		Installation: installation.Config{
+			Environment: installation.EnvironmentDevelopment,
+			State:       installation.StateMemory,
+			Messaging:   installation.MessagingMemory,
+			Runtime:     installation.RuntimeProcess,
+			Keys:        installation.KeyEphemeral,
+			PublicURL:   "https://127.0.0.1:8443",
+		},
+		Adapters: sharedAdapters,
+		Dev: &shellapp.DevelopmentConfig{
+			Bootstrap: &shellapp.Bootstrap{
+				TenantID:       "tenant-b",
+				TenantName:     "Tenant B",
+				ProjectID:      "proj-b",
+				ProjectName:    "Project B",
+				AdminPrincipal: "admin-b",
+				AdminRoles:     []string{"admin", "engineer", "reviewer", "operator", "viewer"},
+			},
+			Tokens: devTokens,
+		},
+		GitCompanion: &shellapp.GitCompanionConfig{
+			AdminURL:       "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+			PublicGitURL:   "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443",
+			ServiceID:      "kodema-git-{tenant}",
+			TrustedOrigins: []string{"https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443"},
+			TokenFile:      filepath.Join(tmp, "shell-provision", "{tenant}", "token"),
+			RoundTripper: &hostRoutingRoundTripper{
+				routes: routes,
+				base:   http.DefaultTransport,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("shellapp.New: %v", err)
+	}
+	defer func() { _ = app.Close(ctx) }()
+
+	shellHTTP := httptest.NewServer(app.Handler())
+	defer shellHTTP.Close()
+
+	restDo := func(method, path, token, body string) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, shellHTTP.URL+path, bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", api.MediaType)
+		resp, err := shellHTTP.Client().Do(req)
+		if err != nil {
+			t.Fatalf("do request: %v", err)
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return resp.StatusCode, buf.Bytes()
+	}
+
+	// Register each tenant's per-tenant enforcing git service account and create
+	// + list a repository in each tenant (REST and MCP).
+	for _, f := range fixtures {
+		wantService := "kodema-git-" + f.tenantID
+		wantOrigin := "https://" + f.host
+		repoName := f.tenantID + "/service"
+		wantResourceID := api.DeriveRepositoryResourceID(repoName)
+		wantCloneURL := wantOrigin + "/" + repoName + ".git"
+
+		status, raw := restDo(http.MethodPut, "/api/v1/projects/"+f.projectID+"/memberships/admin-"+strings.TrimPrefix(f.tenantID, "tenant-"), f.adminToken,
+			`{"input":{"roles":["admin","engineer","reviewer","operator","viewer"]},"idempotency_key":"grant-`+f.tenantID+`"}`)
+		if status != http.StatusOK {
+			t.Fatalf("membership.grant %s status=%d body=%s", f.tenantID, status, raw)
+		}
+
+		status, raw = restDo(http.MethodPost, "/api/v1/projects/"+f.projectID+"/services", f.projToken,
+			`{"input":{"service_id":"`+wantService+`","roles":["viewer"]},"idempotency_key":"svc-`+f.tenantID+`"}`)
+		if status != http.StatusOK {
+			t.Fatalf("service.create %s status=%d body=%s", wantService, status, raw)
+		}
+
+		status, raw = restDo(http.MethodPost, "/api/v1/projects/"+f.projectID+"/repositories", f.adminToken,
+			`{"input":{"name":"`+repoName+`","default_branch":"main"},"idempotency_key":"repo-`+f.tenantID+`"}`)
+		if status != http.StatusOK {
+			t.Fatalf("repository.create %s status=%d body=%s", f.tenantID, status, raw)
+		}
+		var createEnv struct {
+			Body api.RepositoryCreateResult `json:"body"`
+		}
+		if err := json.Unmarshal(raw, &createEnv); err != nil {
+			t.Fatalf("decode repository.create(%s): %v", f.tenantID, err)
+		}
+		if createEnv.Body.EnforcingService != wantService ||
+			createEnv.Body.CloneURL != wantCloneURL ||
+			!reflect.DeepEqual(createEnv.Body.TrustedOrigins, []string{wantOrigin}) ||
+			!createEnv.Body.Created {
+			t.Fatalf("repository.create(%s) = %+v; want service=%q clone_url=%q origins=[%q] created=true",
+				f.tenantID, createEnv.Body, wantService, wantCloneURL, wantOrigin)
+		}
+
+		// Verify the repository was provisioned in THIS tenant's Git companion.
+		resolved, err := f.gitServer.Service().ResolveResourceID(ctx, repoName)
+		if err != nil || resolved != wantResourceID {
+			t.Fatalf("%s gitServer ResolveResourceID(%s) = %q, %v; want %q", f.tenantID, repoName, resolved, err, wantResourceID)
+		}
+
+		// Verify repository.list renders the tenant-expanded clone_url.
+		status, raw = restDo(http.MethodGet, "/api/v1/projects/"+f.projectID+"/repositories", f.projToken, "")
+		if status != http.StatusOK {
+			t.Fatalf("repository.list %s status=%d body=%s", f.tenantID, status, raw)
+		}
+		var listEnv struct {
+			Body api.RepositoryListResult `json:"body"`
+		}
+		if err := json.Unmarshal(raw, &listEnv); err != nil {
+			t.Fatalf("decode repository.list(%s): %v", f.tenantID, err)
+		}
+		if len(listEnv.Body.Repositories) != 1 ||
+			listEnv.Body.Repositories[0].CloneURL != wantCloneURL ||
+			listEnv.Body.Repositories[0].EnforcingService != wantService ||
+			!reflect.DeepEqual(listEnv.Body.Repositories[0].TrustedOrigins, []string{wantOrigin}) {
+			t.Fatalf("repository.list(%s) = %+v", f.tenantID, listEnv.Body.Repositories)
+		}
+
+		// Also verify MCP repository_create and repository_list expand {tenant} identically.
+		mcpRepoName := f.tenantID + "/mcp-app"
+		mcpCloneURL := wantOrigin + "/" + mcpRepoName + ".git"
+		mcpCreatePayload, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "tools/call",
+			"params": map[string]any{
+				"name": "repository_create",
+				"arguments": map[string]any{
+					"project_id":      f.projectID,
+					"name":            mcpRepoName,
+					"default_branch":  "main",
+					"idempotency_key": "mcp-repo-" + f.tenantID,
+				},
+			},
+		})
+		status, raw = restDo(http.MethodPost, "/mcp", f.adminToken, string(mcpCreatePayload))
+		if status != http.StatusOK || !strings.Contains(string(raw), mcpCloneURL) || !strings.Contains(string(raw), wantService) {
+			t.Fatalf("MCP repository_create(%s) status=%d body=%s; want clone_url=%q service=%q",
+				f.tenantID, status, raw, mcpCloneURL, wantService)
+		}
+		mcpListPayload, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      2,
+			"method":  "tools/call",
+			"params": map[string]any{
+				"name": "repository_list",
+				"arguments": map[string]any{
+					"project_id": f.projectID,
+				},
+			},
+		})
+		status, raw = restDo(http.MethodPost, "/mcp", f.projToken, string(mcpListPayload))
+		if status != http.StatusOK || !strings.Contains(string(raw), mcpCloneURL) || !strings.Contains(string(raw), wantCloneURL) {
+			t.Fatalf("MCP repository_list(%s) status=%d body=%s; want both clone URLs", f.tenantID, status, raw)
+		}
+	}
+
+	// Verify isolation: tenant-a's repo does NOT exist on tenant-b's Git companion
+	// and vice versa.
+	if _, err := fixtures[1].gitServer.Service().ResolveResourceID(ctx, "tenant-a/service"); err == nil {
+		t.Fatal("tenant-b git companion unexpectedly contains tenant-a/service")
+	}
+	if _, err := fixtures[0].gitServer.Service().ResolveResourceID(ctx, "tenant-b/service"); err == nil {
+		t.Fatal("tenant-a git companion unexpectedly contains tenant-b/service")
 	}
 }

@@ -19,11 +19,14 @@ import (
 	"github.com/optimiware/kodema/internal/control/resource"
 	"github.com/optimiware/kodema/internal/control/service"
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/id"
 	opsapp "github.com/optimiware/kodema/internal/server/ops"
 )
 
 const (
 	gitCompanionProvisionPath         = "/_kodema/repositories"
+	gitCompanionTenantPlaceholder     = "{tenant}"
+	gitCompanionTenantCheckValue      = "tenant-check"
 	gitCompanionMaxResponseBytes      = 64 << 10
 	gitCompanionDefaultTimeout        = 30 * time.Second
 	gitCompanionDefaultServiceID      = "git"
@@ -46,19 +49,28 @@ type GitCompanionConfig struct {
 	// A "{tenant}" placeholder is replaced by the owning tenant ID per request.
 	AdminURL string
 	// PublicGitURL is the client-facing Git HTTP base URL used to render
-	// clone_url (for example "https://127.0.0.1:8443/git"). When empty, it
-	// falls back to "<Installation.PublicURL>/git" when PublicURL is set.
+	// clone_url (for example "https://127.0.0.1:8443/git" or
+	// "https://kodema-git-{tenant}.kodema-system.svc.cluster.local:8443").
+	// A "{tenant}" placeholder is replaced by the owning tenant ID per request.
+	// When empty, it falls back to "<Installation.PublicURL>/git" when PublicURL
+	// is set.
 	PublicGitURL string
 	// ServiceID is the default enforcing service ID for repository bindings
-	// created via repository.create. Defaults to "git".
+	// created via repository.create (for example "git" or "kodema-git-{tenant}").
+	// A "{tenant}" placeholder is replaced by the owning tenant ID per request.
+	// Defaults to "git".
 	ServiceID string
 	// TrustedOrigins are the default trusted origins for repository bindings
-	// created via repository.create. When empty, defaults to the installation's
-	// public URL and workload URL (deduplicated).
+	// created via repository.create. Each entry may contain a "{tenant}"
+	// placeholder that is replaced by the owning tenant ID per request. When
+	// empty, defaults to the installation's public URL and workload URL
+	// (deduplicated).
 	TrustedOrigins []string
 	// TokenFile is the path to the bearer token file presented to the Git
-	// companion's provisioning endpoint. It is read on every request so
-	// rotations take effect without restarting the server.
+	// companion's provisioning endpoint (for example
+	// "/etc/kodema/git-provision/{tenant}/token"). A "{tenant}" placeholder is
+	// replaced by the validated owning tenant ID per request. It is read on
+	// every request so rotations take effect without restarting the server.
 	TokenFile string
 	// CAFile optionally trusts a PEM CA certificate bundle when AdminURL uses
 	// HTTPS.
@@ -75,7 +87,7 @@ func (cfg *GitCompanionConfig) validate() error {
 	if adminURL == "" {
 		return fault.New(fault.InvalidInput, "git companion configuration requires an admin URL")
 	}
-	if err := validateGitCompanionHTTPURL(strings.ReplaceAll(adminURL, "{tenant}", "tenant-check"), "git companion admin URL"); err != nil {
+	if err := validateGitCompanionHTTPURL(strings.ReplaceAll(adminURL, gitCompanionTenantPlaceholder, gitCompanionTenantCheckValue), "git companion admin URL"); err != nil {
 		return err
 	}
 	if cfg.PublicGitURL != "" {
@@ -83,12 +95,13 @@ func (cfg *GitCompanionConfig) validate() error {
 		if publicGitURL == "" {
 			return fault.New(fault.InvalidInput, "git companion public git URL is empty")
 		}
-		if err := validateGitCompanionHTTPURL(publicGitURL, "git companion public git URL"); err != nil {
+		if err := validateGitCompanionHTTPURL(strings.ReplaceAll(publicGitURL, gitCompanionTenantPlaceholder, gitCompanionTenantCheckValue), "git companion public git URL"); err != nil {
 			return err
 		}
 	}
 	if cfg.ServiceID != "" {
-		if _, err := service.ParseServiceID(strings.TrimSpace(cfg.ServiceID)); err != nil {
+		expandedServiceID := strings.ReplaceAll(strings.TrimSpace(cfg.ServiceID), gitCompanionTenantPlaceholder, gitCompanionTenantCheckValue)
+		if _, err := service.ParseServiceID(expandedServiceID); err != nil {
 			return fault.Wrap(fault.InvalidInput, "git companion service ID is invalid", err)
 		}
 	}
@@ -97,7 +110,8 @@ func (cfg *GitCompanionConfig) validate() error {
 		if origin == "" {
 			return fault.New(fault.InvalidInput, "git companion trusted origin is empty")
 		}
-		if err := resource.ValidateTrustedOrigins([]string{origin}); err != nil {
+		expandedOrigin := strings.ReplaceAll(origin, gitCompanionTenantPlaceholder, gitCompanionTenantCheckValue)
+		if err := resource.ValidateTrustedOrigins([]string{expandedOrigin}); err != nil {
 			return fault.Wrap(fault.InvalidInput, "git companion trusted origin is invalid", err)
 		}
 	}
@@ -234,15 +248,35 @@ func deriveDefaultGitTrustedOrigins(explicit []string, publicURL, workloadURL st
 	return out
 }
 
-func (p *httpRepositoryProvisioner) DefaultServiceID() string {
-	return p.serviceID
+func expandGitCompanionTenant(template string, tenantID id.TenantID) string {
+	if tenantID == "" || !strings.Contains(template, gitCompanionTenantPlaceholder) {
+		return template
+	}
+	return strings.ReplaceAll(template, gitCompanionTenantPlaceholder, string(tenantID))
 }
 
-func (p *httpRepositoryProvisioner) DefaultTrustedOrigins() []string {
-	return append([]string(nil), p.trustedOrigins...)
+func (p *httpRepositoryProvisioner) DefaultServiceID(tenantID id.TenantID) string {
+	return expandGitCompanionTenant(p.serviceID, tenantID)
 }
 
-func (p *httpRepositoryProvisioner) CloneURL(repository string) string {
+func (p *httpRepositoryProvisioner) DefaultTrustedOrigins(tenantID id.TenantID) []string {
+	if len(p.trustedOrigins) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(p.trustedOrigins))
+	out := make([]string, 0, len(p.trustedOrigins))
+	for _, raw := range p.trustedOrigins {
+		expanded := strings.TrimRight(expandGitCompanionTenant(raw, tenantID), "/")
+		if expanded == "" || seen[expanded] {
+			continue
+		}
+		seen[expanded] = true
+		out = append(out, expanded)
+	}
+	return out
+}
+
+func (p *httpRepositoryProvisioner) CloneURL(tenantID id.TenantID, repository string) string {
 	repo := strings.TrimLeft(strings.TrimSpace(repository), "/")
 	if p.publicGitURL == "" || repo == "" {
 		return ""
@@ -250,7 +284,8 @@ func (p *httpRepositoryProvisioner) CloneURL(repository string) string {
 	if !strings.HasSuffix(repo, ".git") {
 		repo += ".git"
 	}
-	return p.publicGitURL + "/" + repo
+	baseURL := strings.TrimRight(expandGitCompanionTenant(p.publicGitURL, tenantID), "/")
+	return baseURL + "/" + repo
 }
 
 type gitCompanionProvisionRequest struct {
@@ -270,7 +305,17 @@ func (p *httpRepositoryProvisioner) ProvisionRepository(ctx context.Context, req
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	tokenBytes, err := os.ReadFile(p.tokenFile)
+	tenant := req.TenantID
+	if strings.Contains(p.tokenFile, gitCompanionTenantPlaceholder) || strings.Contains(p.adminURL, gitCompanionTenantPlaceholder) {
+		parsed, err := id.ParseTenantID(string(req.TenantID))
+		if err != nil {
+			return opsapp.RepositoryProvisionResult{}, fault.Wrap(fault.InvalidInput,
+				"git companion provision tenant ID is invalid", err)
+		}
+		tenant = parsed
+	}
+	tokenFile := expandGitCompanionTenant(p.tokenFile, tenant)
+	tokenBytes, err := os.ReadFile(tokenFile)
 	if err != nil {
 		return opsapp.RepositoryProvisionResult{}, fault.Wrap(fault.DependencyUnavailable,
 			"git companion provision credential is unavailable", err)
@@ -290,7 +335,7 @@ func (p *httpRepositoryProvisioner) ProvisionRepository(ctx context.Context, req
 		return opsapp.RepositoryProvisionResult{}, fault.Wrap(fault.InternalFailure,
 			"encode git repository provision request", err)
 	}
-	baseURL := strings.ReplaceAll(p.adminURL, "{tenant}", string(req.TenantID))
+	baseURL := expandGitCompanionTenant(p.adminURL, tenant)
 	targetURL := strings.TrimRight(baseURL, "/") + gitCompanionProvisionPath
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
 	if err != nil {
@@ -337,7 +382,7 @@ func (p *httpRepositoryProvisioner) ProvisionRepository(ctx context.Context, req
 	return opsapp.RepositoryProvisionResult{
 		Repository:    repoName,
 		DefaultBranch: branch,
-		CloneURL:      p.CloneURL(repoName),
+		CloneURL:      p.CloneURL(tenant, repoName),
 		Created:       decoded.Created,
 	}, nil
 }

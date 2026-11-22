@@ -186,22 +186,45 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 
 	var caches []preparedCache
 	if len(request.Caches) > 0 {
-		resolvedCacheClaim := ""
+		caches = make([]preparedCache, len(request.Caches))
 		if a.cacheClaimName != "" {
-			// Explicitly non-authoritative: if the shared cache PVC is missing,
-			// evicted, or terminating, degrade cleanly to emptyDir rather than
-			// failing preparation or execution.
+			// Opt-in shared tenant claim override: if the shared cache PVC is
+			// missing, evicted, or terminating, degrade cleanly to emptyDir
+			// rather than failing preparation or execution.
+			resolvedCacheClaim := ""
 			if cacheClaim, claimErr := a.cluster.GetClaim(ctx, a.namespace, a.cacheClaimName); claimErr == nil &&
 				cacheClaim.Namespace == a.namespace && cacheClaim.DeletionTimestamp == nil {
 				resolvedCacheClaim = a.cacheClaimName
 			}
-		}
-		caches = make([]preparedCache, len(request.Caches))
-		for index, cache := range request.Caches {
-			caches[index] = preparedCache{
-				name:      cache.Name,
-				key:       cache.Key,
-				claimName: resolvedCacheClaim,
+			for index, cache := range request.Caches {
+				subPath := ""
+				if resolvedCacheClaim != "" {
+					subPath = cache.Key
+				}
+				caches[index] = preparedCache{
+					name:      cache.Name,
+					key:       cache.Key,
+					claimName: resolvedCacheClaim,
+					subPath:   subPath,
+				}
+			}
+		} else {
+			// Default per-slug persistent PVC mode: mount each owned
+			// kodema-cache-<key> PVC at its root (no subPath). Missing,
+			// unowned, workspace-labelled, or terminating claims degrade
+			// cleanly to emptyDir.
+			for index, cache := range request.Caches {
+				entry := preparedCache{
+					name: cache.Name,
+					key:  cache.Key,
+				}
+				if cacheClaimName, nameErr := CacheClaimName(cache.Key); nameErr == nil {
+					if claim, claimErr := a.cluster.GetClaim(ctx, a.namespace, cacheClaimName); claimErr == nil &&
+						ownedCacheClaim(claim, a.namespace, a.tenant, cache.Key) {
+						entry.claimName = cacheClaimName
+					}
+				}
+				caches[index] = entry
 			}
 		}
 	}
@@ -278,7 +301,7 @@ func (a *Adapter) prepareToolboxPlan(ctx context.Context, cm *ConfigMap, request
 		if err := json.Unmarshal(raw, &plan); err != nil || plan.Image == "" {
 			return toolboxPlan{}, fault.New(fault.InvalidInput, "invalid stored toolbox plan")
 		}
-		if err := validateToolbox(plan.Image, plan.GitURL); err != nil {
+		if err := validateToolbox(plan.Image, plan.GitURL, a.allowUnpinnedToolbox); err != nil {
 			return toolboxPlan{}, err
 		}
 		if plan.CASecret != "" {
@@ -522,23 +545,27 @@ func (a *Adapter) memoryLimitFor(workload id.WorkloadID) string {
 	return a.policy.MemoryLimit
 }
 
+// ownedCacheClaim reports whether claim is a live, tenant-owned persistent
+// cache PVC matching cacheKey and never a retained workspace claim.
+func ownedCacheClaim(claim Claim, namespace string, tenant id.TenantID, cacheKey string) bool {
+	return claim.Namespace == namespace &&
+		claim.Labels[LabelTenant] == string(tenant) &&
+		claim.Labels[LabelCacheKey] == cacheKey &&
+		claim.Labels[LabelWorkspace] == "" &&
+		claim.DeletionTimestamp == nil
+}
+
 // Logs returns ordered, bounded and redacted chunks. It carries no lifecycle
 // authority and fails closed when the redaction source is unavailable.
 func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reconcile.LogBatch, error) {
 	if err := container.ValidateLogsRequest(request); err != nil {
 		return reconcile.LogBatch{}, err
 	}
-	// The pod log is one interleaved stream: stock clusters cannot separate
-	// stdout from stderr, so the combined log is attributed to stdout and the
-	// stderr position of the continuation token stays zero.
-	offset, stderrOffset := container.DecodeLogCursor(request.AfterOffset)
-	if stderrOffset != 0 {
-		// A cursor from the retired two-stream reader carries a stderr
-		// position. Reinterpreting its high half as a combined-log offset would
-		// silently skip or repeat bytes, so refuse it as an invalid cursor
-		// before touching the cluster.
+	stdoutOffset, stderrOffset := container.DecodeLogCursor(request.AfterOffset)
+	if stdoutOffset < 0 || stdoutOffset > container.MaxStdoutLogCursorPosition ||
+		stderrOffset < 0 || stderrOffset > container.MaxStderrLogCursorPosition {
 		return reconcile.LogBatch{}, fault.New(fault.InvalidInput,
-			"log cursor carries a stderr position; the combined log has one position")
+			"log position exceeds the continuation-token range")
 	}
 
 	pods, err := a.cluster.ListPods(ctx, a.namespace, workloadSelector(request.Identity))
@@ -567,9 +594,10 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 	values := redactionValues(secret)
 
 	page, err := a.cluster.ReadPodLogs(ctx, a.namespace, pod.Name, PodLogRequest{
-		Stream: LogStreamCombined,
-		Offset: offset,
-		Limit:  request.Limit,
+		Stream:       LogStreamSplit,
+		Offset:       stdoutOffset,
+		StderrOffset: stderrOffset,
+		Limit:        request.Limit,
 	})
 	if err != nil {
 		// A pod that vanished after the successful list keeps NotFound so the
@@ -592,13 +620,13 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 			return reconcile.LogBatch{}, fault.Wrap(fault.DependencyUnavailable, "pod log read is unavailable", err)
 		}
 	}
-	// A truncated page is a strict prefix of the log: a value that starts
+	// A truncated page is a strict prefix of its stream: a value that starts
 	// inside it may still complete after the page. Only the final page (no
-	// truncation) is known to hold the whole remaining log, so nothing there can
-	// extend past its last byte.
-	chunk, hasChunk, nextPos, err := container.BuildLogChunk(container.LogPageInput{
+	// truncation) is known to hold the whole remaining stream, so nothing there
+	// can extend past its last byte.
+	stdoutChunk, hasStdout, nextStdout, err := container.BuildLogChunk(container.LogPageInput{
 		Stream:        reconcile.LogStdout,
-		Offset:        offset,
+		Offset:        stdoutOffset,
 		Sequence:      1,
 		Raw:           page.Data,
 		PageTruncated: page.Truncated,
@@ -607,13 +635,27 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 		MayGrow:       page.Truncated,
 	})
 	if err != nil {
-		// The page itself was already read, but a position that does not fit the
-		// token must never surface as a negative cursor.
 		return reconcile.LogBatch{}, err
 	}
-	batch := reconcile.LogBatch{NextOffset: container.EncodeLogCursor(nextPos, 0)}
-	if hasChunk {
-		batch.Chunks = append(batch.Chunks, chunk)
+	stderrChunk, hasStderr, nextStderr, err := container.BuildLogChunk(container.LogPageInput{
+		Stream:        reconcile.LogStderr,
+		Offset:        stderrOffset,
+		Sequence:      2,
+		Raw:           page.StderrData,
+		PageTruncated: page.StderrTruncated,
+		Values:        values,
+		Limit:         request.Limit,
+		MayGrow:       page.StderrTruncated,
+	})
+	if err != nil {
+		return reconcile.LogBatch{}, err
+	}
+	batch := reconcile.LogBatch{NextOffset: container.EncodeLogCursor(nextStdout, nextStderr)}
+	if hasStdout {
+		batch.Chunks = append(batch.Chunks, stdoutChunk)
+	}
+	if hasStderr {
+		batch.Chunks = append(batch.Chunks, stderrChunk)
 	}
 	return batch, nil
 }

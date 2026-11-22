@@ -68,6 +68,25 @@ func WorkspaceResourceName(workspaceID id.WorkspaceID) (string, error) {
 	return "kodema-workspace-" + StableDigest(string(workspaceID)), nil
 }
 
+// CacheResourceName returns the deterministic runtime resource name (volume or
+// PersistentVolumeClaim) for one scoped cache key.
+func CacheResourceName(key string) (string, error) {
+	if len(key) < 16 || len(key) > 64 {
+		return "", fault.New(fault.InvalidInput, "cache key length is invalid")
+	}
+	for index := 0; index < len(key); index++ {
+		c := key[index]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", fault.New(fault.InvalidInput, "cache key must be lowercase hexadecimal")
+		}
+	}
+	name := "kodema-cache-" + key
+	if len(name) > 63 {
+		return "", fault.New(fault.InvalidInput, "cache resource name exceeds 63 characters")
+	}
+	return name, nil
+}
+
 // DescribeIdentity renders a stable, non-secret diagnostic identity.
 func DescribeIdentity(identity reconcile.EffectIdentity) string {
 	return fmt.Sprintf("workload %q (execution %q action %q)", identity.WorkloadID, identity.ExecutionID, identity.ActionID)

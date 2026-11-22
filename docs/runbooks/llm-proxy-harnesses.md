@@ -40,6 +40,32 @@ Store the matching project secret (for example `printf '%s' "$OPENROUTER_API_KEY
 
 For `kodema serve`, pass `--models-file /path/to/models.json` (or `KODEMA_MODELS_FILE`) or repeatable `--llm-provider <name>=<base_url>[,secret=<NAME>][,auth=<Authorization|x-api-key>][,tenant=<TENANT>][,project=<PROJECT>]`.
 
+### Enabling on Kubernetes (Helm)
+
+In [`deploy/charts/kodema`](../../deploy/charts/kodema/values.yaml) (and `kodema.*` in `deploy/charts/kodema-stack`), configure `config.models` to mount `KODEMA_MODELS_FILE` without putting raw API keys in Helm values (`secretName` always references Kodema's encrypted database secrets):
+
+```yaml
+config:
+  models:
+    defaultProviders: true # enables openai, anthropic, and opencode for every declared tenant
+    providers:
+      - tenantID: tenant-a
+        name: openrouter
+        baseURL: https://openrouter.ai/api/v1
+        secretName: OPENROUTER_API_KEY
+    budgets:
+      defaultExecution:
+        maxTokens: 250000
+  secretRules:
+    rules:
+      - tenantID: tenant-a
+        names: ["NPM_TOKEN"]
+```
+
+- `environment: "production"` keeps both `config.models` and `config.secretRules` fail-closed/off by default and refuses `allowAll: true` secret rules and non-`https://` provider URLs.
+- `environment: "test"` (including [`deploy/k3s/values.yaml`](../../deploy/k3s/values.yaml)) defaults `config.secretRules.allowAllInTest: true` for declared tenants and enables `config.models.defaultProviders: true` in the k3s reference values.
+- To supply an operator-managed ConfigMap instead of inline values, set `config.models.existingConfigMap` or `config.secretRules.existingConfigMap` (mutually exclusive with inline fields).
+
 ## Recommended in-container pattern: `kodema harness exec -- <cmd>`
 
 `kodema harness exec` is built into `/kodema/bin/kodema` (on `PATH` inside every container action). It starts an ephemeral loopback-only HTTP reverse proxy (`127.0.0.1:0`) for the lifetime of the child command:

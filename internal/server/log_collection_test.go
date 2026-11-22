@@ -87,6 +87,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -97,6 +98,7 @@ import (
 
 	runtimecontainer "github.com/optimiware/kodema/internal/adapter/runtime/container"
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
+	"github.com/optimiware/kodema/internal/adapter/runtime/kube/logframe"
 	shelllog "github.com/optimiware/kodema/internal/control/log"
 	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/engine"
@@ -2223,6 +2225,20 @@ func (cluster *destructiveKubeCluster) ReadPodLogs(_ context.Context, _ string, 
 	if len(cluster.pods) == 0 || cluster.pods[0].Name != pod {
 		return runtimekube.PodLogPage{}, runtimekube.ErrNotFound
 	}
+	if request.Stream == runtimekube.LogStreamSplit {
+		demuxed, err := logframe.Demux(bytes.NewReader(cluster.logs), request.Offset, request.StderrOffset, request.Limit)
+		if err != nil {
+			return runtimekube.PodLogPage{}, err
+		}
+		return runtimekube.PodLogPage{
+			Data:             demuxed.Stdout,
+			NextOffset:       demuxed.StdoutNext,
+			Truncated:        demuxed.StdoutTruncated,
+			StderrData:       demuxed.Stderr,
+			StderrNextOffset: demuxed.StderrNext,
+			StderrTruncated:  demuxed.StderrTruncated,
+		}, nil
+	}
 	start := min(max(request.Offset, 0), int64(len(cluster.logs)))
 	end := min(start+int64(request.Limit), int64(len(cluster.logs)))
 	return runtimekube.PodLogPage{
@@ -2427,6 +2443,103 @@ func TestLogCollectionCheckpointsBeforeKubernetesSuspension(t *testing.T) {
 	}
 	if cursor, ok, err := cursors.Load(context.Background(), identity.ExecutionID, identity.ActionID, identity.WorkloadID); err != nil || !ok || cursor != logCollectionComplete {
 		t.Fatalf("cursor after Remove = (%d, %v, %v); want the completion token", cursor, ok, err)
+	}
+}
+
+// TestLogCollectionCheckpointsSplitStdoutAndStderrBeforeKubernetesSuspension
+// proves that framed stdout and stderr streams produced by a Kubernetes toolbox
+// pod are both checkpointed into their respective retained sink streams before
+// SuspendJob deletes the active Pod.
+func TestLogCollectionCheckpointsSplitStdoutAndStderrBeforeKubernetesSuspension(t *testing.T) {
+	const wantStdout = "stdout-ready\nstdout-progress\n"
+	const wantStderr = "stderr-warn\nstderr-detail\n"
+
+	var wire bytes.Buffer
+	w := logframe.NewWriter(&wire)
+	_, _ = w.WriteStream(logframe.StreamStdout, []byte("stdout-ready\n"))
+	_, _ = w.WriteStream(logframe.StreamStderr, []byte("stderr-warn\n"))
+	_, _ = w.WriteStream(logframe.StreamStdout, []byte("stdout-progress\n"))
+	_, _ = w.WriteStream(logframe.StreamStderr, []byte("stderr-detail\n"))
+
+	identity := kernelengine.EffectIdentity{
+		ExecutionID:    id.ExecutionID("execution-split-stop-1"),
+		ActionID:       id.ActionID("action-split-stop-1"),
+		WorkloadID:     id.WorkloadID("workload-split-stop-1"),
+		IdempotencyKey: "idempotency-split-stop-1",
+	}
+	workspaceID := id.WorkspaceID("workspace-split-stop-1")
+	scope := tenancy.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+
+	cluster := newDestructiveKubeCluster(identity, workspaceID, wire.String())
+	adapter, err := runtimekube.New(runtimekube.Config{
+		Cluster:   cluster,
+		Namespace: kubeStopNamespace,
+		TenantID:  id.TenantID(kubeStopTenant),
+		KodemaURL: "https://kodema.example.com",
+		Policy: runtimekube.Policy{
+			CPURequest:    "100m",
+			CPULimit:      "1",
+			MemoryRequest: "128Mi",
+			MemoryLimit:   "256Mi",
+			JobTTLSeconds: 600,
+		},
+		Cleanup: runtimekube.CleanupPolicy{Attempts: 1, Backoff: time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("kubernetes New: %v", err)
+	}
+
+	fileSink, err := shelllog.NewFileSink(shelllog.SinkConfig{Root: t.TempDir(), Clock: newFakeClock()})
+	if err != nil {
+		t.Fatalf("NewFileSink: %v", err)
+	}
+	sink := &recordingSink{inner: fileSink, order: &collectionOrder{}}
+	scopes := &fakeExecutionScopes{scopes: map[id.ExecutionID]tenancy.Scope{identity.ExecutionID: scope}}
+	cursors := &memoryLogCursors{cursors: map[string]int64{}}
+	collector, err := newLogCollectingRuntime(logCollectionConfig{
+		Inner:   adapter,
+		Sink:    sink,
+		Scopes:  scopes,
+		Cursors: cursors,
+	})
+	if err != nil {
+		t.Fatalf("newLogCollectingRuntime: %v", err)
+	}
+
+	var stdoutAtStop, stderrAtStop string
+	cluster.onSuspend = func() {
+		stdoutAtStop = joinLogData(readAllLogs(t, fileSink, scope, identity.ExecutionID, identity.ActionID, shelllog.StreamStdout))
+		stderrAtStop = joinLogData(readAllLogs(t, fileSink, scope, identity.ExecutionID, identity.ActionID, shelllog.StreamStderr))
+	}
+
+	evidence, err := collector.Stop(context.Background(), kernelengine.StopRequest{
+		Identity:    identity,
+		WorkspaceID: workspaceID,
+	})
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if !evidence.IsConfirmed() {
+		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
+	}
+	if stdoutAtStop != wantStdout {
+		t.Fatalf("stdout at suspension = %q; want %q", stdoutAtStop, wantStdout)
+	}
+	if stderrAtStop != wantStderr {
+		t.Fatalf("stderr at suspension = %q; want %q", stderrAtStop, wantStderr)
+	}
+
+	if removal, err := collector.Remove(context.Background(), kernelengine.RemoveRequest{
+		Identity:    identity,
+		WorkspaceID: workspaceID,
+	}); err != nil || !removal.Removed {
+		t.Fatalf("Remove after suspension = (%+v, %v); want removed", removal, err)
+	}
+	if got := joinLogData(readAllLogs(t, sink, scope, identity.ExecutionID, identity.ActionID, shelllog.StreamStdout)); got != wantStdout {
+		t.Fatalf("final stdout = %q; want %q", got, wantStdout)
+	}
+	if got := joinLogData(readAllLogs(t, sink, scope, identity.ExecutionID, identity.ActionID, shelllog.StreamStderr)); got != wantStderr {
+		t.Fatalf("final stderr = %q; want %q", got, wantStderr)
 	}
 }
 

@@ -1,0 +1,16 @@
+{{- $modelsJSON := include "kodema.modelsJSON" . | trim }}
+{{- if $modelsJSON }}
+{{- $m := .Values.config.models | default dict }}
+{{- $key := $m.key | default "models.json" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kodema-models
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kodema
+    app.kubernetes.io/component: control-plane
+data:
+  {{ $key }}: |
+{{ $modelsJSON | indent 4 }}
+{{- end }}

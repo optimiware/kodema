@@ -179,6 +179,46 @@ func TestKodemaChartImageDigestSchemaRejectsNonDigest(t *testing.T) {
 	if !strings.Contains(rendered, "name: KODEMA_TOOLBOX_IMAGE\n              value: \"registry.example.com/kodema@"+digest+"\"") {
 		t.Error("tenant toolbox is not pinned to the control-plane image")
 	}
+
+	// Production with empty digest keeps KODEMA_TOOLBOX_IMAGE empty (fail-closed).
+	rendered, err = renderChartArgs(t, helm, "kodema", chart, kodemaProductionArgs()...)
+	if err != nil {
+		t.Fatalf("helm template kodema production with empty digest: %v\n%s", err, rendered)
+	}
+	prodEntry := renderedEnvEntry(t, renderedObjectOfKind(t, rendered, "Deployment"), "KODEMA_TOOLBOX_IMAGE")
+	if got := stringAtKey(t, prodEntry, "value"); got != "" {
+		t.Errorf("production KODEMA_TOOLBOX_IMAGE with empty digest = %q, want empty (fail-closed)", got)
+	}
+
+	// Test profile with empty digest falls back KODEMA_TOOLBOX_IMAGE to repository:tag.
+	rendered, err = renderChartArgs(t, helm, "kodema", chart, kodemaProductionArgs(
+		"--set", "environment=test",
+		"--set", "config.keyAdapter=keyfile",
+		"--set", "config.keyReference=keyfile:kek-v1",
+		"--set", "image.tag=1.2.3",
+	)...)
+	if err != nil {
+		t.Fatalf("helm template kodema test with empty digest: %v\n%s", err, rendered)
+	}
+	testEntry := renderedEnvEntry(t, renderedObjectOfKind(t, rendered, "Deployment"), "KODEMA_TOOLBOX_IMAGE")
+	if got := stringAtKey(t, testEntry, "value"); got != "registry.example.com/kodema:1.2.3" {
+		t.Errorf("test KODEMA_TOOLBOX_IMAGE with empty digest = %q, want registry.example.com/kodema:1.2.3", got)
+	}
+
+	// Test profile with digest set still pins KODEMA_TOOLBOX_IMAGE by digest.
+	rendered, err = renderChartArgs(t, helm, "kodema", chart, kodemaProductionArgs(
+		"--set", "environment=test",
+		"--set", "config.keyAdapter=keyfile",
+		"--set", "config.keyReference=keyfile:kek-v1",
+		"--set", "image.digest="+digest,
+	)...)
+	if err != nil {
+		t.Fatalf("helm template kodema test with digest: %v\n%s", err, rendered)
+	}
+	testDigestEntry := renderedEnvEntry(t, renderedObjectOfKind(t, rendered, "Deployment"), "KODEMA_TOOLBOX_IMAGE")
+	if got := stringAtKey(t, testDigestEntry, "value"); got != "registry.example.com/kodema@"+digest {
+		t.Errorf("test KODEMA_TOOLBOX_IMAGE with digest = %q, want registry.example.com/kodema@%s", got, digest)
+	}
 }
 
 // TestKodemaChartDatabaseCAVolumeIsRequired proves the database CA Secret is

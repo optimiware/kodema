@@ -35,7 +35,7 @@ deploy/k3s/install.sh --dry-run
 deploy/k3s/install.sh
 ```
 
-To enable the `/kodema/bin/kodema` workload toolbox inside pipeline containers (needed for `kodema output push` and `kodema git credential`), pass a digest-pinned image:
+In `environment: "test"`, leaving `kodema.image.digest` empty automatically falls back `KODEMA_TOOLBOX_IMAGE` to `repository:tag`, so the `/kodema/bin/kodema` workload toolbox initContainer (`kodema output push`, `kodema git credential`, `kodema harness exec`) works out of the box. To pin both the control plane and toolbox by immutable digest (required in `production`), pass `KODEMA_K3S_IMAGE_DIGEST`:
 
 ```bash
 KODEMA_K3S_IMAGE_DIGEST=sha256:<64-hex-digest> deploy/k3s/install.sh

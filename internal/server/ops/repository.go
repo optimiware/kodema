@@ -13,6 +13,7 @@ import (
 	"github.com/optimiware/kodema/internal/control/service"
 	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/transport/ops"
 )
 
@@ -56,14 +57,14 @@ func repositoryHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			}
 			enforcingService := strings.TrimSpace(request.EnforcingService)
 			if enforcingService == "" {
-				enforcingService = strings.TrimSpace(deps.Repositories.DefaultServiceID())
+				enforcingService = strings.TrimSpace(deps.Repositories.DefaultServiceID(call.Scope.TenantID))
 			}
 			if enforcingService == "" {
 				enforcingService = defaultGitEnforcingService
 			}
 			trustedOrigins := request.TrustedOrigins
 			if trustedOrigins == nil {
-				trustedOrigins = deps.Repositories.DefaultTrustedOrigins()
+				trustedOrigins = deps.Repositories.DefaultTrustedOrigins(call.Scope.TenantID)
 			}
 			if trustedOrigins == nil {
 				trustedOrigins = []string{}
@@ -125,7 +126,7 @@ func repositoryHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 			}
 			cloneURL := strings.TrimSpace(provisioned.CloneURL)
 			if cloneURL == "" {
-				cloneURL = deps.Repositories.CloneURL(request.Name)
+				cloneURL = deps.Repositories.CloneURL(call.Scope.TenantID, request.Name)
 			}
 			return respond(call, api.RepositoryCreateResult{
 				Name:             request.Name,
@@ -162,7 +163,7 @@ func repositoryHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 					if !bindingMatchesKind(binding, "git") {
 						return api.RepositoryView{}, false, nil
 					}
-					return repositoryViewFromBinding(binding, deps.Repositories), true, nil
+					return repositoryViewFromBinding(call.Scope.TenantID, binding, deps.Repositories), true, nil
 				},
 			)
 			if err != nil {
@@ -176,7 +177,7 @@ func repositoryHandlers(deps Dependencies) map[authorizeOperation]ops.Handler {
 	}
 }
 
-func repositoryViewFromBinding(binding api.ResourceBindingView, provisioner RepositoryProvisioner) api.RepositoryView {
+func repositoryViewFromBinding(tenantID id.TenantID, binding api.ResourceBindingView, provisioner RepositoryProvisioner) api.RepositoryView {
 	name := ""
 	defaultBranch := ""
 	if binding.Metadata != nil {
@@ -192,7 +193,7 @@ func repositoryViewFromBinding(binding api.ResourceBindingView, provisioner Repo
 	}
 	cloneURL := ""
 	if provisioner != nil {
-		cloneURL = provisioner.CloneURL(name)
+		cloneURL = provisioner.CloneURL(tenantID, name)
 	}
 	return api.RepositoryView{
 		Name:             name,

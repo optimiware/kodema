@@ -434,28 +434,29 @@ func newProductionTenantAdapter(getenv productionEnv, cluster *driverkube.Cluste
 		MaxMemoryLimit: strings.TrimSpace(getenv("KODEMA_WORKLOAD_MAX_MEMORY_LIMIT")),
 		JobTTLSeconds:  defaultKubeJobTTLSeconds,
 	}
-	return newTenantAdapterWithPolicy(getenv, cluster, tenant, options, policy)
+	return newTenantAdapterWithPolicy(getenv, cluster, tenant, options, policy, false)
 }
 
 // newTenantAdapterWithPolicy builds one tenant's Kubernetes runtime and
 // workspace adapter using an explicitly resolved resource policy.
-func newTenantAdapterWithPolicy(getenv productionEnv, cluster *driverkube.Cluster, tenant productionTenantEntry, options serverOptions, policy runtimekube.Policy) (*runtimekube.Adapter, error) {
+func newTenantAdapterWithPolicy(getenv productionEnv, cluster *driverkube.Cluster, tenant productionTenantEntry, options serverOptions, policy runtimekube.Policy, allowUnpinnedToolbox bool) (*runtimekube.Adapter, error) {
 	imagePullSecrets, err := parseImagePullSecrets(getenv("KODEMA_WORKLOAD_IMAGE_PULL_SECRETS"))
 	if err != nil {
 		return nil, err
 	}
 	adapter, err := runtimekube.New(runtimekube.Config{
-		Cluster:          cluster,
-		Namespace:        tenant.Namespace,
-		TenantID:         tenant.ID,
-		KodemaURL:        options.PublicURL,
-		ToolboxImage:     strings.TrimSpace(getenv("KODEMA_TOOLBOX_IMAGE")),
-		GitURL:           strings.ReplaceAll(options.WorkloadGitURL, "{tenant}", string(tenant.ID)),
-		Policy:           policy,
-		Cleanup:          runtimekube.CleanupPolicy{Attempts: 3, Backoff: time.Second},
-		WorkloadCA:       runtimekube.WorkloadCAConfig{SecretName: strings.TrimSpace(getenv("KODEMA_WORKLOAD_CA_SECRET"))},
-		ImagePullSecrets: imagePullSecrets,
-		CacheClaimName:   strings.TrimSpace(getenv("KODEMA_WORKLOAD_CACHE_CLAIM")),
+		Cluster:              cluster,
+		Namespace:            tenant.Namespace,
+		TenantID:             tenant.ID,
+		KodemaURL:            options.PublicURL,
+		ToolboxImage:         strings.TrimSpace(getenv("KODEMA_TOOLBOX_IMAGE")),
+		AllowUnpinnedToolbox: allowUnpinnedToolbox,
+		GitURL:               strings.ReplaceAll(options.WorkloadGitURL, "{tenant}", string(tenant.ID)),
+		Policy:               policy,
+		Cleanup:              runtimekube.CleanupPolicy{Attempts: 3, Backoff: time.Second},
+		WorkloadCA:           runtimekube.WorkloadCAConfig{SecretName: strings.TrimSpace(getenv("KODEMA_WORKLOAD_CA_SECRET"))},
+		ImagePullSecrets:     imagePullSecrets,
+		CacheClaimName:       strings.TrimSpace(getenv("KODEMA_WORKLOAD_CACHE_CLAIM")),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes runtime: %w", err)

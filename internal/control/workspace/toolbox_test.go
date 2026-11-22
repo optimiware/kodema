@@ -10,12 +10,27 @@ import (
 )
 
 // TestEntrypointWithoutAToolboxIsThePlainScript pins that a runtime without a
-// toolbox starts the Kernel's script exactly as before.
+// toolbox starts the Kernel's script exactly as before, even if FrameStreams is
+// requested.
 func TestEntrypointWithoutAToolboxIsThePlainScript(t *testing.T) {
-	for _, launch := range []workspace.Launch{{}, {Outputs: true}} {
+	for _, launch := range []workspace.Launch{{}, {Outputs: true}, {FrameStreams: true}, {Outputs: true, FrameStreams: true}} {
 		got := workspace.Entrypoint("/kodema/script", launch)
 		if want := []string{"/bin/sh", "/kodema/script"}; !slices.Equal(got, want) {
 			t.Fatalf("Entrypoint(%+v) = %q; want %q", launch, got, want)
+		}
+	}
+}
+
+// TestEntrypointFrameStreamsWrapsToolboxLaunch pins that FrameStreams prefixes
+// the toolbox shell invocation with `/kodema/bin/kodema _frame --` without
+// changing the shell command itself.
+func TestEntrypointFrameStreamsWrapsToolboxLaunch(t *testing.T) {
+	for _, outputs := range []bool{false, true} {
+		plain := workspace.Entrypoint("/kodema/script", workspace.Launch{Toolbox: true, Outputs: outputs})
+		framed := workspace.Entrypoint("/kodema/script", workspace.Launch{Toolbox: true, Outputs: outputs, FrameStreams: true})
+		want := append([]string{workspace.ToolboxPath, "_frame", "--"}, plain...)
+		if !slices.Equal(framed, want) {
+			t.Fatalf("Entrypoint(outputs=%v, FrameStreams=true) = %q; want %q", outputs, framed, want)
 		}
 	}
 }
