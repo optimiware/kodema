@@ -16,12 +16,13 @@ type layer int
 const (
 	layerNeutral layer = iota
 	layerAPI
-	layerKernel
-	layerShellCapability
-	layerShellAdapter
-	layerShellTransport
-	layerUserland
-	layerUserlandApp
+	layerEngine
+	layerControl
+	layerAdapter
+	layerTransport
+	layerClient
+	layerAppsKit
+	layerApp
 	layerComposition
 	layerInstallation
 	layerTooling
@@ -34,18 +35,20 @@ func (l layer) String() string {
 		return "neutral"
 	case layerAPI:
 		return "api"
-	case layerKernel:
-		return "kernel"
-	case layerShellCapability:
-		return "shell capability"
-	case layerShellAdapter:
-		return "shell adapter"
-	case layerShellTransport:
-		return "shell transport"
-	case layerUserland:
-		return "userland"
-	case layerUserlandApp:
-		return "userland app"
+	case layerEngine:
+		return "engine"
+	case layerControl:
+		return "control"
+	case layerAdapter:
+		return "adapter"
+	case layerTransport:
+		return "transport"
+	case layerClient:
+		return "client"
+	case layerAppsKit:
+		return "apps kit"
+	case layerApp:
+		return "app"
 	case layerComposition:
 		return "composition"
 	case layerInstallation:
@@ -86,7 +89,7 @@ func checkImports(root string) ([]Finding, error) {
 		}
 	}
 
-	findings = append(findings, detectKernelCycles(files, module)...)
+	findings = append(findings, detectEngineCycles(files, module)...)
 	return findings, nil
 }
 
@@ -161,53 +164,28 @@ func classifyPath(rel string) layer {
 	switch {
 	case rel == "api" || strings.HasPrefix(rel, "api/"):
 		return layerAPI
+	case rel == "client" || strings.HasPrefix(rel, "client/"):
+		return layerClient
 	case rel == "internal/id" || strings.HasPrefix(rel, "internal/id/"):
 		return layerNeutral
 	case rel == "internal/fault" || strings.HasPrefix(rel, "internal/fault/"):
 		return layerNeutral
 	case rel == "internal/docs" || strings.HasPrefix(rel, "internal/docs/"):
 		return layerNeutral
-	case rel == "internal/kernel" || strings.HasPrefix(rel, "internal/kernel/"):
-		return layerKernel
-	case rel == "internal/shell" || strings.HasPrefix(rel, "internal/shell/"):
-		rest := strings.TrimPrefix(rel, "internal/shell/")
-		switch {
-		case rest == "store":
-			// The SQL-free commit-unit seam is neutral: capabilities consume
-			// store.Executor without depending on a concrete adapter.
-			return layerShellCapability
-		case strings.HasPrefix(rest, "store/"):
-			// Files directly in internal/shell/store are the seam package;
-			// only deeper directories (store/postgres, store/memory) are
-			// concrete adapters.
-			if !strings.Contains(strings.TrimPrefix(rest, "store/"), "/") &&
-				strings.HasSuffix(rest, ".go") {
-				return layerShellCapability
-			}
-			return layerShellAdapter
-		case rest == "runtime" || strings.HasPrefix(rest, "runtime/"),
-			rest == "integration" || strings.HasPrefix(rest, "integration/"):
-			return layerShellAdapter
-		case rest == "transport" || strings.HasPrefix(rest, "transport/"):
-			return layerShellTransport
-		case rest == "app" || strings.HasPrefix(rest, "app/"):
-			return layerComposition
-		default:
-			return layerShellCapability
-		}
-	case rel == "internal/userland" || strings.HasPrefix(rel, "internal/userland/"):
-		rest := strings.TrimPrefix(rel, "internal/userland/")
-		if rest == "app" || strings.HasPrefix(rest, "app/") || rest == "git/app" || strings.HasPrefix(rest, "git/app/") ||
-			rest == "agent/app" || strings.HasPrefix(rest, "agent/app/") ||
-			rest == "services/app" || strings.HasPrefix(rest, "services/app/") {
-			// Userland app processes use only public client contracts even
-			// when linked into the same binary: no Shell, Kernel or internal
-			// package may be imported.
-			return layerUserlandApp
-		}
-		return layerUserland
-	case rel == "client" || strings.HasPrefix(rel, "client/"):
-		return layerUserland
+	case rel == "internal/engine" || strings.HasPrefix(rel, "internal/engine/"):
+		return layerEngine
+	case rel == "internal/control" || strings.HasPrefix(rel, "internal/control/"):
+		return layerControl
+	case rel == "internal/adapter" || strings.HasPrefix(rel, "internal/adapter/"):
+		return layerAdapter
+	case rel == "internal/transport" || strings.HasPrefix(rel, "internal/transport/"):
+		return layerTransport
+	case rel == "internal/server" || strings.HasPrefix(rel, "internal/server/"):
+		return layerComposition
+	case rel == "internal/apps/kit" || strings.HasPrefix(rel, "internal/apps/kit/"):
+		return layerAppsKit
+	case rel == "internal/apps" || strings.HasPrefix(rel, "internal/apps/"):
+		return layerApp
 	case rel == "internal/installation" || strings.HasPrefix(rel, "internal/installation/"):
 		return layerInstallation
 	case rel == "cmd" || strings.HasPrefix(rel, "cmd/"):
@@ -227,10 +205,37 @@ func classifyPath(rel string) layer {
 	}
 }
 
+// appName returns the top-level app directory under internal/apps/<app> for a
+// source file or module-relative package path, or "" if the path is not inside
+// an app subtree (including internal/apps/kit).
+func appName(rel string) string {
+	rel = filepath.ToSlash(rel)
+	rest, ok := strings.CutPrefix(rel, "internal/apps/")
+	if !ok || rest == "" {
+		return ""
+	}
+	name, _, hasSlash := strings.Cut(rest, "/")
+	if name == "" || name == "kit" {
+		return ""
+	}
+	if !hasSlash && strings.HasSuffix(name, ".go") {
+		return ""
+	}
+	return name
+}
+
 func importViolation(module, rel string, importer layer, imported string) (string, bool) {
 	if productPath, ok := moduleRelative(module, imported); ok {
-		if !productImportAllowed(importer, classifyPath(productPath)) {
+		importedLayer := classifyPath(productPath)
+		if !productImportAllowed(importer, importedLayer) {
 			return fmt.Sprintf("forbidden import %q from %s package", imported, importer), true
+		}
+		if importer == layerApp && importedLayer == layerApp {
+			importerApp := appName(rel)
+			importedApp := appName(productPath)
+			if importerApp == "" || importedApp == "" || importerApp != importedApp {
+				return fmt.Sprintf("forbidden sibling app import %q from app %q", imported, importerApp), true
+			}
 		}
 		return "", false
 	}
@@ -239,7 +244,7 @@ func importViolation(module, rel string, importer layer, imported string) (strin
 			return "", false
 		}
 		switch importer {
-		case layerNeutral, layerAPI, layerKernel, layerShellCapability, layerInstallation:
+		case layerNeutral, layerAPI, layerEngine, layerControl, layerInstallation:
 			return fmt.Sprintf("forbidden external import %q from %s package", imported, importer), true
 		}
 		// Test consumers may use external test dependencies, and the remaining
@@ -270,9 +275,9 @@ type approvedExternalImport struct {
 }
 
 // approvedExternalImports is the explicit allowlist for external modules.
-// Neutral, API, Kernel and Installation packages remain standard-library only.
+// Neutral, API, Engine and Installation packages remain standard-library only.
 var approvedExternalImports = []approvedExternalImport{
-	{module: "go.yaml.in/yaml/v3", layer: layerShellCapability},
+	{module: "go.yaml.in/yaml/v3", layer: layerControl},
 }
 
 func externalImportApproved(importer layer, imported string) bool {
@@ -307,23 +312,24 @@ func productImportAllowed(importer, imported layer) bool {
 	}
 	switch importer {
 	case layerNeutral, layerAPI:
-		// S01 allows api, internal/id and internal/fault to import only the
-		// standard library. They must not import any product package, not even
-		// each other.
+		// S01 allows api, internal/id, internal/fault and internal/docs to
+		// import only the standard library. They must not import any product
+		// package, not even each other.
 		return false
-	case layerKernel:
-		return imported == layerNeutral || imported == layerKernel
-	case layerShellCapability:
-		return imported == layerNeutral || imported == layerAPI || imported == layerKernel || imported == layerShellCapability
-	case layerShellAdapter:
-		return imported == layerNeutral || imported == layerAPI || imported == layerKernel || imported == layerShellCapability || imported == layerShellAdapter
-	case layerShellTransport:
-		return imported == layerNeutral || imported == layerAPI || imported == layerKernel ||
-			imported == layerShellCapability || imported == layerShellTransport
-	case layerUserland:
-		return imported == layerNeutral || imported == layerAPI || imported == layerUserland
-	case layerUserlandApp:
-		return imported == layerNeutral || imported == layerAPI || imported == layerUserland || imported == layerUserlandApp
+	case layerEngine:
+		return imported == layerNeutral || imported == layerEngine
+	case layerControl:
+		return imported == layerNeutral || imported == layerAPI || imported == layerEngine || imported == layerControl
+	case layerAdapter:
+		return imported == layerNeutral || imported == layerAPI || imported == layerEngine || imported == layerControl || imported == layerAdapter
+	case layerTransport:
+		return imported == layerNeutral || imported == layerAPI || imported == layerEngine || imported == layerControl || imported == layerTransport
+	case layerClient:
+		return imported == layerNeutral || imported == layerAPI || imported == layerClient
+	case layerAppsKit:
+		return imported == layerNeutral || imported == layerAPI || imported == layerClient || imported == layerAppsKit
+	case layerApp:
+		return imported == layerNeutral || imported == layerAPI || imported == layerClient || imported == layerAppsKit || imported == layerApp
 	case layerComposition:
 		return true
 	case layerInstallation:
@@ -352,11 +358,11 @@ var infrastructureStdlib = []string{
 // is declaration and pure preflight logic, so it alone may import the pure URL
 // parser net/url (a leaf package with no subpackages); it still rejects net,
 // net/http, net/http/httptest, os/exec, crypto/tls and every other
-// infrastructure client. No other capability, neutral, api, kernel or
+// infrastructure client. No other control, neutral, api, engine or
 // installation file may use either exception.
 var approvedStdlibImports = map[string][]string{
-	"internal/shell/gateway": {"net/http"},
-	"internal/installation":  {"net/url"},
+	"internal/control/gateway": {"net/http"},
+	"internal/installation":    {"net/url"},
 }
 
 func stdlibImportApproved(rel, imported string) bool {
@@ -371,13 +377,13 @@ func stdlibImportApproved(rel, imported string) bool {
 
 func forbiddenStdlibImport(importer layer, rel, imported string) bool {
 	switch importer {
-	case layerNeutral, layerAPI, layerKernel, layerShellCapability, layerInstallation:
+	case layerNeutral, layerAPI, layerEngine, layerControl, layerInstallation:
 		for _, prefix := range infrastructureStdlib {
 			if hasImportPrefix(imported, prefix) && !stdlibImportApproved(rel, imported) {
 				return true
 			}
 		}
-	case layerShellTransport:
+	case layerTransport:
 		return hasImportPrefix(imported, "database/sql")
 	}
 	// layerTest is deliberately absent: repository test code may use
@@ -389,16 +395,16 @@ func hasImportPrefix(imported, prefix string) bool {
 	return imported == prefix || strings.HasPrefix(imported, prefix+"/")
 }
 
-func detectKernelCycles(files []goSourceFile, module string) []Finding {
+func detectEngineCycles(files []goSourceFile, module string) []Finding {
 	edges := make(map[string][]string)
 	representative := make(map[string]string)
-	kernelDirs := make(map[string]bool)
+	engineDirs := make(map[string]bool)
 	for _, file := range files {
-		if classifyPath(file.rel) != layerKernel {
+		if classifyPath(file.rel) != layerEngine {
 			continue
 		}
 		dir := filepath.ToSlash(filepath.Dir(file.rel))
-		kernelDirs[dir] = true
+		engineDirs[dir] = true
 		if representative[dir] == "" {
 			representative[dir] = file.rel
 		}
@@ -407,7 +413,7 @@ func detectKernelCycles(files []goSourceFile, module string) []Finding {
 			if !ok {
 				continue
 			}
-			if classifyPath(productPath) != layerKernel {
+			if classifyPath(productPath) != layerEngine {
 				continue
 			}
 			importedDir := filepath.ToSlash(productPath)
@@ -421,7 +427,7 @@ func detectKernelCycles(files []goSourceFile, module string) []Finding {
 		sort.Strings(edges[dir])
 	}
 
-	color := make(map[string]int, len(kernelDirs))
+	color := make(map[string]int, len(engineDirs))
 	var stack []string
 	seenCycles := make(map[string]bool)
 	var findings []Finding
@@ -430,7 +436,7 @@ func detectKernelCycles(files []goSourceFile, module string) []Finding {
 		color[dir] = 1
 		stack = append(stack, dir)
 		for _, next := range edges[dir] {
-			if !kernelDirs[next] {
+			if !engineDirs[next] {
 				continue
 			}
 			switch color[next] {
@@ -468,8 +474,8 @@ func detectKernelCycles(files []goSourceFile, module string) []Finding {
 		stack = stack[:len(stack)-1]
 		color[dir] = 2
 	}
-	dirs := make([]string, 0, len(kernelDirs))
-	for dir := range kernelDirs {
+	dirs := make([]string, 0, len(engineDirs))
+	for dir := range engineDirs {
 		dirs = append(dirs, dir)
 	}
 	sort.Strings(dirs)

@@ -7,12 +7,12 @@ import (
 
 // TestApprovedExternalImportAllowlistIsExact pins the external dependency
 // policy at its narrowest: exactly one external module is approved, it is
-// recorded without a trailing slash, and only shell capability packages may use
+// recorded without a trailing slash, and only control packages may use
 // it. Every neighbouring YAML module spelling is rejected, including the broad
 // prefixes (go.yaml.in, go.yaml.in/yaml) and the boundary lookalikes
 // (go.yaml.in/yaml/v3x) that a slash-insensitive prefix matcher would accept.
 func TestApprovedExternalImportAllowlistIsExact(t *testing.T) {
-	want := []approvedExternalImport{{module: "go.yaml.in/yaml/v3", layer: layerShellCapability}}
+	want := []approvedExternalImport{{module: "go.yaml.in/yaml/v3", layer: layerControl}}
 	if len(approvedExternalImports) != len(want) {
 		t.Fatalf("approvedExternalImports has %d entries, want exactly %d: %+v", len(approvedExternalImports), len(want), approvedExternalImports)
 	}
@@ -25,11 +25,11 @@ func TestApprovedExternalImportAllowlistIsExact(t *testing.T) {
 		}
 	}
 
-	// The real module and one real subpackage remain approved for shell
-	// capability packages.
+	// The real module and one real subpackage remain approved for control
+	// packages.
 	for _, imported := range []string{"go.yaml.in/yaml/v3", "go.yaml.in/yaml/v3/extra"} {
-		if !externalImportApproved(layerShellCapability, imported) {
-			t.Errorf("shell capability must accept approved dependency %q", imported)
+		if !externalImportApproved(layerControl, imported) {
+			t.Errorf("control must accept approved dependency %q", imported)
 		}
 	}
 
@@ -50,21 +50,21 @@ func TestApprovedExternalImportAllowlistIsExact(t *testing.T) {
 		"go.yaml.in/yaml/v30",
 	}
 	for _, imported := range rejected {
-		if externalImportApproved(layerShellCapability, imported) {
-			t.Errorf("shell capability must reject external module %q", imported)
+		if externalImportApproved(layerControl, imported) {
+			t.Errorf("control must reject external module %q", imported)
 		}
 	}
 
-	// The same real module is not approved outside shell capability packages,
+	// The same real module is not approved outside control packages,
 	// even for layers that are otherwise standard-library only.
-	for _, importer := range []layer{layerNeutral, layerAPI, layerKernel, layerInstallation} {
+	for _, importer := range []layer{layerNeutral, layerAPI, layerEngine, layerInstallation} {
 		if externalImportApproved(importer, "go.yaml.in/yaml/v3") {
-			t.Errorf("%s must not accept the shell capability allowlist", importer)
+			t.Errorf("%s must not accept the control allowlist", importer)
 		}
 	}
-	for _, importer := range []layer{layerShellAdapter, layerShellTransport, layerUserland, layerComposition, layerTooling} {
+	for _, importer := range []layer{layerAdapter, layerTransport, layerClient, layerAppsKit, layerApp, layerComposition, layerTooling} {
 		if externalImportApproved(importer, "go.yaml.in/yaml/v3") {
-			t.Errorf("%s must not accept the shell capability allowlist", importer)
+			t.Errorf("%s must not accept the control allowlist", importer)
 		}
 	}
 }
@@ -98,7 +98,7 @@ func TestHasImportPrefixKeepsSlashBoundary(t *testing.T) {
 }
 
 // TestImportsExternalAllowlistIsScoped drives the real checker over a fixture:
-// the single approved module is accepted in shell capability code, and every
+// the single approved module is accepted in control code, and every
 // other module spelling or importing layer is reported.
 func TestImportsExternalAllowlistIsScoped(t *testing.T) {
 	res := runCheck(t, fixturePath(t, "imports/external-allowlist-scope"), "imports")
@@ -106,7 +106,7 @@ func TestImportsExternalAllowlistIsScoped(t *testing.T) {
 		"api/dto.go",
 		"internal/id/id.go",
 		"internal/fault/fault.go",
-		"internal/kernel/flow/flow.go",
+		"internal/engine/flow/flow.go",
 		"internal/installation/decode.go",
 		`forbidden external import "gopkg.in/yaml.v3"`,
 		`forbidden external import "go.yaml.in/yaml"`,
@@ -115,8 +115,8 @@ func TestImportsExternalAllowlistIsScoped(t *testing.T) {
 		`forbidden external import "go.yaml.in/yaml/v4"`,
 		`forbidden external import "go.yaml.in/yaml/v3x"`,
 	)
-	if strings.Contains(res.stdout, "internal/shell/pipeline/approved.go") {
-		t.Errorf("shell capability approved yaml import was reported:\n%s", res.stdout)
+	if strings.Contains(res.stdout, "internal/control/pipeline/approved.go") {
+		t.Errorf("control approved yaml import was reported:\n%s", res.stdout)
 	}
 	if got := len(strings.Split(strings.TrimRight(res.stdout, "\n"), "\n")); got != 11 {
 		t.Errorf("finding count = %d, want 11:\n%s", got, res.stdout)
@@ -125,7 +125,7 @@ func TestImportsExternalAllowlistIsScoped(t *testing.T) {
 
 // TestStdlibImportAllowlistDirectoryScope pins the directory-scoped standard
 // library exceptions with direct table cases: net/url is allowed only in
-// internal/installation itself, net/http only in internal/shell/gateway itself,
+// internal/installation itself, net/http only in internal/control/gateway itself,
 // and neither exception leaks to sibling packages, subdirectories or lookalike
 // paths that merely contain the approved directory name.
 func TestStdlibImportAllowlistDirectoryScope(t *testing.T) {
@@ -142,20 +142,20 @@ func TestStdlibImportAllowlistDirectoryScope(t *testing.T) {
 		{"installation direct net is forbidden", "internal/installation/net.go", layerInstallation, "net", true},
 		{"installation subdirectory does not inherit", "internal/installation/sub/url.go", layerInstallation, "net/url", true},
 		{"installation lookalike does not inherit", "internal/installation-evil/url.go", layerInstallation, "net/url", true},
-		{"kernel direct file is forbidden", "internal/kernel/url.go", layerKernel, "net/url", true},
-		{"kernel subdirectory is forbidden", "internal/kernel/flow/url.go", layerKernel, "net/url", true},
-		{"kernel lookalike installation path does not inherit", "internal/kernel/internal/installation/url.go", layerKernel, "net/url", true},
+		{"engine direct file is forbidden", "internal/engine/url.go", layerEngine, "net/url", true},
+		{"engine subdirectory is forbidden", "internal/engine/flow/url.go", layerEngine, "net/url", true},
+		{"engine lookalike installation path does not inherit", "internal/engine/internal/installation/url.go", layerEngine, "net/url", true},
 		{"api direct file is forbidden", "api/url.go", layerAPI, "net/url", true},
 		{"fault direct file is forbidden", "internal/fault/url.go", layerNeutral, "net/url", true},
-		{"gateway direct net/http is allowed", "internal/shell/gateway/gateway.go", layerShellCapability, "net/http", false},
-		{"gateway test net/http is allowed", "internal/shell/gateway/gateway_test.go", layerShellCapability, "net/http/httptest", false},
-		{"gateway direct net/url is forbidden", "internal/shell/gateway/gateway.go", layerShellCapability, "net/url", true},
-		{"gateway direct net is forbidden", "internal/shell/gateway/gateway.go", layerShellCapability, "net", true},
-		{"gateway subpackage does not inherit", "internal/shell/gateway/sub/client.go", layerShellCapability, "net/http", true},
-		{"gateway lookalike does not inherit", "internal/shell/gateway-evil/client.go", layerShellCapability, "net/http", true},
-		{"other capability net/http is forbidden", "internal/shell/mcpproxy/mcpproxy.go", layerShellCapability, "net/http", true},
-		{"other capability does not inherit", "internal/shell/secret/secret.go", layerShellCapability, "database/sql", true},
-		{"kernel net/http is forbidden", "internal/kernel/flow/flow.go", layerKernel, "net/http", true},
+		{"gateway direct net/http is allowed", "internal/control/gateway/gateway.go", layerControl, "net/http", false},
+		{"gateway test net/http is allowed", "internal/control/gateway/gateway_test.go", layerControl, "net/http/httptest", false},
+		{"gateway direct net/url is forbidden", "internal/control/gateway/gateway.go", layerControl, "net/url", true},
+		{"gateway direct net is forbidden", "internal/control/gateway/gateway.go", layerControl, "net", true},
+		{"gateway subpackage does not inherit", "internal/control/gateway/sub/client.go", layerControl, "net/http", true},
+		{"gateway lookalike does not inherit", "internal/control/gateway-evil/client.go", layerControl, "net/http", true},
+		{"other control net/http is forbidden", "internal/control/mcpproxy/mcpproxy.go", layerControl, "net/http", true},
+		{"other control does not inherit", "internal/control/secret/secret.go", layerControl, "database/sql", true},
+		{"engine net/http is forbidden", "internal/engine/flow/flow.go", layerEngine, "net/http", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -168,21 +168,21 @@ func TestStdlibImportAllowlistDirectoryScope(t *testing.T) {
 
 // TestImportsStdlibAllowlistDirectoryScopeFixtures drives the real checker over
 // the same directory-scope cases: only direct internal/installation net/url and
-// direct internal/shell/gateway net/http imports stay clean.
+// direct internal/control/gateway net/http imports stay clean.
 func TestImportsStdlibAllowlistDirectoryScopeFixtures(t *testing.T) {
 	res := runCheck(t, fixturePath(t, "imports/stdlib-directory-scope"), "imports")
 	assertFindings(t, res,
 		"api/url.go",
 		"internal/fault/url.go",
 		"internal/id/url.go",
-		"internal/kernel/url.go",
-		"internal/kernel/internal/installation/url.go",
+		"internal/engine/url.go",
+		"internal/engine/internal/installation/url.go",
 		"internal/installation/mail.go",
 		"internal/installation/sub/url.go",
-		"internal/shell/gateway/gateway.go",
-		"internal/shell/gateway/sub/client.go",
+		"internal/control/gateway/gateway.go",
+		"internal/control/gateway/sub/client.go",
 	)
-	for _, clean := range []string{"internal/installation/url.go", "internal/shell/gateway/allowed.go"} {
+	for _, clean := range []string{"internal/installation/url.go", "internal/control/gateway/allowed.go"} {
 		for line := range strings.SplitSeq(res.stdout, "\n") {
 			if strings.HasPrefix(line, clean+": ") {
 				t.Errorf("allowlisted standard-library import in %s was reported: %s", clean, line)
