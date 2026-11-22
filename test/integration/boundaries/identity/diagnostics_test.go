@@ -11,8 +11,8 @@ import (
 
 	"github.com/optimiware/kodema/client"
 	"github.com/optimiware/kodema/internal/apps/cli"
-	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	"github.com/optimiware/kodema/internal/apps/cli/userlandfs"
+	gitapp "github.com/optimiware/kodema/internal/apps/git/app"
 	idfix "github.com/optimiware/kodema/test/support/boundaries/identity"
 )
 
