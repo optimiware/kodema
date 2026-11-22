@@ -278,13 +278,8 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 			WorkloadCAFile: workloadCAFile,
 			ToolboxFile:    toolboxFile,
 			GitURL:         options.WorkloadGitURL,
-			Resources: runtimepodman.ResourcePolicy{
-				DefaultMemoryBytes:   workloadResources.DefaultMemoryBytes,
-				DefaultCPUMillicores: workloadResources.DefaultCPUMillicores,
-				MaxMemoryBytes:       workloadResources.MaxMemoryBytes,
-				MaxCPUMillicores:     workloadResources.MaxCPUMillicores,
-			},
-			Cleanup: runtimepodman.CleanupPolicy{Attempts: 3, Backoff: time.Second},
+			Resources:      workloadResources,
+			Cleanup:        runtimepodman.CleanupPolicy{Attempts: 3, Backoff: time.Second},
 		})
 		if err != nil {
 			return productionBuild{}, fmt.Errorf("podman runtime: %w", err)

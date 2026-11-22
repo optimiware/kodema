@@ -35,7 +35,8 @@ func TestPreparationFailureReleasesUnconsumedClaimAndPartialResources(t *testing
 	}
 
 	identity := testIdentity("exec-prep-failure", "action-prep-failure", "workload-prep-failure", "idem-prep-failure")
-	request := prepareRequest(identity, workspaceID, "denied", "", testContainer([]string{"true"}, nil), nil, "tok-prep-failure")
+	request := workloadRequest(identity, workspaceID, []string{"true"}, "tok-prep-failure")
+	request.ActionName = "denied"
 	if _, err := fx.Adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}

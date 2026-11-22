@@ -11,6 +11,7 @@ import (
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // TestPodLogPaginationOverTheCombinedLog proves the real pod log endpoint, with
@@ -22,12 +23,11 @@ func TestPodLogPaginationOverTheCombinedLog(t *testing.T) {
 	workspaceID := id.WorkspaceID("workspace-kube-5")
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-k5", "action-k5", "workload-k5", "idem-k5")
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{
 			`printf '0123456789'`,
 			`printf 'abcdefghij' >&2`,
-		}, nil), nil, "tok-k5",
+		}, "tok-k5",
 	))
 	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
@@ -76,8 +76,8 @@ func TestPodLogPaginationOverTheCombinedLog(t *testing.T) {
 	}
 
 	// A small limit must still deliver the complete log through the cursor.
-	stdout, stderr := readAllLogs(t, ctx, fx.Adapter, identity, 3)
-	if !bytes.Equal(stdout, whole.Data) || len(stderr) != 0 {
+	stdout, stderr := runtimesupport.ReadAllLogs(t, ctx, fx.Adapter, identity, 3)
+	if stdout != string(whole.Data) || len(stderr) != 0 {
 		t.Fatalf("adapter log = %q (stderr %q); want the complete combined log %q", stdout, stderr, whole.Data)
 	}
 }

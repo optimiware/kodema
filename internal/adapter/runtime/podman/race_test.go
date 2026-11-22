@@ -1,44 +1,20 @@
-// Race and cancellation behavior: a start cancelled at a barrier stays
-// unknown, concurrent duplicate starts never create a second container, a
-// removal fence is never crossed by an in-flight start, a stop acknowledgment
-// never confirms during a start race, and concurrent credential refreshes leave
-// one whole token.
+// Podman-specific race and barrier schedules: cancellation at the libpod
+// CreateContainer barrier, start-vs-remove fence serialization, and stop during
+// an in-flight start.
+//
+// Shared cancellation and concurrency invariants (pre-effect cancelled Start,
+// concurrent duplicate Starts, concurrent RefreshCredential) are verified in
+// TestPodmanConformance and internal/adapter/runtime/container/lifecycle_test.go.
 package podman
 
 import (
 	"context"
-	"fmt"
-	"slices"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
-	"github.com/optimiware/kodema/internal/id"
 )
-
-func TestStartCancelledBeforeCallHasNoEffect(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	result, err := fx.adapter.Start(ctx, startRequest(fx))
-	if err == nil {
-		t.Fatal("Start hid a cancelled context")
-	}
-	if result.Outcome != reconcile.StartUnknown {
-		t.Fatalf("outcome = %q, want unknown", result.Outcome)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-		t.Fatalf("cancelled Start created %d containers", calls)
-	}
-	if calls := fx.libpod.callsFor("StartContainer"); calls != 0 {
-		t.Fatalf("cancelled Start started %d containers", calls)
-	}
-}
 
 func TestStartCancelledAtCreateBarrierStaysUnknown(t *testing.T) {
 	fx := newFixture(t)
@@ -83,55 +59,6 @@ func TestStartCancelledAtCreateBarrierStaysUnknown(t *testing.T) {
 	}
 	if calls := fx.libpod.callsFor("CreateContainer"); calls != 2 {
 		t.Fatalf("CreateContainer calls = %d, want one cancelled and one successful", calls)
-	}
-}
-
-func TestConcurrentStartsCreateOneContainer(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-
-	const workers = 8
-	start := make(chan struct{})
-	results := make(chan reconcile.StartResult, workers)
-	errs := make(chan error, workers)
-	var wait sync.WaitGroup
-	wait.Add(workers)
-	for range workers {
-		go func() {
-			defer wait.Done()
-			<-start
-			result, err := fx.adapter.Start(context.Background(), startRequest(fx))
-			results <- result
-			errs <- err
-		}()
-	}
-	close(start)
-	wait.Wait()
-	close(results)
-	close(errs)
-
-	accepted := 0
-	for result := range results {
-		if result.Outcome == reconcile.StartProvenNotStarted {
-			t.Fatalf("concurrent start claimed proven-not-started: %+v", result)
-		}
-		if result.Outcome == reconcile.StartAccepted {
-			accepted++
-		}
-	}
-	if accepted == 0 {
-		t.Fatal("no concurrent start was accepted")
-	}
-	if count := fx.libpod.containerCount(); count != 1 {
-		t.Fatalf("concurrent starts created %d containers, want 1", count)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls < 1 {
-		t.Fatalf("CreateContainer calls = %d, want at least one", calls)
-	}
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("concurrent Start returned error: %v", err)
-		}
 	}
 }
 
@@ -186,8 +113,6 @@ func TestStartAndRemoveDoNotCrossTheFence(t *testing.T) {
 		t.Fatalf("Remove returned error: %v", removeResult.err)
 	}
 	if removeResult.removal.Removed {
-		// Remove won the race before the create effect. The fence must then
-		// prevent an orphan container and any later start.
 		if count := fx.libpod.containerCount(); count != 0 {
 			t.Fatalf("Remove reported success but left %d orphan containers", count)
 		}
@@ -200,8 +125,6 @@ func TestStartAndRemoveDoNotCrossTheFence(t *testing.T) {
 		return
 	}
 
-	// Remove lost the race to the accepted start. It must retain the live
-	// container and materialization rather than reporting a false success.
 	if _, ok := fx.libpod.container(fx.containerName); !ok {
 		t.Fatal("Remove reported a retained removal but the container disappeared")
 	}
@@ -241,11 +164,8 @@ func TestStopDuringStartNeverConfirms(t *testing.T) {
 
 	select {
 	case got := <-started:
-		if got.err != nil {
-			t.Fatalf("Start returned error: %v", got.err)
-		}
-		if got.result.Outcome != reconcile.StartAccepted {
-			t.Fatalf("start outcome = %q, want accepted", got.result.Outcome)
+		if got.err != nil || got.result.Outcome != reconcile.StartAccepted {
+			t.Fatalf("Start = (%+v, %v), want accepted", got.result, got.err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start did not return")
@@ -261,88 +181,4 @@ func TestStopDuringStartNeverConfirms(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop did not return")
 	}
-}
-
-func TestConcurrentRefreshKeepsTokenWhole(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.seedRunning(t)
-
-	const workers = 8
-	tokens := make([]string, workers)
-	for index := range tokens {
-		tokens[index] = "tok-" + strings.Repeat("x", index+1)
-	}
-	start := make(chan struct{})
-	errs := make(chan error, workers)
-	delivered := make(chan bool, workers)
-	var wait sync.WaitGroup
-	wait.Add(workers)
-	for index := range workers {
-		go func() {
-			defer wait.Done()
-			<-start
-			refresh, err := fx.adapter.RefreshCredential(context.Background(), reconcile.CredentialRequest{
-				Identity:   fx.request.Identity,
-				Credential: tokens[index],
-			})
-			errs <- err
-			delivered <- refresh.Delivered
-		}()
-	}
-	close(start)
-	wait.Wait()
-	close(errs)
-	close(delivered)
-
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("concurrent refresh returned error: %v", err)
-		}
-	}
-	for ok := range delivered {
-		if !ok {
-			t.Fatal("concurrent refresh did not report delivery")
-		}
-	}
-	final := string(readHostFile(t, fx.credentialPath()))
-	found := slices.Contains(tokens, final)
-	if !found {
-		t.Fatalf("final token %q is torn or not one of the delivered values", final)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-		t.Fatalf("concurrent refresh created %d containers", calls)
-	}
-	if calls := fx.libpod.callsFor("StartContainer"); calls != 0 {
-		t.Fatalf("concurrent refresh restarted %d containers", calls)
-	}
-}
-
-func TestKeyedLocksCleanUpAfterConcurrentUse(t *testing.T) {
-	fx := newFixture(t)
-
-	const keys = 16
-	const workersPerKey = 8
-	start := make(chan struct{})
-	var wait sync.WaitGroup
-	for keyIdx := range keys {
-		workloadID := id.WorkloadID(fmt.Sprintf("workload-lock-%d", keyIdx))
-		workspaceID := id.WorkspaceID(fmt.Sprintf("workspace-lock-%d", keyIdx))
-		for range workersPerKey {
-			wait.Add(1)
-			go func() {
-				defer wait.Done()
-				<-start
-				unlockWorkload := fx.adapter.lockFor(workloadID)
-				unlockWorkspace := fx.adapter.lockForWorkspace(workspaceID)
-				unlockWorkspace()
-				unlockWorkload()
-			}()
-		}
-	}
-	close(start)
-	wait.Wait()
-
-	fx.adapter.lockFor("workload-lock-0")()
-	fx.adapter.lockForWorkspace("workspace-lock-0")()
 }

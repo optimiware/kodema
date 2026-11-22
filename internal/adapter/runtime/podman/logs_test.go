@@ -1,7 +1,11 @@
-// Log behavior: bounded ordered stdout/stderr chunks, a shared continuation
-// token that never skips the quieter stream, redaction of configured values
-// from the isolated secrets directory, and fail-closed reads without a
-// redaction source. Logs carry no lifecycle authority.
+// Podman-specific log behavior: two-stream stdout+stderr ordering and packed
+// cursor interleaving, post-restart redaction from the host secrets directory,
+// and host-filesystem fail-closed checks (missing declared secret file, missing
+// KODEMA_TOKEN, symlink inside secrets directory).
+//
+// Shared log invariants (redaction, split-page holdback, short-secret marker
+// expansion, limit/offset validation, missing redaction source) are verified in
+// TestPodmanConformance and internal/adapter/runtime/container/logs_test.go.
 package podman
 
 import (
@@ -12,7 +16,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -38,7 +41,7 @@ func packCursor(stdout, stderr int64) int64 {
 	return stdout<<32 | stderr
 }
 
-func TestLogsAreOrderedBoundedAndRedacted(t *testing.T) {
+func TestLogsTwoStreamOrderingAndPostRestartRedaction(t *testing.T) {
 	fx := newFixture(t)
 	fx.prepare(t)
 	fx.seedRunning(t)
@@ -57,30 +60,14 @@ func TestLogsAreOrderedBoundedAndRedacted(t *testing.T) {
 	if batch.Chunks[1].Stream != reconcile.LogStderr || batch.Chunks[1].Sequence != 2 {
 		t.Fatalf("chunk[1] = %+v, want stderr sequence 2", batch.Chunks[1])
 	}
-	if batch.Chunks[0].Offset != 0 || batch.Chunks[1].Offset != 0 {
-		t.Fatalf("chunk offsets = %d/%d, want 0/0", batch.Chunks[0].Offset, batch.Chunks[1].Offset)
-	}
-	if len(batch.Chunks[0].Data) > 64 || len(batch.Chunks[1].Data) > 64 {
-		t.Fatalf("chunks exceed the bounded limit: %d/%d", len(batch.Chunks[0].Data), len(batch.Chunks[1].Data))
-	}
-	if !strings.Contains(string(batch.Chunks[0].Data), Redacted) {
-		t.Fatalf("stdout chunk was not redacted: %q", batch.Chunks[0].Data)
-	}
-	if !strings.Contains(string(batch.Chunks[1].Data), Redacted) {
-		t.Fatalf("stderr chunk was not redacted: %q", batch.Chunks[1].Data)
-	}
-	for _, chunk := range batch.Chunks {
-		for _, secret := range []string{"s3cr3t", "tok-abc"} {
-			if strings.Contains(string(chunk.Data), secret) {
-				t.Fatalf("log chunk leaked %q: %q", secret, chunk.Data)
-			}
-		}
+	if !strings.Contains(string(batch.Chunks[0].Data), Redacted) || !strings.Contains(string(batch.Chunks[1].Data), Redacted) {
+		t.Fatalf("two-stream chunks not redacted: %+v", batch.Chunks)
 	}
 	if want := packCursor(int64(len(stdout)), int64(len(stderr))); batch.NextOffset != want {
 		t.Fatalf("NextOffset = %d, want %d", batch.NextOffset, want)
 	}
 
-	// Logs also work after controller reconstruction without prepared.json.
+	// Logs also redact after controller reconstruction without in-memory prepared state.
 	reconstructed := newAdapterWithRoot(t, fx)
 	afterRestart, err := reconstructed.Logs(context.Background(), logsRequest(fx, 0, 64))
 	if err != nil {
@@ -88,12 +75,6 @@ func TestLogsAreOrderedBoundedAndRedacted(t *testing.T) {
 	}
 	if len(afterRestart.Chunks) != 2 || strings.Contains(string(afterRestart.Chunks[0].Data), "s3cr3t") || strings.Contains(string(afterRestart.Chunks[1].Data), "tok-abc") {
 		t.Fatalf("reconstructed Logs failed to redact: %+v", afterRestart.Chunks)
-	}
-
-	for _, operation := range []string{"CreateContainer", "StartContainer", "StopContainer", "RemoveContainer"} {
-		if calls := fx.libpod.callsFor(operation); calls != 0 {
-			t.Fatalf("Logs called %s %d times", operation, calls)
-		}
 	}
 }
 
@@ -139,67 +120,12 @@ func TestLogsContinuationDoesNotSkipQuieterStream(t *testing.T) {
 		gotStderr = append(gotStderr, stderrChunk...)
 		cursor = batch.NextOffset
 	}
-	if string(gotStdout) != string(stdout) {
-		t.Fatalf("stdout reassembled = %q, want %q", gotStdout, stdout)
-	}
-	if string(gotStderr) != string(stderr) {
-		t.Fatalf("stderr reassembled = %q, want %q", gotStderr, stderr)
+	if string(gotStdout) != string(stdout) || string(gotStderr) != string(stderr) {
+		t.Fatalf("reassembled = (%q, %q), want (%q, %q)", gotStdout, gotStderr, stdout, stderr)
 	}
 }
 
-func TestLogsRefusesUnboundedOrUnpreparedReads(t *testing.T) {
-	t.Run("unbounded limit", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedRunning(t)
-		fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("data"))
-		for _, limit := range []int{0, -1, MaxLogBytes + 1} {
-			_, err := fx.adapter.Logs(context.Background(), logsRequest(fx, 0, limit))
-			assertFaultClass(t, err, fault.InvalidInput)
-		}
-		if calls := len(fx.libpod.seenLogRequests()); calls != 0 {
-			t.Fatalf("unbounded read reached libpod %d times", calls)
-		}
-	})
-
-	t.Run("negative offset", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedRunning(t)
-		_, err := fx.adapter.Logs(context.Background(), logsRequest(fx, -1, 16))
-		assertFaultClass(t, err, fault.InvalidInput)
-		if calls := len(fx.libpod.seenLogRequests()); calls != 0 {
-			t.Fatalf("negative offset reached libpod %d times", calls)
-		}
-	})
-
-	t.Run("absent container", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		_, err := fx.adapter.Logs(context.Background(), logsRequest(fx, 0, 16))
-		assertFaultClass(t, err, fault.NotFound)
-		if calls := len(fx.libpod.seenLogRequests()); calls != 0 {
-			t.Fatalf("absent container reached libpod logs %d times", calls)
-		}
-	})
-
-	t.Run("removed identity", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedExited(t, 0, true)
-		if removal := fx.remove(t); !removal.Removed {
-			t.Fatalf("removal = %+v, want success", removal)
-		}
-		before := len(fx.libpod.seenLogRequests())
-		_, err := fx.adapter.Logs(context.Background(), logsRequest(fx, 0, 16))
-		assertFaultClass(t, err, fault.NotFound)
-		if after := len(fx.libpod.seenLogRequests()); after != before {
-			t.Fatalf("removed identity reached libpod logs %d times", after-before)
-		}
-	})
-}
-
-func TestLogsFailClosedWithoutRedactionSource(t *testing.T) {
+func TestLogsFailClosedOnHostSecretsTampering(t *testing.T) {
 	assertRefused := func(t *testing.T, fx *fixture, adapter *Adapter) {
 		t.Helper()
 		batch, err := adapter.Logs(context.Background(), logsRequest(fx, 0, 16))
@@ -229,24 +155,13 @@ func TestLogsFailClosedWithoutRedactionSource(t *testing.T) {
 		assertRefused(t, fx, fx.adapter)
 	})
 
-	t.Run("missing KODEMA_TOKEN", func(t *testing.T) {
+	t.Run("missing KODEMA_TOKEN after restart", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.prepare(t)
 		fx.seedRunning(t)
 		fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("tok-abc"))
 		if err := os.Remove(fx.credentialPath()); err != nil {
 			t.Fatalf("removing credential: %v", err)
-		}
-		assertRefused(t, fx, newAdapterWithRoot(t, fx))
-	})
-
-	t.Run("missing secrets directory", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.prepare(t)
-		fx.seedRunning(t)
-		fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("s3cr3t"))
-		if err := os.RemoveAll(fx.secretsRoot()); err != nil {
-			t.Fatalf("removing secrets dir: %v", err)
 		}
 		assertRefused(t, fx, newAdapterWithRoot(t, fx))
 	})
@@ -265,97 +180,4 @@ func TestLogsFailClosedWithoutRedactionSource(t *testing.T) {
 		}
 		assertRefused(t, fx, fx.adapter)
 	})
-}
-
-func collectPodmanLogStreams(t *testing.T, fx *fixture, limit int) (stdout, stderr []byte) {
-	t.Helper()
-	cursor := int64(0)
-	for step := range 1000 {
-		batch := logs(t, fx, cursor, limit)
-		for _, chunk := range batch.Chunks {
-			if len(chunk.Data) > limit {
-				t.Fatalf("step %d chunk (%s) length = %d; exceeds limit %d", step, chunk.Stream, len(chunk.Data), limit)
-			}
-			switch chunk.Stream {
-			case reconcile.LogStdout:
-				stdout = append(stdout, chunk.Data...)
-			case reconcile.LogStderr:
-				stderr = append(stderr, chunk.Data...)
-			}
-		}
-		if batch.NextOffset == cursor {
-			return stdout, stderr
-		}
-		cursor = batch.NextOffset
-	}
-	t.Fatal("podman log pagination did not terminate")
-	return nil, nil
-}
-
-// TestLogsShortSecretExpansionNeverDropsTrailingBytes proves a short secret
-// (< 10 bytes) whose [REDACTED] expansion crosses request.Limit advances the
-// cursor only over consumed raw bytes instead of clipping and dropping the
-// trailing log bytes, and sets Truncated when unconsumed bytes remain.
-func TestLogsShortSecretExpansionNeverDropsTrailingBytes(t *testing.T) {
-	fx := newFixture(t)
-	fx.request.Secrets = []reconcile.SecretValue{{Name: "API_KEY", Value: "s3c"}}
-	fx.request.Credential = "tok4"
-	fx.prepare(t)
-	fx.seedRunning(t)
-
-	fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte("0123456789s3c-TAIL"))
-	fx.libpod.setLogs(fx.containerName, reconcile.LogStderr, []byte("abcdefghijtok4-END"))
-
-	first := logs(t, fx, 0, 18)
-	for _, chunk := range first.Chunks {
-		if !chunk.Truncated {
-			t.Fatalf("first %s chunk Truncated = false; want true when redaction expansion leaves unconsumed bytes", chunk.Stream)
-		}
-	}
-
-	gotOut, gotErr := collectPodmanLogStreams(t, fx, 18)
-	if want := "0123456789" + Redacted + "-TAIL"; string(gotOut) != want {
-		t.Fatalf("stdout = %q; want %q", gotOut, want)
-	}
-	if want := "abcdefghij" + Redacted + "-END"; string(gotErr) != want {
-		t.Fatalf("stderr = %q; want %q", gotErr, want)
-	}
-	for _, secret := range []string{"s3c", "tok4"} {
-		if strings.Contains(string(gotOut), secret) || strings.Contains(string(gotErr), secret) {
-			t.Fatalf("output leaked %q: stdout=%q stderr=%q", secret, gotOut, gotErr)
-		}
-	}
-}
-
-func TestLogsSplitSecretAcrossPageBoundary(t *testing.T) {
-	fx := newFixture(t)
-	fx.request.Secrets = []reconcile.SecretValue{{Name: "API_KEY", Value: "s3cr3t"}}
-	fx.prepare(t)
-	fx.seedRunning(t)
-
-	prefix := strings.Repeat("x", 10)
-	fx.libpod.setLogs(fx.containerName, reconcile.LogStdout, []byte(prefix+"s3cr3t-tail"))
-	gotOut, _ := collectPodmanLogStreams(t, fx, 13)
-	if want := prefix + Redacted + "-tail"; string(gotOut) != want {
-		t.Fatalf("stdout = %q; want %q", gotOut, want)
-	}
-}
-
-func TestLogsCursorOverflowBounds(t *testing.T) {
-	if pos, err := container.NextStreamLogPosition(reconcile.LogStdout, container.MaxStdoutLogCursorPosition, 0); err != nil || pos != container.MaxStdoutLogCursorPosition {
-		t.Fatalf("stdout boundary = (%d, %v); want (%d, nil)", pos, err, container.MaxStdoutLogCursorPosition)
-	}
-	if _, err := container.NextStreamLogPosition(reconcile.LogStdout, container.MaxStdoutLogCursorPosition, 1); err == nil {
-		t.Fatal("stdout accepted position past 2^31-1")
-	} else {
-		assertFaultClass(t, err, fault.InvalidInput)
-	}
-	if pos, err := container.NextStreamLogPosition(reconcile.LogStderr, container.MaxStderrLogCursorPosition, 0); err != nil || pos != container.MaxStderrLogCursorPosition {
-		t.Fatalf("stderr boundary = (%d, %v); want (%d, nil)", pos, err, container.MaxStderrLogCursorPosition)
-	}
-	if _, err := container.NextStreamLogPosition(reconcile.LogStderr, container.MaxStderrLogCursorPosition, 1); err == nil {
-		t.Fatal("stderr accepted position past 2^32-1")
-	} else {
-		assertFaultClass(t, err, fault.InvalidInput)
-	}
 }

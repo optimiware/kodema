@@ -8,15 +8,14 @@ import (
 	"testing"
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
-	"github.com/optimiware/kodema/internal/engine"
-	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/id"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // TestAdapterActionEndToEnd proves one complete adapter action on a real
-// cluster: materialized inputs/outputs/task/secret mounts, the reserved
-// environment, redacted logs, the pinned Job security policy, retained cleanup
+// cluster satisfies the S07 materialization contract, the pinned Job security
+// policy, combined-log redaction, absent-workload observation, retained cleanup
 // and release.
 func TestAdapterActionEndToEnd(t *testing.T) {
 	t.Parallel()
@@ -26,90 +25,22 @@ func TestAdapterActionEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WorkspaceClaimName: %v", err)
 	}
-	identity := testIdentity("exec-e2e", "action-e2e", "workload-e2e", "idem-e2e")
-	commands := []string{
-		`cat /kodema/inputs/input-a > /workspace/input-copy.txt`,
-		`cat /kodema/task.json > /workspace/task-copy.json`,
-		`cat /kodema/outputs/earlier/out-a > /workspace/output-copy.txt`,
-		`cat /kodema/secrets/API_KEY`,
-		`cat /kodema/secrets/KODEMA_TOKEN`,
-		`printf '\n'`,
-		`printf 'stdout-line\n'`,
-		`printf 'stderr-line\n' >&2`,
-		`env | sort > /workspace/env.txt`,
-	}
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "task-e2e",
-		testContainer(commands, []definition.EnvVar{{Name: "BUILD_MODE", Value: "release"}}),
-		[]reconcile.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}},
-		"tok-e2e",
-	))
-	observation := waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
-		Identity: identity, WorkspaceID: workspaceID,
-	}, engine.ObservationExited)
-	if code, ok := observation.ExitStatus(); !ok || code != 0 {
-		t.Fatalf("action exit = %d/%v; want 0/true (%+v)", code, ok, observation)
-	}
 
-	job := oneJob(t, ctx, fx.Client, identity)
-	assertJobSecurityPolicy(t, ctx, fx, job.Name)
-
-	stdout, stderr := readAllLogs(t, ctx, fx.Adapter, identity, 1<<20)
-	if !strings.Contains(string(stdout), "[REDACTED][REDACTED]") {
-		t.Fatalf("stdout = %q; want the configured values redacted", stdout)
-	}
-	if strings.Contains(string(stdout), "s3cr3t-value") || strings.Contains(string(stdout), "tok-e2e") {
-		t.Fatalf("stdout leaked credential material: %q", stdout)
-	}
-	if !containsLine(string(stdout), "stdout-line") {
-		t.Fatalf("stdout = %q; want the workload line", stdout)
-	}
-	// Stock clusters cannot split the streams: stderr output arrives in the one
-	// combined log, attributed to stdout.
-	if !containsLine(string(stdout), "stderr-line") || len(stderr) != 0 {
-		t.Fatalf("combined log = %q, stderr = %q; want the stderr line in the combined log only", stdout, stderr)
-	}
-
-	readerOutput := runReader(t, ctx, fx, workspaceID, "e2e-read", []string{
-		`printf 'INPUT:'`,
-		`cat /workspace/input-copy.txt`,
-		`printf 'TASK:'`,
-		`cat /workspace/task-copy.json`,
-		`printf '\n'`,
-		`printf 'OUTPUT:'`,
-		`cat /workspace/output-copy.txt`,
-		`printf '\n'`,
-		`grep -E '^KODEMA_(URL|EXECUTION|ACTION|TASK)=' /workspace/env.txt | sort | sed 's/^/ENV:/'`,
-	})
-	for _, want := range []string{
-		"INPUT:line1\nline2\n",
-		"TASK:{\"id\":\"task-1\"}",
-		"OUTPUT:earlier-output",
-		"ENV:KODEMA_ACTION=build",
-		"ENV:KODEMA_EXECUTION=exec-e2e",
-		"ENV:KODEMA_TASK=task-e2e",
-		"ENV:KODEMA_URL=" + testKodemaURL,
-	} {
-		if !strings.Contains(readerOutput, want) {
-			t.Fatalf("reader output is missing %q:\n%s", want, readerOutput)
+	h := fx.harness(t, workspaceID)
+	h.AfterExit = func(t testing.TB, ctx context.Context, identity reconcile.EffectIdentity) {
+		t.Helper()
+		job := oneJob(t, ctx, fx.Client, identity)
+		assertJobSecurityPolicy(t, ctx, fx, job.Name)
+		// Stock clusters cannot split the streams: stderr stays empty and all
+		// output arrives in stdout.
+		stdout, stderr := runtimesupport.ReadAllLogs(t, ctx, fx.Adapter, identity, 1<<20)
+		if !strings.Contains(stdout, "[REDACTED][REDACTED]") || len(stderr) != 0 {
+			t.Fatalf("combined log = %q, stderr = %q; want redacted combined log with empty stderr", stdout, stderr)
 		}
 	}
-	if strings.Contains(readerOutput, "s3cr3t-value") || strings.Contains(readerOutput, "tok-e2e") {
-		t.Fatalf("secret material reached the workspace environment:\n%s", readerOutput)
-	}
 
-	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: workspaceID})
-	if err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	if !removal.Removed || !strings.Contains(removal.Detail, claimName) {
-		t.Fatalf("removal = %+v; want removed with the retained claim named", removal)
-	}
-	reader := testIdentity("exec-e2e-read", "action-e2e-read", "workload-e2e-read", "idem-e2e-read")
-	if _, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: reader, WorkspaceID: workspaceID}); err != nil {
-		t.Fatalf("Remove reader: %v", err)
-	}
-	waitForWorkspaceUnreferenced(t, ctx, fx.Client, workspaceID)
+	runtimesupport.AssertMaterializationContract(t, ctx, h)
+	runtimesupport.AssertAbsentObservation(t, ctx, h)
 
 	releaseWorkspaceEventually(t, ctx, fx, workspaceID)
 	if err := waitForClaimGone(ctx, fx.Client, claimName); err != nil {
@@ -120,7 +51,7 @@ func TestAdapterActionEndToEnd(t *testing.T) {
 // assertJobSecurityPolicy reads the live Job through kubectl and proves the
 // no-replay, no-token, no-host-network and bounded-resource policy survived the
 // API server.
-func assertJobSecurityPolicy(t *testing.T, ctx context.Context, fx *fixture, jobName string) {
+func assertJobSecurityPolicy(t testing.TB, ctx context.Context, fx *fixture, jobName string) {
 	t.Helper()
 	document, err := fx.Cluster.GetJSON(ctx, "get", "job", jobName, "-n", testNamespace)
 	if err != nil {

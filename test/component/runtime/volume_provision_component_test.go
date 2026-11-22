@@ -29,7 +29,7 @@ func TestPodmanDriverCreateVolumeProvisionsRetainedWorkspace(t *testing.T) {
 		t.Fatalf("workspace volume %q still exists after removal", fixture.volumeName)
 	}
 	// The gap under test: retention never recreates a missing volume.
-	assertFaultClass(t, fixture.adapter.Retain(ctx, fixture.workspaceID), fault.NotFound)
+	runtimesupport.RequireFaultClass(t, fixture.adapter.Retain(ctx, fixture.workspaceID), fault.NotFound)
 
 	// The Shell provisions the volume with the ownership label the adapter
 	// validates, plus this run's cleanup labels so a sweep can scope it.

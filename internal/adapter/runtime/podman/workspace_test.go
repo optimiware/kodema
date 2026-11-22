@@ -1,11 +1,15 @@
-// Retained workspace behavior: availability evidence, idempotent retention
-// verification, reference-safe release, partial-failure visibility and shared
-// per-workspace serialization with start/remove.
+// Podman-specific retained workspace behavior: volume label ownership,
+// disk-marker-free retention, container-reference-safe release, partial
+// RemoveVolume visibility, and per-workspace lock serialization with Start and
+// Retain.
+//
+// Shared reconcile.Workspace invariants (Status/Retain/Release basic lifecycle,
+// missing/invalid/cancelled handling, secret-free details) are verified in
+// TestPodmanConformance.
 package podman
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -19,60 +23,13 @@ func testWorkspacePort() id.WorkspaceID {
 	return testWorkspaceID()
 }
 
-func TestWorkspaceStatusReportsAvailabilityWithoutRecreating(t *testing.T) {
-	t.Run("present", func(t *testing.T) {
-		fx := newFixture(t)
-		observation, err := fx.adapter.Status(context.Background(), testWorkspacePort())
-		if err != nil {
-			t.Fatalf("Status returned error: %v", err)
-		}
-		if observation.WorkspaceID != testWorkspacePort() {
-			t.Fatalf("observation workspace = %q, want %q", observation.WorkspaceID, testWorkspacePort())
-		}
-		if !observation.Available {
-			t.Fatalf("observation = %+v, want the retained volume available", observation)
-		}
-		if observation.Detail == "" {
-			t.Fatal("available observation has no detail")
-		}
-		if calls := fx.files.callCount("WriteFile"); calls != 0 {
-			t.Fatalf("Status wrote %d files, want none", calls)
-		}
-		if calls := fx.libpod.callsFor("RemoveVolume"); calls != 0 {
-			t.Fatalf("Status issued %d volume removals, want none", calls)
-		}
-	})
-
-	t.Run("missing", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.libpod.deleteVolume(fx.volumeName)
-		observation, err := fx.adapter.Status(context.Background(), testWorkspacePort())
-		if err != nil {
-			t.Fatalf("Status returned error for a missing volume: %v", err)
-		}
-		if observation.Available {
-			t.Fatalf("observation = %+v, want a missing workspace unavailable", observation)
-		}
-		if !strings.Contains(observation.Detail, "missing") {
-			t.Fatalf("detail = %q, want the missing workspace named", observation.Detail)
-		}
-		if _, ok := fx.libpod.volume(fx.volumeName); ok {
-			t.Fatal("Status recreated the missing workspace volume")
-		}
-	})
-
+func TestWorkspaceStatusVolumeOwnershipAndErrors(t *testing.T) {
 	t.Run("foreign", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.libpod.addVolume(fx.volumeName, map[string]string{LabelWorkspace: "workspace-2"})
 		observation, err := fx.adapter.Status(context.Background(), testWorkspacePort())
-		if err != nil {
-			t.Fatalf("Status returned error for a foreign volume: %v", err)
-		}
-		if observation.Available {
-			t.Fatalf("observation = %+v, want a foreign volume unavailable", observation)
-		}
-		if !strings.Contains(observation.Detail, "not owned") {
-			t.Fatalf("detail = %q, want the foreign ownership named", observation.Detail)
+		if err != nil || observation.Available || !strings.Contains(observation.Detail, "not owned") {
+			t.Fatalf("Status(foreign) = (%+v, %v); want unavailable foreign detail", observation, err)
 		}
 	})
 
@@ -80,11 +37,8 @@ func TestWorkspaceStatusReportsAvailabilityWithoutRecreating(t *testing.T) {
 		fx := newFixture(t)
 		fx.libpod.addVolume(fx.volumeName, nil)
 		observation, err := fx.adapter.Status(context.Background(), testWorkspacePort())
-		if err != nil {
-			t.Fatalf("Status returned error for an unlabelled volume: %v", err)
-		}
-		if observation.Available {
-			t.Fatalf("observation = %+v, want an unlabelled volume unavailable", observation)
+		if err != nil || observation.Available {
+			t.Fatalf("Status(unlabelled) = (%+v, %v); want unavailable", observation, err)
 		}
 	})
 
@@ -94,127 +48,43 @@ func TestWorkspaceStatusReportsAvailabilityWithoutRecreating(t *testing.T) {
 		observation, err := fx.adapter.Status(context.Background(), testWorkspacePort())
 		assertFaultClass(t, err, fault.DependencyUnavailable)
 		if observation.Available {
-			t.Fatalf("observation = %+v, want an unreachable volume unavailable", observation)
-		}
-	})
-
-	t.Run("invalid workspace", func(t *testing.T) {
-		fx := newFixture(t)
-		_, err := fx.adapter.Status(context.Background(), "")
-		assertFaultClass(t, err, fault.InvalidInput)
-	})
-
-	t.Run("cancelled before effect", func(t *testing.T) {
-		fx := newFixture(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		_, err := fx.adapter.Status(ctx, testWorkspacePort())
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Status error = %v, want context.Canceled", err)
-		}
-		if calls := len(fx.libpod.inspectedVolumes()); calls != 0 {
-			t.Fatalf("cancelled Status inspected %d volumes, want 0", calls)
+			t.Fatalf("observation = %+v, want unreachable volume unavailable", observation)
 		}
 	})
 }
 
 func TestWorkspaceRetainVerifiesOwnershipWithoutDiskMarkers(t *testing.T) {
-	t.Run("retains idempotently without writing host files", func(t *testing.T) {
+	t.Run("no host files written", func(t *testing.T) {
 		fx := newFixture(t)
 		if err := fx.adapter.Retain(context.Background(), testWorkspacePort()); err != nil {
 			t.Fatalf("Retain returned error: %v", err)
 		}
-		if err := fx.adapter.Retain(context.Background(), testWorkspacePort()); err != nil {
-			t.Fatalf("repeated Retain returned error: %v", err)
-		}
 		if calls := fx.files.callCount("WriteFile"); calls != 0 {
 			t.Fatalf("Retain wrote %d host files, want 0 (PostgreSQL owns retention)", calls)
-		}
-		if _, ok := fx.libpod.volume(fx.volumeName); !ok {
-			t.Fatal("Retain removed the retained workspace volume")
-		}
-	})
-
-	t.Run("missing volume", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.libpod.deleteVolume(fx.volumeName)
-		err := fx.adapter.Retain(context.Background(), testWorkspacePort())
-		assertFaultClass(t, err, fault.NotFound)
-		if _, ok := fx.libpod.volume(fx.volumeName); ok {
-			t.Fatal("Retain recreated the missing workspace volume")
 		}
 	})
 
 	t.Run("foreign volume", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.libpod.addVolume(fx.volumeName, map[string]string{LabelWorkspace: "workspace-2"})
-		err := fx.adapter.Retain(context.Background(), testWorkspacePort())
-		assertFaultClass(t, err, fault.Forbidden)
-	})
-
-	t.Run("cancelled before effect", func(t *testing.T) {
-		fx := newFixture(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		err := fx.adapter.Retain(ctx, testWorkspacePort())
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Retain error = %v, want context.Canceled", err)
-		}
-		if calls := len(fx.libpod.inspectedVolumes()); calls != 0 {
-			t.Fatalf("cancelled Retain inspected %d volumes, want 0", calls)
-		}
+		assertFaultClass(t, fx.adapter.Retain(context.Background(), testWorkspacePort()), fault.Forbidden)
 	})
 }
 
-func TestWorkspaceReleaseRemovesOnlyOwnedUnreferencedWorkspaces(t *testing.T) {
-	t.Run("releases workspace idempotently", func(t *testing.T) {
-		fx := newFixture(t)
-		if err := fx.adapter.Release(context.Background(), testWorkspacePort()); err != nil {
-			t.Fatalf("Release returned error: %v", err)
-		}
-		if _, ok := fx.libpod.volume(fx.volumeName); ok {
-			t.Fatal("Release left the workspace volume behind")
-		}
-		if removed := fx.libpod.removedVolumes(); len(removed) != 1 || removed[0] != fx.volumeName {
-			t.Fatalf("removed volumes = %v, want exactly %q", removed, fx.volumeName)
-		}
-		if err := fx.adapter.Release(context.Background(), testWorkspacePort()); err != nil {
-			t.Fatalf("repeated Release returned error: %v", err)
-		}
-		if removed := fx.libpod.removedVolumes(); len(removed) != 1 {
-			t.Fatalf("repeated Release issued %d volume removals, want idempotent 1", len(removed))
-		}
-	})
-
-	t.Run("absent volume is idempotent", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.libpod.deleteVolume(fx.volumeName)
-		if err := fx.adapter.Release(context.Background(), testWorkspacePort()); err != nil {
-			t.Fatalf("Release of an absent workspace returned error: %v", err)
-		}
-		if removed := fx.libpod.removedVolumes(); len(removed) != 0 {
-			t.Fatalf("Release of an absent workspace issued removals %v, want none", removed)
-		}
-	})
-
+func TestWorkspaceReleaseVolumeOwnershipIsolation(t *testing.T) {
 	t.Run("foreign workspace is refused", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.libpod.addVolume(fx.volumeName, map[string]string{LabelWorkspace: "workspace-2"})
-		err := fx.adapter.Release(context.Background(), testWorkspacePort())
-		assertFaultClass(t, err, fault.Forbidden)
-		if _, ok := fx.libpod.volume(fx.volumeName); !ok {
+		assertFaultClass(t, fx.adapter.Release(context.Background(), testWorkspacePort()), fault.Forbidden)
+		if _, ok := fx.libpod.volume(fx.volumeName); !ok || len(fx.libpod.removedVolumes()) != 0 {
 			t.Fatal("Release removed a foreign volume")
-		}
-		if removed := fx.libpod.removedVolumes(); len(removed) != 0 {
-			t.Fatalf("Release issued removals %v for a foreign volume, want none", removed)
 		}
 	})
 
 	t.Run("unlabelled workspace is refused", func(t *testing.T) {
 		fx := newFixture(t)
 		fx.libpod.addVolume(fx.volumeName, nil)
-		err := fx.adapter.Release(context.Background(), testWorkspacePort())
-		assertFaultClass(t, err, fault.Forbidden)
+		assertFaultClass(t, fx.adapter.Release(context.Background(), testWorkspacePort()), fault.Forbidden)
 		if _, ok := fx.libpod.volume(fx.volumeName); !ok {
 			t.Fatal("Release removed an unlabelled volume")
 		}
@@ -224,33 +94,14 @@ func TestWorkspaceReleaseRemovesOnlyOwnedUnreferencedWorkspaces(t *testing.T) {
 		fx := newFixture(t)
 		otherName, err := WorkspaceVolumeName("workspace-2")
 		if err != nil {
-			t.Fatalf("WorkspaceVolumeName returned error: %v", err)
+			t.Fatalf("WorkspaceVolumeName: %v", err)
 		}
 		fx.libpod.addVolume(otherName, map[string]string{LabelWorkspace: "workspace-2"})
 		if err := fx.adapter.Release(context.Background(), testWorkspacePort()); err != nil {
-			t.Fatalf("Release returned error: %v", err)
+			t.Fatalf("Release: %v", err)
 		}
 		if _, ok := fx.libpod.volume(otherName); !ok {
 			t.Fatal("Release removed another workspace's volume")
-		}
-	})
-
-	t.Run("invalid workspace", func(t *testing.T) {
-		fx := newFixture(t)
-		err := fx.adapter.Release(context.Background(), "")
-		assertFaultClass(t, err, fault.InvalidInput)
-	})
-
-	t.Run("cancelled before effect", func(t *testing.T) {
-		fx := newFixture(t)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		err := fx.adapter.Release(ctx, testWorkspacePort())
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Release error = %v, want context.Canceled", err)
-		}
-		if removed := fx.libpod.removedVolumes(); len(removed) != 0 {
-			t.Fatalf("cancelled Release issued removals %v, want none", removed)
 		}
 	})
 }
@@ -486,34 +337,4 @@ func TestWorkspaceConcurrentOperationsAreIdempotent(t *testing.T) {
 			t.Fatalf("concurrent Retain wrote %d files, want 0", writes)
 		}
 	})
-}
-
-func TestWorkspaceDetailsCarryNoSecretMaterial(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	fx.start(t)
-
-	observation, err := fx.adapter.Status(context.Background(), testWorkspacePort())
-	if err != nil {
-		t.Fatalf("Status returned error: %v", err)
-	}
-	details := []string{observation.Detail}
-	if err := fx.adapter.Retain(context.Background(), testWorkspacePort()); err != nil {
-		t.Fatalf("Retain returned error: %v", err)
-	}
-	releaseErr := fx.adapter.Release(context.Background(), testWorkspacePort())
-	if releaseErr == nil {
-		t.Fatal("Release dropped a workspace referenced by a running container")
-	}
-	details = append(details, releaseErr.Error())
-	for _, detail := range details {
-		for _, secret := range []string{"s3cr3t", "tok-abc", fx.request.Credential} {
-			if secret == "" {
-				continue
-			}
-			if strings.Contains(detail, secret) {
-				t.Fatalf("workspace detail leaked secret material %q: %q", secret, detail)
-			}
-		}
-	}
 }

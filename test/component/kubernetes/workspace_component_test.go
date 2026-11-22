@@ -6,16 +6,14 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
-	"github.com/optimiware/kodema/internal/engine"
-	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // TestWorkspacePersistsAcrossTwoJobsAndRelease proves a retained workspace
@@ -30,53 +28,9 @@ func TestWorkspacePersistsAcrossTwoJobsAndRelease(t *testing.T) {
 		t.Fatalf("WorkspaceClaimName: %v", err)
 	}
 
-	writer := testIdentity("exec-k6a", "action-k6a", "workload-k6a", "idem-k6a")
-	startPrepared(t, ctx, fx, prepareRequest(
-		writer, workspaceID, "build", "",
-		testContainer([]string{`printf 'persisted\n' > /workspace/persist.txt`}, nil), nil, "tok-k6a",
-	))
-	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
-		Identity: writer, WorkspaceID: workspaceID,
-	}, engine.ObservationExited)
-	removal, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: writer, WorkspaceID: workspaceID})
-	if err != nil {
-		t.Fatalf("Remove writer: %v", err)
-	}
-	if !removal.Removed {
-		t.Fatalf("writer removal = %+v; want removed", removal)
-	}
-	if !strings.Contains(removal.Detail, claimName) {
-		t.Fatalf("writer removal detail %q does not name the retained claim %q", removal.Detail, claimName)
-	}
-	waitForWorkspaceUnreferenced(t, ctx, fx.Client, workspaceID)
-
-	content := runReader(t, ctx, fx, workspaceID, "k6b", []string{`cat /workspace/persist.txt`})
-	if content != "persisted\n" {
-		t.Fatalf("second Job read %q; want the first Job's persisted bytes", content)
-	}
-	reader := testIdentity("exec-k6b", "action-k6b", "workload-k6b", "idem-k6b")
-	if _, err := fx.Adapter.Remove(ctx, reconcile.RemoveRequest{Identity: reader, WorkspaceID: workspaceID}); err != nil {
-		t.Fatalf("Remove reader: %v", err)
-	}
-	waitForWorkspaceUnreferenced(t, ctx, fx.Client, workspaceID)
-
-	status, err := fx.Adapter.Status(ctx, workspaceID)
-	if err != nil {
-		t.Fatalf("Status: %v", err)
-	}
-	if !status.Available {
-		t.Fatalf("workspace status = %+v; want available before release", status)
-	}
-	releaseWorkspaceEventually(t, ctx, fx, workspaceID)
+	runtimesupport.AssertWorkspacePersistence(t, ctx, fx.harness(t, workspaceID))
 	if err := waitForClaimGone(ctx, fx.Client, claimName); err != nil {
 		t.Fatalf("released claim is still present: %v", err)
-	}
-	status, err = fx.Adapter.Status(ctx, workspaceID)
-	if err != nil {
-		t.Fatalf("Status after release: %v", err)
-	}
-	if status.Available {
-		t.Fatalf("released workspace is still available: %+v", status)
 	}
 	if _, err := fx.Client.GetClaim(ctx, testNamespace, claimName); !errors.Is(err, runtimekube.ErrNotFound) {
 		t.Fatalf("released claim read = %v; want ErrNotFound", err)
@@ -221,7 +175,7 @@ func TestRetainBarrierAndStaleVersionedDelete(t *testing.T) {
 	close(gated.deleteRelease)
 
 	releaseErr := <-released
-	requireFaultClass(t, releaseErr, fault.VersionConflict)
+	runtimesupport.RequireFaultClass(t, releaseErr, fault.VersionConflict)
 	if !errors.Is(gated.err(), runtimekube.ErrConflict) {
 		t.Fatalf("in-flight DeleteClaimVersioned = %v; want ErrConflict", gated.err())
 	}
@@ -329,7 +283,7 @@ func TestRetainBarrierAndStaleVersionedDelete(t *testing.T) {
 		if !errors.Is(deleteErr, runtimekube.ErrConflict) {
 			t.Fatalf("DeleteClaimVersioned = %v; want ErrConflict", deleteErr)
 		}
-		requireFaultClass(t, retainErr, fault.VersionConflict)
+		runtimesupport.RequireFaultClass(t, retainErr, fault.VersionConflict)
 		surviving, err := fx.Client.GetClaim(ctx, testNamespace, raceClaimName)
 		if err != nil || surviving.DeletionTimestamp != nil {
 			t.Fatalf("claim was lost despite conflicting operations: claim=%+v err=%v", surviving, err)

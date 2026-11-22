@@ -17,7 +17,6 @@ import (
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
-	"github.com/optimiware/kodema/internal/id"
 	processdriver "github.com/optimiware/kodema/internal/server/drivers/process"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
@@ -43,17 +42,13 @@ func TestProcessRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 		`cat "$RESOURCE_ROOT/kodema/secrets/KODEMA_TOKEN"`,
 		`echo done > "$PWD/done.txt"`,
 	}
-	request := testPrepareRequest(
+	request := fixture.request(
 		identity,
-		fixture.workspaceID,
-		"build",
-		"task-1",
-		testContainer("registry.example.com/tools/build@sha256:"+strings.Repeat("a", 64), commands,
-			[]definition.EnvVar{
-				{Name: "BUILD_MODE", Value: "release"},
-				{Name: "RESOURCE_ROOT", Value: resourceRoot},
-			},
-			[]id.SecretName{"API_KEY"}),
+		commands,
+		[]definition.EnvVar{
+			{Name: "BUILD_MODE", Value: "release"},
+			{Name: "RESOURCE_ROOT", Value: resourceRoot},
+		},
 		[]reconcile.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}},
 		"tok-abc",
 	)
@@ -92,7 +87,7 @@ func TestProcessRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 	}
 	waitForFile(t, ctx, filepath.Join(fixture.workspaceDir, "done.txt"))
 
-	observation := waitForProcessObservation(t, ctx, fixture.adapter,
+	observation := waitObservation(t, ctx, fixture.adapter,
 		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 	code, ok := observation.ExitStatus()
 	if !ok || code != 0 {
@@ -148,7 +143,7 @@ func TestProcessRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 		t.Fatalf("redaction marker is absent from output: %q", logText)
 	}
 
-	evidence := waitForProcessStop(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	evidence := runtimesupport.WaitForStopConfirmed(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, 0, 0)
 	if !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
@@ -184,15 +179,13 @@ func TestProcessRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 
 	executor := &faultExecutor{inner: fixture.driver, loseSpawn: true, spawnEffect: true}
 	adapter := newProcessAdapterWithExecutor(t, fixture, executor)
-	request := testPrepareRequest(
+	request := fixture.request(
 		identity,
-		fixture.workspaceID,
-		"build",
-		"task-1",
-		testContainer("registry.example.com/tools/build@sha256:"+strings.Repeat("a", 64), []string{
+		[]string{
 			`echo launched >> "$PWD/launch-count"`,
 			`sleep 30`,
-		}, []definition.EnvVar{{Name: "RESOURCE_ROOT", Value: resourceRoot}}, nil),
+		},
+		[]definition.EnvVar{{Name: "RESOURCE_ROOT", Value: resourceRoot}},
 		nil,
 		"tok-abc",
 	)
@@ -217,7 +210,7 @@ func TestProcessRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 	t.Cleanup(func() { _ = recoveredDriver.Close(context.Background()) })
 	recovered := newProcessAdapter(t, fixture, recoveredDriver)
 
-	observation := waitForProcessObservation(t, ctx, recovered,
+	observation := waitObservation(t, ctx, recovered,
 		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationRunning)
 	if observation.Kind != engine.ObservationRunning {
 		t.Fatalf("recovered observation = %+v; want running", observation)
@@ -236,14 +229,14 @@ func TestProcessRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 		t.Fatalf("workload launched %d times; want 1", got)
 	}
 
-	evidence := waitForProcessStop(t, ctx, recovered, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	evidence := runtimesupport.WaitForStopConfirmed(t, ctx, recovered, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, 0, 0)
 	if !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
 	// The first controller's waiter reaps the leader and persists its exit
 	// status; the reconstructed controller can only prove the group is gone,
 	// which stays unknown (never running and never never-started).
-	waitForProcessObservation(t, ctx, fixture.adapter,
+	waitObservation(t, ctx, fixture.adapter,
 		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 	// A retry after exit must still reuse the same group and never relaunch.
 	recoveredStart, err = recovered.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
@@ -265,15 +258,13 @@ func TestProcessRuntimeNoReplayAcrossControllerRestart(t *testing.T) {
 	secondRoot := fixture.resourceRoot(t, secondIdentity.WorkloadID)
 	beforeEffect := &faultExecutor{inner: fixture.driver, loseSpawn: true, spawnEffect: false}
 	secondAdapter := newProcessAdapterWithExecutor(t, fixture, beforeEffect)
-	secondRequest := testPrepareRequest(
+	secondRequest := fixture.request(
 		secondIdentity,
-		fixture.workspaceID,
-		"build",
-		"task-1",
-		testContainer("registry.example.com/tools/build@sha256:"+strings.Repeat("a", 64), []string{
+		[]string{
 			`echo launched >> "$PWD/launch-count"`,
 			`sleep 30`,
-		}, []definition.EnvVar{{Name: "RESOURCE_ROOT", Value: secondRoot}}, nil),
+		},
+		[]definition.EnvVar{{Name: "RESOURCE_ROOT", Value: secondRoot}},
 		nil,
 		"tok-abc",
 	)
@@ -309,15 +300,13 @@ func TestProcessRuntimeWorkspaceExclusivityAndCrash(t *testing.T) {
 	identity := testIdentity("exec-p3", "action-p3", "workload-p3", "idem-p3")
 	resourceRoot := fixture.resourceRoot(t, identity.WorkloadID)
 
-	request := testPrepareRequest(
+	request := fixture.request(
 		identity,
-		fixture.workspaceID,
-		"build",
-		"task-1",
-		testContainer("registry.example.com/tools/build@sha256:"+strings.Repeat("a", 64), []string{
+		[]string{
 			`echo owned > "$PWD/owned.txt"`,
 			`sleep 30`,
-		}, []definition.EnvVar{{Name: "RESOURCE_ROOT", Value: resourceRoot}}, nil),
+		},
+		[]definition.EnvVar{{Name: "RESOURCE_ROOT", Value: resourceRoot}},
 		nil,
 		"tok-abc",
 	)
@@ -340,7 +329,7 @@ func TestProcessRuntimeWorkspaceExclusivityAndCrash(t *testing.T) {
 	if err := second.Release(ctx, fixture.workspaceID); err == nil {
 		t.Fatal("second controller released a workspace owned by a live workload")
 	} else {
-		assertFaultClass(t, err, fault.Forbidden)
+		runtimesupport.RequireFaultClass(t, err, fault.Forbidden)
 	}
 	status, err := second.Status(ctx, fixture.workspaceID)
 	if err != nil || !status.Available {
@@ -355,14 +344,14 @@ func TestProcessRuntimeWorkspaceExclusivityAndCrash(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = crashDriver.Close(context.Background()) })
 	crashed := newProcessAdapter(t, fixture, crashDriver)
-	waitForProcessObservation(t, ctx, crashed,
+	waitObservation(t, ctx, crashed,
 		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationRunning)
 	if err := crashed.Release(ctx, fixture.workspaceID); err == nil {
 		t.Fatal("reconstructed controller released a workspace owned by a running workload")
 	} else {
-		assertFaultClass(t, err, fault.Forbidden)
+		runtimesupport.RequireFaultClass(t, err, fault.Forbidden)
 	}
-	evidence := waitForProcessStop(t, ctx, crashed, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	evidence := runtimesupport.WaitForStopConfirmed(t, ctx, crashed, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, 0, 0)
 	if !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
@@ -389,12 +378,9 @@ func TestProcessRuntimeCredentialRefreshWithoutRestart(t *testing.T) {
 	identity := testIdentity("exec-p4", "action-p4", "workload-p4", "idem-p4")
 	resourceRoot := fixture.resourceRoot(t, identity.WorkloadID)
 
-	request := testPrepareRequest(
+	request := fixture.request(
 		identity,
-		fixture.workspaceID,
-		"build",
-		"task-1",
-		testContainer("registry.example.com/tools/build@sha256:"+strings.Repeat("a", 64), []string{
+		[]string{
 			`echo started >> "$PWD/starts"`,
 			`i=0`,
 			`while [ ! -f "$PWD/stop" ]; do`,
@@ -403,7 +389,8 @@ func TestProcessRuntimeCredentialRefreshWithoutRestart(t *testing.T) {
 			`  if [ "$i" -ge 20 ]; then break; fi`,
 			`  sleep 1`,
 			`done`,
-		}, []definition.EnvVar{{Name: "RESOURCE_ROOT", Value: resourceRoot}}, nil),
+		},
+		[]definition.EnvVar{{Name: "RESOURCE_ROOT", Value: resourceRoot}},
 		nil,
 		"tok-abc",
 	)
@@ -414,14 +401,14 @@ func TestProcessRuntimeCredentialRefreshWithoutRestart(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	waitForContent(t, ctx, filepath.Join(fixture.workspaceDir, "token-seen"), "tok-abc")
-	waitForProcessObservation(t, ctx, fixture.adapter,
+	waitObservation(t, ctx, fixture.adapter,
 		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationRunning)
 
 	if _, err := fixture.adapter.RefreshCredential(ctx, reconcile.CredentialRequest{Identity: identity, Credential: "tok-new"}); err != nil {
 		t.Fatalf("RefreshCredential: %v", err)
 	}
 	waitForContent(t, ctx, filepath.Join(fixture.workspaceDir, "token-seen"), "tok-new")
-	waitForProcessObservation(t, ctx, fixture.adapter,
+	waitObservation(t, ctx, fixture.adapter,
 		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationRunning)
 	if got := strings.Count(readFileString(t, filepath.Join(fixture.workspaceDir, "starts")), "started"); got != 1 {
 		t.Fatalf("workload restarted %d times during credential refresh; want 1", got)
@@ -458,9 +445,9 @@ func TestProcessRuntimeCredentialRefreshWithoutRestart(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixture.workspaceDir, "stop"), []byte("stop"), 0o644); err != nil {
 		t.Fatalf("write stop marker: %v", err)
 	}
-	waitForProcessObservation(t, ctx, fixture.adapter,
+	waitObservation(t, ctx, fixture.adapter,
 		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
-	if evidence := waitForProcessStop(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := runtimesupport.WaitForStopConfirmed(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, 0, 0); !evidence.IsConfirmed() {
 		t.Fatalf("Stop = %+v; want confirmed", evidence)
 	}
 	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {

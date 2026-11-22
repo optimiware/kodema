@@ -289,6 +289,51 @@ func (a *Adapter) verifyPreparedFiles(ctx context.Context, workload id.WorkloadI
 	return nil
 }
 
+// checkNoUnexpectedActivationFiles walks dir recursively and refuses any
+// symlink (Forbidden) or regular file not in expectedFiles
+// (ChangedIdempotencyContent), catching post-restart Prepare retries that drop
+// previously written activation files.
+func (a *Adapter) checkNoUnexpectedActivationFiles(ctx context.Context, dir string, expectedFiles map[string]bool) error {
+	entries, err := a.files.ReadDir(ctx, dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fault.Wrap(fault.DependencyUnavailable, "activation directory is unreadable", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fault.New(fault.Forbidden, "activation snapshot path is a symlink")
+		}
+		if isTransientTempFile(name) {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		info, err := a.files.Lstat(ctx, path)
+		if err != nil {
+			return fault.Wrap(fault.DependencyUnavailable, "activation snapshot path is unreachable", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fault.New(fault.Forbidden, "activation snapshot path is a symlink")
+		}
+		if info.IsDir() {
+			if err := a.checkNoUnexpectedActivationFiles(ctx, path, expectedFiles); err != nil {
+				return err
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fault.New(fault.Forbidden, "activation snapshot path is not a regular file")
+		}
+		if !expectedFiles[path] {
+			return fault.New(fault.ChangedIdempotencyContent,
+				"preparation content changed for the same workload identity")
+		}
+	}
+	return nil
+}
+
 // Prepare materializes the non-secret activation snapshot and isolated 0700
 // secrets directory once and attaches the existing retained workspace volume.
 // It never starts a container and never recreates a missing workspace.
@@ -502,6 +547,17 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 		}
 	}
 
+	// Verify no unexpected activation files remain on disk (for example after a
+	// controller restart when a conflicting Prepare drops a previously written
+	// input, output, or task file).
+	expectedFiles := make(map[string]bool, len(materialization.Files))
+	for _, file := range materialization.Files {
+		expectedFiles[hostPath(a.root, request.Identity.WorkloadID, file.Path)] = true
+	}
+	if err := a.checkNoUnexpectedActivationFiles(ctx, activationDir(a.root, request.Identity.WorkloadID), expectedFiles); err != nil {
+		return reconcile.Preparation{}, err
+	}
+
 	// Verify existing declared secret files match the request before writing.
 	expectedSecrets := make(map[string]string, len(materialization.Secrets))
 	for _, secret := range materialization.Secrets {
@@ -511,13 +567,12 @@ func (a *Adapter) Prepare(ctx context.Context, request reconcile.PrepareRequest)
 	if err != nil {
 		return reconcile.Preparation{}, fault.Wrap(fault.DependencyUnavailable, "secrets directory is unreadable", err)
 	}
-	tempPrefix := string(id.SecretTokenName) + ".tmp-"
 	for _, entry := range secEntries {
 		name := entry.Name()
 		if entry.Type()&os.ModeSymlink != 0 {
 			return reconcile.Preparation{}, fault.New(fault.Forbidden, "secret snapshot path is a symlink")
 		}
-		if name == string(id.SecretTokenName) || strings.HasPrefix(name, tempPrefix) {
+		if name == string(id.SecretTokenName) || isTransientTempFile(name) {
 			continue
 		}
 		if _, expected := expectedSecrets[name]; !expected {
@@ -837,7 +892,6 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 		if err != nil {
 			return reconcile.LogBatch{}, fault.Wrap(fault.DependencyUnavailable, "container log read is unavailable", err)
 		}
-		mayGrow := page.Truncated && len(page.Data) == request.Limit
 		chunk, hasChunk, nextPosition, err := container.BuildLogChunk(container.LogPageInput{
 			Stream:        stream,
 			Offset:        offset,
@@ -846,7 +900,7 @@ func (a *Adapter) Logs(ctx context.Context, request reconcile.LogsRequest) (reco
 			PageTruncated: page.Truncated,
 			Values:        values,
 			Limit:         request.Limit,
-			MayGrow:       mayGrow,
+			MayGrow:       page.Truncated,
 		})
 		if err != nil {
 			return reconcile.LogBatch{}, err

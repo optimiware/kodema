@@ -21,6 +21,9 @@ import (
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
 	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
+	"github.com/optimiware/kodema/internal/control/secret"
+	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/factory"
 )
 
@@ -267,6 +270,41 @@ func cleanupNoneCanBeTrue(execution api.ExecutionInspectResult) bool {
 	return true
 }
 
+// waitExecutionOptions configures the unified terminal-and-cleanup wait loop.
+type waitExecutionOptions struct {
+	// terminalTimeout bounds reaching a terminal execution state when
+	// totalTimeout is zero. Defaults to 2 minutes.
+	terminalTimeout time.Duration
+	// cleanupTimeout bounds cleanup settlement after reaching a terminal state
+	// when totalTimeout is zero. Defaults to 1 minute.
+	cleanupTimeout time.Duration
+	// totalTimeout, when positive, bounds both terminal arrival and cleanup
+	// settlement under one shared wall-clock deadline.
+	totalTimeout time.Duration
+	// pollInterval sets the delay between inspections. Defaults to 10ms.
+	pollInterval time.Duration
+	// allowCleanupNone permits settling on cleanup.state == "none" after a
+	// grace period when the execution has no active container action and the
+	// live resource probe proves nothing remains.
+	allowCleanupNone bool
+	// onPendingCleanup is called while cleanup.state == "pending" so callers
+	// with a frozen factory clock can advance or pace durable retry backoffs.
+	onPendingCleanup func(api.ExecutionCleanup)
+	// onFailure is invoked in the failure defer for backend-specific evidence
+	// (for example, Kubernetes Jobs/Pods/logs).
+	onFailure func(context.Context, api.ExecutionInspectResult)
+}
+
+// isTerminalExecutionState reports whether state is a terminal execution state.
+func isTerminalExecutionState(state string) bool {
+	switch state {
+	case "succeeded", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
 // waitExecution waits for one execution to reach a terminal state and for its
 // independent cleanup record to settle.
 //
@@ -285,6 +323,25 @@ func cleanupNoneCanBeTrue(execution api.ExecutionInspectResult) bool {
 // red test carries its own evidence.
 func waitExecution(t *testing.T, harness *factory.Harness, token, executionID string) api.ExecutionInspectResult {
 	t.Helper()
+	return waitExecutionWithOptions(t, harness, token, executionID, waitExecutionOptions{
+		allowCleanupNone: true,
+	})
+}
+
+// waitExecutionWithOptions is the unified terminal-and-cleanup barrier shared
+// by Podman, Kubernetes, and paced-retry lifecycle tests.
+func waitExecutionWithOptions(t *testing.T, harness *factory.Harness, token, executionID string, opts waitExecutionOptions) api.ExecutionInspectResult {
+	t.Helper()
+	if opts.terminalTimeout <= 0 {
+		opts.terminalTimeout = 2 * time.Minute
+	}
+	if opts.cleanupTimeout <= 0 {
+		opts.cleanupTimeout = time.Minute
+	}
+	if opts.pollInterval <= 0 {
+		opts.pollInterval = 10 * time.Millisecond
+	}
+
 	var last api.ExecutionInspectResult
 	var resources executionResources
 	probed := false
@@ -294,51 +351,60 @@ func waitExecution(t *testing.T, harness *factory.Harness, token, executionID st
 			// through a cleanup, so the evidence reads take their own bound.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if !probed {
+			if !probed && harness.Cluster == nil {
 				resources = probeExecutionResources(ctx, harness, executionID)
 			}
 			t.Logf("execution %s last inspect: state=%q version=%d cleanup=%+v failure=%+v actions=%+v",
 				last.ExecutionID, last.State, last.Version, last.Cleanup, last.Failure, last.Actions)
-			t.Logf("execution %s runtime evidence: %s", executionID, harness.ExecutionRuntimeEvidence(ctx, executionID))
-			t.Logf("execution %s last live resources: %s", executionID, resources)
+			if harness.Cluster == nil {
+				t.Logf("execution %s runtime evidence: %s", executionID, harness.ExecutionRuntimeEvidence(ctx, executionID))
+				t.Logf("execution %s last live resources: %s", executionID, resources)
+			}
 			dumpExecutionLogs(t, harness, token, executionID, last)
+			if opts.onFailure != nil {
+				opts.onFailure(ctx, last)
+			}
 		}
 	}()
-	harness.Eventually(t, 2*time.Minute, func() bool {
-		result, publicError := harness.REST(token, "execution.inspect", api.ExecutionInspectRequest{
-			ExecutionID: executionID,
-		}, nil, "")
-		if publicError.Code != "" {
-			return false
-		}
-		harness.Decode(result, &last)
-		switch last.State {
-		case "succeeded", "failed", "cancelled":
-			return true
-		default:
-			return false
-		}
-	})
 
-	// The cleanup intent for a terminal execution is a separate commit, so give
-	// a "none" record one grace period before probing the live state once. A
-	// clean live state then settles the wait; a dirty one can only settle by
-	// reaching "complete".
 	const noneGrace = 2 * time.Second
-	probeAfter := time.Now().Add(noneGrace)
+	now := time.Now()
+	terminalDeadline := now.Add(opts.terminalTimeout)
+	var cleanupDeadline time.Time
+	if opts.totalTimeout > 0 {
+		shared := now.Add(opts.totalTimeout)
+		terminalDeadline = shared
+		cleanupDeadline = shared
+	}
+
+	terminalReached := false
+	var probeAfter time.Time
 	probedNone := false
-	deadline := time.Now().Add(time.Minute)
+
 	for {
+		inspected := false
 		result, publicError := harness.REST(token, "execution.inspect", api.ExecutionInspectRequest{
 			ExecutionID: executionID,
 		}, nil, "")
 		if publicError.Code == "" {
 			harness.Decode(result, &last)
+			inspected = true
+			if !terminalReached && isTerminalExecutionState(last.State) {
+				terminalReached = true
+				at := time.Now()
+				probeAfter = at.Add(noneGrace)
+				if opts.totalTimeout <= 0 {
+					cleanupDeadline = at.Add(opts.cleanupTimeout)
+				}
+			}
+		}
+
+		if terminalReached && inspected {
 			switch last.Cleanup.State {
 			case "complete":
 				return last
 			case "none":
-				if !probedNone && !time.Now().Before(probeAfter) {
+				if opts.allowCleanupNone && !probedNone && !time.Now().Before(probeAfter) {
 					probedNone = true
 					probed = true
 					resources = probeExecutionResources(t.Context(), harness, executionID)
@@ -348,15 +414,34 @@ func waitExecution(t *testing.T, harness *factory.Harness, token, executionID st
 				}
 			}
 		}
-		if !time.Now().Before(deadline) {
-			if !probedNone {
+
+		checkNow := time.Now()
+		if !terminalReached {
+			if !checkNow.Before(terminalDeadline) {
+				bound := opts.terminalTimeout
+				if opts.totalTimeout > 0 {
+					bound = opts.totalTimeout
+				}
+				t.Fatalf("execution %s did not reach a terminal state within %s: state=%q cleanup=%+v\ncomposition log:\n%s",
+					executionID, bound, last.State, last.Cleanup, factory.SanitizeDiagnostic(harness.Logs()))
+			}
+		} else if !checkNow.Before(cleanupDeadline) {
+			if !probed && harness.Cluster == nil {
 				probed = true
 				resources = probeExecutionResources(t.Context(), harness, executionID)
 			}
+			bound := opts.cleanupTimeout
+			if opts.totalTimeout > 0 {
+				bound = opts.totalTimeout
+			}
 			t.Fatalf("execution %s reached state %q but cleanup did not settle within %s: cleanup=%+v; live resources: %s\ncomposition log:\n%s",
-				executionID, last.State, time.Minute, last.Cleanup, resources, factory.SanitizeDiagnostic(harness.Logs()))
+				executionID, last.State, bound, last.Cleanup, resources, factory.SanitizeDiagnostic(harness.Logs()))
 		}
-		time.Sleep(10 * time.Millisecond)
+
+		if inspected && last.Cleanup.State == "pending" && opts.onPendingCleanup != nil {
+			opts.onPendingCleanup(last.Cleanup)
+		}
+		time.Sleep(opts.pollInterval)
 	}
 }
 
@@ -593,6 +678,103 @@ test "$(cat /kodema/outputs/prepare/artifact)" = %q
 FINAL="consumed:$(cat /kodema/outputs/prepare/artifact)"`, artifact)
 }
 
+// readActionStreamLogs drains every retained log page for one action and stream
+// through the public execution.logs.read operation.
+func readActionStreamLogs(t *testing.T, harness *factory.Harness, token, executionID, actionID, stream string) string {
+	t.Helper()
+	var builder strings.Builder
+	cursor := ""
+	for range 64 {
+		req := api.ExecutionLogsReadRequest{
+			ExecutionID: executionID,
+			ActionID:    actionID,
+			Stream:      stream,
+		}
+		if cursor != "" {
+			req.Page = &api.Page{Cursor: cursor}
+		}
+		result := harness.MustREST(token, "execution.logs.read", req, nil, "")
+		var page api.ExecutionLogsReadResult
+		harness.Decode(result, &page)
+		for _, chunk := range page.Chunks {
+			_, _ = builder.Write(chunk.Data)
+		}
+		if page.NextCursor == "" {
+			return builder.String()
+		}
+		cursor = page.NextCursor
+	}
+	t.Fatalf("execution.logs.read for %s/%s (%s) exceeded 64 pages", executionID, actionID, stream)
+	return ""
+}
+
+// executionLogs concatenates the retained stdout and stderr of one action.
+func executionLogs(t *testing.T, harness *factory.Harness, token, executionID, actionName string) string {
+	t.Helper()
+	execution := inspectExecution(t, harness, token, executionID)
+	action := actionByName(t, execution, actionName)
+	return readActionStreamLogs(t, harness, token, executionID, action.ActionID, "stdout") +
+		readActionStreamLogs(t, harness, token, executionID, action.ActionID, "stderr")
+}
+
+// cancelExecutionCurrent cancels one execution from the latest inspected
+// version, retrying a stale expected version from a fresh inspect.
+func cancelExecutionCurrent(t *testing.T, harness *factory.Harness, token, executionID, key string) api.ExecutionCancelResult {
+	t.Helper()
+	for range 20 {
+		current := inspectExecution(t, harness, harness.ProjectToken, executionID)
+		result, publicError := harness.REST(token, "execution.cancel", api.ExecutionCancelRequest{
+			ExecutionID: executionID,
+		}, &current.Version, key)
+		if publicError.Code == api.CodeVersionConflict {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		if publicError.Code != "" {
+			t.Fatalf("execution.cancel refused: %s (%s)", publicError.Code, publicError.Message)
+		}
+		var cancelled api.ExecutionCancelResult
+		harness.Decode(result, &cancelled)
+		return cancelled
+	}
+	t.Fatalf("execution.cancel did not converge on a current execution version")
+	return api.ExecutionCancelResult{}
+}
+
+// invokeStartViaClient issues one pipeline.start through the public Go client
+// at an explicit expected pipeline version, returning transport or API errors
+// to the caller so lost-response paths can observe them.
+func invokeStartViaClient(t *testing.T, transport *client.HTTPTransport, pipelineID string, inputs map[string]string, expected uint64, key string) (api.PipelineStartResult, error) {
+	t.Helper()
+	input, err := json.Marshal(api.PipelineStartRequest{
+		ProjectID:  factory.ProjectID,
+		PipelineID: pipelineID,
+		Inputs:     inputs,
+	})
+	if err != nil {
+		t.Fatalf("marshal start input: %v", err)
+	}
+	result, err := transport.Invoke(t.Context(), api.Invocation{
+		Operation: "pipeline.start",
+		Request: api.Request{
+			Input:           input,
+			ExpectedVersion: &expected,
+			IdempotencyKey:  key,
+		},
+	})
+	if err != nil {
+		return api.PipelineStartResult{}, err
+	}
+	var started api.PipelineStartResult
+	if err := json.Unmarshal(result.Body, &started); err != nil {
+		t.Fatalf("decode client start: %v; body=%s", err, string(result.Body))
+	}
+	if err := started.Validate(); err != nil {
+		t.Fatalf("client start result: %v", err)
+	}
+	return started, nil
+}
+
 // startViaClient starts one stored pipeline through the public Go client at its
 // currently observed stored version.
 func startViaClient(t *testing.T, transport *client.HTTPTransport, pipelineID string, inputs map[string]string, key string) api.PipelineStartResult {
@@ -618,30 +800,58 @@ func startViaClient(t *testing.T, transport *client.HTTPTransport, pipelineID st
 	if stored.Version == 0 {
 		t.Fatalf("client pipeline.read %s version = 0", pipelineID)
 	}
-	input, err := json.Marshal(api.PipelineStartRequest{
-		ProjectID:  factory.ProjectID,
-		PipelineID: pipelineID,
-		Inputs:     inputs,
-	})
+	started, err := invokeStartViaClient(t, transport, pipelineID, inputs, stored.Version, key)
 	if err != nil {
-		t.Fatalf("marshal start input: %v", err)
+		t.Fatalf("pipeline.start over client: %v", err)
+	}
+	return started
+}
+
+// invokeCancelViaClient issues one execution.cancel through the public Go
+// client at an explicit expected execution version.
+func invokeCancelViaClient(t *testing.T, transport *client.HTTPTransport, executionID string, expected uint64, key string) (api.ExecutionCancelResult, error) {
+	t.Helper()
+	input, err := json.Marshal(api.ExecutionCancelRequest{ExecutionID: executionID})
+	if err != nil {
+		t.Fatalf("marshal cancel input: %v", err)
 	}
 	result, err := transport.Invoke(t.Context(), api.Invocation{
-		Operation: "pipeline.start",
+		Operation: "execution.cancel",
 		Request: api.Request{
 			Input:           input,
-			ExpectedVersion: &stored.Version,
+			ExpectedVersion: &expected,
 			IdempotencyKey:  key,
 		},
 	})
 	if err != nil {
-		t.Fatalf("pipeline.start over client: %v", err)
+		return api.ExecutionCancelResult{}, err
 	}
-	var started api.PipelineStartResult
-	if err := json.Unmarshal(result.Body, &started); err != nil {
-		t.Fatalf("decode client start: %v; body=%s", err, string(result.Body))
+	var cancelled api.ExecutionCancelResult
+	if err := json.Unmarshal(result.Body, &cancelled); err != nil {
+		t.Fatalf("decode client cancel: %v; body=%s", err, string(result.Body))
 	}
-	return started
+	if err := cancelled.Validate(); err != nil {
+		t.Fatalf("client cancel result: %v", err)
+	}
+	return cancelled, nil
+}
+
+// newDroppingClient returns a public Go client that commits its next HTTP
+// request on the server and then reports a transport failure instead of
+// returning the response.
+func newDroppingClient(harness *factory.Harness, token string, maxAttempts int) *client.HTTPTransport {
+	transport := harness.Client(token)
+	base := transport.RoundTripper
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	transport.RoundTripper = &dropOnceRoundTripper{base: base}
+	transport.Retry = client.RetryPolicy{
+		MaxAttempts: maxAttempts,
+		BaseDelay:   time.Millisecond,
+		MaxDelay:    time.Millisecond,
+	}
+	return transport
 }
 
 // inspectViaClient reads one execution through the public Go client.
@@ -659,6 +869,150 @@ func inspectViaClient(t *testing.T, transport *client.HTTPTransport, executionID
 		t.Fatalf("execution.inspect over client: %v", err)
 	}
 	return result
+}
+
+// assertExecutionCount asserts the exact number of executions persisted for one
+// pipeline.
+func assertExecutionCount(t *testing.T, harness *factory.Harness, pipelineID string, want int64) {
+	t.Helper()
+	count, err := harness.ExecutionCount(t.Context(), pipelineID)
+	if err != nil {
+		t.Fatalf("count executions for %s: %v", pipelineID, err)
+	}
+	if count != want {
+		t.Fatalf("execution count for %s = %d; want %d", pipelineID, count, want)
+	}
+}
+
+// assertReceiptCount asserts the exact number of durable idempotency receipts
+// stored for key.
+func assertReceiptCount(t *testing.T, harness *factory.Harness, key string, want int64) {
+	t.Helper()
+	count, err := harness.ReceiptCount(t.Context(), key)
+	if err != nil {
+		t.Fatalf("count receipts for %q: %v", key, err)
+	}
+	if count != want {
+		t.Fatalf("receipt count for %q = %d; want %d", key, count, want)
+	}
+}
+
+// assertConfirmedStop asserts that action recorded confirmed stop evidence and,
+// when wantDetail is non-empty, that its detail contains wantDetail.
+func assertConfirmedStop(t *testing.T, action api.ExecutionAction, wantDetail string) {
+	t.Helper()
+	if action.Stop == nil || action.Stop.State != "confirmed" {
+		t.Fatalf("action %q stop evidence = %+v; want confirmed", action.Name, action.Stop)
+	}
+	if wantDetail != "" && !strings.Contains(action.Stop.Detail, wantDetail) {
+		t.Fatalf("action %q stop detail = %q; want substring %q", action.Name, action.Stop.Detail, wantDetail)
+	}
+}
+
+// assertCancelledExecution proves an execution settled cancelled without a
+// failure record and, when requireCompleteCleanup is true, with complete cleanup.
+func assertCancelledExecution(t *testing.T, execution api.ExecutionInspectResult, requireCompleteCleanup bool) {
+	t.Helper()
+	if execution.State != "cancelled" {
+		t.Fatalf("execution %s state = %q; want cancelled", execution.ExecutionID, execution.State)
+	}
+	if execution.Failure != nil {
+		t.Fatalf("cancelled execution %s carries a failure: %+v", execution.ExecutionID, execution.Failure)
+	}
+	if requireCompleteCleanup && execution.Cleanup.State != "complete" {
+		t.Fatalf("cancelled execution %s cleanup = %+v; want complete", execution.ExecutionID, execution.Cleanup)
+	}
+}
+
+// assertSingleRunLogs proves retained logs show exactly one command execution
+// ("runs=1" and no replay "runs=2") along with all required markers and none of
+// the forbidden markers.
+func assertSingleRunLogs(t *testing.T, logs string, required, forbidden []string) {
+	t.Helper()
+	if got := strings.Count(logs, "runs="); got != 1 {
+		t.Fatalf("retained log has %d runs lines; want exactly one:\n%s", got, logs)
+	}
+	if !strings.Contains(logs, "runs=1") {
+		t.Fatalf("retained log does not show exactly one command execution (runs=1):\n%s", logs)
+	}
+	if strings.Contains(logs, "runs=2") {
+		t.Fatalf("retained log shows a replayed workload (runs=2):\n%s", logs)
+	}
+	for _, want := range required {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("retained log missing expected marker %q:\n%s", want, logs)
+		}
+	}
+	for _, reject := range forbidden {
+		if strings.Contains(logs, reject) {
+			t.Fatalf("retained log contains forbidden marker %q:\n%s", reject, logs)
+		}
+	}
+}
+
+// deniedSecretOptions configures a harness with one allowed pipeline secret and
+// one stored but unallowed secret so activation fails during preparation.
+func deniedSecretOptions() []factory.Option {
+	return []factory.Option{
+		factory.WithSecretRules(secret.NameRule{
+			Scope: tenancy.Scope{
+				TenantID:  id.TenantID(factory.TenantID),
+				ProjectID: id.ProjectID(factory.ProjectID),
+			},
+			Names: []id.SecretName{pipelineSecretName},
+		}),
+		factory.WithSecrets(map[string]string{
+			pipelineSecretName: pipelineSecretValue,
+			deniedSecretName:   deniedSecretValue,
+		}),
+	}
+}
+
+// deniedSecretPipeline renders a single-action pipeline that requests the
+// unallowed secret so activation fails closed during preparation.
+func deniedSecretPipeline(t *testing.T, harness *factory.Harness, timeout string) []byte {
+	t.Helper()
+	return marshalPipeline(t, pipelineDoc{
+		Actions: []pipelineActionDoc{{
+			Name:     "denied",
+			Image:    harness.Image.Reference,
+			Secrets:  []string{deniedSecretName},
+			Commands: []string{"true"},
+			Timeout:  timeout,
+		}},
+	})
+}
+
+// assertPreparationFailure verifies the shared contract for an execution whose
+// activation fails during preparation before Start is issued.
+func assertPreparationFailure(t *testing.T, execution api.ExecutionInspectResult, actionName, wantWorkspaceID string) {
+	t.Helper()
+	if execution.State != "failed" {
+		t.Fatalf("preparation-failure execution state = %q; want failed", execution.State)
+	}
+	if execution.Failure == nil || execution.Failure.Kind != "preparation" {
+		t.Fatalf("preparation-failure failure = %+v; want preparation", execution.Failure)
+	}
+	if execution.Cleanup.State != "complete" {
+		t.Fatalf("preparation-failure cleanup = %+v; want complete", execution.Cleanup)
+	}
+	if execution.Cleanup.WorkloadID == "" {
+		t.Fatal("preparation-failure cleanup did not name the failed identity")
+	}
+	if wantWorkspaceID != "" {
+		if execution.Cleanup.WorkspaceID != wantWorkspaceID {
+			t.Fatalf("preparation-failure cleanup workspace = %q; want %q", execution.Cleanup.WorkspaceID, wantWorkspaceID)
+		}
+	} else if execution.Cleanup.WorkspaceID == "" {
+		t.Fatal("preparation-failure cleanup did not name the retained workspace")
+	}
+	action := actionByName(t, execution, actionName)
+	if action.State != "failed" {
+		t.Fatalf("preparation-failure action %q state = %q; want failed", actionName, action.State)
+	}
+	if action.Stop != nil && action.Stop.State == "confirmed" {
+		t.Fatalf("preparation failure fabricated stop evidence: %+v", action.Stop)
+	}
 }
 
 // dropOnceRoundTripper forwards the request to the real edge, reads and closes

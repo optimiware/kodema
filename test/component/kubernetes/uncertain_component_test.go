@@ -16,6 +16,7 @@ import (
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/infrastructure/harness"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // TestCancelledStartLeavesNoJobAndRetryReusesOne proves a start cancelled before
@@ -26,8 +27,7 @@ func TestCancelledStartLeavesNoJobAndRetryReusesOne(t *testing.T) {
 	workspaceID := id.WorkspaceID("workspace-kube-10")
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-k10", "action-k10", "workload-k10", "idem-k10")
-	request := prepareRequest(identity, workspaceID, "build", "",
-		testContainer([]string{`printf 'ok\n'`}, nil), nil, "tok-k10")
+	request := workloadRequest(identity, workspaceID, []string{`printf 'ok\n'`}, "tok-k10")
 	if _, err := fx.Adapter.Prepare(ctx, request); err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestCancelledStartLeavesNoJobAndRetryReusesOne(t *testing.T) {
 	if start.Outcome != reconcile.StartUnknown {
 		t.Fatalf("cancelled start outcome = %q; want unknown", start.Outcome)
 	}
-	requireFaultClass(t, err, fault.DependencyUnavailable)
+	runtimesupport.RequireFaultClass(t, err, fault.DependencyUnavailable)
 	jobs, err := fx.Client.ListJobs(ctx, testNamespace, map[string]string{
 		runtimekube.LabelWorkload: string(identity.WorkloadID),
 	})
@@ -79,9 +79,8 @@ func TestStopWithoutTerminationEvidenceStaysPending(t *testing.T) {
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-k11", "action-k11", "workload-k11", "idem-k11")
 	const marker = "stop-pending-marker"
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`trap '' TERM`, `printf 'stop-pending-marker\n'`, `sleep 20`}, nil), nil, "tok-k11",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`trap '' TERM`, `printf 'stop-pending-marker\n'`, `sleep 20`}, "tok-k11",
 	))
 	// The trap precedes the marker, so a readable marker proves the workload
 	// ignores SIGTERM. Observe's Running plus a pod that merely exists does not.
@@ -122,7 +121,7 @@ func TestStopWithoutTerminationEvidenceStaysPending(t *testing.T) {
 
 	// Convergence: once the container is gone the surviving Job confirms.
 	waitForNoWorkloadPods(t, ctx, fx, identity)
-	waitForStopConfirmed(t, ctx, fx, identity, workspaceID)
+	runtimesupport.WaitForStopConfirmed(t, ctx, fx.Adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID}, 3*time.Minute, 200*time.Millisecond)
 	jobConfirmed := oneJob(t, ctx, fx.Client, identity)
 	if jobConfirmed.UID != jobBefore.UID {
 		t.Fatalf("confirmed stop observed Job UID %q; want %q", jobConfirmed.UID, jobBefore.UID)
@@ -148,15 +147,15 @@ func TestSlowStopRetainsLogsAndReleasesResources(t *testing.T) {
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-k13", "action-k13", "workload-k13", "idem-k13")
 	const predecessorMarker = "predecessor-output"
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID,
+		[]string{
 			// Install the trap before printing so the marker is post-trap
 			// evidence, then keep the workload alive past the stop request.
 			`trap '' TERM`,
 			`printf 'predecessor-output\n'`,
 			`sleep 25`,
-		}, nil), nil, "tok-k13",
+		}, "tok-k13",
 	))
 	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
@@ -194,12 +193,12 @@ func TestSlowStopRetainsLogsAndReleasesResources(t *testing.T) {
 	// on a real cluster, report the classified cause and the observed pod state
 	// instead of a bare error: a dependency_unavailable here means the container
 	// was not actually serving its log when Stop returned.
-	stdout, stderr, logErr := readWorkloadLogs(ctx, fx.Adapter, identity, 1<<20)
+	stdout, stderr, logErr := runtimesupport.ReadAllLogsErr(ctx, fx.Adapter, identity, 1<<20)
 	if logErr != nil {
 		t.Fatalf("post-stop retained log read failed: %s; %s",
 			classifiedFault(logErr), workloadPodDiagnostic(t, ctx, fx, identity))
 	}
-	if !containsLine(string(stdout), predecessorMarker) {
+	if !runtimesupport.ContainsLine(stdout, predecessorMarker) {
 		t.Fatalf("post-stop retained stdout = %q; want the predecessor marker %q; %s",
 			stdout, predecessorMarker, workloadPodDiagnostic(t, ctx, fx, identity))
 	}
@@ -210,7 +209,7 @@ func TestSlowStopRetainsLogsAndReleasesResources(t *testing.T) {
 	// The stop must be affirmatively confirmed before the destructive Remove
 	// path. Suspension keeps the Job; the container's own exit and the fresh
 	// zero-counter observation close the barrier.
-	waitForStopConfirmed(t, ctx, fx, identity, workspaceID)
+	runtimesupport.WaitForStopConfirmed(t, ctx, fx.Adapter, reconcile.StopRequest{Identity: identity, WorkspaceID: workspaceID}, 3*time.Minute, 200*time.Millisecond)
 	jobAfterStop := oneJob(t, ctx, fx.Client, identity)
 	if jobAfterStop.UID != job.UID {
 		t.Fatalf("confirmed stop observed Job UID %q; want %q", jobAfterStop.UID, job.UID)
@@ -252,9 +251,8 @@ func TestDeletedJobIsNotAnAbsentWorkload(t *testing.T) {
 	workspaceID := id.WorkspaceID("workspace-kube-12")
 	fx, ctx := newFixture(t, workspaceID, fixtureOptions{withClaim: true})
 	identity := testIdentity("exec-k12", "action-k12", "workload-k12", "idem-k12")
-	startPrepared(t, ctx, fx, prepareRequest(
-		identity, workspaceID, "build", "",
-		testContainer([]string{`trap '' TERM`, `sleep 20`}, nil), nil, "tok-k12",
+	startPrepared(t, ctx, fx, workloadRequest(
+		identity, workspaceID, []string{`trap '' TERM`, `sleep 20`}, "tok-k12",
 	))
 	waitForObservation(t, ctx, fx.Adapter, reconcile.ObserveRequest{
 		Identity: identity, WorkspaceID: workspaceID,
@@ -331,12 +329,12 @@ func waitForWorkloadContainerRunning(
 		if !running {
 			return fmt.Errorf("workload container state = %q; want running", state)
 		}
-		stdout, _, err := readWorkloadLogs(ctx, fx.Adapter, identity, 1<<20)
+		stdout, _, err := runtimesupport.ReadAllLogsErr(ctx, fx.Adapter, identity, 1<<20)
 		if err != nil {
 			lastLog = classifiedFault(err)
 			return fmt.Errorf("marker log read: %w", err)
 		}
-		if !containsLine(string(stdout), marker) {
+		if !runtimesupport.ContainsLine(stdout, marker) {
 			return fmt.Errorf("stdout = %q; want the marker before Stop", stdout)
 		}
 		return nil
@@ -350,40 +348,6 @@ func waitForWorkloadContainerRunning(
 		t.Fatalf("wait for running workload container: %v; last pod %q container=%q last log read=%q; %s",
 			err, last.Phase, lastState, lastLog, workloadPodDiagnostic(t, ctx, fx, identity))
 	}
-}
-
-// readWorkloadLogs paginates the adapter log seam without failing the test so
-// callers can report the classified fault instead of a bare read error.
-func readWorkloadLogs(
-	ctx context.Context,
-	adapter *runtimekube.Adapter,
-	identity reconcile.EffectIdentity,
-	limit int,
-) (stdout, stderr []byte, err error) {
-	var offset int64
-	for page := 0; page < 10000; page++ {
-		batch, err := adapter.Logs(ctx, reconcile.LogsRequest{
-			Identity:    identity,
-			AfterOffset: offset,
-			Limit:       limit,
-		})
-		if err != nil {
-			return stdout, stderr, fmt.Errorf("log read at offset %d: %w", offset, err)
-		}
-		for _, chunk := range batch.Chunks {
-			switch chunk.Stream {
-			case reconcile.LogStdout:
-				stdout = append(stdout, chunk.Data...)
-			case reconcile.LogStderr:
-				stderr = append(stderr, chunk.Data...)
-			}
-		}
-		if batch.NextOffset == offset {
-			return stdout, stderr, nil
-		}
-		offset = batch.NextOffset
-	}
-	return stdout, stderr, errors.New("log pagination did not terminate")
 }
 
 // classifiedFault names the stable public class and message of a fault so a

@@ -364,8 +364,8 @@ func (c *Libpod) StopContainer(ctx context.Context, name string) error {
 // RemoveContainer removes one container without touching its named volumes.
 //
 // Removal is deliberately not forced. The adapter only calls this seam after
-// affirmative evidence that the container is created-never-started or has
-// whole-container stop evidence, and a non-forced DELETE refuses a container
+// affirmative whole-container stop evidence (exited with whole-container stop,
+// never created-unconfirmed), and a non-forced DELETE refuses a container
 // that another controller started in the meantime instead of silently killing
 // it. A running container must be stopped first; the refusal is surfaced as an
 // uncertain removal, never as success.

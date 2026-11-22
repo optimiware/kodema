@@ -113,6 +113,14 @@ func describeContainerState(state ContainerState) string {
 		state.Status, state.Started, state.StartPending, state.WholeStopped)
 }
 
+// isTransientTempFile reports whether name is an atomic-write staging file
+// created either by replaceFile (KODEMA_TOKEN.tmp-*) or by the production host
+// file boundary (.kodema-write-*).
+func isTransientTempFile(name string) bool {
+	return strings.HasPrefix(name, string(id.SecretTokenName)+".tmp-") ||
+		strings.HasPrefix(name, ".kodema-write-")
+}
+
 // redactionValues reads every configured secret and credential file directly
 // from the isolated <root>/<workload>/secrets directory, returning non-empty
 // values longest first. A missing/unreadable/non-directory secrets root, a
@@ -132,7 +140,6 @@ func (a *Adapter) redactionValues(ctx context.Context, workload id.WorkloadID) (
 		return nil, err
 	}
 
-	tempPrefix := string(id.SecretTokenName) + ".tmp-"
 	present := make(map[string]bool, len(entries))
 	values := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -143,7 +150,7 @@ func (a *Adapter) redactionValues(ctx context.Context, workload id.WorkloadID) (
 		path := filepath.Join(dir, name)
 		info, err := a.files.Lstat(ctx, path)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) && strings.HasPrefix(name, tempPrefix) {
+			if errors.Is(err, os.ErrNotExist) && isTransientTempFile(name) {
 				continue
 			}
 			return nil, err
@@ -153,7 +160,7 @@ func (a *Adapter) redactionValues(ctx context.Context, workload id.WorkloadID) (
 		}
 		data, err := a.files.ReadFile(ctx, path)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) && strings.HasPrefix(name, tempPrefix) {
+			if errors.Is(err, os.ErrNotExist) && isTransientTempFile(name) {
 				continue
 			}
 			return nil, err

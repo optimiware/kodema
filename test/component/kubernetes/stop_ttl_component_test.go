@@ -75,12 +75,12 @@ func TestSuspensionClearsFinishedJobTTL(t *testing.T) {
 	fxShort.Adapter = shortLived
 
 	identity := testIdentity("exec-stop-ttl", "action-stop-ttl", "workload-stop-ttl", "idem-stop-ttl")
-	startPrepared(t, ctx, &fxShort, prepareRequest(
-		identity, workspaceID, "build", "",
+	startPrepared(t, ctx, &fxShort, workloadRequest(
+		identity, workspaceID,
 		// The workload finishes immediately, so the Job becomes Complete and its
 		// finished-Job TTL starts counting before Stop observes it: the race
 		// described above, made deterministic.
-		testContainer([]string{`printf 'ttl-stop-marker\n'`}, nil), nil, "tok-stop-ttl",
+		[]string{`printf 'ttl-stop-marker\n'`}, "tok-stop-ttl",
 	))
 
 	jobBefore := waitForJobSettled(t, ctx, fx.Client, identity)

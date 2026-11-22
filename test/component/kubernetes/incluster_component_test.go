@@ -17,6 +17,7 @@ import (
 	"github.com/optimiware/kodema/internal/id"
 	driverkube "github.com/optimiware/kodema/internal/server/drivers/kube"
 	kubesupport "github.com/optimiware/kodema/test/support/infrastructure/kubernetes"
+	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // TestServiceAccountTokenFileAuthentication proves the real API accepts the
@@ -81,7 +82,7 @@ func TestServiceAccountTokenFileAuthentication(t *testing.T) {
 	if err := read(); err == nil {
 		t.Fatal("GetConfigMap with an invalid replacement token = nil; want an authentication refusal")
 	} else {
-		requireFaultClass(t, err, fault.DependencyUnavailable)
+		runtimesupport.RequireFaultClass(t, err, fault.DependencyUnavailable)
 		requireNoCredential(t, err, token)
 	}
 
@@ -104,7 +105,7 @@ func TestServiceAccountTokenFileAuthentication(t *testing.T) {
 	for {
 		err := read()
 		if err != nil {
-			requireFaultClass(t, err, fault.DependencyUnavailable)
+			runtimesupport.RequireFaultClass(t, err, fault.DependencyUnavailable)
 			requireNoCredential(t, err, token)
 			break
 		}

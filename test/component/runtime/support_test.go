@@ -21,7 +21,6 @@ import (
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
-	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
 	processdriver "github.com/optimiware/kodema/internal/server/drivers/process"
@@ -29,7 +28,7 @@ import (
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
-const testKodemaURL = "https://kodema.example.com"
+const testKodemaURL = runtimesupport.StandardKodemaURL
 
 // TestMain installs the harness signal handler and dead-owner sweep, then
 // removes only the runtime-labelled containers and volumes this run owns. The
@@ -66,54 +65,9 @@ func testIdentityInScope(scope runtimesupport.Scope, execution, action, workload
 	}
 }
 
-func testContainer(image string, commands []string, env []definition.EnvVar, secrets []id.SecretName) definition.Container {
-	return definition.Container{
-		Image:    image,
-		Commands: commands,
-		Env:      env,
-		Secrets:  secrets,
-	}
-}
-
-func testPrepareRequest(
-	identity reconcile.EffectIdentity,
-	workspaceID id.WorkspaceID,
-	actionName id.ActionName,
-	taskID id.TaskID,
-	container definition.Container,
-	secrets []reconcile.SecretValue,
-	credential string,
-) reconcile.PrepareRequest {
-	return reconcile.PrepareRequest{
-		Identity:    identity,
-		WorkspaceID: workspaceID,
-		ActionName:  actionName,
-		TaskID:      taskID,
-		Container:   container,
-		Secrets:     secrets,
-		Inputs: map[id.InputKey]string{
-			"input-a": "line1\nline2\n",
-		},
-		Outputs: map[id.ActionName]engine.Outputs{
-			"earlier": {"out-a": "earlier-output"},
-		},
-		Task:       []byte(`{"id":"task-1"}`),
-		Credential: credential,
-	}
-}
-
-func assertFaultClass(t *testing.T, err error, want fault.Class) {
+func waitObservation(t testing.TB, ctx context.Context, rt reconcile.Runtime, req reconcile.ObserveRequest, want engine.ObservationKind) engine.Observation {
 	t.Helper()
-	if err == nil {
-		t.Fatalf("error = nil; want fault class %s", want)
-	}
-	class, ok := fault.ClassOf(err)
-	if !ok {
-		t.Fatalf("error %v carries no fault class; want %s", err, want)
-	}
-	if class != want {
-		t.Fatalf("fault class = %s; want %s (error %v)", class, want, err)
-	}
+	return runtimesupport.WaitForObservation(t, ctx, rt, req, 0, 0, runtimesupport.ObservationKindIs(want))
 }
 
 // waitForFile waits for a file to exist. It is a barrier with a bounded
@@ -155,73 +109,6 @@ func waitForContent(t *testing.T, ctx context.Context, path, want string) {
 	}
 }
 
-// waitForProcessStop retries the stop barrier until the adapter affirms
-// whole-group termination. A signal acknowledgment alone is not confirmation,
-// so the barrier is observed, not assumed.
-func waitForProcessStop(t *testing.T, ctx context.Context, adapter *process.Adapter, request reconcile.StopRequest) engine.StopEvidence {
-	t.Helper()
-	var last engine.StopEvidence
-	probe := func(ctx context.Context) error {
-		evidence, err := adapter.Stop(ctx, request)
-		last = evidence
-		if err != nil {
-			return err
-		}
-		if !evidence.IsConfirmed() {
-			return errors.New("stop is not confirmed yet")
-		}
-		return nil
-	}
-	if err := harness.WaitReady(ctx, harness.RealClock{}, "process stop barrier", probe, harness.DefaultWaitOptions()); err != nil {
-		t.Fatalf("wait for process stop: %v (last %+v)", err, last)
-	}
-	return last
-}
-
-// waitForProcessObservation waits for the adapter to report the wanted kind.
-func waitForProcessObservation(t *testing.T, ctx context.Context, adapter *process.Adapter, request reconcile.ObserveRequest, want engine.ObservationKind) engine.Observation {
-	t.Helper()
-	var last engine.Observation
-	probe := func(ctx context.Context) error {
-		observation, err := adapter.Observe(ctx, request)
-		if err != nil {
-			return err
-		}
-		last = observation
-		if observation.Kind != want {
-			return errors.New("observation kind does not match yet")
-		}
-		return nil
-	}
-	if err := harness.WaitReady(ctx, harness.RealClock{}, "process observation", probe, harness.DefaultWaitOptions()); err != nil {
-		t.Fatalf("wait for process observation %s: %v (last %+v)", want, err, last)
-	}
-	return last
-}
-
-// waitForPodmanStop retries the stop barrier until the adapter affirms
-// whole-container termination. A stop acknowledgment alone is not
-// confirmation.
-func waitForPodmanStop(t *testing.T, ctx context.Context, adapter *podman.Adapter, request reconcile.StopRequest) engine.StopEvidence {
-	t.Helper()
-	var last engine.StopEvidence
-	probe := func(ctx context.Context) error {
-		evidence, err := adapter.Stop(ctx, request)
-		last = evidence
-		if err != nil {
-			return err
-		}
-		if !evidence.IsConfirmed() {
-			return errors.New("stop is not confirmed yet")
-		}
-		return nil
-	}
-	if err := harness.WaitReady(ctx, harness.RealClock{}, "podman stop barrier", probe, harness.DefaultWaitOptions()); err != nil {
-		t.Fatalf("wait for podman stop: %v (last %+v)", err, last)
-	}
-	return last
-}
-
 // podmanContainerNames returns the containers bound to one workspace.
 func podmanContainerNames(t *testing.T, ctx context.Context, workspaceID id.WorkspaceID) []string {
 	t.Helper()
@@ -230,28 +117,6 @@ func podmanContainerNames(t *testing.T, ctx context.Context, workspaceID id.Work
 		t.Fatalf("list workspace containers: %v", err)
 	}
 	return names
-}
-
-// waitForPodmanObservation waits for the Podman adapter to report the wanted
-// kind.
-func waitForPodmanObservation(t *testing.T, ctx context.Context, adapter *podman.Adapter, request reconcile.ObserveRequest, want engine.ObservationKind) engine.Observation {
-	t.Helper()
-	var last engine.Observation
-	probe := func(ctx context.Context) error {
-		observation, err := adapter.Observe(ctx, request)
-		if err != nil {
-			return err
-		}
-		last = observation
-		if observation.Kind != want {
-			return errors.New("observation kind does not match yet")
-		}
-		return nil
-	}
-	if err := harness.WaitReady(ctx, harness.RealClock{}, "podman observation", probe, harness.DefaultWaitOptions()); err != nil {
-		t.Fatalf("wait for podman observation %s: %v (last %+v)", want, err, last)
-	}
-	return last
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +195,22 @@ func newProcessAdapter(t *testing.T, f *processFixture, driver *processdriver.Dr
 	return adapter
 }
 
+func (f *processFixture) request(
+	identity reconcile.EffectIdentity,
+	commands []string,
+	env []definition.EnvVar,
+	secrets []reconcile.SecretValue,
+	credential string,
+) reconcile.PrepareRequest {
+	image := "registry.example.com/tools/build@sha256:" + strings.Repeat("a", 64)
+	req := runtimesupport.StandardPrepareRequest(identity, f.workspaceID, image, commands)
+	req.Container.Env = env
+	req.Container.Secrets = secretNames(secrets)
+	req.Secrets = secrets
+	req.Credential = credential
+	return req
+}
+
 // ---------------------------------------------------------------------------
 // Podman fixture
 // ---------------------------------------------------------------------------
@@ -344,6 +225,7 @@ type podmanFixture struct {
 	volumeName  string
 	image       runtimesupport.PinnedImage
 	shardID     string
+	caFile      string
 }
 
 // newPodmanFixture builds a fixture in this process's run scope.
@@ -407,11 +289,12 @@ func newPodmanAdapter(t *testing.T, f *podmanFixture, wrapper podman.Libpod) (*p
 	// a post-run sweep can never select a foreign or live-owner container.
 	client = runtimesupport.ScopedLibpod(client)
 	adapter, err := podman.New(podman.Config{
-		Libpod:    client,
-		Files:     files,
-		Root:      f.root,
-		KodemaURL: testKodemaURL,
-		Cleanup:   podman.CleanupPolicy{Attempts: 3, Backoff: 100 * time.Millisecond},
+		Libpod:         client,
+		Files:          files,
+		Root:           f.root,
+		KodemaURL:      testKodemaURL,
+		WorkloadCAFile: f.caFile,
+		Cleanup:        podman.CleanupPolicy{Attempts: 3, Backoff: 100 * time.Millisecond},
 	})
 	if err != nil {
 		t.Fatalf("podman adapter: %v", err)
@@ -420,8 +303,35 @@ func newPodmanAdapter(t *testing.T, f *podmanFixture, wrapper podman.Libpod) (*p
 }
 
 func (f *podmanFixture) request(identity reconcile.EffectIdentity, commands []string, env []definition.EnvVar, secrets []reconcile.SecretValue, credential string) reconcile.PrepareRequest {
-	return testPrepareRequest(identity, f.workspaceID, "build", "task-1",
-		testContainer(f.image.Reference, commands, env, secretNames(secrets)), secrets, credential)
+	req := runtimesupport.StandardPrepareRequest(identity, f.workspaceID, f.image.Reference, commands)
+	req.Container.Env = env
+	req.Container.Secrets = secretNames(secrets)
+	req.Secrets = secrets
+	req.Credential = credential
+	return req
+}
+
+func (f *podmanFixture) harness(t testing.TB) runtimesupport.ContainerHarness {
+	t.Helper()
+	return runtimesupport.ContainerHarness{
+		Runtime:          f.adapter,
+		Workspace:        f.adapter,
+		WorkspaceID:      f.workspaceID,
+		Image:            f.image.Reference,
+		KodemaURL:        testKodemaURL,
+		ExpectWorkloadCA: f.caFile != "",
+		NewIdentity: func(_ testing.TB, label string) reconcile.EffectIdentity {
+			return testIdentity("exec-"+label, "action-"+label, "workload-"+label, "idem-"+label)
+		},
+		ReadWorkspaceFile: func(t testing.TB, ctx context.Context, path string) string {
+			t.Helper()
+			data, found := runtimesupport.ReadVolumeFile(ctx, t, f.volumeName, path)
+			if !found {
+				t.Fatalf("workspace file %q is missing", path)
+			}
+			return string(data)
+		},
+	}
 }
 
 func secretNames(secrets []reconcile.SecretValue) []id.SecretName {

@@ -79,11 +79,13 @@ func DocumentDigest(document []byte) string {
 var outputSubmissionTemplate string
 
 // OutputSubmissionScript builds one shell command that submits declared outputs
-// through the workload's mounted execution credential. caFile is the declared
-// CA secret mount (empty means the image's system roots). The script reads the
-// current action id from its own inspection, re-reads the token for each call,
-// bounds bodies, refuses redirects and retries only an explicit
-// version_conflict with a fresh per-action key.
+// through the workload's mounted execution credential. caFile is an explicit
+// CA bundle path inside the container; when empty, the generated script falls
+// back to the runtime-provided KODEMA_CA_FILE environment variable and then to
+// the image's system roots. The script reads the current action id from its
+// own inspection, re-reads the token for each call, bounds bodies, refuses
+// redirects and retries only an explicit version_conflict with a fresh
+// per-action key.
 func OutputSubmissionScript(outputs map[string]string, caFile string) (string, error) {
 	if len(outputs) == 0 || len(outputs) > 16 {
 		return "", fmt.Errorf("output submission needs 1..16 outputs")

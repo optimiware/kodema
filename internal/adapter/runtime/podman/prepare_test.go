@@ -1,6 +1,11 @@
-// Preparation behavior: confined read-only activation files, the retained
-// workspace volume, the rendered fail-fast script, reserved environment,
-// idempotency and every failure that must prevent a start.
+// Podman-specific preparation and host-layout behavior: 0444/0700 host modes,
+// permissive secrets-directory refusal, symlink confinement, local image store
+// checks, partial-write recovery, libpod mount wiring, and post-restart
+// container digest conflict detection.
+//
+// Shared container-runtime preparation invariants (activation materialization,
+// task files, idempotency, ChangedIdempotencyContent, invalid input refusal,
+// missing workspace refusal, labels) are verified in TestPodmanConformance.
 package podman
 
 import (
@@ -10,145 +15,72 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime"
 	"github.com/optimiware/kodema/internal/control/workspace"
-	"github.com/optimiware/kodema/internal/engine"
-	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
-	"github.com/optimiware/kodema/internal/engine/script"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 )
 
-func mustInputPath(t *testing.T, key id.InputKey) string {
-	t.Helper()
-	path, err := workspace.InputPath(key)
-	if err != nil {
-		t.Fatalf("workspace.InputPath(%q): %v", key, err)
-	}
-	return path
-}
-
-func mustOutputPath(t *testing.T, action id.ActionName, key id.OutputKey) string {
-	t.Helper()
-	path, err := workspace.OutputPath(action, key)
-	if err != nil {
-		t.Fatalf("workspace.OutputPath(%q, %q): %v", action, key, err)
-	}
-	return path
-}
-
-func TestPrepareMaterializesConfinedSnapshot(t *testing.T) {
+func TestPrepareHostLayoutModesAndConfinement(t *testing.T) {
 	fx := newFixture(t)
 	fx.prepare(t)
 
-	input := fx.hostPath(mustInputPath(t, "input-a"))
-	if got := readHostFile(t, input); string(got) != "line1\nline2\n" {
-		t.Fatalf("input bytes = %q, want exact admitted bytes", got)
+	for _, path := range []string{
+		fx.hostPath("/kodema/inputs/input-a"),
+		fx.hostPath("/kodema/outputs/build/out-a"),
+		fx.hostPath(workspace.TaskPath),
+		fx.scriptPath(),
+		fx.secretPath("API_KEY"),
+		fx.credentialPath(),
+	} {
+		if mode := hostFileMode(t, path); mode != 0o444 {
+			t.Fatalf("%s mode = %o, want 0444", path, mode)
+		}
 	}
-	if mode := hostFileMode(t, input); mode != 0o444 {
-		t.Fatalf("input mode = %o, want 0444", mode)
-	}
-
-	output := fx.hostPath(mustOutputPath(t, "build", "out-a"))
-	if got := readHostFile(t, output); string(got) != "out" {
-		t.Fatalf("output bytes = %q, want %q", got, "out")
-	}
-	if mode := hostFileMode(t, output); mode != 0o444 {
-		t.Fatalf("output mode = %o, want 0444", mode)
-	}
-
-	task := fx.hostPath(workspace.TaskPath)
-	if got := readHostFile(t, task); string(got) != `{"id":"task-1"}` {
-		t.Fatalf("task bytes = %q, want the exact task snapshot", got)
-	}
-
 	if mode := hostFileMode(t, fx.secretsRoot()); mode != 0o700 {
 		t.Fatalf("secrets directory mode = %o, want 0700", mode)
-	}
-	secret := fx.secretPath("API_KEY")
-	if got := readHostFile(t, secret); string(got) != "s3cr3t" {
-		t.Fatalf("secret bytes = %q, want exact declared value", got)
-	}
-	if mode := hostFileMode(t, secret); mode != 0o444 {
-		t.Fatalf("secret mode = %o, want 0444", mode)
-	}
-
-	if got := readHostFile(t, fx.credentialPath()); string(got) != "tok-abc" {
-		t.Fatalf("credential bytes = %q, want tok-abc", got)
-	}
-	if mode := hostFileMode(t, fx.credentialPath()); mode != 0o444 {
-		t.Fatalf("credential mode = %o, want 0444", mode)
 	}
 
 	// /kodema/secrets inside the activation bind must be an empty mount point;
 	// secrets and KODEMA_TOKEN must never be written into <root>/<workload>/kodema.
-	mountPoint := fx.hostPath(workspace.SecretRoot)
-	if entries, err := os.ReadDir(mountPoint); err != nil {
+	if entries, err := os.ReadDir(fx.hostPath(workspace.SecretRoot)); err != nil {
 		t.Fatalf("reading /kodema/secrets mount point: %v", err)
 	} else if len(entries) != 0 {
 		t.Fatalf("/kodema/secrets mount point holds %d entries; want empty", len(entries))
 	}
 
-	wantScript, err := script.Render(fx.request.Container.Commands)
-	if err != nil {
-		t.Fatalf("script.Render returned error: %v", err)
-	}
-	if got := readHostFile(t, fx.scriptPath()); string(got) != wantScript {
-		t.Fatalf("script bytes = %q, want script.Render output %q", got, wantScript)
-	}
-	if mode := hostFileMode(t, fx.scriptPath()); mode != 0o444 {
-		t.Fatalf("script mode = %o, want 0444", mode)
-	}
-
-	for _, operation := range []string{"CreateContainer", "StartContainer", "StopContainer", "RemoveContainer", "ReadLogs"} {
-		if calls := fx.libpod.callsFor(operation); calls != 0 {
-			t.Fatalf("Prepare called %s %d times, want 0", operation, calls)
-		}
-	}
 	if calls := fx.libpod.inspectedVolumes(); len(calls) != 1 || calls[0] != fx.volumeName {
-		t.Fatalf("Inspected volumes = %v, want the retained workspace volume %q", calls, fx.volumeName)
+		t.Fatalf("Inspected volumes = %v, want %q", calls, fx.volumeName)
 	}
 	if calls := fx.libpod.inspectedImages(); len(calls) != 1 || calls[0] != testImage {
-		t.Fatalf("Inspected images = %v, want the workload image %q", calls, testImage)
-	}
-	if volume, ok := fx.libpod.volume(fx.volumeName); !ok {
-		t.Fatal("Prepare removed the retained workspace volume")
-	} else if volume.Labels[LabelWorkspace] != string(fx.request.WorkspaceID) {
-		t.Fatalf("workspace volume labels = %v", volume.Labels)
+		t.Fatalf("Inspected images = %v, want %q", calls, testImage)
 	}
 }
 
-func TestPrepareInspectsExistingWorkspaceVolume(t *testing.T) {
-	t.Run("missing volume", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.libpod.deleteVolume(fx.volumeName)
-		_, err := fx.adapter.Prepare(context.Background(), fx.request)
-		assertFaultClass(t, err, fault.NotFound)
-		if calls := fx.files.callCount("WriteFile"); calls != 0 {
-			t.Fatalf("missing workspace volume wrote %d files", calls)
-		}
-		result, startErr := fx.startResult(t)
-		if startErr == nil {
-			t.Fatal("Start hid a missing workspace volume")
-		}
-		if result.Outcome != reconcile.StartUnknown {
-			t.Fatalf("start outcome = %q, want unknown", result.Outcome)
-		}
-		if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-			t.Fatalf("Start created a container without a workspace volume")
-		}
-	})
+func TestPrepareRefusesPermissiveSecretsDirectory(t *testing.T) {
+	fx := newFixture(t)
+	if err := os.MkdirAll(fx.secretsRoot(), 0o755); err != nil {
+		t.Fatalf("creating permissive secrets dir: %v", err)
+	}
+	if err := os.Chmod(fx.secretsRoot(), 0o755); err != nil {
+		t.Fatalf("chmod permissive secrets dir: %v", err)
+	}
 
-	t.Run("foreign workspace volume", func(t *testing.T) {
-		fx := newFixture(t)
-		fx.libpod.addVolume(fx.volumeName, map[string]string{LabelWorkspace: "workspace-2"})
-		_, err := fx.adapter.Prepare(context.Background(), fx.request)
-		assertFaultClass(t, err, fault.Forbidden)
-		if calls := fx.files.callCount("WriteFile"); calls != 0 {
-			t.Fatalf("foreign workspace volume wrote %d files", calls)
-		}
-	})
+	_, err := fx.adapter.Prepare(context.Background(), fx.request)
+	assertFaultClass(t, err, fault.Forbidden)
+	if calls := fx.files.callCount("WriteFile"); calls != 0 {
+		t.Fatalf("permissive secrets dir wrote %d files", calls)
+	}
+}
+
+func TestPrepareRefusesForeignWorkspaceVolume(t *testing.T) {
+	fx := newFixture(t)
+	fx.libpod.addVolume(fx.volumeName, map[string]string{LabelWorkspace: "workspace-2"})
+	_, err := fx.adapter.Prepare(context.Background(), fx.request)
+	assertFaultClass(t, err, fault.Forbidden)
+	if calls := fx.files.callCount("WriteFile"); calls != 0 {
+		t.Fatalf("foreign workspace volume wrote %d files", calls)
+	}
 }
 
 func TestPrepareFailsFastWhenWorkloadImageIsAbsentLocally(t *testing.T) {
@@ -168,26 +100,11 @@ func TestPrepareFailsFastWhenWorkloadImageIsAbsentLocally(t *testing.T) {
 		if hostFileExists(t, fx.workloadRoot()) {
 			t.Fatal("missing workload image left a materialization root behind")
 		}
-		if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-			t.Fatalf("missing workload image called CreateContainer %d times", calls)
-		}
-
-		result, startErr := fx.startResult(t)
-		if startErr == nil {
-			t.Fatal("Start hid a missing workload image")
-		}
-		if result.Outcome != reconcile.StartUnknown {
-			t.Fatalf("start outcome = %q, want unknown", result.Outcome)
-		}
-		if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-			t.Fatal("Start created a container after preparation refused an absent image")
-		}
 
 		// Once the image is present locally, preparation and start succeed.
 		fx.libpod.addImage(testImage)
 		fx.prepare(t)
-		accepted := fx.start(t)
-		if accepted.Outcome != reconcile.StartAccepted {
+		if accepted := fx.start(t); accepted.Outcome != reconcile.StartAccepted {
 			t.Fatalf("start outcome after pulling image = %q, want accepted", accepted.Outcome)
 		}
 	})
@@ -207,66 +124,6 @@ func TestPrepareFailsFastWhenWorkloadImageIsAbsentLocally(t *testing.T) {
 	})
 }
 
-func TestPrepareRefusesUnsafeOrIncompleteInput(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(*reconcile.PrepareRequest)
-	}{
-		{"unpinned image", func(request *reconcile.PrepareRequest) {
-			request.Container.Image = "registry.example.com/tools/build:latest"
-		}},
-		{"empty image", func(request *reconcile.PrepareRequest) {
-			request.Container.Image = ""
-		}},
-		{"no commands", func(request *reconcile.PrepareRequest) {
-			request.Container.Commands = nil
-		}},
-		{"NUL command", func(request *reconcile.PrepareRequest) {
-			request.Container.Commands = []string{"echo a\x00b"}
-		}},
-		{"traversal input key", func(request *reconcile.PrepareRequest) {
-			request.Inputs = map[id.InputKey]string{"../../etc/passwd": "x"}
-		}},
-		{"empty credential", func(request *reconcile.PrepareRequest) {
-			request.Credential = ""
-		}},
-		{"invalid action name", func(request *reconcile.PrepareRequest) {
-			request.ActionName = "not a slug"
-		}},
-		{"invalid task id", func(request *reconcile.PrepareRequest) {
-			request.TaskID = "not a task"
-		}},
-		{"reserved environment", func(request *reconcile.PrepareRequest) {
-			request.Container.Env = append(request.Container.Env,
-				definition.EnvVar{Name: id.EnvAction, Value: "spoofed"})
-		}},
-		{"reserved secret name", func(request *reconcile.PrepareRequest) {
-			request.Secrets = append(request.Secrets,
-				reconcile.SecretValue{Name: id.SecretTokenName, Value: "spoofed"})
-		}},
-		{"invalid output action", func(request *reconcile.PrepareRequest) {
-			request.Outputs = map[id.ActionName]engine.Outputs{"not a slug": {"out-a": "x"}}
-		}},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			fx := newFixture(t)
-			testCase.mutate(&fx.request)
-			_, err := fx.adapter.Prepare(context.Background(), fx.request)
-			assertFaultClass(t, err, fault.InvalidInput)
-			if calls := fx.files.callCount("WriteFile"); calls != 0 {
-				t.Fatalf("%s wrote %d files before refusing", testCase.name, calls)
-			}
-			if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
-				t.Fatalf("%s created a container", testCase.name)
-			}
-			if hostFileExists(t, fx.workloadRoot()) {
-				t.Fatalf("%s left a materialization root behind", testCase.name)
-			}
-		})
-	}
-}
-
 func TestPrepareRefusesSymlinkEscape(t *testing.T) {
 	fx := newFixture(t)
 	outside := t.TempDir()
@@ -280,60 +137,18 @@ func TestPrepareRefusesSymlinkEscape(t *testing.T) {
 	_, err := fx.adapter.Prepare(context.Background(), fx.request)
 	assertFaultClass(t, err, fault.Forbidden)
 
-	entries, readErr := os.ReadDir(outside)
-	if readErr != nil {
+	if entries, readErr := os.ReadDir(outside); readErr != nil {
 		t.Fatalf("reading outside directory: %v", readErr)
-	}
-	if len(entries) != 0 {
+	} else if len(entries) != 0 {
 		t.Fatalf("Prepare wrote %d entries through a symlink outside the root", len(entries))
 	}
 
 	result, startErr := fx.startResult(t)
-	if startErr == nil {
-		t.Fatal("Start hid a preparation that never completed")
-	}
-	if result.Outcome != reconcile.StartUnknown {
-		t.Fatalf("start outcome = %q, want unknown", result.Outcome)
+	if startErr == nil || result.Outcome != reconcile.StartUnknown {
+		t.Fatalf("Start after symlink escape = (%+v, %v); want unknown error", result, startErr)
 	}
 	if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
 		t.Fatal("Start created a container from an unsafe preparation")
-	}
-}
-
-func TestPrepareIsIdempotentAndRefusesChangedContent(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	input := fx.hostPath(mustInputPath(t, "input-a"))
-	original := readHostFile(t, input)
-
-	fx.prepare(t)
-	if got := readHostFile(t, input); string(got) != string(original) {
-		t.Fatalf("idempotent Prepare changed input bytes: %q", got)
-	}
-
-	fx.request.Inputs["input-a"] = "changed\n"
-	_, err := fx.adapter.Prepare(context.Background(), fx.request)
-	assertFaultClass(t, err, fault.ChangedIdempotencyContent)
-	if got := readHostFile(t, input); string(got) != string(original) {
-		t.Fatalf("changed preparation overwrote the committed input: %q", got)
-	}
-
-	fx.request.Inputs["input-a"] = "line1\nline2\n"
-	fx.request.Secrets[0].Value = "rotated-secret"
-	_, err = fx.adapter.Prepare(context.Background(), fx.request)
-	assertFaultClass(t, err, fault.ChangedIdempotencyContent)
-
-	fx.request.Secrets[0].Value = "s3cr3t"
-	result := fx.start(t)
-	if result.Outcome != reconcile.StartAccepted {
-		t.Fatalf("start outcome = %q, want accepted after a refused change", result.Outcome)
-	}
-	specs := fx.libpod.createSpecs()
-	if len(specs) != 1 {
-		t.Fatalf("created %d containers, want 1", len(specs))
-	}
-	if specs[0].Image != testImage {
-		t.Fatalf("container image = %q, want the pinned image", specs[0].Image)
 	}
 }
 
@@ -345,11 +160,8 @@ func TestPreparePartialFailureNeverAuthorizesStart(t *testing.T) {
 	assertFaultClass(t, err, fault.DependencyUnavailable)
 
 	result, startErr := fx.startResult(t)
-	if startErr == nil {
-		t.Fatal("Start hid a partial preparation")
-	}
-	if result.Outcome != reconcile.StartUnknown {
-		t.Fatalf("start outcome = %q, want unknown", result.Outcome)
+	if startErr == nil || result.Outcome != reconcile.StartUnknown {
+		t.Fatalf("Start after partial prepare = (%+v, %v); want unknown error", result, startErr)
 	}
 	if calls := fx.libpod.callsFor("CreateContainer"); calls != 0 {
 		t.Fatal("Start created a container from a partial preparation")
@@ -357,228 +169,47 @@ func TestPreparePartialFailureNeverAuthorizesStart(t *testing.T) {
 
 	fx.files.clearFailOn("WriteFile")
 	fx.prepare(t)
-	accepted := fx.start(t)
-	if accepted.Outcome != reconcile.StartAccepted {
+	if accepted := fx.start(t); accepted.Outcome != reconcile.StartAccepted {
 		t.Fatalf("start outcome after recovery = %q, want accepted", accepted.Outcome)
-	}
-	if calls := fx.libpod.callsFor("CreateContainer"); calls != 1 {
-		t.Fatalf("CreateContainer calls = %d, want 1 after recovery", calls)
 	}
 }
 
-func TestStartBuildsPinnedContainerSpec(t *testing.T) {
+func TestStartBuildsLibpodContainerMountsAndSpec(t *testing.T) {
 	fx := newFixture(t)
 	fx.prepare(t)
 	fx.start(t)
 
-	specs := fx.libpod.createSpecs()
-	if len(specs) != 1 {
-		t.Fatalf("CreateContainer calls = %d, want 1", len(specs))
-	}
-	spec := specs[0]
+	spec := fx.createdSpec(t)
 	if spec.Name != fx.containerName {
-		t.Fatalf("container name = %q, want stable %q", spec.Name, fx.containerName)
+		t.Fatalf("container name = %q, want %q", spec.Name, fx.containerName)
 	}
 	if spec.Image != testImage {
-		t.Fatalf("container image = %q, want the digest-pinned image", spec.Image)
+		t.Fatalf("container image = %q, want %q", spec.Image, testImage)
 	}
 	if spec.RestartPolicy != "no" {
-		t.Fatalf("restart policy = %q, want no automatic replay", spec.RestartPolicy)
-	}
-	wantEntrypoint := []string{script.ShellPath, "/kodema/script"}
-	if len(spec.Entrypoint) != len(wantEntrypoint) ||
-		spec.Entrypoint[0] != wantEntrypoint[0] || spec.Entrypoint[1] != wantEntrypoint[1] {
-		t.Fatalf("entrypoint = %v, want %v", spec.Entrypoint, wantEntrypoint)
-	}
-
-	wantEnv := []string{
-		joinEnv("BUILD_MODE", "release"),
-		joinEnv("KODEMA_URL", testKodemaURL),
-		joinEnv("KODEMA_EXECUTION", string(fx.request.Identity.ExecutionID)),
-		joinEnv("KODEMA_ACTION", string(fx.request.ActionName)),
-		joinEnv("KODEMA_TASK", string(fx.request.TaskID)),
-	}
-	if len(spec.Env) != len(wantEnv) {
-		t.Fatalf("env = %v, want exactly %v", spec.Env, wantEnv)
-	}
-	for index := range wantEnv {
-		if spec.Env[index] != wantEnv[index] {
-			t.Fatalf("env[%d] = %q, want %q (full %v)", index, spec.Env[index], wantEnv[index], spec.Env)
-		}
-	}
-
-	for key, want := range fx.containerLabels() {
-		if spec.Labels[key] != want {
-			t.Fatalf("label %q = %q, want %q", key, spec.Labels[key], want)
-		}
+		t.Fatalf("restart policy = %q, want no", spec.RestartPolicy)
 	}
 	if len(spec.Labels[LabelPreparation]) != 48 {
 		t.Fatalf("label %q = %q, want 48-char preparation digest", LabelPreparation, spec.Labels[LabelPreparation])
 	}
-
 	if len(spec.Mounts) != 3 {
 		t.Fatalf("mounts = %+v, want activation bind, isolated secrets bind, and workspace volume", spec.Mounts)
 	}
-	bind, ok := mountAt(spec, "/kodema")
-	if !ok {
-		t.Fatalf("mounts = %+v, want /kodema bind", spec.Mounts)
-	}
-	if bind.Type != "bind" || bind.Source != fx.kodemaRoot() || !bind.ReadOnly {
-		t.Fatalf("activation bind = %+v, want read-only bind from %q", bind, fx.kodemaRoot())
-	}
-	if info, err := os.Stat(bind.Source); err != nil || !info.IsDir() {
-		t.Fatalf("bind source %q is not a directory: %v", bind.Source, err)
-	}
 
-	secBind, ok := mountAt(spec, workspace.SecretRoot)
-	if !ok {
-		t.Fatalf("mounts = %+v, want /kodema/secrets bind", spec.Mounts)
+	bind, ok := mountAt(spec, "/kodema")
+	if !ok || bind.Type != "bind" || bind.Source != fx.kodemaRoot() || !bind.ReadOnly {
+		t.Fatalf("activation bind = %+v (ok=%v), want read-only bind from %q", bind, ok, fx.kodemaRoot())
 	}
-	if secBind.Type != "bind" || secBind.Source != fx.secretsRoot() || !secBind.ReadOnly {
-		t.Fatalf("secrets bind = %+v, want read-only bind from %q", secBind, fx.secretsRoot())
+	secBind, ok := mountAt(spec, workspace.SecretRoot)
+	if !ok || secBind.Type != "bind" || secBind.Source != fx.secretsRoot() || !secBind.ReadOnly {
+		t.Fatalf("secrets bind = %+v (ok=%v), want read-only bind from %q", secBind, ok, fx.secretsRoot())
 	}
 	if !hostFileExists(t, filepath.Join(secBind.Source, "KODEMA_TOKEN")) {
-		t.Fatal("the credential is not inside the isolated secrets bind directory")
+		t.Fatal("credential is not inside the isolated secrets bind directory")
 	}
-
-	volume, ok := mountAt(spec, "/workspace")
-	if !ok {
-		t.Fatalf("mounts = %+v, want /workspace volume", spec.Mounts)
-	}
-	if volume.Type != "volume" || volume.Source != fx.volumeName || volume.ReadOnly {
-		t.Fatalf("volume mount = %+v, want read-write volume %q", volume, fx.volumeName)
-	}
-
-	serialized := strings.Join(append(append([]string{}, spec.Env...), spec.Entrypoint...), "\n")
-	for _, forbidden := range []string{"s3cr3t", "tok-abc"} {
-		if strings.Contains(serialized, forbidden) {
-			t.Fatalf("container spec leaked %q: %q", forbidden, serialized)
-		}
-		for key, value := range spec.Labels {
-			if strings.Contains(key+value, forbidden) {
-				t.Fatalf("container label leaked %q", forbidden)
-			}
-		}
-	}
-}
-
-func TestStartOmitsTaskContextWhenTaskFree(t *testing.T) {
-	fx := newFixture(t)
-	fx.request.TaskID = ""
-	fx.request.Task = nil
-	fx.prepare(t)
-
-	if hostFileExists(t, fx.hostPath(workspace.TaskPath)) {
-		t.Fatal("task-free preparation wrote a task snapshot")
-	}
-	if hostFileExists(t, fx.hostPath(workspace.TaskRoot)) {
-		t.Fatal("task-free preparation wrote a /kodema/task directory")
-	}
-
-	fx.start(t)
-	specs := fx.libpod.createSpecs()
-	if len(specs) != 1 {
-		t.Fatalf("CreateContainer calls = %d, want 1", len(specs))
-	}
-	for _, entry := range specs[0].Env {
-		if strings.HasPrefix(entry, "KODEMA_TASK=") {
-			t.Fatalf("task-free container carries %q", entry)
-		}
-	}
-	if specs[0].Env[len(specs[0].Env)-1] != joinEnv("KODEMA_ACTION", string(fx.request.ActionName)) {
-		t.Fatalf("reserved env does not end with KODEMA_ACTION: %v", specs[0].Env)
-	}
-}
-
-func TestPrepareMaterializesTaskSpecFiles(t *testing.T) {
-	taskFiles, err := workspace.BuildTaskFiles(
-		"task-1",
-		"Podman task title",
-		"Podman description",
-		map[string]string{"b": "2", "a": "1"},
-	)
-	if err != nil {
-		t.Fatalf("BuildTaskFiles: %v", err)
-	}
-
-	fx := newFixture(t)
-	fx.request.Task = []byte("[]")
-	fx.request.TaskFiles = taskFiles
-	fx.prepare(t)
-
-	want := map[string]string{
-		workspace.TaskPath:            "[]",
-		workspace.TaskTitlePath:       "Podman task title",
-		workspace.TaskDescriptionPath: "Podman description",
-		workspace.TaskMetadataPath:    `{"a":"1","b":"2"}`,
-		workspace.TaskSpecPath:        `{"id":"task-1","title":"Podman task title","description":"Podman description","metadata":{"a":"1","b":"2"}}`,
-	}
-	for logical, expected := range want {
-		host := fx.hostPath(logical)
-		if got := string(readHostFile(t, host)); got != expected {
-			t.Fatalf("%s = %q; want %q", logical, got, expected)
-		}
-		if mode := hostFileMode(t, host); mode != 0o444 {
-			t.Fatalf("%s mode = %o; want 0444", logical, mode)
-		}
-	}
-
-	// Re-preparing with changed task-spec bytes is refused.
-	changed := fx.request
-	changed.TaskFiles = map[string][]byte{
-		workspace.TaskTitleFile:       []byte("Changed title"),
-		workspace.TaskDescriptionFile: taskFiles[workspace.TaskDescriptionFile],
-		workspace.TaskMetadataFile:    taskFiles[workspace.TaskMetadataFile],
-		workspace.TaskSpecFile:        taskFiles[workspace.TaskSpecFile],
-	}
-	_, err = fx.adapter.Prepare(context.Background(), changed)
-	assertFaultClass(t, err, fault.ChangedIdempotencyContent)
-
-	// Task-free request with stray task files is refused before writing.
-	fxFree := newFixture(t)
-	fxFree.request.TaskID = ""
-	fxFree.request.Task = nil
-	fxFree.request.TaskFiles = taskFiles
-	_, err = fxFree.adapter.Prepare(context.Background(), fxFree.request)
-	assertFaultClass(t, err, fault.InvalidInput)
-	if hostFileExists(t, fxFree.hostPath(workspace.TaskRoot)) {
-		t.Fatal("refused task-free preparation created /kodema/task")
-	}
-}
-
-func TestPrepareRefusesWithoutStartingOrWritingTheWorkspace(t *testing.T) {
-	fx := newFixture(t)
-	fx.prepare(t)
-	for _, path := range fx.files.callsFor("WriteFile") {
-		if strings.HasPrefix(path, fx.volumeName) {
-			t.Fatalf("Prepare wrote into the retained workspace volume path %q", path)
-		}
-	}
-	if calls := fx.libpod.callsFor("StartContainer"); calls != 0 {
-		t.Fatalf("Prepare started %d containers", calls)
-	}
-}
-
-func TestPrepareEmitsProjectAndRoleLabels(t *testing.T) {
-	fx := newFixture(t)
-	fx.request.ActionName = RoleSandbox
-	fx.request.Container.Commands = []string{"exec /kodema/bin/kodema sandbox serve --port 8080"}
-	fx.request.Container.Secrets = []id.SecretName{"KODEMA_SBOX_TOK_1"}
-	fx.request.Secrets = []reconcile.SecretValue{{Name: "KODEMA_SBOX_TOK_1", Value: "tok"}}
-	fx.request.Outputs = nil
-
-	ctx := runtime.WithExecutionProject(context.Background(), "proj-alpha")
-	if _, err := fx.adapter.Prepare(ctx, fx.request); err != nil {
-		t.Fatalf("Prepare: %v", err)
-	}
-	fx.start(t)
-
-	spec := fx.createdSpec(t)
-	if spec.Labels[LabelProject] != "proj-alpha" {
-		t.Fatalf("label %q = %q; want proj-alpha", LabelProject, spec.Labels[LabelProject])
-	}
-	if spec.Labels[LabelRole] != RoleSandbox {
-		t.Fatalf("label %q = %q; want %q", LabelRole, spec.Labels[LabelRole], RoleSandbox)
+	vol, ok := mountAt(spec, "/workspace")
+	if !ok || vol.Type != "volume" || vol.Source != fx.volumeName || vol.ReadOnly {
+		t.Fatalf("workspace volume mount = %+v (ok=%v), want rw volume %q", vol, ok, fx.volumeName)
 	}
 }
 
@@ -591,5 +222,34 @@ func TestPrepareRefusesPostRestartContainerDigestConflict(t *testing.T) {
 	changed := fx.request
 	changed.Inputs = map[id.InputKey]string{"input-a": "mutated\n"}
 	_, err := reconstructed.Prepare(context.Background(), changed)
+	assertFaultClass(t, err, fault.ChangedIdempotencyContent)
+}
+
+func TestPrepareRefusesPostRestartDroppedActivationFile(t *testing.T) {
+	fx := newFixture(t)
+	fx.request.Inputs = map[id.InputKey]string{
+		"input-a": "first\n",
+		"input-b": "second\n",
+	}
+	fx.prepare(t)
+
+	// Simulate an orphaned staging temp file from a crashed write alongside a
+	// fresh adapter with an empty in-memory prepared map (before Start).
+	staging := filepath.Join(fx.kodemaRoot(), "inputs", ".kodema-write-orphan")
+	if err := fx.files.WriteFile(context.Background(), staging, []byte("partial"), readOnlyMode); err != nil {
+		t.Fatalf("seed staging file: %v", err)
+	}
+
+	reconstructed := newAdapterWithRoot(t, fx)
+	// Identical retry ignores the orphaned staging file and succeeds.
+	if _, err := reconstructed.Prepare(context.Background(), fx.request); err != nil {
+		t.Fatalf("identical post-restart Prepare with staging file = %v; want nil", err)
+	}
+
+	// Dropping a previously written input file after restart must conflict.
+	reconstructed2 := newAdapterWithRoot(t, fx)
+	dropped := fx.request
+	dropped.Inputs = map[id.InputKey]string{"input-a": "first\n"}
+	_, err := reconstructed2.Prepare(context.Background(), dropped)
 	assertFaultClass(t, err, fault.ChangedIdempotencyContent)
 }

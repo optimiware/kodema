@@ -220,11 +220,11 @@ func testRequestPass(t *testing.T, harness *factory.Harness) {
 	// Completed container logs must already be drained and readable while the
 	// downstream request action waits, before terminal execution cleanup removes
 	// the stopped container.
-	waitStdout := readActionLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stdout")
+	waitStdout := readActionStreamLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stdout")
 	if got := strings.Count(waitStdout, prepareStdoutMarker); got != 1 {
 		t.Fatalf("prepare stdout during request wait = %q; want %q once", waitStdout, prepareStdoutMarker)
 	}
-	waitStderr := readActionLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stderr")
+	waitStderr := readActionStreamLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stderr")
 	if got := strings.Count(waitStderr, prepareStderrMarker); got != 1 {
 		t.Fatalf("prepare stderr during request wait = %q; want %q once", waitStderr, prepareStderrMarker)
 	}
@@ -349,11 +349,11 @@ func testRequestPass(t *testing.T, harness *factory.Harness) {
 	// the already-drained action logs.
 	assertRequestSubject(t, harness, started.ExecutionID, "approve")
 	assertExecutionResourcesReleased(t, harness, started.ExecutionID)
-	afterStdout := readActionLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stdout")
+	afterStdout := readActionStreamLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stdout")
 	if got := strings.Count(afterStdout, prepareStdoutMarker); got != 1 {
 		t.Fatalf("prepare stdout after terminal cleanup = %q; want %q once (no duplicate drain)", afterStdout, prepareStdoutMarker)
 	}
-	afterStderr := readActionLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stderr")
+	afterStderr := readActionStreamLogs(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stderr")
 	if got := strings.Count(afterStderr, prepareStderrMarker); got != 1 {
 		t.Fatalf("prepare stderr after terminal cleanup = %q; want %q once (no duplicate drain)", afterStderr, prepareStderrMarker)
 	}
@@ -922,29 +922,6 @@ func requestResolveCurrent(t *testing.T, harness *factory.Harness, token, execut
 	return resolveOutcome{}
 }
 
-// cancelExecutionCurrent cancels one execution from the latest inspected
-// version, retrying a stale expected version from a fresh inspect.
-func cancelExecutionCurrent(t *testing.T, harness *factory.Harness, token, executionID, key string) api.ExecutionCancelResult {
-	t.Helper()
-	for range 20 {
-		current := inspectExecution(t, harness, harness.ProjectToken, executionID)
-		result, publicError := harness.REST(token, "execution.cancel", api.ExecutionCancelRequest{
-			ExecutionID: executionID,
-		}, &current.Version, key)
-		if publicError.Code == api.CodeVersionConflict {
-			continue
-		}
-		if publicError.Code != "" {
-			t.Fatalf("execution.cancel refused: %s (%s)", publicError.Code, publicError.Message)
-		}
-		var cancelled api.ExecutionCancelResult
-		harness.Decode(result, &cancelled)
-		return cancelled
-	}
-	t.Fatalf("execution.cancel did not converge on a current execution version")
-	return api.ExecutionCancelResult{}
-}
-
 // inboxRequests reads the request-kind inbox for one principal.
 func inboxRequests(t *testing.T, harness *factory.Harness, token string) api.TaskInboxResult {
 	t.Helper()
@@ -980,36 +957,6 @@ func readRequestEvents(t *testing.T, harness *factory.Harness, types ...string) 
 	var events api.EventReadResult
 	harness.Decode(result, &events)
 	return events
-}
-
-// readActionLogs drains every retained log page for one action and stream
-// through the public execution.logs.read operation.
-func readActionLogs(t *testing.T, harness *factory.Harness, token, executionID, actionID, stream string) string {
-	t.Helper()
-	var builder strings.Builder
-	cursor := ""
-	for range 64 {
-		req := api.ExecutionLogsReadRequest{
-			ExecutionID: executionID,
-			ActionID:    actionID,
-			Stream:      stream,
-		}
-		if cursor != "" {
-			req.Page = &api.Page{Cursor: cursor}
-		}
-		result := harness.MustREST(token, "execution.logs.read", req, nil, "")
-		var page api.ExecutionLogsReadResult
-		harness.Decode(result, &page)
-		for _, chunk := range page.Chunks {
-			_, _ = builder.Write(chunk.Data)
-		}
-		if page.NextCursor == "" {
-			return builder.String()
-		}
-		cursor = page.NextCursor
-	}
-	t.Fatalf("execution.logs.read for %s/%s (%s) exceeded 64 pages", executionID, actionID, stream)
-	return ""
 }
 
 // requireEvent proves one committed event of the exact type names one of the

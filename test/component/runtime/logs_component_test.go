@@ -43,33 +43,33 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 	if _, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	waitForPodmanObservation(t, ctx, fixture.adapter,
+	waitObservation(t, ctx, fixture.adapter,
 		reconcile.ObserveRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
 
 	// Read in one page so the configured values are whole in the chunk the
 	// adapter redacts; a value split across caller-chosen pages is outside the
 	// per-chunk redaction contract.
-	stdout, stderr := readAllLogs(t, ctx, fixture.adapter, identityValue, 1<<20)
+	stdout, stderr := runtimesupport.ReadAllLogs(t, ctx, fixture.adapter, identityValue, 1<<20)
 	wantStdout := "alpha\nbeta\n[REDACTED][REDACTED]"
 	wantStderr := "err-one\nerr-two\n"
-	if string(stdout) != wantStdout {
+	if stdout != wantStdout {
 		t.Fatalf("stdout = %q; want %q", stdout, wantStdout)
 	}
-	if string(stderr) != wantStderr {
+	if stderr != wantStderr {
 		t.Fatalf("stderr = %q; want %q", stderr, wantStderr)
 	}
-	if bytes.Contains(stdout, []byte("s3cr3t-value")) || bytes.Contains(stdout, []byte("tok-abc")) {
+	if strings.Contains(stdout, "s3cr3t-value") || strings.Contains(stdout, "tok-abc") {
 		t.Fatalf("retained output leaked secret material: %q", stdout)
 	}
 
 	// A reconstructed controller reads the same retained capture from zero.
 	recovered := newPodmanAdapterOnly(t, fixture)
-	recoveredStdout, recoveredStderr := readAllLogs(t, ctx, recovered, identityValue, 1<<20)
-	if !bytes.Equal(recoveredStdout, stdout) || !bytes.Equal(recoveredStderr, stderr) {
+	recoveredStdout, recoveredStderr := runtimesupport.ReadAllLogs(t, ctx, recovered, identityValue, 1<<20)
+	if recoveredStdout != stdout || recoveredStderr != stderr {
 		t.Fatalf("logs changed across controller restart: %q/%q vs %q/%q",
 			recoveredStdout, recoveredStderr, stdout, stderr)
 	}
-	if again, _ := readAllLogs(t, ctx, recovered, identityValue, 1<<20); !bytes.Equal(again, stdout) {
+	if again, _ := runtimesupport.ReadAllLogs(t, ctx, recovered, identityValue, 1<<20); again != stdout {
 		t.Fatalf("repeated log read is not stable: %q vs %q", again, stdout)
 	}
 
@@ -89,19 +89,19 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 	if _, err := recovered.Start(ctx, reconcile.StartRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); err != nil {
 		t.Fatalf("paged Start: %v", err)
 	}
-	waitForPodmanObservation(t, ctx, recovered,
+	waitObservation(t, ctx, recovered,
 		reconcile.ObserveRequest{Identity: paged, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
-	pagedStdout, pagedStderr := readAllLogs(t, ctx, recovered, paged, 3)
-	if string(pagedStdout) != "one\ntwo\nthree\n" {
+	pagedStdout, pagedStderr := runtimesupport.ReadAllLogs(t, ctx, recovered, paged, 3)
+	if pagedStdout != "one\ntwo\nthree\n" {
 		t.Fatalf("paged stdout = %q", pagedStdout)
 	}
-	if string(pagedStderr) != "err-a\nerr-b\n" {
+	if pagedStderr != "err-a\nerr-b\n" {
 		t.Fatalf("paged stderr = %q", pagedStderr)
 	}
-	if again, _ := readAllLogs(t, ctx, recovered, paged, 3); !bytes.Equal(again, pagedStdout) {
+	if again, _ := runtimesupport.ReadAllLogs(t, ctx, recovered, paged, 3); again != pagedStdout {
 		t.Fatalf("paged stdout is not stable: %q vs %q", again, pagedStdout)
 	}
-	if evidence := waitForPodmanStop(t, ctx, recovered, reconcile.StopRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := runtimesupport.WaitForStopConfirmed(t, ctx, recovered, reconcile.StopRequest{Identity: paged, WorkspaceID: fixture.workspaceID}, 0, 0); !evidence.IsConfirmed() {
 		t.Fatalf("paged stop evidence = %+v; want confirmed", evidence)
 	}
 	if removal, err := recovered.Remove(ctx, reconcile.RemoveRequest{Identity: paged, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
@@ -112,7 +112,7 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 	sinkRoot := t.TempDir()
 	scope := tenancy.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
 	sink := newFileSink(t, sinkRoot, log.DefaultLimits())
-	appendCaptured(t, sink, scope, identityValue, stdout, stderr)
+	appendCaptured(t, sink, scope, identityValue, []byte(stdout), []byte(stderr))
 	reopened := newFileSink(t, sinkRoot, log.DefaultLimits())
 	page, err := reopened.Read(ctx, log.ReadRequest{
 		Scope: scope, ExecutionID: identityValue.ExecutionID, ActionID: identityValue.ActionID,
@@ -253,7 +253,7 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 		t.Fatalf("authorized read crossed an execution boundary: %+v", isolated.Chunks)
 	}
 
-	if evidence := waitForPodmanStop(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); !evidence.IsConfirmed() {
+	if evidence := runtimesupport.WaitForStopConfirmed(t, ctx, fixture.adapter, reconcile.StopRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}, 0, 0); !evidence.IsConfirmed() {
 		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 	}
 	if removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identityValue, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
@@ -267,37 +267,6 @@ func TestPodmanRuntimeRetainedLogsAndReadPath(t *testing.T) {
 		ImageTag: fixture.image.Tag, ImageDigest: fixture.image.Digest,
 		Podman: runtimesupport.PodmanVersion(ctx),
 	})
-}
-
-// readAllLogs pages the adapter's captured streams to completion.
-func readAllLogs(t *testing.T, ctx context.Context, adapter interface {
-	Logs(context.Context, reconcile.LogsRequest) (reconcile.LogBatch, error)
-}, identityValue reconcile.EffectIdentity, pageSize int) ([]byte, []byte) {
-	t.Helper()
-	var stdout, stderr []byte
-	var cursor int64
-	for range 10000 {
-		batch, err := adapter.Logs(ctx, reconcile.LogsRequest{
-			Identity: identityValue, AfterOffset: cursor, Limit: pageSize,
-		})
-		if err != nil {
-			t.Fatalf("Logs: %v", err)
-		}
-		for _, chunk := range batch.Chunks {
-			switch chunk.Stream {
-			case reconcile.LogStdout:
-				stdout = append(stdout, chunk.Data...)
-			case reconcile.LogStderr:
-				stderr = append(stderr, chunk.Data...)
-			}
-		}
-		if batch.NextOffset == cursor {
-			return stdout, stderr
-		}
-		cursor = batch.NextOffset
-	}
-	t.Fatal("log pagination did not terminate")
-	return nil, nil
 }
 
 // appendCaptured appends the captured streams to one retained sink with a

@@ -49,7 +49,6 @@ import (
 
 	"github.com/optimiware/kodema/api"
 	runtimekube "github.com/optimiware/kodema/internal/adapter/runtime/kube"
-	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/test/support/factory"
 )
@@ -92,7 +91,6 @@ const (
 func TestKubernetesPipeline(t *testing.T) {
 	acquireLifecycleKindSlot(t)
 	harness := factory.StartKubernetes(t)
-	ctx := t.Context()
 
 	if harness.Cluster == nil || harness.KubernetesClient == nil || harness.KubernetesAdapter == nil {
 		t.Fatalf("Kubernetes harness did not expose its cluster, client and adapter")
@@ -252,12 +250,7 @@ func TestKubernetesPipeline(t *testing.T) {
 	// The adapter observed both pods terminate with exit code 0: the two Jobs
 	// actually ran to completion on the shared claim.
 	for _, action := range []api.ExecutionAction{prepare, consume} {
-		if action.Stop == nil || action.Stop.State != "confirmed" {
-			t.Fatalf("action %s stop = %+v; want confirmed termination evidence", action.Name, action.Stop)
-		}
-		if !strings.Contains(action.Stop.Detail, "exit code 0") {
-			t.Fatalf("action %s stop detail = %q; want a zero exit code", action.Name, action.Stop.Detail)
-		}
+		assertConfirmedStop(t, action, "exit code 0")
 	}
 
 	// Terminal cleanup removed both Jobs and released the PVC. Release is
@@ -271,8 +264,8 @@ func TestKubernetesPipeline(t *testing.T) {
 
 	// The retained logs are readable through the public operation after the
 	// Jobs are gone: the composition drains them before it removes a workload.
-	prepareLogs := readActionLog(t, harness, harness.ProjectToken, started.ExecutionID, prepare.ActionID, "stdout")
-	consumeLogs := readActionLog(t, harness, harness.ProjectToken, started.ExecutionID, consume.ActionID, "stdout")
+	prepareLogs := executionLogs(t, harness, harness.ProjectToken, started.ExecutionID, "prepare")
+	consumeLogs := executionLogs(t, harness, harness.ProjectToken, started.ExecutionID, "consume")
 	if !strings.Contains(prepareLogs, "prepare: credential accepted and marker written") {
 		t.Fatalf("prepare retained stdout does not contain its marker:\n%s", prepareLogs)
 	}
@@ -306,20 +299,7 @@ func TestKubernetesPipeline(t *testing.T) {
 
 	// No run-labelled Podman workload leftovers remain. The infrastructure
 	// containers belong to the harness and stay until Close.
-	containers, err := harness.Containers(ctx, runtimepodman.LabelExecution, started.ExecutionID)
-	if err != nil {
-		t.Fatalf("list run-labelled containers: %v", err)
-	}
-	if len(containers) != 0 {
-		t.Fatalf("execution %s left run-labelled Podman containers %v", started.ExecutionID, containers)
-	}
-	present, err := harness.WorkspaceVolumePresent(ctx, workspaceID)
-	if err != nil {
-		t.Fatalf("probe Podman workspace volume: %v", err)
-	}
-	if present {
-		t.Fatalf("execution %s left a Podman workspace volume for %s", started.ExecutionID, workspaceID)
-	}
+	assertExecutionResourcesReleased(t, harness, started.ExecutionID)
 }
 
 // waitWorkspaceID waits for the durable execution row that names the retained
@@ -765,37 +745,18 @@ func liveWorkloadToken(t *testing.T, pods []map[string]any, tokens map[string]st
 // kubeCleanupTimeout.
 func waitKubernetesExecution(t *testing.T, harness *factory.Harness, executionID string) api.ExecutionInspectResult {
 	t.Helper()
-	var last api.ExecutionInspectResult
-	deadline := time.Now().Add(kubeCleanupTimeout)
-	for {
-		result, publicError := harness.REST(harness.ProjectToken, "execution.inspect", api.ExecutionInspectRequest{
-			ExecutionID: executionID,
-		}, nil, "")
-		inspected := false
-		if publicError.Code == "" {
-			harness.Decode(result, &last)
-			inspected = true
-			switch last.State {
-			case "succeeded", "failed", "cancelled":
-				if last.Cleanup.State == "complete" {
-					return last
-				}
+	return waitExecutionWithOptions(t, harness, harness.ProjectToken, executionID, waitExecutionOptions{
+		totalTimeout: kubeCleanupTimeout,
+		pollInterval: kubePollInterval,
+		onPendingCleanup: func(cleanup api.ExecutionCleanup) {
+			if cleanup.Attempts > 0 {
+				harness.Clock.Advance(kubeCleanupRetryClockStep)
 			}
-		}
-		if !time.Now().Before(deadline) {
-			t.Logf("execution %s last inspect: state=%q cleanup=%+v failure=%+v actions=%+v",
-				executionID, last.State, last.Cleanup, last.Failure, last.Actions)
-			dumpExecutionLogs(t, harness, harness.ProjectToken, executionID, last)
-			t.Logf("composition log:\n%s", factory.SanitizeDiagnostic(harness.Logs()))
+		},
+		onFailure: func(context.Context, api.ExecutionInspectResult) {
 			t.Logf("%s", debugKubernetesExecution(t, harness, executionID))
-			t.Fatalf("execution %s did not reach a terminal state with complete cleanup within %s: state=%q cleanup=%+v",
-				executionID, kubeCleanupTimeout, last.State, last.Cleanup)
-		}
-		if inspected && last.Cleanup.State == "pending" && last.Cleanup.Attempts > 0 {
-			harness.Clock.Advance(kubeCleanupRetryClockStep)
-		}
-		time.Sleep(kubePollInterval)
-	}
+		},
+	})
 }
 
 // waitJobsGone waits until no Job carries the execution label.
@@ -866,27 +827,6 @@ func waitClaimGone(t *testing.T, harness *factory.Harness, claimName string) {
 		return fmt.Sprintf("last error: %v\nclaim:\n%s", lastErr,
 			kubectlDump(t, harness, "persistentvolumeclaim", claimName))
 	})
-}
-
-// readActionLog reads one retained stream through the public operation and
-// concatenates the chunks. It fails on a refusal or a missing stream.
-func readActionLog(t *testing.T, harness *factory.Harness, token, executionID, actionID, stream string) string {
-	t.Helper()
-	result, publicError := harness.REST(token, "execution.logs.read", api.ExecutionLogsReadRequest{
-		ExecutionID: executionID,
-		ActionID:    actionID,
-		Stream:      stream,
-	}, nil, "")
-	if publicError.Code != "" {
-		t.Fatalf("read retained %s logs of action %s: %s (%s)", stream, actionID, publicError.Code, publicError.Message)
-	}
-	var read api.ExecutionLogsReadResult
-	harness.Decode(result, &read)
-	var builder strings.Builder
-	for _, chunk := range read.Chunks {
-		_, _ = builder.Write(chunk.Data)
-	}
-	return builder.String()
 }
 
 // executionJSON returns the raw public inspection body as text so a secret
@@ -997,14 +937,10 @@ func waitForKubernetes(t *testing.T, harness *factory.Harness, what string, time
 
 // kubectlItems lists one resource kind by execution label.
 func kubectlItems(ctx context.Context, harness *factory.Harness, kind, executionID string) ([]map[string]any, error) {
-	result, err := harness.Cluster.Kubectl(ctx, "get", kind, "-n", factory.KubernetesNamespace,
-		"-l", runtimekube.LabelExecution+"="+executionID, "-o", "json")
+	document, err := harness.Cluster.GetJSON(ctx, "get", kind, "-n", factory.KubernetesNamespace,
+		"-l", runtimekube.LabelExecution+"="+executionID)
 	if err != nil {
 		return nil, err
-	}
-	var document map[string]any
-	if err := json.Unmarshal(result.Stdout, &document); err != nil {
-		return nil, fmt.Errorf("decode kubectl %s JSON: %w", kind, err)
 	}
 	raw, ok := document["items"]
 	if !ok {
@@ -1023,6 +959,29 @@ func kubectlItems(ctx context.Context, harness *factory.Harness, kind, execution
 		decoded = append(decoded, object)
 	}
 	return decoded, nil
+}
+
+// podContainerRunning reports whether containerName (or any container when
+// containerName is empty) has state.running set in one decoded pod document.
+func podContainerRunning(pod map[string]any, containerName string) bool {
+	status, _ := pod["status"].(map[string]any)
+	containers, _ := status["containerStatuses"].([]any)
+	for _, raw := range containers {
+		container, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if containerName != "" {
+			if name, _ := container["name"].(string); name != containerName {
+				continue
+			}
+		}
+		states, _ := container["state"].(map[string]any)
+		if _, running := states["running"]; running {
+			return true
+		}
+	}
+	return false
 }
 
 // kubectlJSON runs one kubectl get with -o json and decodes the document.

@@ -4,139 +4,92 @@ package runtimeconformance
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/optimiware/kodema/internal/adapter/runtime/podman"
-	"github.com/optimiware/kodema/internal/engine"
-	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
+	"github.com/optimiware/kodema/internal/id"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
 )
 
 // TestPodmanRuntimeManifestEnvironmentPermissionsAndExit proves the real
-// Podman runtime materializes the manifest into the read-only bind, injects
-// only the declared environment, applies explicit file modes/ownership and
-// reports an affirmative exit.
+// Podman runtime satisfies the S07 §3 materialization contract: read-only
+// activation bind, isolated 0700 host secrets directory, shared /etc/kodema/ca
+// CA bind with env precedence, WorkingDir == /workspace, cgroup resource
+// defaults, redacted logs, absent-workload observation, and retained workspace
+// separation across Remove and Release.
 func TestPodmanRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 	ctx := t.Context()
 	fixture := newPodmanFixture(t, "workspace-podman-1")
-	identity := testIdentity("exec-c1", "action-c1", "workload-c1", "idem-c1")
-	commands := []string{
-		`env | sort > /workspace/env.txt`,
-		`stat -c '%a %u %g' /kodema/inputs/input-a > /workspace/modes.txt`,
-		`stat -c '%a %u %g' /kodema/secrets/API_KEY >> /workspace/modes.txt`,
-		`stat -c '%a %u %g' /kodema/script >> /workspace/modes.txt`,
-		`cat /kodema/inputs/input-a > /workspace/input-copy.txt`,
-		`cat /kodema/task.json > /workspace/task-copy.json`,
-		`cat /kodema/secrets/API_KEY`,
-		`cat /kodema/secrets/KODEMA_TOKEN`,
-		`echo done > /workspace/done.txt`,
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(caFile, runtimesupport.GenerateTestCAPEM(t, "kodema-podman-component-ca"), 0o600); err != nil {
+		t.Fatalf("write workload CA bundle: %v", err)
 	}
-	request := fixture.request(identity, commands,
-		[]definition.EnvVar{{Name: "BUILD_MODE", Value: "release"}},
-		[]reconcile.SecretValue{{Name: "API_KEY", Value: "s3cr3t-value"}},
-		"tok-abc",
-	)
-	t.Setenv("KODEMA_HOST_CANARY", "must-not-leak")
-	if _, err := fixture.adapter.Prepare(ctx, request); err != nil {
-		t.Fatalf("Prepare: %v", err)
-	}
-	start, err := fixture.adapter.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if start.Outcome != reconcile.StartAccepted {
-		t.Fatalf("start outcome = %q; want accepted", start.Outcome)
-	}
-	observation := waitForPodmanObservation(t, ctx, fixture.adapter,
-		reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}, engine.ObservationExited)
-	code, ok := observation.ExitStatus()
-	if !ok || code != 0 {
-		t.Fatalf("exit status = %d/%v; want 0/true (%+v)", code, ok, observation)
-	}
-	if !observation.StopConfirmed() {
-		t.Fatalf("exited observation has no confirmed stop: %+v", observation)
-	}
+	fixture.caFile = caFile
+	fixture.libpod, fixture.files, fixture.adapter = newPodmanAdapter(t, fixture, nil)
 
-	env := string(readVolume(t, ctx, fixture, "env.txt"))
-	for _, want := range []string{
-		"BUILD_MODE=release",
-		"KODEMA_URL=" + testKodemaURL,
-		"KODEMA_EXECUTION=" + string(identity.ExecutionID),
-		"KODEMA_ACTION=build",
-		"KODEMA_TASK=task-1",
-	} {
-		if !strings.Contains(env, want+"\n") && !strings.Contains(env, want) {
-			t.Fatalf("container environment is missing %q:\n%s", want, env)
+	t.Setenv("KODEMA_HOST_CANARY", "must-not-leak")
+
+	h := fixture.harness(t)
+	h.AfterExit = func(t testing.TB, ctx context.Context, identity reconcile.EffectIdentity) {
+		t.Helper()
+		// Host secret confinement: <root>/<workload>/secrets is 0700 with 0444
+		// files, and <root>/<workload>/kodema/secrets is an empty mount point.
+		assertPodmanSecretConfinement(t, fixture.root, identity.WorkloadID,
+			runtimesupport.StandardCredential,
+			map[string]string{string(runtimesupport.StandardSecretName): runtimesupport.StandardSecretValue})
+
+		// Activation files are explicit 0444 and CA is never copied into kodema/.
+		for _, rel := range []string{"inputs/input-a", "script"} {
+			host := filepath.Join(fixture.root, string(identity.WorkloadID), "kodema", rel)
+			if info, err := os.Lstat(host); err != nil || info.Mode().Perm() != 0o444 {
+				t.Fatalf("activation file %s mode = %v, %v; want 0444", rel, info, err)
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(fixture.root, string(identity.WorkloadID), "kodema", podman.WorkloadCAKey)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("CA bundle was copied into <root>/<workload>/kodema: err = %v", err)
+		}
+
+		// Container inspection: WorkingDir == /workspace and default 2 CPU / 2 GiB limits.
+		containerName, err := podman.ContainerName(identity.WorkloadID)
+		if err != nil {
+			t.Fatalf("ContainerName: %v", err)
+		}
+		wd, err := runtimesupport.RunPodman(ctx, "inspect", "--format", "{{.Config.WorkingDir}}", containerName)
+		if err != nil {
+			t.Fatalf("inspect WorkingDir: %v", err)
+		}
+		if got := strings.TrimSpace(string(wd.Stdout)); got != "/workspace" {
+			t.Fatalf("container WorkingDir = %q; want /workspace", got)
+		}
+		limits, err := runtimesupport.RunPodman(ctx, "inspect", "--format",
+			"{{.HostConfig.CpuQuota}} {{.HostConfig.CpuPeriod}} {{.HostConfig.Memory}}", containerName)
+		if err != nil {
+			t.Fatalf("inspect resource limits: %v", err)
+		}
+		wantQuota := (podman.DefaultCPUMillicores * podman.DefaultCPUPeriod) / 1000
+		wantLimits := fmt.Sprintf("%d %d %d", wantQuota, podman.DefaultCPUPeriod, podman.DefaultMemoryBytes)
+		if got := strings.TrimSpace(string(limits.Stdout)); got != wantLimits {
+			t.Fatalf("container resource limits = %q; want %q (default 2 CPUs / 2 GiB)", got, wantLimits)
+		}
+
+		evidence, err := fixture.adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+		if !evidence.IsConfirmed() {
+			t.Fatalf("stop evidence = %+v; want confirmed", evidence)
 		}
 	}
-	if strings.Contains(env, "KODEMA_HOST_CANARY") {
-		t.Fatalf("host environment leaked into the container:\n%s", env)
-	}
-	if strings.Contains(env, "s3cr3t-value") || strings.Contains(env, "tok-abc") {
-		t.Fatalf("secret material appeared in the container environment:\n%s", env)
-	}
-	if strings.Contains(env, "API_KEY=") || strings.Contains(env, "KODEMA_TOKEN=") {
-		t.Fatalf("secret/credential name appeared as an environment variable:\n%s", env)
-	}
 
-	modes := strings.TrimSpace(string(readVolume(t, ctx, fixture, "modes.txt")))
-	if modes != "444 0 0\n444 0 0\n444 0 0" {
-		t.Fatalf("materialized modes/ownership = %q; want 444/0/0 for every file", modes)
-	}
-	if got := string(readVolume(t, ctx, fixture, "input-copy.txt")); got != "line1\nline2\n" {
-		t.Fatalf("input bytes = %q", got)
-	}
-	if got := string(readVolume(t, ctx, fixture, "task-copy.json")); got != `{"id":"task-1"}` {
-		t.Fatalf("task snapshot = %q", got)
-	}
+	runtimesupport.AssertMaterializationContract(t, ctx, h)
+	runtimesupport.AssertAbsentObservation(t, ctx, h)
 
-	batch, err := fixture.adapter.Logs(ctx, reconcile.LogsRequest{Identity: identity, Limit: 1 << 20})
-	if err != nil {
-		t.Fatalf("Logs: %v", err)
-	}
-	logText := ""
-	for _, chunk := range batch.Chunks {
-		logText += string(chunk.Data)
-	}
-	if strings.Contains(logText, "s3cr3t-value") || strings.Contains(logText, "tok-abc") {
-		t.Fatalf("secret or credential leaked into retained output: %q", logText)
-	}
-	if !strings.Contains(logText, "[REDACTED]") {
-		t.Fatalf("redaction marker is absent from output: %q", logText)
-	}
-
-	containerName, err := podman.ContainerName(identity.WorkloadID)
-	if err != nil {
-		t.Fatalf("ContainerName: %v", err)
-	}
-	limits, err := runtimesupport.RunPodman(ctx, "inspect", "--format",
-		"{{.HostConfig.CpuQuota}} {{.HostConfig.CpuPeriod}} {{.HostConfig.Memory}}", containerName)
-	if err != nil {
-		t.Fatalf("inspect resource limits: %v", err)
-	}
-	wantQuota := (podman.DefaultCPUMillicores * podman.DefaultCPUPeriod) / 1000
-	wantLimits := fmt.Sprintf("%d %d %d", wantQuota, podman.DefaultCPUPeriod, podman.DefaultMemoryBytes)
-	if got := strings.TrimSpace(string(limits.Stdout)); got != wantLimits {
-		t.Fatalf("container resource limits = %q; want %q (default 2 CPUs / 2 GiB)", got, wantLimits)
-	}
-
-	evidence, err := fixture.adapter.Stop(ctx, reconcile.StopRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
-	if err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if !evidence.IsConfirmed() {
-		t.Fatalf("stop evidence = %+v; want confirmed", evidence)
-	}
-	removal, err := fixture.adapter.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
-	if err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	if !removal.Removed {
-		t.Fatalf("removal = %+v; want removed", removal)
-	}
 	if !runtimesupport.VolumeExists(ctx, fixture.volumeName) {
 		t.Fatal("Remove touched the retained workspace volume")
 	}
@@ -153,8 +106,59 @@ func TestPodmanRuntimeManifestEnvironmentPermissionsAndExit(t *testing.T) {
 	})
 }
 
+// assertPodmanSecretConfinement verifies the S07 §3 host secret layout:
+// <root>/<workload>/secrets has 0700 mode, contains 0444 secret/credential
+// files with expected contents, and <root>/<workload>/kodema/secrets is an
+// empty mount-point directory with no host secret files.
+func assertPodmanSecretConfinement(
+	t testing.TB,
+	root string,
+	workload id.WorkloadID,
+	wantToken string,
+	wantSecrets map[string]string,
+) {
+	t.Helper()
+	secretsDir := filepath.Join(root, string(workload), "secrets")
+	dirInfo, err := os.Lstat(secretsDir)
+	if err != nil {
+		t.Fatalf("stat isolated secrets dir %s: %v", secretsDir, err)
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("secrets dir %s mode = %o (dir=%t); want 0700 directory", secretsDir, dirInfo.Mode().Perm(), dirInfo.IsDir())
+	}
+
+	mountPoint := filepath.Join(root, string(workload), "kodema", "secrets")
+	entries, err := os.ReadDir(mountPoint)
+	if err != nil {
+		t.Fatalf("read /kodema/secrets mount point %s: %v", mountPoint, err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("host %s holds %d entries; want empty mount point with no secret files", mountPoint, len(entries))
+	}
+
+	checkFile := func(name, want string) {
+		t.Helper()
+		path := filepath.Join(secretsDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read isolated secret %s: %v", path, err)
+		}
+		if string(data) != want {
+			t.Fatalf("isolated secret %s = %q; want %q", name, data, want)
+		}
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode().Perm() != 0o444 {
+			t.Fatalf("isolated secret %s mode = %v, %v; want 0444", name, info, err)
+		}
+	}
+	checkFile(string(id.SecretTokenName), wantToken)
+	for name, want := range wantSecrets {
+		checkFile(name, want)
+	}
+}
+
 // readVolume reads one file from the fixture's retained workspace volume.
-func readVolume(t *testing.T, ctx context.Context, fixture *podmanFixture, logical string) []byte {
+func readVolume(t testing.TB, ctx context.Context, fixture *podmanFixture, logical string) []byte {
 	t.Helper()
 	data, found := runtimesupport.ReadVolumeFile(ctx, t, fixture.volumeName, logical)
 	if !found {

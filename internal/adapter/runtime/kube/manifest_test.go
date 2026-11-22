@@ -1,5 +1,14 @@
-// Manifest and preparation behavior: confined activation data, tenant
-// ownership, pinned image, fail-fast script, limits and retained workspace.
+// Kubernetes-specific manifest and preparation behavior: immutable activation
+// ConfigMap, mutable credential Secret, tenant namespace ownership, post-restart
+// conflict detection, controller-upgrade toolbox plan persistence, Job security
+// context/policy defaults, and projected volume wiring (PVC workspace,
+// ConfigMap/previous-outputs split, memory emptyDir action outputs, init-container
+// toolbox).
+//
+// Shared container-runtime preparation invariants (activation bytes, task files,
+// idempotency, ChangedIdempotencyContent, invalid input refusal, missing
+// workspace refusal, WorkingDir, Entrypoint, env, labels) are verified in
+// TestKubeConformance.
 package kube
 
 import (
@@ -7,12 +16,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/optimiware/kodema/internal/adapter/runtime"
 	"github.com/optimiware/kodema/internal/adapter/runtime/container"
 	"github.com/optimiware/kodema/internal/control/workspace"
+	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
-	"github.com/optimiware/kodema/internal/engine/script"
 	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 )
@@ -54,6 +62,7 @@ func TestToolboxPreparationSurvivesControllerUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := testPrepareRequest()
+	request.Outputs = map[id.ActionName]engine.Outputs{"clone": {"commit": "abc"}}
 	request.Container.Outputs = []id.OutputKey{"result"}
 	prepareTestWorkload(t, before, request)
 
@@ -72,6 +81,21 @@ func TestToolboxPreparationSurvivesControllerUpgrade(t *testing.T) {
 	if value, _ := testEnvValue(spec.Env, workspace.EnvGitURL); value != "https://git-a.example" {
 		t.Errorf("prepared Git endpoint changed: %q", value)
 	}
+	// Verify init-container toolbox volume, memory emptyDir output volume, and
+	// previous-outputs ConfigMap split.
+	toolboxVol := testVolumeAt(t, spec, workspace.ToolboxRoot)
+	if !toolboxVol.EmptyDir || !toolboxVol.ReadOnly {
+		t.Errorf("toolbox volume = %+v; want read-only emptyDir", toolboxVol)
+	}
+	actionOutVol := testVolumeAt(t, spec, "/kodema/outputs/build")
+	if !actionOutVol.EmptyDir || actionOutVol.ReadOnly || actionOutVol.MemoryBytes != workspace.OutputDirectoryBytes {
+		t.Errorf("action-outputs volume = %+v; want rw memory emptyDir (%d bytes)", actionOutVol, workspace.OutputDirectoryBytes)
+	}
+	prevOutVol := testVolumeAt(t, spec, workspace.OutputRoot)
+	if prevOutVol.ConfigMapName == "" || !prevOutVol.ReadOnly || len(prevOutVol.Items) != 1 || prevOutVol.Items[0].Path != "/kodema/outputs/clone/commit" {
+		t.Errorf("previous-outputs volume = %+v; want read-only ConfigMap split", prevOutVol)
+	}
+
 	request.Container.Outputs = nil
 	if _, err := after.Prepare(t.Context(), request); err == nil {
 		t.Fatal("rebound a prepared action to different outputs")
@@ -85,129 +109,35 @@ func TestToolboxPreparationSurvivesControllerUpgrade(t *testing.T) {
 	}
 }
 
-// TestPrepareMaterializesConfinedActivationSnapshot proves one complete,
-// all-or-nothing snapshot outside /workspace: exact input bytes, earlier
-// succeeded outputs, the optional task file, and declared secrets plus the
-// credential only in the mutable Secret.
-func TestPrepareMaterializesConfinedActivationSnapshot(t *testing.T) {
+func TestPrepareCreatesImmutableConfigMapAndMutableSecret(t *testing.T) {
 	fake, _, adapter := testSetup(t)
 	request := testPrepareRequest()
-
-	preparation := prepareTestWorkload(t, adapter, request)
-	if preparation.WorkspaceID != request.WorkspaceID {
-		t.Fatalf("preparation workspace = %q; want %q", preparation.WorkspaceID, request.WorkspaceID)
-	}
-	if preparation.Detail == "" {
-		t.Fatal("preparation detail is empty")
-	}
+	prepareTestWorkload(t, adapter, request)
 
 	configMaps := fake.configMapsSnapshot()
 	if len(configMaps) != 1 {
-		t.Fatalf("prepared %d configmaps; want exactly 1", len(configMaps))
+		t.Fatalf("prepared %d configmaps; want 1", len(configMaps))
 	}
-	configMap := configMaps[0]
-	if configMap.Namespace != testNamespace {
-		t.Fatalf("activation configmap namespace = %q; want %q", configMap.Namespace, testNamespace)
+	cm := configMaps[0]
+	if cm.Namespace != testNamespace || !cm.Immutable {
+		t.Fatalf("configmap namespace=%q immutable=%v; want (%q, true)", cm.Namespace, cm.Immutable, testNamespace)
 	}
-	if !configMap.Immutable {
-		t.Fatal("activation snapshot configmap is mutable")
-	}
-	if configMap.Labels[LabelTenant] != string(testTenant()) {
-		t.Errorf("activation configmap tenant label = %q", configMap.Labels[LabelTenant])
-	}
-	if configMap.Labels[LabelWorkspace] != string(request.WorkspaceID) {
-		t.Errorf("activation configmap workspace label = %q", configMap.Labels[LabelWorkspace])
-	}
-	if configMap.Labels[LabelWorkload] != string(request.Identity.WorkloadID) {
-		t.Errorf("activation configmap workload label = %q", configMap.Labels[LabelWorkload])
-	}
-	if len(configMap.Labels[LabelPreparation]) != 48 {
-		t.Errorf("activation configmap preparation label = %q (len %d); want 48 hex chars",
-			configMap.Labels[LabelPreparation], len(configMap.Labels[LabelPreparation]))
-	}
-
-	wantScript, err := script.Render(request.Container.Commands)
-	if err != nil {
-		t.Fatalf("script.Render returned error: %v", err)
-	}
-	wantFiles := map[string]string{
-		"/kodema/inputs/input-a":      "line1\nline2",
-		"/kodema/outputs/build/out-a": "out",
-		"/kodema/task.json":           `{"id":"task-1"}`,
-		container.WorkloadScriptPath:  wantScript,
-	}
-	if len(configMap.Data) != len(wantFiles) {
-		t.Fatalf("activation configmap has %d files; want %d: %v", len(configMap.Data), len(wantFiles), configMap.Data)
-	}
-	for path, want := range wantFiles {
-		got, ok := configMap.Data[path]
-		if !ok {
-			t.Errorf("activation configmap is missing %q", path)
-			continue
-		}
-		if string(got) != want {
-			t.Errorf("activation file %q = %q; want %q (no appended newline or reinterpretation)", path, got, want)
-		}
-		if path != container.WorkloadScriptPath {
-			if err := workspace.ValidatePath(path); err != nil {
-				t.Errorf("activation file %q is not confined: %v", path, err)
-			}
-		}
-		if strings.HasPrefix(path, workspace.WorkspaceRoot) {
-			t.Errorf("activation file %q was materialized inside the writable workspace", path)
-		}
-		if strings.Contains(string(got), request.Credential) {
-			t.Errorf("activation file %q contains the execution credential", path)
-		}
+	if cm.Labels[LabelTenant] != string(testTenant()) || cm.Labels[LabelWorkspace] != string(request.WorkspaceID) || len(cm.Labels[LabelPreparation]) != 48 {
+		t.Fatalf("configmap labels = %v; want tenant, workspace, and 48-char preparation digest", cm.Labels)
 	}
 
 	secrets := fake.secretsSnapshot()
 	if len(secrets) != 1 {
-		t.Fatalf("prepared %d secrets; want exactly 1", len(secrets))
+		t.Fatalf("prepared %d secrets; want 1", len(secrets))
 	}
-	secret := secrets[0]
-	if secret.Immutable {
-		t.Fatal("credential secret is immutable; credential refresh must be possible without a restart")
+	if secrets[0].Immutable {
+		t.Fatal("credential secret is immutable; live refresh requires a mutable Secret")
 	}
-	if got := string(secret.Data[id.SecretTokenName]); got != request.Credential {
-		t.Errorf("credential secret KODEMA_TOKEN = %q; want the execution credential", got)
-	}
-	if got := string(secret.Data["API_KEY"]); got != "s3cr3t" {
-		t.Errorf("credential secret API_KEY = %q; want %q", got, "s3cr3t")
-	}
-	if len(secret.Data) != 2 {
-		t.Errorf("credential secret has %d keys; want exactly the declared secret and the credential", len(secret.Data))
-	}
-	if secret.Labels[LabelWorkspace] != string(request.WorkspaceID) {
-		t.Errorf("credential secret workspace label = %q", secret.Labels[LabelWorkspace])
-	}
-
-	if jobs := fake.jobCount(); jobs != 0 {
-		t.Fatalf("Prepare created %d jobs; preparation must never start a workload", jobs)
+	if secrets[0].Labels[LabelWorkspace] != string(request.WorkspaceID) {
+		t.Fatalf("credential secret workspace label = %q", secrets[0].Labels[LabelWorkspace])
 	}
 }
 
-// TestPrepareRefusesMissingWorkspaceClaim proves a missing retained workspace
-// is a failure, never permission to create a replacement.
-func TestPrepareRefusesMissingWorkspaceClaim(t *testing.T) {
-	fake := newFakeCluster()
-	addTestNamespace(fake)
-	adapter := newTestAdapter(t, fake, newFakeClock())
-
-	_, err := adapter.Prepare(context.Background(), testPrepareRequest())
-	if err == nil {
-		t.Fatal("Prepare succeeded without the retained workspace claim")
-	}
-	if len(fake.configMapsSnapshot()) != 0 || len(fake.secretsSnapshot()) != 0 {
-		t.Fatal("Prepare materialized activation data without an attached workspace")
-	}
-	if fake.jobCount() != 0 {
-		t.Fatal("Prepare started a workload without a workspace")
-	}
-}
-
-// TestPrepareRefusesForeignTenantNamespace proves the adapter cannot place a
-// tenant's workload in another tenant's namespace.
 func TestPrepareRefusesForeignTenantNamespace(t *testing.T) {
 	fake := newFakeCluster()
 	fake.addNamespace(Namespace{Name: testNamespace, Labels: map[string]string{LabelTenant: "tenant-other"}})
@@ -215,122 +145,17 @@ func TestPrepareRefusesForeignTenantNamespace(t *testing.T) {
 	adapter := newTestAdapter(t, fake, newFakeClock())
 
 	_, err := adapter.Prepare(context.Background(), testPrepareRequest())
-	if err == nil {
-		t.Fatal("Prepare accepted a namespace owned by another tenant")
-	}
 	class, ok := fault.ClassOf(err)
 	if !ok || class != fault.Forbidden {
-		t.Fatalf("foreign namespace refusal class = %v (present=%v); want %q", class, ok, fault.Forbidden)
+		t.Fatalf("foreign namespace refusal class = (%v, %v) for %v; want %q", class, ok, err, fault.Forbidden)
 	}
 	if len(fake.configMapsSnapshot()) != 0 || len(fake.secretsSnapshot()) != 0 || fake.jobCount() != 0 {
 		t.Fatal("Prepare wrote resources into a foreign tenant namespace")
 	}
 }
 
-// TestPrepareRefusesIncompleteOrUnsafeSnapshot proves partial, credential-less
-// and traversal-shaped snapshots never authorize a workload.
-func TestPrepareRefusesIncompleteOrUnsafeSnapshot(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(*reconcile.PrepareRequest)
-	}{
-		{name: "missing credential", mutate: func(request *reconcile.PrepareRequest) { request.Credential = "" }},
-		{name: "traversal input key", mutate: func(request *reconcile.PrepareRequest) {
-			request.Inputs = map[id.InputKey]string{"../escape": "x"}
-		}},
-		{name: "invalid secret name", mutate: func(request *reconcile.PrepareRequest) {
-			request.Secrets = []reconcile.SecretValue{{Name: "bad name", Value: "x"}}
-		}},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			fake, _, adapter := testSetup(t)
-			request := testPrepareRequest()
-			testCase.mutate(&request)
-
-			if _, err := adapter.Prepare(context.Background(), request); err == nil {
-				t.Fatalf("Prepare accepted a snapshot with %s", testCase.name)
-			}
-			if len(fake.configMapsSnapshot()) != 0 || len(fake.secretsSnapshot()) != 0 {
-				t.Fatalf("Prepare partially materialized a snapshot with %s", testCase.name)
-			}
-			if fake.jobCount() != 0 {
-				t.Fatalf("Prepare started a workload with %s", testCase.name)
-			}
-		})
-	}
-}
-
-// TestPrepareRefusesInvalidActionContext proves an unusable action slug or task
-// identity is refused with InvalidInput before any cluster read or write.
-func TestPrepareRefusesInvalidActionContext(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(*reconcile.PrepareRequest)
-	}{
-		{name: "empty action name", mutate: func(request *reconcile.PrepareRequest) { request.ActionName = "" }},
-		{name: "invalid action name", mutate: func(request *reconcile.PrepareRequest) { request.ActionName = "Build Mode" }},
-		{name: "invalid task id", mutate: func(request *reconcile.PrepareRequest) { request.TaskID = "../escape" }},
-		{name: "empty image", mutate: func(request *reconcile.PrepareRequest) { request.Container.Image = "   " }},
-		{name: "tag-only image", mutate: func(request *reconcile.PrepareRequest) { request.Container.Image = "alpine:3.24" }},
-		{name: "bare image", mutate: func(request *reconcile.PrepareRequest) { request.Container.Image = "busybox" }},
-		{name: "invalid env name", mutate: func(request *reconcile.PrepareRequest) {
-			request.Container.Env = []definition.EnvVar{{Name: "BAD NAME", Value: "x"}}
-		}},
-		{name: "empty commands", mutate: func(request *reconcile.PrepareRequest) { request.Container.Commands = nil }},
-		{name: "nul byte in command", mutate: func(request *reconcile.PrepareRequest) {
-			request.Container.Commands = []string{"echo\x00bad"}
-		}},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			fake, _, adapter := testSetup(t)
-			request := testPrepareRequest()
-			testCase.mutate(&request)
-
-			_, err := adapter.Prepare(context.Background(), request)
-			class, ok := fault.ClassOf(err)
-			if !ok || class != fault.InvalidInput {
-				t.Fatalf("Prepare error class = (%v, %v) for %v; want %q", class, ok, err, fault.InvalidInput)
-			}
-			if len(fake.configMapsSnapshot()) != 0 || len(fake.secretsSnapshot()) != 0 || fake.jobCount() != 0 {
-				t.Fatalf("Prepare performed an effect with %s", testCase.name)
-			}
-		})
-	}
-}
-
-// TestPrepareIsIdempotentAndRefusesChangedContent proves the same persisted
-// identity may be retried with identical content but never silently rebound to
-// different activation data.
-func TestPrepareIsIdempotentAndRefusesChangedContent(t *testing.T) {
-	fake, _, adapter := testSetup(t)
-	request := testPrepareRequest()
-	prepareTestWorkload(t, adapter, request)
-
-	if _, err := adapter.Prepare(context.Background(), request); err != nil {
-		t.Fatalf("identical Prepare retry returned error: %v", err)
-	}
-	if len(fake.configMapsSnapshot()) != 1 || len(fake.secretsSnapshot()) != 1 {
-		t.Fatal("identical Prepare retry duplicated activation resources")
-	}
-
-	changed := request
-	changed.Inputs = map[id.InputKey]string{"input-a": "different"}
-	_, err := adapter.Prepare(context.Background(), changed)
-	if err == nil {
-		t.Fatal("Prepare accepted different content for the same workload identity")
-	}
-	class, ok := fault.ClassOf(err)
-	if !ok || class != fault.ChangedIdempotencyContent {
-		t.Fatalf("changed-content refusal class = %v (present=%v); want %q", class, ok, fault.ChangedIdempotencyContent)
-	}
-	configMap := fake.configMapsSnapshot()[0]
-	if string(configMap.Data["/kodema/inputs/input-a"]) != "line1\nline2" {
-		t.Fatal("changed Prepare overwrote the original activation snapshot")
-	}
-
-	declarationMutations := []struct {
+func TestPreparePostRestartConflictAndRemoveCleanup(t *testing.T) {
+	mutations := []struct {
 		name      string
 		wantClass fault.Class
 		mutate    func(*fakeCluster, *reconcile.PrepareRequest)
@@ -338,29 +163,13 @@ func TestPrepareIsIdempotentAndRefusesChangedContent(t *testing.T) {
 		{
 			name:      "changed commands",
 			wantClass: fault.ChangedIdempotencyContent,
-			mutate: func(_ *fakeCluster, req *reconcile.PrepareRequest) {
-				req.Container.Commands = []string{"echo changed"}
-			},
+			mutate:    func(_ *fakeCluster, req *reconcile.PrepareRequest) { req.Container.Commands = []string{"echo changed"} },
 		},
 		{
 			name:      "changed env",
 			wantClass: fault.ChangedIdempotencyContent,
 			mutate: func(_ *fakeCluster, req *reconcile.PrepareRequest) {
 				req.Container.Env = []definition.EnvVar{{Name: "BUILD_MODE", Value: "debug"}}
-			},
-		},
-		{
-			name:      "changed image",
-			wantClass: fault.ChangedIdempotencyContent,
-			mutate: func(_ *fakeCluster, req *reconcile.PrepareRequest) {
-				req.Container.Image = "registry.example.com/tools/build@sha256:" + strings.Repeat("f", 64)
-			},
-		},
-		{
-			name:      "changed idempotency key",
-			wantClass: fault.ChangedIdempotencyContent,
-			mutate: func(_ *fakeCluster, req *reconcile.PrepareRequest) {
-				req.Identity.IdempotencyKey = "idem-changed"
 			},
 		},
 		{
@@ -373,548 +182,112 @@ func TestPrepareIsIdempotentAndRefusesChangedContent(t *testing.T) {
 			},
 		},
 	}
+	for _, tc := range mutations {
+		t.Run("after_restart_"+tc.name, func(t *testing.T) {
+			cluster, clock, first := testSetup(t)
+			base := testPrepareRequest()
+			prepareTestWorkload(t, first, base)
 
-	for _, mode := range []string{"in_memory", "after_restart"} {
-		for _, tc := range declarationMutations {
-			t.Run(mode+"_"+tc.name, func(t *testing.T) {
-				cluster, clock, first := testSetup(t)
-				base := testPrepareRequest()
-				prepareTestWorkload(t, first, base)
+			reconstructed := newTestAdapter(t, cluster, clock)
+			secretPutsBefore := cluster.callCount("PutSecret")
 
-				target := first
-				if mode == "after_restart" {
-					target = newTestAdapter(t, cluster, clock)
-				}
-				secretPutsBefore := cluster.callCount("PutSecret")
+			mutated := testPrepareRequest()
+			mutated.Credential = "tok-rotated-attempt"
+			tc.mutate(cluster, &mutated)
 
-				mutated := testPrepareRequest()
-				mutated.Credential = "tok-rotated-attempt"
-				tc.mutate(cluster, &mutated)
-
-				_, retryErr := target.Prepare(context.Background(), mutated)
-				gotClass, present := fault.ClassOf(retryErr)
-				if !present || gotClass != tc.wantClass {
-					t.Fatalf("Prepare retry class = (%v, %v) for %v; want %q", gotClass, present, retryErr, tc.wantClass)
-				}
-				if cluster.callCount("PutSecret") != secretPutsBefore {
-					t.Fatal("refused Prepare retry mutated the credential Secret")
-				}
-				if got := string(cluster.secretsSnapshot()[0].Data[id.SecretTokenName]); got != base.Credential {
-					t.Fatalf("credential Secret after refused retry = %q; want original %q", got, base.Credential)
-				}
-			})
-		}
+			_, retryErr := reconstructed.Prepare(context.Background(), mutated)
+			if gotClass, ok := fault.ClassOf(retryErr); !ok || gotClass != tc.wantClass {
+				t.Fatalf("Prepare retry class = (%v, %v) for %v; want %q", gotClass, ok, retryErr, tc.wantClass)
+			}
+			if cluster.callCount("PutSecret") != secretPutsBefore {
+				t.Fatal("refused post-restart Prepare mutated credential Secret")
+			}
+		})
 	}
 
-	t.Run("refuses unpinned image and clears prepared entry on confirmed remove", func(t *testing.T) {
-		cluster, _, localAdapter := testSetup(t)
-		tagged := testPrepareRequest()
-		tagged.Container.Image = "alpine:3.24"
-		if _, err := localAdapter.Prepare(context.Background(), tagged); err == nil {
-			t.Fatal("Prepare accepted an unpinned tag-only image")
-		} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
-			t.Fatalf("unpinned image fault class = (%v, %v) for %v; want %q", class, ok, err, fault.InvalidInput)
-		}
+	t.Run("confirmed Remove clears Adapter.prepared and deletes ConfigMap", func(t *testing.T) {
+		cluster, _, adapter := testSetup(t)
+		req := testPrepareRequest()
+		prepareTestWorkload(t, adapter, req)
 
-		pinned := testPrepareRequest()
-		prepareTestWorkload(t, localAdapter, pinned)
-
-		removal, removeErr := localAdapter.Remove(context.Background(), reconcile.RemoveRequest{
-			Identity:    pinned.Identity,
-			WorkspaceID: pinned.WorkspaceID,
+		removal, err := adapter.Remove(context.Background(), reconcile.RemoveRequest{
+			Identity: req.Identity, WorkspaceID: req.WorkspaceID,
 		})
-		if removeErr != nil || !removal.Removed {
-			t.Fatalf("Remove = (%+v, %v); want Removed=true", removal, removeErr)
+		if err != nil || !removal.Removed {
+			t.Fatalf("Remove = (%+v, %v); want Removed=true", removal, err)
 		}
-		localAdapter.mu.Lock()
-		_, stillPrepared := localAdapter.prepared[pinned.Identity.WorkloadID]
-		localAdapter.mu.Unlock()
-		if stillPrepared {
-			t.Fatal("confirmed Remove left the workload in Adapter.prepared")
-		}
-		if len(cluster.configMapsSnapshot()) != 0 {
-			t.Fatal("confirmed Remove left ConfigMap behind")
+		adapter.mu.Lock()
+		_, stillPrepared := adapter.prepared[req.Identity.WorkloadID]
+		adapter.mu.Unlock()
+		if stillPrepared || len(cluster.configMapsSnapshot()) != 0 {
+			t.Fatalf("Remove left prepared=%v configMaps=%d", stillPrepared, len(cluster.configMapsSnapshot()))
 		}
 	})
 }
 
-// TestStartBuildsPinnedFailFastJob pins the generated Job manifest: pinned
-// image, fail-fast script, tenant ownership/limits, no replay settings, the
-// retained workspace claim and confined read-only activation mounts.
-func TestStartBuildsPinnedFailFastJob(t *testing.T) {
+func TestStartBuildsKubeJobSpecSecurityAndVolumes(t *testing.T) {
 	fake, _, adapter := testSetup(t)
 	request := testPrepareRequest()
 	prepareTestWorkload(t, adapter, request)
+	startTestWorkload(t, adapter, request.Identity, request.WorkspaceID)
 
-	result := startTestWorkload(t, adapter, request.Identity, request.WorkspaceID)
-	if result.Outcome != reconcile.StartAccepted {
-		t.Fatalf("start outcome = %q; want %q", result.Outcome, reconcile.StartAccepted)
-	}
-	if result.WorkloadID != request.Identity.WorkloadID {
-		t.Fatalf("start workload id = %q; want %q", result.WorkloadID, request.Identity.WorkloadID)
-	}
-
-	jobs := fake.jobsSnapshot()
-	if len(jobs) != 1 {
-		t.Fatalf("Start created %d jobs; want exactly 1", len(jobs))
-	}
-	job := jobs[0]
+	job := onlyJob(t, fake)
 	spec := job.Spec
 
-	if job.Namespace != testNamespace {
-		t.Errorf("job namespace = %q; want the tenant namespace %q", job.Namespace, testNamespace)
+	if job.Namespace != testNamespace || job.Name == "" {
+		t.Fatalf("job identity = (%q, %q)", job.Namespace, job.Name)
 	}
-	if job.Name == "" {
-		t.Error("job has no stable name")
-	}
-	wantLabels := map[string]string{
-		LabelTenant:    string(testTenant()),
-		LabelExecution: string(request.Identity.ExecutionID),
-		LabelAction:    string(request.Identity.ActionID),
-		LabelWorkload:  string(request.Identity.WorkloadID),
-		LabelWorkspace: string(request.WorkspaceID),
-	}
-	for key, want := range wantLabels {
-		if got := job.Labels[key]; got != want {
-			t.Errorf("job label %q = %q; want %q", key, got, want)
-		}
-		if got := spec.PodLabels[key]; got != want {
-			t.Errorf("pod label %q = %q; want %q (the tenant network policy selects it)", key, got, want)
-		}
+	if job.Labels[LabelTenant] != string(testTenant()) || spec.PodLabels[LabelTenant] != string(testTenant()) {
+		t.Errorf("tenant labels = job:%q pod:%q; want %q", job.Labels[LabelTenant], spec.PodLabels[LabelTenant], testTenant())
 	}
 	if got := job.Annotations[AnnotationIdempotencyKey]; got != request.Identity.IdempotencyKey {
 		t.Errorf("job idempotency annotation = %q; want %q", got, request.Identity.IdempotencyKey)
 	}
-
 	if spec.Image != testImage {
-		t.Errorf("job image = %q; want the pinned digest %q", spec.Image, testImage)
+		t.Errorf("job image = %q; want %q", spec.Image, testImage)
 	}
-	if spec.WorkingDir != workspace.WorkspaceRoot {
-		t.Errorf("job workingDir = %q; want %q", spec.WorkingDir, workspace.WorkspaceRoot)
+	if spec.RestartPolicy != "Never" || spec.BackoffLimit != 0 || spec.PodReplacementPolicy != "Failed" {
+		t.Errorf("replay policy = restart:%q backoff:%d replacement:%q; want Never/0/Failed",
+			spec.RestartPolicy, spec.BackoffLimit, spec.PodReplacementPolicy)
 	}
-	wantCommand := workspace.Entrypoint(container.WorkloadScriptPath, workspace.Launch{})
-	if len(spec.Command) != len(wantCommand) {
-		t.Fatalf("job command = %v; want %v", spec.Command, wantCommand)
+	if spec.TTLSecondsAfterFinished == nil || *spec.TTLSecondsAfterFinished != 600 {
+		t.Errorf("job TTL = %v; want 600", spec.TTLSecondsAfterFinished)
 	}
-	for index := range wantCommand {
-		if spec.Command[index] != wantCommand[index] {
-			t.Fatalf("job command = %v; want %v", spec.Command, wantCommand)
-		}
+	if spec.AutomountServiceAccountToken || spec.HostNetwork {
+		t.Errorf("security flags = automountSA:%v hostNetwork:%v; want both false",
+			spec.AutomountServiceAccountToken, spec.HostNetwork)
 	}
-	configMap := fake.configMapsSnapshot()[0]
-	rendered := string(configMap.Data[container.WorkloadScriptPath])
-	wantScript, err := script.Render(request.Container.Commands)
-	if err != nil {
-		t.Fatalf("script.Render returned error: %v", err)
-	}
-	if rendered != wantScript {
-		t.Fatalf("fail-fast script = %q; want %q", rendered, wantScript)
-	}
-	if strings.Contains(rendered, "set -x") {
-		t.Error("fail-fast script enables tracing")
-	}
-
-	if spec.RestartPolicy != "Never" {
-		t.Errorf("restart policy = %q; want Never", spec.RestartPolicy)
-	}
-	if spec.BackoffLimit != 0 {
-		t.Errorf("backoff limit = %d; a Job must not retry the command", spec.BackoffLimit)
-	}
-	if spec.PodReplacementPolicy != "Failed" {
-		t.Errorf("pod replacement policy = %q; want Failed so a running pod is never replaced", spec.PodReplacementPolicy)
-	}
-	if spec.TTLSecondsAfterFinished == nil {
-		t.Error("job has no TTL; finished Jobs must not accumulate")
-	} else if *spec.TTLSecondsAfterFinished != 600 {
-		t.Errorf("job TTL = %d; want the configured 600", *spec.TTLSecondsAfterFinished)
-	}
-	if spec.AutomountServiceAccountToken {
-		t.Error("job automounts a service-account token")
-	}
-	if spec.HostNetwork {
-		t.Error("job uses the host network; tenant network isolation is broken")
-	}
-	wantResources := Resources{
-		CPURequest:    "100m",
-		CPULimit:      "1",
-		MemoryRequest: "64Mi",
-		MemoryLimit:   "256Mi",
-	}
+	wantResources := Resources{CPURequest: "100m", CPULimit: "1", MemoryRequest: "64Mi", MemoryLimit: "256Mi"}
 	if spec.Resources != wantResources {
 		t.Errorf("job resources = %+v; want %+v", spec.Resources, wantResources)
 	}
 
-	if got, ok := testEnvValue(spec.Env, id.EnvURL); !ok || got != testKodemaURL {
-		t.Errorf("%s = %q (present=%v); want %q", id.EnvURL, got, ok, testKodemaURL)
-	}
-	if got, ok := testEnvValue(spec.Env, id.EnvExecution); !ok || got != string(request.Identity.ExecutionID) {
-		t.Errorf("%s = %q (present=%v); want %q", id.EnvExecution, got, ok, request.Identity.ExecutionID)
-	}
-	if got, ok := testEnvValue(spec.Env, id.EnvAction); !ok || got != string(request.ActionName) {
-		t.Errorf("%s = %q (present=%v); want the action slug %q", id.EnvAction, got, ok, request.ActionName)
-	}
-	if got, ok := testEnvValue(spec.Env, id.EnvAction); ok && got == string(request.Identity.ActionID) {
-		t.Errorf("%s = %q; must be the slug, not the action id %q", id.EnvAction, got, request.Identity.ActionID)
-	}
-	if got, ok := testEnvValue(spec.Env, id.EnvTask); !ok || got != string(request.TaskID) {
-		t.Errorf("%s = %q (present=%v); want the task id %q", id.EnvTask, got, ok, request.TaskID)
-	}
-	if got, ok := testEnvValue(spec.Env, "BUILD_MODE"); !ok || got != "release" {
-		t.Errorf("literal environment BUILD_MODE = %q (present=%v); want release", got, ok)
+	wsVol := testVolumeAt(t, spec, workspace.WorkspaceRoot)
+	if wsVol.ClaimName != testClaimName(t, request.WorkspaceID) || wsVol.ReadOnly {
+		t.Errorf("workspace volume = %+v; want rw PVC", wsVol)
 	}
 
-	claimName := testClaimName(t, request.WorkspaceID)
-	workspaceVolume := testVolumeAt(t, spec, workspace.WorkspaceRoot)
-	if workspaceVolume.ClaimName != claimName {
-		t.Errorf("workspace volume claim = %q; want the retained claim %q", workspaceVolume.ClaimName, claimName)
+	cm := fake.configMapsSnapshot()[0]
+	actVol := testVolumeAt(t, spec, container.ActivationRoot)
+	if !actVol.ReadOnly || actVol.ConfigMapName != cm.Name || len(actVol.Items) != len(cm.Data) {
+		t.Fatalf("activation volume = %+v; want ro ConfigMap %q with %d items", actVol, cm.Name, len(cm.Data))
 	}
-	if workspaceVolume.ReadOnly {
-		t.Error("workspace volume is read-only")
-	}
-
-	activationVolume := testVolumeAt(t, spec, container.ActivationRoot)
-	if !activationVolume.ReadOnly {
-		t.Error("activation volume is writable")
-	}
-	if activationVolume.ConfigMapName != configMap.Name {
-		t.Errorf("activation volume configmap = %q; want %q", activationVolume.ConfigMapName, configMap.Name)
-	}
-	if len(activationVolume.Items) != len(configMap.Data) {
-		t.Fatalf("activation volume has %d items; want %d", len(activationVolume.Items), len(configMap.Data))
-	}
-	for _, item := range activationVolume.Items {
-		if _, ok := configMap.Data[item.Path]; !ok {
-			t.Errorf("activation volume item path %q is not in the snapshot", item.Path)
-		}
-		if item.Path != container.WorkloadScriptPath {
-			if err := workspace.ValidatePath(item.Path); err != nil {
-				t.Errorf("activation volume item path %q is not confined: %v", item.Path, err)
-			}
-		}
+	for _, item := range actVol.Items {
 		if item.Mode&0o222 != 0 {
-			t.Errorf("activation volume item %q mode %#o is writable", item.Path, item.Mode)
-		}
-		if strings.HasPrefix(item.Path, workspace.WorkspaceRoot) {
-			t.Errorf("activation volume item %q mounts inside the writable workspace", item.Path)
+			t.Errorf("activation item %q mode %#o is writable", item.Path, item.Mode)
 		}
 	}
 
-	secret := fake.secretsSnapshot()[0]
-	credentialVolume := testVolumeAt(t, spec, workspace.SecretRoot)
-	if !credentialVolume.ReadOnly {
-		t.Error("credential volume is writable")
+	sec := fake.secretsSnapshot()[0]
+	credVol := testVolumeAt(t, spec, workspace.SecretRoot)
+	if !credVol.ReadOnly || credVol.SecretName != sec.Name || len(credVol.Items) != 2 {
+		t.Fatalf("credential volume = %+v; want ro Secret %q with 2 items", credVol, sec.Name)
 	}
-	if credentialVolume.SecretName != secret.Name {
-		t.Errorf("credential volume secret = %q; want %q", credentialVolume.SecretName, secret.Name)
-	}
-	wantSecretPaths := map[string]string{
-		"API_KEY":          workspace.SecretRoot + "/API_KEY",
-		id.SecretTokenName: workspace.ReservedCredentialPath,
-	}
-	if len(credentialVolume.Items) != len(wantSecretPaths) {
-		t.Fatalf("credential volume has %d items; want %d", len(credentialVolume.Items), len(wantSecretPaths))
-	}
-	for _, item := range credentialVolume.Items {
-		want, ok := wantSecretPaths[item.Key]
-		if !ok {
-			t.Errorf("credential volume item key %q is not a declared secret", item.Key)
-			continue
-		}
-		if item.Path != want {
-			t.Errorf("credential volume item %q path = %q; want %q", item.Key, item.Path, want)
-		}
+	for _, item := range credVol.Items {
 		if item.Mode&0o222 != 0 {
-			t.Errorf("credential volume item %q mode %#o is writable", item.Path, item.Mode)
+			t.Errorf("credential item %q mode %#o is writable", item.Key, item.Mode)
 		}
 	}
-}
-
-// TestStartOmitsTaskContextWhenTaskFree proves task-free workloads mount no
-// task snapshot and inject no task environment.
-func TestStartOmitsTaskContextWhenTaskFree(t *testing.T) {
-	fake, _, adapter := testSetup(t)
-	request := testPrepareRequest()
-	request.Task = nil
-	request.TaskID = ""
-	prepareTestWorkload(t, adapter, request)
-	startTestWorkload(t, adapter, request.Identity, request.WorkspaceID)
-
-	configMap := fake.configMapsSnapshot()[0]
-	if _, ok := configMap.Data[workspace.TaskPath]; ok {
-		t.Fatalf("task-free workload mounted %q", workspace.TaskPath)
-	}
-	for key := range configMap.Data {
-		if strings.HasPrefix(key, workspace.TaskRoot+"/") {
-			t.Fatalf("task-free workload mounted task spec file %q", key)
-		}
-	}
-	job := fake.jobsSnapshot()[0]
-	if _, ok := testEnvValue(job.Spec.Env, id.EnvTask); ok {
-		t.Fatal("task-free workload injected KODEMA_TASK")
-	}
-}
-
-// TestPrepareAndStartMaterializeTaskSpecFiles proves Kubernetes workloads carry
-// read-only /kodema/task/{title,description,metadata.json,spec.json} alongside
-// /kodema/task.json in the immutable activation ConfigMap and projected Job
-// volume, refuse changed task-spec content on retry, and refuse stray task
-// files when task-free.
-func TestPrepareAndStartMaterializeTaskSpecFiles(t *testing.T) {
-	taskFiles, err := workspace.BuildTaskFiles(
-		"task-1",
-		"Kube task title",
-		"Kube description",
-		map[string]string{"env": "prod", "component": "api"},
-	)
-	if err != nil {
-		t.Fatalf("BuildTaskFiles: %v", err)
-	}
-
-	fake, _, adapter := testSetup(t)
-	request := testPrepareRequest()
-	request.Task = []byte("[]")
-	request.TaskFiles = taskFiles
-
-	prepareTestWorkload(t, adapter, request)
-	startTestWorkload(t, adapter, request.Identity, request.WorkspaceID)
-
-	want := map[string]string{
-		workspace.TaskPath:            "[]",
-		workspace.TaskTitlePath:       "Kube task title",
-		workspace.TaskDescriptionPath: "Kube description",
-		workspace.TaskMetadataPath:    `{"component":"api","env":"prod"}`,
-		workspace.TaskSpecPath:        `{"id":"task-1","title":"Kube task title","description":"Kube description","metadata":{"component":"api","env":"prod"}}`,
-	}
-	configMap := fake.configMapsSnapshot()[0]
-	for path, expected := range want {
-		got, ok := configMap.Data[path]
-		if !ok {
-			t.Fatalf("activation configmap missing %q", path)
-		}
-		if string(got) != expected {
-			t.Fatalf("activation configmap[%q] = %q; want %q", path, got, expected)
-		}
-	}
-
-	job := fake.jobsSnapshot()[0]
-	activationVol := testVolumeAt(t, job.Spec, "/kodema")
-	projected := make(map[string]VolumeItem, len(activationVol.Items))
-	for _, item := range activationVol.Items {
-		projected[item.Path] = item
-	}
-	for path := range want {
-		item, ok := projected[path]
-		if !ok {
-			t.Fatalf("activation volume missing projected item %q", path)
-		}
-		if item.Key != path || item.Mode != 0o444 {
-			t.Fatalf("activation volume item %q = %+v; want key=%q mode=0444", path, item, path)
-		}
-	}
-
-	// Re-preparing with changed task-spec bytes is refused.
-	changed := request
-	changed.TaskFiles = map[string][]byte{
-		workspace.TaskTitleFile:       []byte("Changed kube title"),
-		workspace.TaskDescriptionFile: taskFiles[workspace.TaskDescriptionFile],
-		workspace.TaskMetadataFile:    taskFiles[workspace.TaskMetadataFile],
-		workspace.TaskSpecFile:        taskFiles[workspace.TaskSpecFile],
-	}
-	if _, err := adapter.Prepare(context.Background(), changed); err == nil {
-		t.Fatal("Prepare accepted changed task spec for the same workload identity")
-	} else if class, ok := fault.ClassOf(err); !ok || class != fault.ChangedIdempotencyContent {
-		t.Fatalf("changed task spec fault class = %v; want ChangedIdempotencyContent", err)
-	}
-
-	// Task-free request with stray task files is refused before cluster calls.
-	fakeFree, _, adapterFree := testSetup(t)
-	freeReq := testPrepareRequest()
-	freeReq.TaskID = ""
-	freeReq.Task = nil
-	freeReq.TaskFiles = taskFiles
-	if _, err := adapterFree.Prepare(context.Background(), freeReq); err == nil {
-		t.Fatal("Prepare accepted stray task files for a task-free workload")
-	} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
-		t.Fatalf("stray task files fault class = %v; want InvalidInput", err)
-	}
-	if len(fakeFree.configMapsSnapshot()) != 0 {
-		t.Fatal("refused task-free Prepare created a ConfigMap")
-	}
-}
-
-// TestStartRefusesWithoutCompletePreparation proves Start never prepares
-// implicitly and never starts against a vanished workspace or a preparation
-// bound to another workspace.
-func TestStartRefusesWithoutCompletePreparation(t *testing.T) {
-	t.Run("no preparation", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		_, err := adapter.Start(context.Background(), reconcile.StartRequest{
-			Identity:    testIdentity(),
-			WorkspaceID: testWorkspaceID(),
-		})
-		if err == nil {
-			t.Fatal("Start succeeded without a preparation snapshot")
-		}
-		if fake.jobCount() != 0 {
-			t.Fatal("Start created a job without a preparation snapshot")
-		}
-	})
-
-	t.Run("workspace vanished after preparation", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		request := testPrepareRequest()
-		prepareTestWorkload(t, adapter, request)
-		fake.removeClaim(testNamespace, testClaimName(t, request.WorkspaceID))
-
-		_, err := adapter.Start(context.Background(), reconcile.StartRequest{
-			Identity:    request.Identity,
-			WorkspaceID: request.WorkspaceID,
-		})
-		if err == nil {
-			t.Fatal("Start succeeded after the retained workspace disappeared")
-		}
-		if fake.jobCount() != 0 {
-			t.Fatal("Start created a job against a missing workspace")
-		}
-		if fake.claimExists(testNamespace, testClaimName(t, request.WorkspaceID)) {
-			t.Fatal("Start recreated the missing workspace claim")
-		}
-	})
-
-	t.Run("preparation bound to another workspace", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		otherWorkspace := id.WorkspaceID("workspace-2")
-		addTestClaim(t, fake, otherWorkspace)
-		request := testPrepareRequest()
-		prepareTestWorkload(t, adapter, request)
-
-		_, err := adapter.Start(context.Background(), reconcile.StartRequest{
-			Identity:    request.Identity,
-			WorkspaceID: otherWorkspace,
-		})
-		if err == nil {
-			t.Fatal("Start accepted a workspace different from the prepared one")
-		}
-		if fake.jobCount() != 0 {
-			t.Fatal("Start created a job bound to a different workspace")
-		}
-	})
-}
-
-func TestJobPodLabelsEmitProjectAndSandboxRole(t *testing.T) {
-	t.Run("regular workload carries tenant and project without sandbox role", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		req := testPrepareRequest()
-		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
-		if _, err := adapter.Prepare(ctx, req); err != nil {
-			t.Fatalf("Prepare: %v", err)
-		}
-		if _, err := adapter.Start(ctx, reconcile.StartRequest{
-			Identity:    req.Identity,
-			WorkspaceID: req.WorkspaceID,
-		}); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
-		if err != nil {
-			t.Fatalf("GetJob: %v", err)
-		}
-		if got := job.Spec.PodLabels[LabelTenant]; got != string(testTenant()) {
-			t.Fatalf("PodLabels[%s] = %q; want %q", LabelTenant, got, testTenant())
-		}
-		if got := job.Spec.PodLabels[LabelProject]; got != "project-alpha" {
-			t.Fatalf("PodLabels[%s] = %q; want project-alpha", LabelProject, got)
-		}
-		if got, ok := job.Spec.PodLabels[LabelRole]; ok {
-			t.Fatalf("regular workload unexpectedly carried %s=%q", LabelRole, got)
-		}
-	})
-
-	t.Run("sandbox workload carries tenant, project, and role=sandbox", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		req := testPrepareRequest()
-		req.ActionName = "sandbox"
-		req.Container.Commands = []string{"exec /kodema/bin/kodema sandbox serve --listen 0.0.0.0:8090 --workspace /workspace --token-file /kodema/secrets/KODEMA_SBOX_TOK_1"}
-		req.Container.Secrets = []id.SecretName{"KODEMA_SBOX_TOK_1"}
-		req.Secrets = []reconcile.SecretValue{{Name: "KODEMA_SBOX_TOK_1", Value: "kodsbox.test"}}
-		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
-		if _, err := adapter.Prepare(ctx, req); err != nil {
-			t.Fatalf("Prepare: %v", err)
-		}
-		if _, err := adapter.Start(ctx, reconcile.StartRequest{
-			Identity:    req.Identity,
-			WorkspaceID: req.WorkspaceID,
-		}); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
-		if err != nil {
-			t.Fatalf("GetJob: %v", err)
-		}
-		for key, want := range map[string]string{
-			LabelTenant:  string(testTenant()),
-			LabelProject: "project-alpha",
-			LabelRole:    RoleSandbox,
-		} {
-			if got := job.Labels[key]; got != want {
-				t.Errorf("Job.Labels[%s] = %q; want %q", key, got, want)
-			}
-			if got := job.Spec.PodLabels[key]; got != want {
-				t.Errorf("Job.Spec.PodLabels[%s] = %q; want %q", key, got, want)
-			}
-		}
-	})
-
-	t.Run("sandbox action with non-sandbox privileged secret does not get role=sandbox", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		req := testPrepareRequest()
-		req.ActionName = "sandbox"
-		req.Container.Commands = []string{"exec /kodema/bin/kodema sandbox serve --listen 0.0.0.0:8090"}
-		// testPrepareRequest carries privileged secret API_KEY.
-		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
-		if _, err := adapter.Prepare(ctx, req); err != nil {
-			t.Fatalf("Prepare: %v", err)
-		}
-		if _, err := adapter.Start(ctx, reconcile.StartRequest{
-			Identity:    req.Identity,
-			WorkspaceID: req.WorkspaceID,
-		}); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
-		if err != nil {
-			t.Fatalf("GetJob: %v", err)
-		}
-		if got, ok := job.Spec.PodLabels[LabelRole]; ok {
-			t.Fatalf("privileged sandbox-named workload unexpectedly carried %s=%q", LabelRole, got)
-		}
-	})
-
-	t.Run("sandbox action only mentioning kodema sandbox serve in comment or echo does not get role=sandbox", func(t *testing.T) {
-		fake, _, adapter := testSetup(t)
-		req := testPrepareRequest()
-		req.ActionName = "sandbox"
-		req.Container.Commands = []string{"# /kodema/bin/kodema sandbox serve\necho 'kodema sandbox serve'"}
-		req.Container.Secrets = nil
-		req.Secrets = nil
-		ctx := runtime.WithExecutionProject(context.Background(), "project-alpha")
-		if _, err := adapter.Prepare(ctx, req); err != nil {
-			t.Fatalf("Prepare: %v", err)
-		}
-		if _, err := adapter.Start(ctx, reconcile.StartRequest{
-			Identity:    req.Identity,
-			WorkspaceID: req.WorkspaceID,
-		}); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		job, err := fake.GetJob(ctx, testNamespace, workloadJobName(req.Identity.WorkloadID))
-		if err != nil {
-			t.Fatalf("GetJob: %v", err)
-		}
-		if got, ok := job.Spec.PodLabels[LabelRole]; ok {
-			t.Fatalf("comment/echo sandbox workload unexpectedly carried %s=%q", LabelRole, got)
-		}
-	})
 }
 
 func testEnvValue(env []EnvVar, name string) (string, bool) {

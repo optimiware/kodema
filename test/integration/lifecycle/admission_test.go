@@ -5,13 +5,9 @@ package lifecycle
 import (
 	"bytes"
 	"crypto/sha256"
-	"net/http"
 	"testing"
-	"time"
 
 	"github.com/optimiware/kodema/api"
-	"github.com/optimiware/kodema/client"
-	runtimepodman "github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/id"
@@ -140,13 +136,7 @@ func TestAdmissionParity(t *testing.T) {
 	if replayed.ExecutionID != first.ExecutionID {
 		t.Fatalf("MCP replay execution = %q; want %q", replayed.ExecutionID, first.ExecutionID)
 	}
-	receipts, err := harness.ReceiptCount(ctx, "start-admission")
-	if err != nil {
-		t.Fatalf("count start receipts: %v", err)
-	}
-	if receipts != 1 {
-		t.Fatalf("start receipt count = %d; want 1", receipts)
-	}
+	assertReceiptCount(t, harness, "start-admission", 1)
 
 	// REST/MCP/client parity for inspect.
 	restInspect := harness.MustREST(harness.ProjectToken, "execution.inspect", api.ExecutionInspectRequest{
@@ -224,31 +214,16 @@ func TestAdmissionParity(t *testing.T) {
 		}},
 	})
 	dropped := applyPipeline(t, harness, "dropped", droppedYAML)
-	droppedClient := harness.Client(harness.ProjectToken)
-	droppedClient.RoundTripper = &dropOnceRoundTripper{base: http.DefaultTransport}
-	droppedClient.Retry = client.RetryPolicy{
-		MaxAttempts: 2,
-		BaseDelay:   time.Millisecond,
-		MaxDelay:    time.Millisecond,
+	droppedClient := newDroppingClient(harness, harness.ProjectToken, 2)
+	droppedStart, err := invokeStartViaClient(t, droppedClient, dropped.PipelineID, nil, dropped.Version, "start-dropped")
+	if err != nil {
+		t.Fatalf("dropped-response start over client: %v", err)
 	}
-	droppedStart := startViaClient(t, droppedClient, dropped.PipelineID, nil, "start-dropped")
 	droppedExecution := waitExecution(t, harness, harness.ProjectToken, droppedStart.ExecutionID)
 	requireSucceeded(t, droppedExecution)
 
-	count, err := harness.ExecutionCount(ctx, dropped.PipelineID)
-	if err != nil {
-		t.Fatalf("count dropped executions: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("dropped-response replay created %d executions; want 1", count)
-	}
-	receipts, err = harness.ReceiptCount(ctx, "start-dropped")
-	if err != nil {
-		t.Fatalf("count dropped receipts: %v", err)
-	}
-	if receipts != 1 {
-		t.Fatalf("dropped-response receipt count = %d; want 1", receipts)
-	}
+	assertExecutionCount(t, harness, dropped.PipelineID, 1)
+	assertReceiptCount(t, harness, "start-dropped", 1)
 }
 
 // TestAdmissionRefusals proves the real admission and activation boundaries
@@ -257,66 +232,16 @@ func TestAdmissionParity(t *testing.T) {
 // synthesized digest, and a missing declared input is refused before any
 // execution row is written.
 func TestAdmissionRefusals(t *testing.T) {
-	harness := factory.Start(t,
-		factory.WithSecretRules(secret.NameRule{
-			Scope: tenancy.Scope{
-				TenantID:  id.TenantID(factory.TenantID),
-				ProjectID: id.ProjectID(factory.ProjectID),
-			},
-			Names: []id.SecretName{pipelineSecretName},
-		}),
-		factory.WithSecrets(map[string]string{
-			pipelineSecretName: pipelineSecretValue,
-			deniedSecretName:   deniedSecretValue,
-		}),
-	)
-	ctx := t.Context()
+	harness := factory.Start(t, deniedSecretOptions()...)
 
 	t.Run("undeclared secret fails preparation", func(t *testing.T) {
-		document := marshalPipeline(t, pipelineDoc{
-			Actions: []pipelineActionDoc{{
-				Name:     "denied",
-				Image:    harness.Image.Reference,
-				Secrets:  []string{deniedSecretName},
-				Commands: []string{"true"},
-			}},
-		})
+		document := deniedSecretPipeline(t, harness, "")
 		applied := applyPipeline(t, harness, "denied", document)
 		started := startPipeline(t, harness, harness.ProjectToken, applied.PipelineID, nil, "start-denied")
 
 		execution := waitExecution(t, harness, harness.ProjectToken, started.ExecutionID)
-		if execution.State != "failed" {
-			t.Fatalf("denied-secret execution state = %q; want failed", execution.State)
-		}
-		if execution.Failure == nil || execution.Failure.Kind != "preparation" {
-			t.Fatalf("denied-secret failure = %+v; want preparation", execution.Failure)
-		}
-		// The workspace is retained before preparation. A preparation failure
-		// that never issued Start must still release it and keep the cleanup
-		// record attributable instead of stranding it forever.
-		if execution.Cleanup.State != "complete" {
-			t.Fatalf("denied-secret cleanup = %+v; want complete", execution.Cleanup)
-		}
-		if execution.Cleanup.WorkloadID == "" {
-			t.Fatal("denied-secret cleanup did not name the failed identity")
-		}
-		if execution.Cleanup.WorkspaceID == "" {
-			t.Fatal("denied-secret cleanup did not name the retained workspace")
-		}
-		present, err := harness.WorkspaceVolumePresent(ctx, execution.Cleanup.WorkspaceID)
-		if err != nil {
-			t.Fatalf("probe released workspace volume: %v", err)
-		}
-		if present {
-			t.Fatalf("preparation failure left the workspace volume for %s", execution.Cleanup.WorkspaceID)
-		}
-		containers, err := harness.Containers(ctx, runtimepodman.LabelExecution, started.ExecutionID)
-		if err != nil {
-			t.Fatalf("list execution containers: %v", err)
-		}
-		if len(containers) != 0 {
-			t.Fatalf("preparation failure started containers %v", containers)
-		}
+		assertPreparationFailure(t, execution, "denied", "")
+		assertExecutionResourcesReleased(t, harness, started.ExecutionID)
 	})
 
 	t.Run("mutable tag is refused not synthesized", func(t *testing.T) {
@@ -335,13 +260,7 @@ func TestAdmissionRefusals(t *testing.T) {
 		if publicError.Code != api.CodeDependencyUnavailable {
 			t.Fatalf("mutable-tag start code = %q; want %q", publicError.Code, api.CodeDependencyUnavailable)
 		}
-		count, err := harness.ExecutionCount(ctx, applied.PipelineID)
-		if err != nil {
-			t.Fatalf("count tagged executions: %v", err)
-		}
-		if count != 0 {
-			t.Fatalf("mutable-tag start wrote %d executions; want 0", count)
-		}
+		assertExecutionCount(t, harness, applied.PipelineID, 0)
 	})
 
 	t.Run("missing declared input is refused", func(t *testing.T) {
@@ -361,12 +280,6 @@ func TestAdmissionRefusals(t *testing.T) {
 		if publicError.Code != api.CodeInvalidInput {
 			t.Fatalf("missing-input start code = %q; want %q", publicError.Code, api.CodeInvalidInput)
 		}
-		count, err := harness.ExecutionCount(ctx, applied.PipelineID)
-		if err != nil {
-			t.Fatalf("count missing-input executions: %v", err)
-		}
-		if count != 0 {
-			t.Fatalf("missing-input start wrote %d executions; want 0", count)
-		}
+		assertExecutionCount(t, harness, applied.PipelineID, 0)
 	})
 }

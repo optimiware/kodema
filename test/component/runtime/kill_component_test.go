@@ -14,6 +14,7 @@ import (
 	"github.com/optimiware/kodema/internal/adapter/runtime/podman"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
+	"github.com/optimiware/kodema/internal/fault"
 	"github.com/optimiware/kodema/internal/id"
 	podmandriver "github.com/optimiware/kodema/internal/server/drivers/podman"
 	runtimesupport "github.com/optimiware/kodema/test/support/infrastructure/runtime"
@@ -22,7 +23,7 @@ import (
 // TestPodmanKillHelperProcess is the child controller for
 // TestPodmanRuntimeKilledControllerBetweenLaunchAndObservation. It prepares and
 // creates the container, then blocks inside the start call after publishing a
-// marker. The parent SIGKILLs it between launch intent and observation.
+// marker. The parent SIGKILLs it between container creation and observation.
 func TestPodmanKillHelperProcess(t *testing.T) {
 	if os.Getenv("KODEMA_RUNTIME_HELPER") != "1" {
 		t.Skip("helper process only")
@@ -32,8 +33,8 @@ func TestPodmanKillHelperProcess(t *testing.T) {
 	marker := os.Getenv("KODEMA_HELPER_MARKER")
 	image := os.Getenv("KODEMA_HELPER_IMAGE")
 	// The parent chooses the complete run-scoped identity and workspace; the
-	// helper must never mint its own, or the killed controller's durable state
-	// and container would belong to a different run namespace.
+	// helper must never mint its own, or the killed controller's container
+	// would belong to a different run namespace.
 	identity := reconcile.EffectIdentity{
 		ExecutionID:    id.ExecutionID(os.Getenv("KODEMA_HELPER_EXECUTION")),
 		ActionID:       id.ActionID(os.Getenv("KODEMA_HELPER_ACTION")),
@@ -63,8 +64,10 @@ func TestPodmanKillHelperProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("helper adapter: %v", err)
 	}
-	request := testPrepareRequest(identity, workspaceID, "build", "task-1",
-		testContainer(image, []string{`echo launched >> /workspace/launch-count`}, nil, nil), nil, "tok-abc")
+	request := runtimesupport.StandardPrepareRequest(identity, workspaceID, image, []string{`echo launched >> /workspace/launch-count`})
+	request.Container.Env = nil
+	request.Container.Secrets = nil
+	request.Secrets = nil
 	if _, err := adapter.Prepare(context.Background(), request); err != nil {
 		t.Fatalf("helper Prepare: %v", err)
 	}
@@ -87,9 +90,11 @@ func (b *blockingStartLibpod) StartContainer(ctx context.Context, name string) e
 }
 
 // TestPodmanRuntimeKilledControllerBetweenLaunchAndObservation SIGKILLs a real
-// controller after it persisted the launch intent and created the container but
-// before it observed the start. A reconstructed controller must report unknown,
-// never never-started, and must not replay the command.
+// controller after it created the container in libpod but before Start
+// completed. Under S07 §3, a reconstructed controller must observe
+// ObservationUnknown on the created container (never NeverStarted), refuse to
+// replay Start (StartUnknown / UncertainExternalEffect), retain the created
+// container on Remove, and observe ObservationAbsent once cleaned up.
 func TestPodmanRuntimeKilledControllerBetweenLaunchAndObservation(t *testing.T) {
 	ctx := t.Context()
 	fixture := newPodmanFixture(t, "workspace-podman-kill")
@@ -138,24 +143,32 @@ func TestPodmanRuntimeKilledControllerBetweenLaunchAndObservation(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Observe after kill: %v", err)
 	}
-	if observation.Kind == engine.ObservationNeverStarted || observation.ProofOfNonexecution() {
-		t.Fatalf("killed controller collapsed into never-started: %+v", observation)
+	if observation.Kind != engine.ObservationUnknown || observation.ProofOfNonexecution() {
+		t.Fatalf("killed controller observation = %+v; want ObservationUnknown", observation)
 	}
 	start, err := recovered.Start(ctx, reconcile.StartRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
-	if err == nil || start.Outcome != reconcile.StartUnknown {
+	if start.Outcome != reconcile.StartUnknown {
 		t.Fatalf("reconstructed start after kill = %q/%v; want unknown", start.Outcome, err)
 	}
+	runtimesupport.RequireFaultClass(t, err, fault.UncertainExternalEffect)
 	if _, found := runtimesupport.ReadVolumeFile(ctx, t, fixture.volumeName, "launch-count"); found {
 		t.Fatal("the killed controller's command ran before observation")
 	}
 	if names := podmanContainerNames(t, ctx, fixture.workspaceID); len(names) != 1 {
 		t.Fatalf("workspace containers after kill = %v; want exactly one created container", names)
 	}
+	if retained, err := recovered.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil || retained.Removed {
+		t.Fatalf("Remove on created container = %+v, %v; want retained", retained, err)
+	}
 	if err := runtimesupport.RemoveRunContainersInWorkspace(ctx, string(fixture.workspaceID)); err != nil {
 		t.Fatalf("remove created container: %v", err)
 	}
 	if removal, err := recovered.Remove(ctx, reconcile.RemoveRequest{Identity: identity, WorkspaceID: fixture.workspaceID}); err != nil || !removal.Removed {
 		t.Fatalf("Remove = %+v, %v; want removed", removal, err)
+	}
+	absent, err := recovered.Observe(ctx, reconcile.ObserveRequest{Identity: identity, WorkspaceID: fixture.workspaceID})
+	if err != nil || absent.Kind != engine.ObservationAbsent {
+		t.Fatalf("Observe after cleanup = %+v, %v; want ObservationAbsent", absent, err)
 	}
 	if err := recovered.Release(ctx, fixture.workspaceID); err != nil {
 		t.Fatalf("Release: %v", err)

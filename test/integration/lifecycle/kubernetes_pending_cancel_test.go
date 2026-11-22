@@ -126,24 +126,11 @@ func TestKubernetesPendingCancellationCompletesCleanup(t *testing.T) {
 	// the retry schedule is still paced in real time because Kubernetes
 	// finishes the PVC deletion finalizer asynchronously.
 	finished := waitUncertainStopExecution(t, harness, executionID)
-	if finished.State != "cancelled" {
-		t.Fatalf("terminal state = %q; want cancelled", finished.State)
-	}
-	if finished.Failure != nil {
-		t.Fatalf("cancelled execution carries a failure: %+v", finished.Failure)
-	}
-	if finished.Cleanup.State != "complete" {
-		t.Fatalf("cleanup state = %q; want explicit complete", finished.Cleanup.State)
-	}
+	assertCancelledExecution(t, finished, true)
 
 	// The cancelled outcome is immutable and the cleanup record stays complete.
 	immutable := inspectExecution(t, harness, harness.ProjectToken, executionID)
-	if immutable.State != "cancelled" || immutable.Failure != nil {
-		t.Fatalf("execution outcome changed after cleanup: state=%q failure=%+v", immutable.State, immutable.Failure)
-	}
-	if immutable.Cleanup.State != "complete" {
-		t.Fatalf("cleanup state regressed to %q after completion", immutable.Cleanup.State)
-	}
+	assertCancelledExecution(t, immutable, true)
 
 	// Every owned object and the retained workspace claim are gone.
 	waitJobsGone(t, harness, executionID)

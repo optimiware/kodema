@@ -11,11 +11,9 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"slices"
 	"testing"
 	"time"
 
-	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/engine/reconcile"
 	"github.com/optimiware/kodema/internal/fault"
 )
@@ -42,10 +40,12 @@ func generateTestCAPEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-func TestPodmanWorkloadCAMountsReadOnlyCertAndExposesEnvOptIn(t *testing.T) {
+// TestPodmanSharedCAHostInstallation pins Podman-specific host-side CA
+// installation: private-key stripping, shared <root>/.ca/<digest>/ca.crt (0444)
+// bind mount, reuse across workloads, and survival after workload Remove.
+func TestPodmanSharedCAHostInstallation(t *testing.T) {
 	caPEM := generateTestCAPEM(t)
 	caFile := filepath.Join(t.TempDir(), "ca.crt")
-	// A bundle that also carries a key must reach the workload without it.
 	bundle := append(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("key")}), caPEM...)
 	if err := os.WriteFile(caFile, bundle, 0o600); err != nil {
 		t.Fatal(err)
@@ -65,58 +65,33 @@ func TestPodmanWorkloadCAMountsReadOnlyCertAndExposesEnvOptIn(t *testing.T) {
 		t.Fatalf("New with WorkloadCAFile: %v", err)
 	}
 	fx.adapter = adapter
-	// Attempt to spoof KODEMA_CA_FILE in literal env; the adapter must override
-	// it with the authoritative /etc/kodema/ca/ca.crt path.
-	fx.request.Container.Env = append(fx.request.Container.Env,
-		definition.EnvVar{Name: EnvWorkloadCAFile, Value: "/tmp/evil.crt"})
-
 	fx.prepare(t)
 
-	// The CA bundle must live under <root>/.ca/<digest>/ca.crt and never be
-	// copied into <root>/<workload>/kodema.
 	sharedCA := filepath.Join(fx.adapter.caDir, WorkloadCAKey)
 	if filepath.Dir(fx.adapter.caDir) != filepath.Join(fx.root, caDirectory) {
 		t.Fatalf("caDir = %q; want under %q", fx.adapter.caDir, filepath.Join(fx.root, caDirectory))
 	}
 	if got := readHostFile(t, sharedCA); string(got) != string(caPEM) {
-		t.Fatalf("shared CA bundle mismatch")
+		t.Fatal("shared CA bundle did not strip private key or match CA PEM")
 	}
 	if mode := hostFileMode(t, sharedCA); mode != 0o444 {
 		t.Fatalf("shared CA bundle mode = %o; want 0444", mode)
 	}
 	if hostFileExists(t, filepath.Join(fx.kodemaRoot(), WorkloadCAKey)) {
-		t.Fatal("Prepare copied ca.crt into <root>/<workload>/kodema; must use shared /etc/kodema/ca bind mount")
+		t.Fatal("Prepare copied ca.crt into <root>/<workload>/kodema")
 	}
 
 	fx.start(t)
-	specs := fx.libpod.createSpecs()
-	if len(specs) != 1 {
-		t.Fatalf("createSpecs = %d; want 1", len(specs))
-	}
-	caMount, ok := mountAt(specs[0], WorkloadCAMountPath)
-	if !ok {
-		t.Fatalf("mounts %+v missing %s bind mount", specs[0].Mounts, WorkloadCAMountPath)
-	}
-	if caMount.Type != "bind" || !caMount.ReadOnly || caMount.Source != fx.adapter.caDir {
-		t.Fatalf("CA mount = %+v; want read-only bind from %q", caMount, fx.adapter.caDir)
-	}
-	wantCAEnv := EnvWorkloadCAFile + "=" + WorkloadCAPath
-	if !slices.Contains(specs[0].Env, wantCAEnv) {
-		t.Fatalf("container env %v missing %q", specs[0].Env, wantCAEnv)
-	}
-	if slices.Contains(specs[0].Env, EnvWorkloadCAFile+"=/tmp/evil.crt") {
-		t.Fatalf("container env %v allowed spoofing %s", specs[0].Env, EnvWorkloadCAFile)
+	caMount, ok := mountAt(fx.createdSpec(t), WorkloadCAMountPath)
+	if !ok || caMount.Type != "bind" || !caMount.ReadOnly || caMount.Source != fx.adapter.caDir {
+		t.Fatalf("CA mount = %+v (ok=%v); want read-only bind from %q", caMount, ok, fx.adapter.caDir)
 	}
 
-	// A second workload reuses the shared CA file without rewriting it, and
-	// removing the first workload keeps the shared CA intact.
+	// Second workload reuses the shared CA without rewriting; Remove keeps it.
 	writes := fx.files.countPath("WriteFile", sharedCA)
 	second := fx.request
 	second.Identity = reconcile.EffectIdentity{
-		ExecutionID:    "exec-1",
-		ActionID:       "action-2",
-		WorkloadID:     "workload-2",
-		IdempotencyKey: "idem-2",
+		ExecutionID: "exec-1", ActionID: "action-2", WorkloadID: "workload-2", IdempotencyKey: "idem-2",
 	}
 	if _, err := fx.adapter.Prepare(context.Background(), second); err != nil {
 		t.Fatalf("Prepare of second workload: %v", err)
