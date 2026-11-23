@@ -161,6 +161,9 @@ func TestResolverDoesNotFallBackOnFailure(t *testing.T) {
 		resolver := newResolver(t, &fakePolicy{}, lookup, cipher)
 		_, err := resolver.Resolve(context.Background(), resolverRequest(scope, name))
 		requireClass(t, err, fault.DependencyUnavailable)
+		if message, _ := fault.MessageOf(err); message != "row read failed" {
+			t.Fatalf("message = %q; an unreadable row must keep its own message", message)
+		}
 		if len(lookup.callSnapshot()) != 1 {
 			t.Fatalf("lookup count = %d; want no tenant fallback", len(lookup.callSnapshot()))
 		}
@@ -212,6 +215,7 @@ func TestResolverDoesNotFallBackOnFailure(t *testing.T) {
 		resolver := newResolver(t, &fakePolicy{}, lookup, cipher)
 		_, err := resolver.Resolve(context.Background(), resolverRequest(scope, name))
 		requireClass(t, err, fault.NotFound)
+		requireNamesOnlyMissingSecret(t, err, name)
 		if len(lookup.callSnapshot()) != 2 {
 			t.Fatalf("lookup count = %d; want project then tenant", len(lookup.callSnapshot()))
 		}
@@ -269,6 +273,37 @@ func TestResolverMissingNameFailsWholeRequest(t *testing.T) {
 	requireClass(t, err, fault.NotFound)
 	if len(resolved) != 0 {
 		t.Fatalf("resolved count = %d; want no partial values", len(resolved))
+	}
+	requireNamesOnlyMissingSecret(t, err, absent, present)
+}
+
+// TestResolverMissingTenantNameIsNamed pins that a tenant-scoped request, which
+// has no fallback, names the absent secret like a project-scoped one.
+func TestResolverMissingTenantNameIsNamed(t *testing.T) {
+	tenant := tenantScope("tenant-a")
+	absent := id.SecretName("API_KEY")
+	resolver := newResolver(t, &fakePolicy{}, &fakeLookup{}, &fakeCipher{})
+
+	_, err := resolver.Resolve(context.Background(), resolverRequest(tenant, absent))
+	requireClass(t, err, fault.NotFound)
+	requireNamesOnlyMissingSecret(t, err, absent)
+}
+
+// requireNamesOnlyMissingSecret checks that the public message names the absent
+// secret and none of the other declared names.
+func requireNamesOnlyMissingSecret(t *testing.T, err error, absent id.SecretName, others ...id.SecretName) {
+	t.Helper()
+	message, ok := fault.MessageOf(err)
+	if !ok {
+		t.Fatalf("error %v carries no public message", err)
+	}
+	if want := `secret "` + string(absent) + `" is not stored in scope`; message != want {
+		t.Fatalf("message = %q; want %q", message, want)
+	}
+	for _, other := range others {
+		if strings.Contains(message, string(other)) {
+			t.Fatalf("message = %q; must not name the stored secret %q", message, other)
+		}
 	}
 }
 
