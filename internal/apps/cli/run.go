@@ -433,7 +433,7 @@ func runInspect(ctx context.Context, config Config, args []string, ports Ports) 
 			if executionID == "" {
 				executionID = strings.TrimSpace(positionals[0])
 			}
-			_ = printFailedActionStderr(ctx, ports, executionID, inspected.Actions)
+			_ = printFailedActionStderr(ctx, ports, executionID, inspected)
 		}
 		return ExitSuccess
 	}
@@ -558,7 +558,7 @@ func runWatch(ctx context.Context, config Config, args []string, ports Ports, de
 					if executionID == "" {
 						executionID = strings.TrimSpace(positionals[0])
 					}
-					if err := printFailedActionStderr(ctx, ports, executionID, inspected.Actions); err != nil && ctx.Err() != nil {
+					if err := printFailedActionStderr(ctx, ports, executionID, inspected); err != nil && ctx.Err() != nil {
 						return watchCanceled(ports.Err)
 					}
 				}

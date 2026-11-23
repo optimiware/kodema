@@ -565,6 +565,26 @@ func TestRunFile(t *testing.T) {
 			},
 		},
 		{
+			name: "preparation failure reports the cause without logs or a logs hint",
+			inspections: []string{
+				`{"state":"failed","actions":[
+					{"action_id":"act-1","name":"use-secret","kind":"container","state":"failed"},
+					{"action_id":"act-2","name":"next-step","kind":"container","state":"cancelled"}],
+				"failure":{"kind":"preparation","reason":"preparation_failed","detail":"not_found: secret \"DEMO_TOKEN\" is not stored in scope"}}`,
+			},
+			// The server stores this marker for an action that never started.
+			logs:      map[string][]string{"act-1": {"[logs unavailable]\n"}},
+			stderrErr: fault.New(fault.InvalidInput, "must not fetch stderr for an action that never started"),
+			wantCode:  cli.ExitFailure,
+			wantOut:   "",
+			wantErr: []string{
+				"action use-secret: failed\n",
+				"action next-step: cancelled\n",
+				`execution exec-1 failed: preparation: preparation_failed: not_found: secret "DEMO_TOKEN" is not stored in scope` + "\n",
+			},
+			wantNotErr: []string{"hint:", "kodema logs", "stderr (action", "[logs unavailable]"},
+		},
+		{
 			name: "cancelled exits 1",
 			inspections: []string{
 				`{"state":"cancelled","actions":[{"action_id":"act-1","kind":"container","state":"cancelled"}],
@@ -781,6 +801,17 @@ func numberedLines(count int) string {
 		builder.WriteByte('\n')
 	}
 	return builder.String()
+}
+
+// preparationFailedBody is an execution.inspect body whose first container
+// action failed activation preparation, so it never started, and whose second
+// action was cancelled.
+func preparationFailedBody(executionID string) string {
+	return `{"execution_id":"` + executionID + `","state":"failed","version":5,"current_action":-1,"actions":[
+		{"action_id":"act-1","index":0,"name":"use-secret","kind":"container","state":"failed","version":4},
+		{"action_id":"act-2","index":1,"name":"next-step","kind":"container","state":"cancelled","version":2}],
+	"failure":{"kind":"preparation","reason":"preparation_failed","detail":"not_found: secret \"DEMO_TOKEN\" is not stored in scope"},
+	"cleanup":{"state":"complete"}}`
 }
 
 var _ client.Transport = (*scriptedTransport)(nil)

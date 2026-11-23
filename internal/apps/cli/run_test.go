@@ -514,6 +514,28 @@ func TestRunInspectFailedActionStderr(t *testing.T) {
 		}
 	})
 
+	t.Run("preparation failure fetches no logs and prints no logs hint", func(t *testing.T) {
+		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			if inv.Operation != "execution.inspect" {
+				t.Fatalf("unexpected operation %s for an action that never started", inv.Operation)
+			}
+			return api.Result{Operation: inv.Operation, Body: json.RawMessage(preparationFailedBody("exec-42"))}, nil
+		}}
+		ports, out, errOut := testPorts(transport)
+		cfg := testConfig()
+		cfg.Output = cli.OutputTable
+		code := cli.Run(context.Background(), cfg, []string{"inspect", "exec-42"}, ports)
+		if code != cli.ExitSuccess {
+			t.Fatalf("exit code = %d; want %d (stderr: %s)", code, cli.ExitSuccess, errOut.String())
+		}
+		if !strings.Contains(out.String(), `preparation: preparation_failed: not_found: secret "DEMO_TOKEN" is not stored in scope`) {
+			t.Fatalf("stdout = %q; want the preparation failure detail", out.String())
+		}
+		if errOut.Len() != 0 {
+			t.Fatalf("stderr = %q; want no logs output or hint", errOut.String())
+		}
+	})
+
 	t.Run("output json stays pure valid JSON with no log fetch", func(t *testing.T) {
 		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
 			if inv.Operation != "execution.inspect" {
@@ -709,6 +731,29 @@ func TestRunWatchFailedActionStderr(t *testing.T) {
 			if !strings.Contains(errOut.String(), want) {
 				t.Fatalf("stderr = %q; want %q", errOut.String(), want)
 			}
+		}
+	})
+
+	t.Run("preparation failure fetches no logs and prints no logs hint", func(t *testing.T) {
+		polls := []string{runningBody, preparationFailedBody("exec-42")}
+		inspectIdx := 0
+		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			if inv.Operation != "execution.inspect" {
+				t.Fatalf("unexpected operation %s for an action that never started", inv.Operation)
+			}
+			body := polls[min(inspectIdx, len(polls)-1)]
+			inspectIdx++
+			return api.Result{Operation: inv.Operation, Body: json.RawMessage(body)}, nil
+		}}
+		ports, _, errOut := testPorts(transport)
+		cfg := testConfig()
+		cfg.Output = cli.OutputTable
+		code := cli.Run(context.Background(), cfg, []string{"watch", "exec-42"}, ports)
+		if code != cli.ExitFailure {
+			t.Fatalf("exit code = %d; want %d", code, cli.ExitFailure)
+		}
+		if errOut.String() != "watch failed: execution status failed\n" {
+			t.Fatalf("stderr = %q; want only the watch failure, with no logs hint", errOut.String())
 		}
 	})
 
