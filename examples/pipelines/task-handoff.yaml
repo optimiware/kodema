@@ -1,3 +1,5 @@
+# Unplanned Conversation Handoff (`task.ask` / `task.reply`)
+#
 # A conversation handoff is an ask, not a declared request. The ask operation
 # (POST /api/v1/tasks/{task}/ask) appends the question, marks the task waiting
 # and cancels this execution (cancel reason requested), so nothing here may
@@ -8,31 +10,44 @@
 # read-only /kodema/task.json snapshot present; a task-free run has none of them
 # and cannot ask.
 #
-# /kodema/task.json carries only the admitted conversation (a JSON array of
-# messages with their references) and /kodema/task/ carries the admitted title,
-# description, and metadata. Neither carries the live task lifecycle version,
-# so this example first reads the current task with `kodema call task.read` and
-# passes its lifecycle_version as the ask's expected version. The read pins
-# KODEMA_OUTPUT=json because kodema defaults to a table rendering that never
-# spells the version as JSON.
-# kodema exposes served operations as `kodema call <operation> --input=<json>
-# --expected-version=<n> --idempotency-key=<key>`; there is no `kodema task ask`
-# subcommand.
+# Everyday CLI shortcut inside container actions (auto-uses $KODEMA_TASK and
+# auto-reads the task lifecycle_version before asking):
+#
+#   kodema task ask \
+#     --question "Continue from the durable handoff context." \
+#     --to role/engineer \
+#     --ref "commit=$(cat /kodema/outputs/persist/context_commit)" \
+#     --ref "digest=$(cat /kodema/inputs/digest)" \
+#     --idempotency-key "ask:${KODEMA_TASK}:$(cat /kodema/outputs/persist/context_commit)"
+#
+# Below is the explicit low-level `kodema call` form showing the exact served
+# API contract (`task.read` -> `task.ask` with `--expected-version` and
+# `--idempotency-key`). `/kodema/task.json` carries only the admitted
+# conversation and no live lifecycle version, so `task.read` pins
+# `KODEMA_OUTPUT=json` to read `lifecycle_version` reliably.
 #
 # Persist durable context first, then reference only durable values: the pushed
 # context commit from the earlier action and the admitted commit/digest inputs.
+#
+# Flow: persist (container) -> ask (container, invokes task.read + task.ask)
+# Run:  kodema pipeline apply examples/pipelines/task-handoff.yaml
+#       kodema task run --title "Clarify migration" --pipeline task-handoff \
+#         --input commit=<sha> --input digest=sha256:<64-hex>
 inputs:
   - commit
   - digest
 actions:
   - name: persist
     image: registry.example.com/kodema/handoff@sha256:283b837d6ffdf6c792a33e6bbf622bd14a1bb81292488a90873b5408da745448
-    commands:
-      - push-handoff-context "$(cat /kodema/inputs/commit)"
+    timeout: 10m
     outputs:
       - context_commit
+    commands:
+      - push-handoff-context "$(cat /kodema/inputs/commit)" > /kodema/outputs/persist/context_commit
+
   - name: ask
     image: registry.example.com/kodema/handoff@sha256:283b837d6ffdf6c792a33e6bbf622bd14a1bb81292488a90873b5408da745448
+    timeout: 5m
     commands:
       - |
         task_version="$(KODEMA_OUTPUT=json kodema call task.read \

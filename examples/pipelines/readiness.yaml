@@ -1,7 +1,16 @@
+# Delivery (Stage 4): Explicit Readiness Observation
+#
+# Command exit during rollout is not proof of health. This pipeline observes
+# the deployed target after rollout and records an explicit `ready` output.
+#
+# Flow: observe (container) -> outputs.ready
+# Run:  kodema pipeline apply examples/pipelines/readiness.yaml
+#       kodema pipeline start readiness
 actions:
   - name: observe
     image: registry.example.com/kodema/readiness@sha256:0e06b84496798ba899c50de6eb2efc0b92c62a75e5ba69af7a158cba107352bc
-    commands:
-      - observe-readiness
+    timeout: 10m
     outputs:
       - ready
+    commands:
+      - observe-readiness > /kodema/outputs/observe/ready

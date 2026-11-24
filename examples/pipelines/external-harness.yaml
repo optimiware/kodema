@@ -1,37 +1,53 @@
-# External coding-agent harness recipe (OpenCode, Claude Code, Codex, Pi).
+# External Coding-Agent Harness (OpenCode, Claude Code, Codex, Pi)
 #
-# Raw provider credentials (OPENCODE_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY,
-# or custom provider keys) are stored as project secrets (`kodema secret set ...`)
-# and are NEVER mounted into workload containers. Even in local `kodema up` stacks,
-# Kodema refuses to mount LLM-proxy-managed provider secrets via `secrets: [...]`.
+# Raw provider credentials (`OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`,
+# `OPENAI_API_KEY`, or custom provider keys) live in Kodema's control plane
+# (`kodema secret set ...`) and are NEVER mounted into workload containers.
 #
-# Instead, the harness authenticates to Kodema's streaming LLM proxy
-# (`/llm/{provider}/*`) by reading the mounted execution credential from
-# `/kodema/secrets/KODEMA_TOKEN` into the harness API-key variables while pointing
-# at the injected `KODEMA_LLM_<PROVIDER>_BASE_URL` environment variables and
-# trusting `$KODEMA_CA_FILE`.
+# Wrapping the harness with `kodema harness exec -- <cmd>` (built into
+# `/kodema/bin/kodema`, on `PATH` in every container action) starts a local
+# loopback LLM proxy that:
+#   - Re-reads `/kodema/secrets/KODEMA_TOKEN` fresh on every request (survives
+#     live controller token rotation during long coding sessions),
+#   - Trusts `$KODEMA_CA_FILE` automatically (zero CA env-var boilerplate),
+#   - Exports `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `OPENCODE_BASE_URL`,
+#     `*_API_KEY`, rewritten `KODEMA_LLM_<PROVIDER>_BASE_URL`, and default
+#     OpenCode v2 `OPENCODE_CONFIG_CONTENT`,
+#   - Enforces live token/USD budgets and attributes usage to `model_usage`.
+#
+# Swap `opencode run ...` for `claude -p ...`, `codex exec ...`, or `pi -p ...`
+# without changing the pipeline contract. For custom tools that dial
+# `$KODEMA_LLM_<PROVIDER>_BASE_URL` directly without `kodema harness exec`, read
+# `/kodema/secrets/KODEMA_TOKEN` per request and trust `$KODEMA_CA_FILE`.
+#
+# Flow: prepare (container) -> harness (container, loopback LLM proxy)
+# Run:  kodema pipeline apply examples/pipelines/external-harness.yaml
+#       kodema task run --title "Implement feature" --pipeline external-harness
+budget:
+  max_tokens: 250000
+  max_cost_usd: 5.0
 actions:
   - name: prepare
     image: registry.example.com/kodema/base@sha256:cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2
+    timeout: 5m
     commands:
       - kodema-example prepare-workspace
+
   - name: harness
     image: registry.example.com/kodema/harness@sha256:49f756463ad9dcfb9b6ade54d7d6f15476e7214f46a65b4b0c55d46845b12f70
+    timeout: 30m
+    caches:
+      - go-mod
+      - go-build
+    budget:
+      max_tokens: 200000
+      max_cost_usd: 4.0
+    resources:
+      memory: 4Gi
+      cpu: "2"
+    env:
+      GOMODCACHE: /kodema/cache/go-mod
+      GOCACHE: /kodema/cache/go-build
     commands:
-      - |
-        export ANTHROPIC_BASE_URL="${KODEMA_LLM_ANTHROPIC_BASE_URL:-${KODEMA_URL}/llm/anthropic}"
-        export OPENAI_BASE_URL="${KODEMA_LLM_OPENAI_BASE_URL:-${KODEMA_URL}/llm/openai/v1}"
-        export OPENCODE_BASE_URL="${KODEMA_LLM_OPENCODE_BASE_URL:-${KODEMA_URL}/llm/opencode/v1}"
-        # The credential file has no trailing newline, so read assigns it and reports EOF.
-        IFS= read -r ANTHROPIC_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$ANTHROPIC_API_KEY" ]
-        IFS= read -r OPENAI_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$OPENAI_API_KEY" ]
-        IFS= read -r OPENCODE_API_KEY < /kodema/secrets/KODEMA_TOKEN || [ -n "$OPENCODE_API_KEY" ]
-        export ANTHROPIC_API_KEY OPENAI_API_KEY OPENCODE_API_KEY
-        if [ -n "${KODEMA_CA_FILE:-}" ]; then
-          export NODE_EXTRA_CA_CERTS="${KODEMA_CA_FILE}"
-          export SSL_CERT_FILE="${KODEMA_CA_FILE}"
-          export CURL_CA_BUNDLE="${KODEMA_CA_FILE}"
-          export GIT_SSL_CAINFO="${KODEMA_CA_FILE}"
-        fi
-        harness run --config harness.yaml
+      - kodema harness exec -- opencode run "Implement /kodema/task/spec.json and verify unit tests pass"
       - harness report

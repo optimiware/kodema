@@ -1,11 +1,32 @@
+# Git Push Trigger (`on.push`)
+#
+# Automatically starts an execution when `service/git-service` reports a
+# `git.ref.updated` event on `repo-1` matching `refs/heads/main`.
+#
+# Rules enforced at admission:
+#   - `on.push` requires both `repository` (registered resource ID) and
+#     `service` (service account ID; binding requires Admin authority).
+#   - Ref patterns must be exact refs (`refs/heads/main`) or trailing-slash
+#     prefixes (`refs/heads/work/`) — never globs or regexes.
+#   - Declared inputs may only be chosen from `repository`, `ref`, `commit`,
+#     and `previous_commit`.
+#   - Ref deletions and execution-originated pushes never trigger `on.push`.
+#
+# Flow: on.push (refs/heads/main) -> test (container)
+# Run:  kodema pipeline apply examples/pipelines/push-test.yaml
 repository: repo-1
 service: git-service
 on:
   push:
     - refs/heads/main
-inputs: [repository, ref, commit, previous_commit]
+inputs:
+  - repository
+  - ref
+  - commit
+  - previous_commit
 actions:
   - name: test
     image: registry.example.com/kodema/test@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+    timeout: 15m
     commands:
-      - test-commit
+      - test-commit "$(cat /kodema/inputs/repository)" "$(cat /kodema/inputs/ref)" "$(cat /kodema/inputs/commit)"

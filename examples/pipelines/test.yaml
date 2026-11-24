@@ -1,7 +1,17 @@
+# Delivery (Stage 2): Test Forwarded Image Digest (No Rebuild)
+#
+# Consumes the digest-pinned `image` reference published by `build.yaml` or
+# `oci-build.yaml` without rebuilding or republishing image bytes.
+#
+# Flow: test (container)
+# Run:  kodema pipeline apply examples/pipelines/test.yaml
+#       kodema pipeline start test \
+#         --input image=registry.example.com/shop/web@sha256:<64-hex>
 inputs:
   - image
 actions:
   - name: test
     image: registry.example.com/kodema/test@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+    timeout: 15m
     commands:
-      - test-image
+      - test-image "$(cat /kodema/inputs/image)"

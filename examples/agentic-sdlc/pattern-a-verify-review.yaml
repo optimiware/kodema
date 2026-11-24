@@ -10,6 +10,8 @@
 #   - `revise`: appends feedback to the task conversation and keeps the task
 #               open without alerting the `role/operator` failure inbox.
 #   - `fail`:   rejects the candidate and surfaces the task to `role/operator`.
+#
+# Flow: verify (container) -> review (role/reviewer, 3-way gate)
 inputs:
   - repository
   - resource_id

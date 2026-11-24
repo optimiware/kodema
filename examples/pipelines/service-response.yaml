@@ -1,8 +1,18 @@
+# Explicit Service Request & Response
+#
+# Delegates a `request` action to a project service account (`service/<id>`)
+# with an immutable subject and declared response outputs. The service watches
+# assigned requests and resolves the action via `execution.request.resolve`.
+#
+# Flow: respond (service/git-service)
+# Run:  kodema pipeline apply examples/pipelines/service-response.yaml
+#       kodema pipeline start service-response --input request_id=req-1
 inputs:
   - request_id
 actions:
   - name: respond
     request: service/git-service
+    timeout: 15m
     subject:
       operation: service.response
       request:

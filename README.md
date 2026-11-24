@@ -93,8 +93,9 @@ Each action names its own image, so one pipeline can implement with one
 harness and check the result with another. The review, the Git rules and the
 audit trail do not depend on which harness ran.
 [KODEMA.md](KODEMA.md#environment-and-materialized-files) has the contract in
-full, and [external-harness.yaml](examples/pipelines/external-harness.yaml) is
-the recipe for model access.
+full, [external-harness.yaml](examples/pipelines/external-harness.yaml) is the
+`kodema harness exec` recipe for model access, and
+[examples/README.md](examples/README.md) indexes the full example catalog.
 
 ## Built for enterprise scale
 
@@ -254,6 +255,7 @@ Then follow the [Podman bundle runbook](docs/runbooks/podman-quickstart.md) to
 | [docs/README.md](docs/README.md) | Detailed specifications and runbooks. |
 | [docs/runbooks/quickstart.md](docs/runbooks/quickstart.md) | A local Kodema with `kodema up`, connecting your AI harness over MCP, and a first pipeline with `kodema run`. |
 | [docs/runbooks/llm-proxy-harnesses.md](docs/runbooks/llm-proxy-harnesses.md) | `kodema harness exec`, LLM budgets, attributed `kodsvc.` proxy, and Option 1 / Option 2 OpenCode services. |
+| [examples/README.md](examples/README.md) | Contract-tested catalog of pipelines, delivery recipes, context skills, and Agentic SDLC patterns. |
 | [examples/agentic-sdlc/README.md](examples/agentic-sdlc/README.md) | Tested end-to-end Agentic SDLC pipelines (in-container harness, Option 1 worktrees, Option 2 sandbox mode). |
 | [docs/runbooks/podman-quickstart.md](docs/runbooks/podman-quickstart.md) | The Podman bundle: the single-host test installation the release smoke runs on. |
 | [docs/runbooks/production-deployment.md](docs/runbooks/production-deployment.md) | Deployment on Kubernetes (Scaleway, AWS, GCP). |
@@ -267,7 +269,7 @@ Then follow the [Podman bundle runbook](docs/runbooks/podman-quickstart.md) to
 | `api`, `client` | The public API declarations and the Go client. |
 | `internal` | The Control Plane (execution engine, domain capabilities, adapters, transports, server composition) and first-party apps (`cli`, `git`, `agent`, services, `sandbox`, `up`). |
 | `deploy` | The image, the Helm charts, the Podman bundle and the OpenTofu roots per cloud. |
-| `examples` | Example pipelines and knowledge files. |
+| [`examples`](examples/README.md) | Contract-tested example pipelines, Agentic SDLC patterns, delivery recipes, and knowledge files. |
 | `test` | Contract, component, integration, e2e and qualification suites. |
 
 ## Build and test

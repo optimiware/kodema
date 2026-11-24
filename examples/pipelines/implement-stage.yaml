@@ -1,42 +1,49 @@
-# Stage 1 of the two-stage multi-pipeline task workflow: implement -> integrate.
+# Two-Stage Multi-Pipeline Task (Stage 1 of 2): Implement
 #
-# Keeping expensive coding work in its own pipeline lets Stage 2 (integrate-stage.yaml)
-# rebase, rebuild, review, merge, and deploy on a fresh execution without re-running
-# plan/code/push when the target branch moves or a review needs a clean restart.
+# Keeping coding work in its own pipeline with `completes_task: false` lets
+# Stage 2 (`integrate-stage.yaml`) rebase, rebuild, review, merge, and deploy
+# on a fresh execution without re-running plan/code/push when the target branch
+# moves or a review needs a clean restart.
 #
-# Typical two-stage workflow on one task:
+# Flow: plan (container) -> code (container) -> push (container)
+# Run:
 #   1. Start Stage 1:
-#        kodema task run --project <project> --title "Implement change" \
+#        kodema task run --title "Implement change" \
 #          --pipeline implement-stage \
 #          --input repository=shop/web --input base_ref=refs/heads/main
-#   2. After Stage 1 succeeds, atomically switch the task to Stage 2 (carrying the
-#      pushed work branch from Stage 1's settled push.branch output):
+#   2. After Stage 1 succeeds (task stays `open`), start Stage 2 on the same task:
 #        kodema task start <task-id> --pipeline integrate-stage \
-#          --input repository=shop/web --input target_ref=refs/heads/main \
+#          --input repository=shop/web --input resource_id=git-shop-web \
+#          --input target_ref=refs/heads/main \
 #          --input-from-output branch=push.branch
-#   3. If main advances while Stage 2 waits at review, supersede Stage 2 cleanly
-#      without faking a review rejection or re-running Stage 1:
+#   3. If main advances while Stage 2 waits at review, supersede cleanly:
 #        kodema task restart <task-id> --reason "rebase onto latest main"
 inputs:
   - repository
   - base_ref
+completes_task: false
 actions:
   - name: plan
     image: registry.example.com/kodema/coding-agent@sha256:6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b
-    commands:
-      - plan-from-task-spec /kodema/task/spec.json /kodema/task.json
+    timeout: 15m
     outputs:
       - plan_summary
+    commands:
+      - plan-from-task-spec /kodema/task/spec.json /kodema/task.json > /kodema/outputs/plan/plan_summary
+
   - name: code
     image: registry.example.com/kodema/coding-agent@sha256:6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b
+    timeout: 30m
     commands:
       - implement-change "$(cat /kodema/inputs/repository)" "$(cat /kodema/inputs/base_ref)"
       - run-unit-tests
+
   - name: push
     image: registry.example.com/kodema/git-tools@sha256:d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35
-    commands:
-      - push-work-branch "$(cat /kodema/inputs/repository)" > /kodema/outputs/push/branch
-      - git rev-parse HEAD > /kodema/outputs/push/commit
+    timeout: 5m
     outputs:
       - branch
       - commit
+    commands:
+      - push-work-branch "$(cat /kodema/inputs/repository)" > /kodema/outputs/push/branch
+      - git rev-parse HEAD > /kodema/outputs/push/commit

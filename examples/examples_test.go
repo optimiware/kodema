@@ -257,13 +257,14 @@ func TestTaskHandoffReferencesDurableContext(t *testing.T) {
 	if !strings.Contains(commands, "$KODEMA_TASK") {
 		t.Fatalf("%s ask action must target the current task through $KODEMA_TASK", rel)
 	}
-	// The real CLI dispatches served operations only through `call`; there is no
-	// `kodema task ...` subcommand.
+	// The handoff fixture explicitly exercises the low-level `kodema call`
+	// wire contract (`task.read` + `task.ask`), while documenting the ergonomic
+	// `kodema task ask` shortcut in its header comments.
 	if !strings.Contains(commands, "kodema call task.ask") {
 		t.Fatalf("%s ask action must invoke the served operation as `kodema call task.ask`", rel)
 	}
 	if strings.Contains(commands, "task ask") {
-		t.Fatalf("%s ask action invokes the nonexistent `kodema task ask` subcommand", rel)
+		t.Fatalf("%s ask action commands must stay on the explicit `kodema call task.ask` form pinned by the codec tests", rel)
 	}
 	// /kodema/task.json carries no lifecycle version, so the example must read
 	// the current task first and pass the returned version as expected-version.

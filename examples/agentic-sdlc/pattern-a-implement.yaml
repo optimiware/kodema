@@ -1,10 +1,13 @@
 # Pattern A (Stage 1 of 3): In-Container Harness Implementation
 #
 # Uses `kodema harness exec -- <cmd>` (rotation-safe loopback LLM proxy, zero CA
-# boilerplate), named non-authoritative caches (`/kodema/cache/go-mod`,
-# `/kodema/cache/go-build`), active execution/action LLM budgets, immutable KV
-# handoffs (`kodema kv get` / `kodema kv put`), and `completes_task: false` so
-# Stage 2 (verify + review) and Stage 3 (merge) continue on the same task.
+# boilerplate, automatic OpenCode v2 `OPENCODE_CONFIG_CONTENT`), named
+# non-authoritative caches (`/kodema/cache/go-mod`, `/kodema/cache/go-build`),
+# active execution/action LLM budgets, immutable KV handoffs (`kodema kv get` /
+# `kodema kv put`), and `completes_task: false` so Stage 2 (verify + review) and
+# Stage 3 (merge) continue on the same task.
+#
+# Flow: implement (container, loopback LLM proxy) -> outputs.{branch,base,candidate,summary_key}
 inputs:
   - repository
   - base_ref

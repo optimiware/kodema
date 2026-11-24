@@ -9,6 +9,9 @@
 # Deterministic tests run in an ordinary container action with named caches,
 # followed by a 3-way human `role/reviewer` gate that mints an immutable
 # `decision_id` for cross-execution merge via `pattern-a-merge.yaml`.
+#
+# Flow: plan (opencode) -> implement (opencode) -> verify (container)
+#       -> ai-review (opencode) -> review (role/reviewer)
 inputs:
   - repository
   - resource_id

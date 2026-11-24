@@ -1,12 +1,28 @@
+# Planned Human Review Gate
+#
+# Builds a candidate in a container action, then pauses at a `request` action
+# assigned to `role/reviewer`. While waiting, no container runs, the execution
+# credential is revoked, and `/workspace` is preserved.
+#
+# Reviewers settle the gate with `pass` (mints an immutable `decision_id`),
+# `revise` (appends task feedback without alerting `role/operator`), or `fail`.
+#
+# Flow: build (container) -> review (role/reviewer)
+# Run:  kodema pipeline apply examples/pipelines/planned-review.yaml
+#       kodema pipeline start planned-review
+#       kodema approve <execution-id> --output approved=true
 actions:
   - name: build
     image: registry.example.com/kodema/build@sha256:44575cf5b28512d75644bf54a517dcef304ff809fd511747621b4d64f19aac66
-    commands:
-      - build-image
+    timeout: 15m
     outputs:
       - candidate
+    commands:
+      - build-image > /kodema/outputs/build/candidate
+
   - name: review
     request: role/reviewer
+    timeout: 72h
     subject:
       operation: deployment.approve
       resource: deploy-repo-1

@@ -1,8 +1,19 @@
+# Plain Task-Free Container Pipeline
+#
+# Demonstrates the minimal Kodema pipeline: no associated task, no declared
+# inputs, pipeline-level literal `env`, and one ordinary container action.
+# Because this execution is task-free, `$KODEMA_TASK` is unset while
+# `$KODEMA_URL`, `$KODEMA_EXECUTION`, and `$KODEMA_ACTION` are always provided.
+#
+# Flow: inspect (container)
+# Run:  kodema pipeline apply examples/pipelines/plain.yaml
+#       kodema pipeline start plain
 env:
   LOG_LEVEL: info
 actions:
   - name: inspect
     image: registry.example.com/kodema/base@sha256:cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2
+    timeout: 5m
     commands:
       - kodema-example inspect-context
-      - echo "plain task-free work completed"
+      - echo "execution=${KODEMA_EXECUTION} action=${KODEMA_ACTION} - plain task-free work completed"

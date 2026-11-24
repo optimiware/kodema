@@ -1,15 +1,32 @@
+# Delivery (Rollback): Promote an Older Digest Through the Same Protected Gate
+#
+# Rollback is intentionally a fresh promotion of a previously built,
+# digest-pinned `image` through the exact same `deploy-repo-1` resource,
+# `refs/heads/deploy` target, and `role/reviewer` approval gate as
+# `promote.yaml`:
+#   - Never rebuilds image bytes,
+#   - Never silently targets a different deploy repository or ref,
+#   - Never performs automatic database or stateful data rollback.
+#
+# Flow: release (container) -> approve (role/reviewer) -> integrate (container)
+# Run:  kodema pipeline apply examples/pipelines/rollback.yaml
+#       kodema pipeline start rollback \
+#         --input image=registry.example.com/shop/web@sha256:<older-64-hex>
 inputs:
   - image
 actions:
   - name: release
     image: registry.example.com/kodema/release@sha256:a4d451ec23463726f72c43d64c710968f6b602cd653b4de8adee1b556240a829
-    commands:
-      - write-deploy-candidate
+    timeout: 10m
     outputs:
       - candidate
       - expected_base
+    commands:
+      - write-deploy-candidate "$(cat /kodema/inputs/image)"
+
   - name: approve
     request: role/reviewer
+    timeout: 72h
     subject:
       operation: git.ref.update
       resource: deploy-repo-1
@@ -20,7 +37,9 @@ actions:
         from: release.outputs.candidate
     outputs:
       - approved
+
   - name: integrate
     image: registry.example.com/kodema/integrate@sha256:ad9b338ab555c072a2131a946e8ed993cfcee4fe61c1f65efa37a1ce78ecfed5
+    timeout: 10m
     commands:
-      - integrate-protected-update
+      - integrate-protected-update "$(cat /kodema/outputs/release/candidate)"

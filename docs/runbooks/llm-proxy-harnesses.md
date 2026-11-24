@@ -131,7 +131,7 @@ actions:
       - kodema harness exec -- pi -p "Implement /kodema/task/spec.json and verify tests pass"
 ```
 
-See also [`examples/pipelines/external-harness.yaml`](../../examples/pipelines/external-harness.yaml) and the full tested multi-stage examples in [`examples/agentic-sdlc/README.md`](../../examples/agentic-sdlc/README.md).
+See also [`examples/pipelines/external-harness.yaml`](../../examples/pipelines/external-harness.yaml), the full [examples catalog](../../examples/README.md), and the tested multi-stage examples in [`examples/agentic-sdlc/README.md`](../../examples/agentic-sdlc/README.md).
 
 ## Active LLM token and cost budgets
 

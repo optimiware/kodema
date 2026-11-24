@@ -12,7 +12,12 @@
 #   5. `review` gates protected Git integration on a human `role/reviewer` decision.
 #
 # Note: Sandbox mode's service account requires the `engineer` role (for inline
-# sandbox `pipeline.start`, `execution.cancel`, and ephemeral sandbox secrets).
+# sandbox `pipeline.start`, `execution.cancel`, and ephemeral sandbox secrets),
+# and OpenCode v2 enforces `--max-concurrency 1` per OpenCode server instance.
+#
+# Flow: plan (opencode) -> implement-backend (golang:1.24 sandbox)
+#       -> implement-frontend (node:22 sandbox) -> ai-review (opencode)
+#       -> review (role/reviewer)
 inputs:
   - repository
   - resource_id

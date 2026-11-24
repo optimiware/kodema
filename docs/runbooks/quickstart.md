@@ -314,7 +314,8 @@ harness (**Claude Code**, **Codex**, **OpenCode**, or **Cursor**) to your local
    - Serialized merge coordinator with cross-execution Decision IDs:
      `kodema services --kind merge_coordinator`
 
-See [LLM proxy & agentic harnesses](llm-proxy-harnesses.md) and the tested
+See [LLM proxy & agentic harnesses](llm-proxy-harnesses.md), the
+[examples catalog](../../examples/README.md), and the tested
 [Agentic SDLC examples](../../examples/agentic-sdlc/README.md) for ready-to-run
 pipelines.
 

@@ -13,6 +13,8 @@
 #
 # Keeping `completes_task: false` lets a post-merge step or orchestrator call
 # `kodema task complete <task-id>` explicitly once release checks finish.
+#
+# Flow: merge (service/merge-coordinator, with decision_id) -> outputs.{base,candidate,output}
 inputs:
   - repository
   - target_ref

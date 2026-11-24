@@ -1,8 +1,22 @@
+# Delivery (Stage 1): Build & Publish Digest-Pinned Image
+#
+# Builds image bytes, publishes them to the external registry
+# (`registry.example.com`), and writes the immutable `repository@sha256:<digest>`
+# reference to `/kodema/outputs/build/image`. Kodema automatically submits
+# declared outputs via `kodema output push` after the last command succeeds.
+#
+# For an unprivileged Kaniko `Containerfile` build with no Docker/Podman socket
+# or `/dev/fuse`, see `examples/pipelines/oci-build.yaml`.
+#
+# Flow: build (container) -> outputs.image (`<repo>@sha256:<64-hex>`)
+# Run:  kodema pipeline apply examples/pipelines/build.yaml
+#       kodema pipeline start build
 actions:
   - name: build
     image: registry.example.com/kodema/build@sha256:44575cf5b28512d75644bf54a517dcef304ff809fd511747621b4d64f19aac66
-    commands:
-      - build-image
-      - echo "publish the digest-pinned image output"
+    timeout: 15m
     outputs:
       - image
+    commands:
+      - build-image > /kodema/outputs/build/image
+      - echo "published digest-pinned image output $(cat /kodema/outputs/build/image)"

@@ -1,14 +1,21 @@
-# Unprivileged OCI container image build with Kaniko.
+# Delivery (Stage 1 — OCI): Unprivileged Containerfile Build with Kaniko
 #
 # Kodema workloads run unprivileged with no Docker socket, no Podman socket, and
-# no /dev/fuse, and always launch container actions with /bin/sh. Upstream
-# gcr.io/kaniko-project/executor:debug only ships /busybox/sh (not /bin/sh), so
-# `kaniko-executor` below is a digest-pinned wrapper image that exposes /bin/sh
-# alongside /kaniko/executor (see docs/runbooks/unprivileged-oci-builds.md).
+# no `/dev/fuse`, and always launch container actions with `/bin/sh`. Upstream
+# `gcr.io/kaniko-project/executor:debug` only ships `/busybox/sh`, so
+# `kaniko-executor` below is a digest-pinned wrapper image exposing `/bin/sh`
+# alongside `/kaniko/executor` (see `docs/runbooks/unprivileged-oci-builds.md`).
 #
-# This example builds a Containerfile in userspace with Kaniko, authenticates to
-# the external registry through a declared secret, and publishes the tagless
+# Builds a `Containerfile` in userspace with Kaniko, authenticates to the
+# external registry through a declared secret, and publishes the tagless
 # digest-pinned image reference (`<repo>@sha256:<digest>`) as the `image` output.
+#
+# Flow: checkout (container) -> build-image (container, Kaniko) -> outputs.image
+# Run:  kodema pipeline apply examples/pipelines/oci-build.yaml
+#       kodema pipeline start oci-build \
+#         --input repository=shop/web \
+#         --input ref=refs/heads/main \
+#         --input destination=registry.example.com/shop/web:latest
 inputs:
   - repository
   - ref
@@ -25,6 +32,7 @@ actions:
       - git clone --quiet "$KODEMA_GIT_URL/$repo" /workspace/src
       - git -C /workspace/src checkout --quiet "$ref"
       - git -C /workspace/src rev-parse HEAD > /kodema/outputs/checkout/commit
+
   - name: build-image
     image: registry.example.com/kodema/kaniko-executor@sha256:9c8b7a6f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3
     timeout: 20m

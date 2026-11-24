@@ -1,7 +1,28 @@
-# Delivery examples
+# Delivery Examples
 
-These recipes show how a project ships bytes from an **external registry** and
-promotes them without Kodema owning the image store.
+These recipes show how a project builds, tests, promotes, rolls back, and
+verifies image bytes from an **external registry** without Kodema owning the
+image store.
+
+```mermaid
+flowchart LR
+  Build["1. Build<br/>build.yaml / oci-build.yaml"] -->|publishes bytes| Reg[("External Registry<br/>registry.example.com<br/>@sha256:&lt;digest&gt;")]
+  Build -->|outputs.image| Test["2. Test<br/>test.yaml<br/>(no rebuild)"]
+  Test -->|same digest| Promote["3. Promote<br/>promote.yaml<br/>(role/reviewer -> deploy-repo-1)"]
+  Promote --> Ready["4. Readiness<br/>readiness.yaml<br/>(outputs.ready)"]
+  Reg -.->|older digest, no rebuild| Rollback["Rollback<br/>rollback.yaml<br/>(same deploy-repo-1 gate)"]
+  Rollback --> Ready
+```
+
+## Recipe map
+
+| Stage | Pipeline | Purpose |
+|---|---|---|
+| **1. Build** | [`build.yaml`](../pipelines/build.yaml) / [`oci-build.yaml`](../pipelines/oci-build.yaml) | Build and publish image bytes to `registry.example.com`; emit digest-pinned `image` output (`oci-build.yaml` uses rootless Kaniko with no Docker/Podman socket or `/dev/fuse`). |
+| **2. Test** | [`test.yaml`](../pipelines/test.yaml) | Consume the forwarded `image` digest input without rebuilding or republishing. |
+| **3. Promote** | [`promote.yaml`](../pipelines/promote.yaml) | Write a deploy-repository work-branch candidate, obtain `role/reviewer` approval on `deploy-repo-1` (`refs/heads/deploy`), and integrate. |
+| **Rollback** | [`rollback.yaml`](../pipelines/rollback.yaml) | Promote an older digest through the exact same `deploy-repo-1` / `refs/heads/deploy` approval gate without rebuilding. |
+| **4. Readiness** | [`readiness.yaml`](../pipelines/readiness.yaml) | Reconcile and record an explicit post-rollout `ready` observation. |
 
 ## Registry ownership
 
@@ -65,3 +86,17 @@ for task-free runs such as [plain](../pipelines/plain.yaml). Those names cannot
 be declared in pipeline or action env. The execution credential is mounted as
 `KODEMA_TOKEN`; stored secret names cannot shadow it and values never appear in
 logs, events or receipts.
+
+| Name | Delivery | Scope |
+|---|---|---|
+| `KODEMA_URL` | Environment variable | Control-plane API base URL reachable from the workload. |
+| `KODEMA_EXECUTION` | Environment variable | Current execution ID. |
+| `KODEMA_ACTION` | Environment variable | Current action slug. |
+| `KODEMA_TASK` | Environment variable | Associated task ID (unset for task-free runs such as `plain.yaml`). |
+| `KODEMA_TOKEN` | File (`/kodema/secrets/KODEMA_TOKEN`) | Live execution credential, rotated during long runs and revoked while waiting or terminal. |
+
+## Further reading
+
+- [Examples catalog](../README.md)
+- [Unprivileged OCI container builds & workload limits](../../docs/runbooks/unprivileged-oci-builds.md)
+- [Context repository skills](../knowledge/README.md)
