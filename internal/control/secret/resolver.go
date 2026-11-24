@@ -58,7 +58,7 @@ func (resolver *SecretResolver) Resolve(ctx context.Context, request ResolveRequ
 		}
 		stored, foundScope, err := resolver.lookupName(ctx, request.Scope, name)
 		if err != nil {
-			return nil, err
+			return nil, missingSecretError(name, err)
 		}
 		if err := validateStoredIdentity(stored, foundScope, name); err != nil {
 			return nil, err
@@ -117,6 +117,18 @@ func (resolver *SecretResolver) lookupName(ctx context.Context, scope tenancy.Sc
 		return Stored{}, tenancy.Scope{}, err
 	}
 	return stored, scope, nil
+}
+
+// missingSecretError names the declared secret when no row exists for it in the
+// request scope or, for a project request, the tenant fallback. A pipeline
+// declares several names, and the bare lookup fault cannot say which one is
+// absent. The name is declared definition data, as in a policy denial; the
+// class stays NotFound, and any other failure is returned unchanged.
+func missingSecretError(name id.SecretName, err error) error {
+	if !isNotFound(err) {
+		return err
+	}
+	return fault.Wrap(fault.NotFound, fmt.Sprintf("secret %q is not stored in scope", name), err)
 }
 
 // isNotFound reports whether err is the explicit absent-row class. Only that

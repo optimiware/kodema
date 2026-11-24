@@ -703,7 +703,7 @@ func runRun(ctx context.Context, config Config, args []string, ports Ports, deps
 				continue
 			}
 			for _, action := range inspected.Actions {
-				if action.Kind == "request" || action.effectiveState() == "pending" {
+				if action.Kind == "request" || action.effectiveState() == "pending" || inspected.failedBeforeStart(action) {
 					continue
 				}
 				logs := logStreamState{actionID: action.ActionID}
@@ -716,7 +716,7 @@ func runRun(ctx context.Context, config Config, args []string, ports Ports, deps
 				return ExitSuccess
 			}
 			if state == "failed" {
-				if err := printFailedActionStderr(ctx, ports, executionID, inspected.Actions); err != nil {
+				if err := printFailedActionStderr(ctx, ports, executionID, inspected); err != nil {
 					return failTerminal(state, err)
 				}
 			}
@@ -817,6 +817,15 @@ func isFailedContainerAction(action inspectedAction) bool {
 	return action.Kind == "" || action.Kind == "container"
 }
 
+// failedBeforeStart reports whether action failed during activation
+// preparation. Preparation failure prevents start, so such an action produced
+// no output: its retained log holds only the unavailability marker, and the
+// execution failure already states the cause. An execution stops at its first
+// failure, so a preparation failure belongs to its one failed action.
+func (execution inspectedExecution) failedBeforeStart(action inspectedAction) bool {
+	return execution.Failure != nil && execution.Failure.Kind == "preparation" && action.effectiveState() == "failed"
+}
+
 // hasFailedContainerAction reports whether any action in actions is a failed
 // container action.
 func hasFailedContainerAction(actions []inspectedAction) bool {
@@ -830,10 +839,11 @@ func hasFailedContainerAction(actions []inspectedAction) bool {
 
 // printFailedActionStderr fetches and prints a bounded stderr tail on ports.Err
 // for each failed container action, or prints a `kodema logs` hint when stderr
-// is empty or unavailable.
-func printFailedActionStderr(ctx context.Context, ports Ports, executionID string, actions []inspectedAction) error {
-	for _, action := range actions {
-		if !isFailedContainerAction(action) {
+// is empty or unavailable. An action that failed before it started has no logs
+// to show or point at and is skipped.
+func printFailedActionStderr(ctx context.Context, ports Ports, executionID string, inspected inspectedExecution) error {
+	for _, action := range inspected.Actions {
+		if !isFailedContainerAction(action) || inspected.failedBeforeStart(action) {
 			continue
 		}
 		label := actionDisplayName(action)

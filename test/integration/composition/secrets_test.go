@@ -330,6 +330,9 @@ func TestProjectSecretMaterializationAndPolicyInvariants(t *testing.T) {
 		if inspected.Failure == nil || inspected.Failure.Kind != "preparation" {
 			t.Fatalf("missing secret failure = %+v; want preparation failure", inspected.Failure)
 		}
+		if !strings.Contains(inspected.Failure.Detail, `secret "DOES_NOT_EXIST" is not stored in scope`) {
+			t.Fatalf("missing secret detail = %q; want the missing secret named", inspected.Failure.Detail)
+		}
 		if runtime.startCount() != 0 || len(runtime.prepareRequests()) != 0 {
 			t.Fatalf("nonexistent secret reached runtime: prepares=%d starts=%d", len(runtime.prepareRequests()), runtime.startCount())
 		}
