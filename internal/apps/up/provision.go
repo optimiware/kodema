@@ -21,8 +21,10 @@ import (
 const (
 	gitServiceID              = "git"
 	mergeCoordinatorServiceID = "merge-coordinator"
-	// gitCredentialTTL is the longest lifetime a service credential may have.
-	gitCredentialTTL = 8 * time.Hour
+	// gitCredentialTTL is the lifetime requested for local service credentials.
+	// Default server bounds allow up to 30 days for kodsvc. tokens, preventing
+	// local `kodema up` Git/merge stacks from expiring after 8 hours.
+	gitCredentialTTL = 30 * 24 * time.Hour
 )
 
 // provisionConfig names what a bootstrapped tenant still needs before it can

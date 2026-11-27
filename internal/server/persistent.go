@@ -289,6 +289,7 @@ func buildPersistentEnvironment(ctx context.Context, builder *builder, stores pe
 		Invalidations: brokerAdapter,
 		Clock:         clock,
 		Random:        rand.Reader,
+		Bounds:        cfg.tokenBounds(),
 	})
 	if err != nil {
 		return nil, err

@@ -293,6 +293,12 @@ type Config struct {
 	// run at its own pace.
 	RenewInterval time.Duration
 
+	// ServiceCredentialMaxTTL optionally overrides token.DefaultBounds.ServiceMaxTTL
+	// (default 30 days) for issued/rotated `kodsvc.` service credentials. Zero
+	// selects token.DefaultBounds.ServiceMaxTTL. Execution credentials (`kodex.`)
+	// always remain strictly capped at token.DefaultBounds.MaxTTL (8 hours per S05).
+	ServiceCredentialMaxTTL time.Duration
+
 	Logger     *slog.Logger
 	Dev        *DevelopmentConfig
 	Production *ProductionConfig
@@ -409,6 +415,17 @@ func (config Config) workloadBaseURL() string {
 	return strings.TrimRight(base, "/")
 }
 
+// tokenBounds returns the token.Bounds configured for this composition.
+// Execution credentials always keep token.DefaultBounds.MaxTTL (8h per S05);
+// only ServiceMaxTTL is overridable via Config.ServiceCredentialMaxTTL.
+func (config Config) tokenBounds() token.Bounds {
+	bounds := token.DefaultBounds
+	if config.ServiceCredentialMaxTTL > 0 {
+		bounds.ServiceMaxTTL = config.ServiceCredentialMaxTTL
+	}
+	return bounds
+}
+
 // resolved fills the explicit defaults.
 func (config Config) resolved() Config {
 	if config.DefaultActionTimeout == 0 {
@@ -452,6 +469,9 @@ func (config Config) validate() error {
 	}
 	if config.RenewBefore < 0 {
 		return fault.New(fault.InvalidInput, "composition requires a non-negative renewal margin")
+	}
+	if config.ServiceCredentialMaxTTL < 0 || (config.ServiceCredentialMaxTTL > 0 && config.ServiceCredentialMaxTTL < token.DefaultBounds.MinTTL) {
+		return fault.New(fault.InvalidInput, fmt.Sprintf("composition service credential max ttl must be at least %s", token.DefaultBounds.MinTTL))
 	}
 	if !strings.HasPrefix(config.MCPPath, "/") || strings.HasSuffix(config.MCPPath, "/") {
 		return fault.New(fault.InvalidInput, "MCP path must start with / and have no trailing slash")

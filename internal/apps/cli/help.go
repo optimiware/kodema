@@ -595,27 +595,35 @@ inspects the execution to read its current version and generates an idempotency 
 		usage:   "kodema service credential <issue|rotate|revoke> <service-id> [flags]",
 		summary: "Issue, rotate, or revoke service account credentials",
 		description: `Subcommands:
-  issue    kodema service credential issue <service-id> [--ttl <duration|sec>] [--project <id>] [--expected-version <v>]
-  rotate   kodema service credential rotate <service-id> [--ttl <duration|sec>] [--project <id>] [--expected-version <v>]
-  revoke   kodema service credential revoke <service-id> [--project <id>] [--expected-version <v>]`,
+  issue    kodema service credential issue <service-id> [--ttl <duration|sec>] [--out <path>] [--rotate-if-present] [--project <id> | --tenant-wide] [--expected-version <v>]
+  rotate   kodema service credential rotate <service-id> [--ttl <duration|sec>] [--out <path>] [--project <id> | --tenant-wide] [--expected-version <v>]
+  revoke   kodema service credential revoke <service-id> [--project <id> | --tenant-wide] [--expected-version <v>]`,
 	},
 	"service credential issue": {
-		usage:   "kodema service credential issue <service-id> [--ttl <duration|sec> | --ttl-seconds <n>] [--project <id>] [--expected-version <v>]",
+		usage:   "kodema service credential issue <service-id> [--ttl <duration|sec> | --ttl-seconds <n>] [--out <path>] [--rotate-if-present] [--project <id> | --tenant-wide] [--expected-version <v>]",
 		summary: "Issue a one-time credential token for a service account",
-		description: `Issues a service credential via service.credential.issue (default TTL: 3600s).
-Looks up the service version via service.list when --expected-version is omitted.`,
+		description: `Issues a service credential via service.credential.issue (default TTL: 24h / 86400s).
+Accepts Go durations, day suffixes (e.g. --ttl 7d or --ttl 30d), or whole seconds.
+Pass --out <path> to write the token atomically with 0600 permissions without printing
+the plaintext token to stdout. Pass --rotate-if-present to rotate instead if the service
+already holds a current credential. Looks up the service version via service.list when
+--expected-version is omitted (pass --tenant-wide for tenant-scoped service accounts).`,
 	},
 	"service credential rotate": {
-		usage:   "kodema service credential rotate <service-id> [--ttl <duration|sec> | --ttl-seconds <n>] [--project <id>] [--expected-version <v>]",
+		usage:   "kodema service credential rotate <service-id> [--ttl <duration|sec> | --ttl-seconds <n>] [--out <path>] [--project <id> | --tenant-wide] [--expected-version <v>]",
 		summary: "Rotate a service account's credential token",
-		description: `Rotates a service credential via service.credential.rotate (default TTL: 3600s).
-Looks up the service version via service.list when --expected-version is omitted.`,
+		description: `Rotates a service credential via service.credential.rotate (default TTL: 24h / 86400s).
+Accepts Go durations, day suffixes (e.g. --ttl 7d or --ttl 30d), or whole seconds.
+Pass --out <path> to write the token atomically with 0600 permissions without printing
+the plaintext token to stdout. Looks up the service version via service.list when
+--expected-version is omitted (pass --tenant-wide for tenant-scoped service accounts).`,
 	},
 	"service credential revoke": {
-		usage:   "kodema service credential revoke <service-id> [--project <id>] [--expected-version <v>]",
+		usage:   "kodema service credential revoke <service-id> [--project <id> | --tenant-wide] [--expected-version <v>]",
 		summary: "Revoke a service account's active credential",
 		description: `Revokes a service credential via service.credential.revoke.
-Looks up the service version via service.list when --expected-version is omitted.`,
+Looks up the service version via service.list when --expected-version is omitted
+(pass --tenant-wide for tenant-scoped service accounts).`,
 	},
 	"secret": {
 		usage:   "kodema secret <set|list|delete> [arguments]",

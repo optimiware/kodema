@@ -308,6 +308,7 @@ func wireApp(ctx context.Context, builder *builder, environment *environment) (*
 		Invalidations: environment.invalidator,
 		Clock:         clock,
 		Random:        rand.Reader,
+		Bounds:        cfg.tokenBounds(),
 	})
 	if err != nil {
 		return nil, err

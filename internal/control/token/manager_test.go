@@ -1201,3 +1201,193 @@ func TestManagerDeliveryStringRedactsToken(t *testing.T) {
 		t.Fatalf("Delivery.String leaked the token: %s", delivery.String())
 	}
 }
+
+// TestManagerServiceMaxTTLSeparateFromExecutionMaxTTL pins issue #116:
+// execution credentials (kodex.) remain strictly capped at MaxTTL (8h per S05),
+// service credentials (kodsvc.) use ServiceMaxTTL (default 30d) with concrete
+// [min, max] bounds in invalid_input errors, custom Bounds with zero
+// ServiceMaxTTL fall back to MaxTTL, and custom ServiceMaxTTL overrides apply
+// only to service credentials.
+func TestManagerServiceMaxTTLSeparateFromExecutionMaxTTL(t *testing.T) {
+	newManagerWithBounds := func(t *testing.T, env *testEnv, bounds token.Bounds) (*token.Manager, error) {
+		t.Helper()
+		return token.NewManager(token.ManagerConfig{
+			Keys:          env.keys,
+			Resolver:      env.resolver,
+			Credentials:   env.creds,
+			Principals:    env.principals,
+			Services:      env.services,
+			Mutations:     env.mutations,
+			Receipts:      env.receipts,
+			Deliverer:     env.deliverer,
+			Invalidations: env.invalidator,
+			Clock:         env.clock,
+			Random:        env.random,
+			Bounds:        bounds,
+		})
+	}
+
+	t.Run("execution credential remains strictly capped at 8h with concrete bounds error", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.setAbsentCredential()
+
+		req := executionIssueRequest(env)
+		req.TTL = 8 * time.Hour
+		if _, err := env.manager.Issue(context.Background(), req); err != nil {
+			t.Fatalf("execution Issue at 8h: %v", err)
+		}
+
+		env2 := newTestEnv(t)
+		env2.setAbsentCredential()
+		over := executionIssueRequest(env2)
+		over.TTL = 8*time.Hour + time.Second
+		_, err := env2.manager.Issue(context.Background(), over)
+		requireClass(t, err, fault.InvalidInput)
+		if !strings.Contains(err.Error(), "[15s, 8h0m0s]") {
+			t.Fatalf("execution over-max error = %q; want concrete [15s, 8h0m0s] bounds", err.Error())
+		}
+		if len(env2.mutations.units) != 0 {
+			t.Fatalf("over-max execution issue mutated: %+v", env2.mutations.units)
+		}
+
+		under := executionIssueRequest(env2)
+		under.TTL = 14 * time.Second
+		_, err = env2.manager.Issue(context.Background(), under)
+		requireClass(t, err, fault.InvalidInput)
+		if !strings.Contains(err.Error(), "[15s, 8h0m0s]") {
+			t.Fatalf("execution under-min error = %q; want concrete [15s, 8h0m0s] bounds", err.Error())
+		}
+	})
+
+	t.Run("service credential accepts 24h and 30d default ServiceMaxTTL and rejects above 30d with bounds", func(t *testing.T) {
+		for _, ttl := range []time.Duration{24 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour} {
+			env := newTestEnv(t)
+			env.setServiceCredentialAbsent()
+			req := serviceIssueRequest(env)
+			req.TTL = ttl
+			res, err := env.manager.Issue(context.Background(), req)
+			if err != nil {
+				t.Fatalf("service Issue(%s): %v", ttl, err)
+			}
+			if !strings.HasPrefix(res.Token, token.ServicePrefix) {
+				t.Fatalf("service token = %q; want %s prefix", res.Token, token.ServicePrefix)
+			}
+			wantExpiry := env.now.Add(ttl)
+			if !env.mutations.units[0].Credential.Expiry.Equal(wantExpiry) {
+				t.Fatalf("expiry(%s) = %v; want %v", ttl, env.mutations.units[0].Credential.Expiry, wantExpiry)
+			}
+		}
+
+		// Rotate also honors ServiceMaxTTL.
+		envRot := newTestEnv(t)
+		envRot.creds.fact = token.CredentialFact{
+			Scope:       envRot.scope,
+			PrincipalID: envRot.principalID,
+			ServiceID:   envRot.serviceID,
+			Enabled:     true,
+			Version:     3,
+			Credential:  token.Credential{Nonce: testNonce(), Expiry: envRot.now.Add(time.Hour)},
+		}
+		rotReq := serviceIssueRequest(envRot)
+		rotReq.TTL = 30 * 24 * time.Hour
+		if _, err := envRot.manager.Rotate(context.Background(), rotReq); err != nil {
+			t.Fatalf("service Rotate(30d): %v", err)
+		}
+
+		// Exceeding default 30d ServiceMaxTTL is rejected with concrete bounds.
+		envOver := newTestEnv(t)
+		envOver.setServiceCredentialAbsent()
+		overReq := serviceIssueRequest(envOver)
+		overReq.TTL = 30*24*time.Hour + time.Second
+		_, err := envOver.manager.Issue(context.Background(), overReq)
+		requireClass(t, err, fault.InvalidInput)
+		if !strings.Contains(err.Error(), "[15s, 720h0m0s]") {
+			t.Fatalf("service over-max error = %q; want concrete [15s, 720h0m0s] bounds", err.Error())
+		}
+		if len(envOver.mutations.units) != 0 {
+			t.Fatalf("over-max service issue mutated: %+v", envOver.mutations.units)
+		}
+
+		// Below MinTTL is rejected with concrete service bounds.
+		underReq := serviceIssueRequest(envOver)
+		underReq.TTL = 10 * time.Second
+		_, err = envOver.manager.Issue(context.Background(), underReq)
+		requireClass(t, err, fault.InvalidInput)
+		if !strings.Contains(err.Error(), "[15s, 720h0m0s]") {
+			t.Fatalf("service under-min error = %q; want concrete [15s, 720h0m0s] bounds", err.Error())
+		}
+	})
+
+	t.Run("custom Bounds with zero ServiceMaxTTL falls back to MaxTTL", func(t *testing.T) {
+		env := newTestEnv(t)
+		env.setServiceCredentialAbsent()
+		customBounds := token.Bounds{
+			MinNonceBytes: token.MinNonceBytes,
+			MinTTL:        time.Minute,
+			MaxTTL:        2 * time.Hour,
+		}
+		mgr, err := newManagerWithBounds(t, env, customBounds)
+		if err != nil {
+			t.Fatalf("NewManager: %v", err)
+		}
+
+		okReq := serviceIssueRequest(env)
+		okReq.TTL = 2 * time.Hour
+		if _, err := mgr.Issue(context.Background(), okReq); err != nil {
+			t.Fatalf("service Issue at fallback MaxTTL 2h: %v", err)
+		}
+
+		overReq := serviceIssueRequest(env)
+		overReq.TTL = 2*time.Hour + time.Second
+		_, err = mgr.Issue(context.Background(), overReq)
+		requireClass(t, err, fault.InvalidInput)
+		if !strings.Contains(err.Error(), "[1m0s, 2h0m0s]") {
+			t.Fatalf("fallback over-max error = %q; want [1m0s, 2h0m0s]", err.Error())
+		}
+	})
+
+	t.Run("custom ServiceMaxTTL override applies to service tokens only while execution stays capped at 8h", func(t *testing.T) {
+		env := newTestEnv(t)
+		customBounds := token.DefaultBounds
+		customBounds.ServiceMaxTTL = 90 * 24 * time.Hour
+		mgr, err := newManagerWithBounds(t, env, customBounds)
+		if err != nil {
+			t.Fatalf("NewManager: %v", err)
+		}
+
+		env.setServiceCredentialAbsent()
+		svcReq := serviceIssueRequest(env)
+		svcReq.TTL = 90 * 24 * time.Hour
+		if _, err := mgr.Issue(context.Background(), svcReq); err != nil {
+			t.Fatalf("service Issue at custom 90d ServiceMaxTTL: %v", err)
+		}
+
+		svcOver := serviceIssueRequest(env)
+		svcOver.TTL = 90*24*time.Hour + time.Second
+		_, err = mgr.Issue(context.Background(), svcOver)
+		requireClass(t, err, fault.InvalidInput)
+		if !strings.Contains(err.Error(), "[15s, 2160h0m0s]") {
+			t.Fatalf("custom service over-max error = %q; want [15s, 2160h0m0s]", err.Error())
+		}
+
+		// Execution credentials MUST remain capped at 8h despite 90d ServiceMaxTTL.
+		env.setAbsentCredential()
+		execOver := executionIssueRequest(env)
+		execOver.TTL = 9 * time.Hour
+		_, err = mgr.Issue(context.Background(), execOver)
+		requireClass(t, err, fault.InvalidInput)
+		if !strings.Contains(err.Error(), "[15s, 8h0m0s]") {
+			t.Fatalf("execution over-max error with custom ServiceMaxTTL = %q; want [15s, 8h0m0s]", err.Error())
+		}
+	})
+
+	t.Run("NewManager rejects invalid ServiceMaxTTL bounds", func(t *testing.T) {
+		env := newTestEnv(t)
+		for _, bad := range []time.Duration{-time.Second, 5 * time.Second} {
+			b := token.DefaultBounds
+			b.ServiceMaxTTL = bad
+			_, err := newManagerWithBounds(t, env, b)
+			requireClass(t, err, fault.InvalidInput)
+		}
+	})
+}

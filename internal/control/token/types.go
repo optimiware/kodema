@@ -165,27 +165,46 @@ func encodeMACInput(domain, tenant, principal string, nonce []byte, expiry time.
 }
 
 // Bounds are the installation credential lifetime bounds. Both ends are
-// inclusive, so a TTL exactly at MaxTTL is permitted; S05 caps execution
-// credentials at eight hours, which is the declared maximum.
+// inclusive, so a TTL exactly at MaxTTL (for execution credentials) or
+// ServiceMaxTTL (for service credentials) is permitted; S05 caps execution
+// credentials at eight hours, which is the declared MaxTTL.
 type Bounds struct {
 	MinNonceBytes int           `json:"min_nonce_bytes"`
 	MinTTL        time.Duration `json:"min_ttl"`
 	MaxTTL        time.Duration `json:"max_ttl"`
+	ServiceMaxTTL time.Duration `json:"service_max_ttl"`
 }
 
 // DefaultBounds is the declared credential bound set. MinTTL stays below the
 // one-minute minimum action timeout so an action with `timeout: 1m` retains
 // headroom to mint its execution credential after activation commits its
-// deadline.
+// deadline. MaxTTL caps execution credentials (`kodex.`) at 8 hours per S05;
+// ServiceMaxTTL caps service credentials (`kodsvc.`) at 30 days by default.
 var DefaultBounds = Bounds{
 	MinNonceBytes: MinNonceBytes,
 	MinTTL:        15 * time.Second,
 	MaxTTL:        8 * time.Hour,
+	ServiceMaxTTL: 30 * 24 * time.Hour,
 }
 
-// ValidTTL reports whether ttl is within [MinTTL, MaxTTL].
+// EffectiveServiceMaxTTL returns the service-credential ceiling, falling back
+// to MaxTTL only when a custom Bounds leaves ServiceMaxTTL zero.
+func (bounds Bounds) EffectiveServiceMaxTTL() time.Duration {
+	if bounds.ServiceMaxTTL == 0 {
+		return bounds.MaxTTL
+	}
+	return bounds.ServiceMaxTTL
+}
+
+// ValidTTL reports whether ttl is within [MinTTL, MaxTTL] for execution credentials.
 func (bounds Bounds) ValidTTL(ttl time.Duration) bool {
 	return ttl >= bounds.MinTTL && ttl <= bounds.MaxTTL
+}
+
+// ValidServiceTTL reports whether ttl is within [MinTTL, ServiceMaxTTL]
+// (falling back to MaxTTL when ServiceMaxTTL is zero) for service credentials.
+func (bounds Bounds) ValidServiceTTL(ttl time.Duration) bool {
+	return ttl >= bounds.MinTTL && ttl <= bounds.EffectiveServiceMaxTTL()
 }
 
 // MutationKind names one credential lifecycle mutation.
