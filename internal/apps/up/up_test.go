@@ -1030,10 +1030,59 @@ func TestStackUpStatusAndDownWithMockEngine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read env.sh: %v", err)
 	}
-	for _, want := range []string{"KODEMA_URL=", "KODEMA_CA_FILE=", "KODEMA_TOKEN=", "KODEMA_PROJECT="} {
+	tenantTokenPath := filepath.Join(desc.StateDir, "tenant-admin-token")
+	adminTokenPath := filepath.Join(desc.StateDir, "admin-token")
+	tenantTokenBytes, err := os.ReadFile(tenantTokenPath)
+	if err != nil {
+		t.Fatalf("read tenant-admin-token: %v", err)
+	}
+	tenantToken := strings.TrimSpace(string(tenantTokenBytes))
+	adminTokenBytes, err := os.ReadFile(adminTokenPath)
+	if err != nil {
+		t.Fatalf("read admin-token: %v", err)
+	}
+	adminToken := strings.TrimSpace(string(adminTokenBytes))
+
+	for _, want := range []string{
+		"KODEMA_URL=",
+		"KODEMA_CA_FILE=",
+		fmt.Sprintf("export KODEMA_CREDENTIAL_FILE=%s\n", shellSingleQuote(tenantTokenPath)),
+		fmt.Sprintf("export KODEMA_TOKEN=%s\n", shellSingleQuote(tenantToken)),
+		fmt.Sprintf("export KODEMA_TENANT_ADMIN_CREDENTIAL_FILE=%s\n", shellSingleQuote(tenantTokenPath)),
+		fmt.Sprintf("export KODEMA_PROJECT=%s\n", shellSingleQuote(DefaultProjectID)),
+	} {
 		if !strings.Contains(string(envSh), want) {
 			t.Fatalf("env.sh missing %q:\n%s", want, envSh)
 		}
+	}
+	// Verify exported KODEMA_TOKEN is tenant-scoped (no project_id claim), while
+	// the legacy admin-token file remains on disk with project_id=project-local.
+	decodeJWTClaims := func(raw string) map[string]any {
+		t.Helper()
+		parts := strings.Split(raw, ".")
+		if len(parts) != 3 {
+			t.Fatalf("token is not a 3-part JWT")
+		}
+		payload, decErr := base64.RawURLEncoding.DecodeString(parts[1])
+		if decErr != nil {
+			t.Fatalf("decode JWT payload: %v", decErr)
+		}
+		var claims map[string]any
+		if decErr := json.Unmarshal(payload, &claims); decErr != nil {
+			t.Fatalf("unmarshal JWT claims: %v", decErr)
+		}
+		return claims
+	}
+	tenantClaims := decodeJWTClaims(tenantToken)
+	if tenantClaims["org_id"] != DefaultTenantID {
+		t.Fatalf("tenant-admin-token org_id = %v; want %q", tenantClaims["org_id"], DefaultTenantID)
+	}
+	if _, hasProject := tenantClaims["project_id"]; hasProject {
+		t.Fatalf("tenant-admin-token unexpectedly carries project_id claim: %v", tenantClaims["project_id"])
+	}
+	adminClaims := decodeJWTClaims(adminToken)
+	if adminClaims["project_id"] != DefaultProjectID {
+		t.Fatalf("admin-token project_id = %v; want %q", adminClaims["project_id"], DefaultProjectID)
 	}
 	wantLoginHint := fmt.Sprintf("CLI login:  kodema --server %s --ca-file %s login",
 		shellSingleQuote(desc.PublicURL), shellSingleQuote(desc.CACertPath))
@@ -2663,4 +2712,108 @@ func TestNewGatewayNonHTTPDefaultTransportFallback(t *testing.T) {
 	if gw == nil {
 		t.Fatal("NewGateway returned nil")
 	}
+}
+
+func TestWriteEnvFilesTenantAdminAndFallback(t *testing.T) {
+	t.Run("prefers tenant-admin-token in env.sh while retaining admin-token and backward-compat exports", func(t *testing.T) {
+		dir := t.TempDir()
+		envPath := filepath.Join(dir, "env.sh")
+		adminPath := filepath.Join(dir, "admin-token")
+		tenantPath := filepath.Join(dir, "tenant-admin-token")
+
+		err := WriteEnvFiles(EnvFileSpec{
+			EnvFilePath:          envPath,
+			AdminTokenPath:       adminPath,
+			PublicURL:            "https://127.0.0.1:8443",
+			CACertPath:           filepath.Join(dir, "tls", "ca.crt"),
+			AdminToken:           "project-scoped-token",
+			TenantID:             "tenant-local",
+			ProjectID:            "project-local",
+			TenantAdminTokenPath: tenantPath,
+			TenantAdminToken:     "tenant-scoped-token",
+		})
+		if err != nil {
+			t.Fatalf("WriteEnvFiles: %v", err)
+		}
+
+		for _, tc := range []struct {
+			path string
+			want string
+		}{
+			{adminPath, "project-scoped-token\n"},
+			{tenantPath, "tenant-scoped-token\n"},
+		} {
+			got, readErr := os.ReadFile(tc.path)
+			if readErr != nil {
+				t.Fatalf("read %s: %v", tc.path, readErr)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("%s = %q; want %q", tc.path, string(got), tc.want)
+			}
+			info, statErr := os.Stat(tc.path)
+			if statErr != nil {
+				t.Fatalf("stat %s: %v", tc.path, statErr)
+			}
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Fatalf("%s perm = %o; want 600", tc.path, perm)
+			}
+		}
+
+		envBytes, err := os.ReadFile(envPath)
+		if err != nil {
+			t.Fatalf("read env.sh: %v", err)
+		}
+		envText := string(envBytes)
+		for _, want := range []string{
+			fmt.Sprintf("export KODEMA_CREDENTIAL_FILE=%s\n", shellSingleQuote(tenantPath)),
+			fmt.Sprintf("export KODEMA_TOKEN=%s\n", shellSingleQuote("tenant-scoped-token")),
+			fmt.Sprintf("export KODEMA_TENANT=%s\n", shellSingleQuote("tenant-local")),
+			fmt.Sprintf("export KODEMA_PROJECT=%s\n", shellSingleQuote("project-local")),
+			fmt.Sprintf("export KODEMA_TENANT_ADMIN_CREDENTIAL_FILE=%s\n", shellSingleQuote(tenantPath)),
+		} {
+			if !strings.Contains(envText, want) {
+				t.Fatalf("env.sh missing %q:\n%s", want, envText)
+			}
+		}
+		if strings.Contains(envText, "project-scoped-token") {
+			t.Fatalf("env.sh unexpectedly exported project-scoped token:\n%s", envText)
+		}
+	})
+
+	t.Run("falls back to AdminTokenPath and AdminToken when TenantAdminTokenPath is empty", func(t *testing.T) {
+		dir := t.TempDir()
+		envPath := filepath.Join(dir, "env.sh")
+		adminPath := filepath.Join(dir, "admin-token")
+
+		err := WriteEnvFiles(EnvFileSpec{
+			EnvFilePath:    envPath,
+			AdminTokenPath: adminPath,
+			PublicURL:      "https://127.0.0.1:8443",
+			CACertPath:     filepath.Join(dir, "tls", "ca.crt"),
+			AdminToken:     "fallback-admin-token",
+			TenantID:       "tenant-local",
+			ProjectID:      "project-local",
+		})
+		if err != nil {
+			t.Fatalf("WriteEnvFiles: %v", err)
+		}
+
+		envBytes, err := os.ReadFile(envPath)
+		if err != nil {
+			t.Fatalf("read env.sh: %v", err)
+		}
+		envText := string(envBytes)
+		for _, want := range []string{
+			fmt.Sprintf("export KODEMA_CREDENTIAL_FILE=%s\n", shellSingleQuote(adminPath)),
+			fmt.Sprintf("export KODEMA_TOKEN=%s\n", shellSingleQuote("fallback-admin-token")),
+			fmt.Sprintf("export KODEMA_PROJECT=%s\n", shellSingleQuote("project-local")),
+		} {
+			if !strings.Contains(envText, want) {
+				t.Fatalf("env.sh missing %q:\n%s", want, envText)
+			}
+		}
+		if strings.Contains(envText, "KODEMA_TENANT_ADMIN_CREDENTIAL_FILE") {
+			t.Fatalf("env.sh unexpectedly exported KODEMA_TENANT_ADMIN_CREDENTIAL_FILE:\n%s", envText)
+		}
+	})
 }

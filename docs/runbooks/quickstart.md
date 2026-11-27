@@ -63,10 +63,13 @@ The command is safe to run again. It:
    project `project-local`.
 3. Gives the four built-in personas their project roles: `admin` (every role),
    `engineer`, `reviewer` and `operator`.
-4. Writes `env.sh`, which points `kodema` at this installation as `admin`.
+4. Writes `env.sh`, which points `kodema` at this installation as the
+   tenant-scoped `admin` (matching `kodema login` as `admin`) with
+   `KODEMA_PROJECT=project-local` as the default project.
 
 Everything is kept in `~/.kodema/instances/default`. `whoami` should answer
-with the roles `admin,engineer,reviewer,operator`.
+with tenant scope (`tenant-local`), tenant role `admin`, and project
+memberships for `project-local`.
 
 ## Run a first pipeline
 
@@ -172,12 +175,17 @@ to continue to the persona picker, or use `kodema login --device` (alias
 The sign-in page offers the four personas and asks for no password. It answers
 this machine only.
 
-Project and membership administration needs the tenant-wide administrator
-token instead:
+Because `env.sh` already exports the tenant-scoped `admin` token
+(`KODEMA_CREDENTIAL_FILE` points to `tenant-admin-token`, matching
+`kodema login` as `admin`), project and membership administration work out of
+the box:
 
 ```sh
-kodema --credential-file "$KODEMA_TENANT_ADMIN_CREDENTIAL_FILE" member list
+kodema member list
 ```
+
+`KODEMA_TENANT_ADMIN_CREDENTIAL_FILE` and `admin-token` remain available for
+backward compatibility.
 
 ## Git
 
@@ -189,7 +197,7 @@ the installation's CA:
 origin=https://127.0.0.1:8443
 git config --global --replace-all "credential.$origin.helper" ''
 git config --global --add "credential.$origin.helper" \
-  "!kodema --trusted-origin $origin --credential-file ~/.kodema/instances/default/admin-token git credential"
+  "!kodema --trusted-origin $origin --credential-file ~/.kodema/instances/default/tenant-admin-token git credential"
 git config --global "http.$origin.sslCAInfo" ~/.kodema/instances/default/tls/ca.crt
 
 git clone https://127.0.0.1:8443/git/admin

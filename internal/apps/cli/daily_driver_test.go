@@ -1182,6 +1182,76 @@ func TestWhoamiAndMemberZeroHashMagic(t *testing.T) {
 		}
 	})
 
+	t.Run("whoami table renders project memberships alongside tenant roles and preserves JSON output", func(t *testing.T) {
+		tenantWhoamiBody, err := json.Marshal(api.PrincipalWhoamiResult{
+			PrincipalID: wantOIDCID,
+			Kind:        "human",
+			TenantID:    "tenant-local",
+			Roles:       []string{"admin"},
+			Memberships: []api.PrincipalMembershipView{
+				{ProjectID: "project-local", Roles: []string{"engineer", "reviewer", "operator"}},
+				{ProjectID: "app-two", Roles: []string{"viewer"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal tenant whoami: %v", err)
+		}
+		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			if inv.Operation != "principal.whoami" {
+				t.Fatalf("unexpected operation %s", inv.Operation)
+			}
+			return api.Result{Operation: inv.Operation, Body: tenantWhoamiBody}, nil
+		}}
+
+		cfg := testConfig()
+		cfg.Output = cli.OutputTable
+		ports, out, errOut := testPorts(transport)
+		if code := cli.Run(context.Background(), cfg, []string{"whoami"}, ports); code != cli.ExitSuccess {
+			t.Fatalf("whoami table exit = %d; stderr=%q", code, errOut.String())
+		}
+		for _, want := range []string{
+			"scope\ttenant (tenant-local)",
+			"roles\tadmin",
+			"memberships\tproject-local: engineer,reviewer,operator; app-two: viewer",
+		} {
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("whoami table missing %q:\n%s", want, out.String())
+			}
+		}
+
+		// JSON output remains the raw principal.whoami payload including memberships.
+		cfg.Output = cli.OutputJSON
+		ports, out, errOut = testPorts(transport)
+		if code := cli.Run(context.Background(), cfg, []string{"whoami"}, ports); code != cli.ExitSuccess {
+			t.Fatalf("whoami json exit = %d; stderr=%q", code, errOut.String())
+		}
+		if strings.TrimSpace(out.String()) != string(tenantWhoamiBody) {
+			t.Fatalf("whoami json = %q; want %q", strings.TrimSpace(out.String()), string(tenantWhoamiBody))
+		}
+
+		// Negative case: no memberships row when server returns none.
+		noMembershipBody, err := json.Marshal(api.PrincipalWhoamiResult{
+			PrincipalID: wantOIDCID,
+			Kind:        "human",
+			TenantID:    "tenant-local",
+			Roles:       []string{"admin"},
+		})
+		if err != nil {
+			t.Fatalf("marshal whoami without memberships: %v", err)
+		}
+		emptyTransport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			return api.Result{Operation: inv.Operation, Body: noMembershipBody}, nil
+		}}
+		cfg.Output = cli.OutputTable
+		ports, out, errOut = testPorts(emptyTransport)
+		if code := cli.Run(context.Background(), cfg, []string{"whoami"}, ports); code != cli.ExitSuccess {
+			t.Fatalf("whoami without memberships exit = %d; stderr=%q", code, errOut.String())
+		}
+		if strings.Contains(out.String(), "memberships\t") {
+			t.Fatalf("whoami unexpectedly printed memberships row when empty:\n%s", out.String())
+		}
+	})
+
 	t.Run("member grant with --github discovers issuer, prints derived oidc ID, and grants roles", func(t *testing.T) {
 		oidc := &staticDiscoveryOIDC{doc: api.DiscoveryDocument{Issuer: issuer, APIURL: "https://kodema.example.com"}}
 		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
@@ -1651,6 +1721,92 @@ func TestMCPStdioAndInstall(t *testing.T) {
 		}
 		if errOut.Len() != 0 {
 			t.Fatalf("service token emitted unexpected warning: %q", errOut.String())
+		}
+
+		// 6. Project-scoped JWTs warn on stderr without swapping the embedded credential path or leaking token bytes.
+		projectAdminPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"admin","org_id":"tenant-local","project_id":"project-local","exp":1800000000}`))
+		projectAdminJWT := header + "." + projectAdminPayload + ".PROJECT-ADMIN-SENTINEL"
+		tenantAdminPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"admin","org_id":"tenant-local","exp":1800000000}`))
+		tenantAdminJWT := header + "." + tenantAdminPayload + ".TENANT-ADMIN-SENTINEL"
+		customProjectPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"engineer","org_id":"tenant-local","project_id":"proj-alpha","exp":1800000000}`))
+		customProjectJWT := header + "." + customProjectPayload + ".CUSTOM-PROJ-SENTINEL"
+
+		fs.files["/home/dev/.kodema/instances/default/admin-token"] = []byte(projectAdminJWT + "\n")
+		fs.files["/home/dev/.kodema/instances/default/tenant-admin-token"] = []byte(tenantAdminJWT + "\n")
+		fs.files["/home/dev/project-scoped-jwt"] = []byte(customProjectJWT + "\n")
+
+		// 6a. Local admin-token carrying project_id emits both the 24h warning and the project-scope warning,
+		// and embeds the exact requested admin-token path (no silent privilege escalation).
+		ports, out, errOut = testPorts(nil)
+		ports.Files = fs
+		if code := cli.RunWithDeps(context.Background(), adminCfg, []string{"mcp", "install", "opencode", "--print"}, ports, cli.CommandDeps{ExplicitCredentialFile: true}); code != cli.ExitSuccess {
+			t.Fatalf("project-scoped admin-token exit = %d; stderr=%q", code, errOut.String())
+		}
+		if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+			t.Fatalf("stdout is not valid JSON: %v\n%s", err, out.String())
+		}
+		if !strings.Contains(out.String(), `"/home/dev/.kodema/instances/default/admin-token"`) || strings.Contains(out.String(), "tenant-admin-token") {
+			t.Fatalf("mcp install silently altered embedded credential path:\n%s", out.String())
+		}
+		for _, want := range []string{"warning:", "24h", `"project-local"`, "project_create", "kodema login", "tenant-scoped"} {
+			if !strings.Contains(errOut.String(), want) {
+				t.Fatalf("stderr missing %q for project-scoped admin-token:\n%s", want, errOut.String())
+			}
+		}
+		if strings.Contains(errOut.String(), "PROJECT-ADMIN-SENTINEL") || strings.Contains(out.String(), "PROJECT-ADMIN-SENTINEL") {
+			t.Fatal("project-scoped admin-token bytes leaked")
+		}
+
+		// 6b. Custom project-scoped JWT file warns about both expiry and project scope without leaking token bytes.
+		customProjCfg := cli.Config{
+			ServerURL:      "https://127.0.0.1:8443",
+			CredentialFile: "/home/dev/project-scoped-jwt",
+			Output:         cli.OutputTable,
+		}
+		ports, out, errOut = testPorts(nil)
+		ports.Files = fs
+		if code := cli.RunWithDeps(context.Background(), customProjCfg, []string{"mcp", "install", "claude", "--print"}, ports, cli.CommandDeps{ExplicitCredentialFile: true}); code != cli.ExitSuccess {
+			t.Fatalf("custom project-scoped jwt exit = %d; stderr=%q", code, errOut.String())
+		}
+		for _, want := range []string{"warning:", "expiring token", `"proj-alpha"`, "project_create", "kodema login", "tenant-scoped"} {
+			if !strings.Contains(errOut.String(), want) {
+				t.Fatalf("stderr missing %q for custom project-scoped jwt:\n%s", want, errOut.String())
+			}
+		}
+		if strings.Contains(errOut.String(), "CUSTOM-PROJ-SENTINEL") || strings.Contains(out.String(), "CUSTOM-PROJ-SENTINEL") {
+			t.Fatal("custom project-scoped jwt bytes leaked")
+		}
+
+		// 6c. Tenant-scoped tenant-admin-token emits only the 24h local admin warning, NOT a project-scope warning.
+		tenantAdminCfg := cli.Config{
+			ServerURL:      "https://127.0.0.1:8443",
+			CAFile:         "/etc/kodema/ca.crt",
+			CredentialFile: "/home/dev/.kodema/instances/default/tenant-admin-token",
+			Output:         cli.OutputTable,
+		}
+		ports, out, errOut = testPorts(nil)
+		ports.Files = fs
+		if code := cli.RunWithDeps(context.Background(), tenantAdminCfg, []string{"mcp", "install", "opencode", "--print"}, ports, cli.CommandDeps{ExplicitCredentialFile: true}); code != cli.ExitSuccess {
+			t.Fatalf("tenant-admin-token exit = %d; stderr=%q", code, errOut.String())
+		}
+		if !strings.Contains(errOut.String(), "24h") {
+			t.Fatalf("stderr missing 24h warning for tenant-admin-token:\n%s", errOut.String())
+		}
+		if strings.Contains(errOut.String(), "project_create") || strings.Contains(errOut.String(), "scoped to project") {
+			t.Fatalf("tenant-admin-token unexpectedly emitted project-scope warning:\n%s", errOut.String())
+		}
+		if strings.Contains(errOut.String(), "TENANT-ADMIN-SENTINEL") || strings.Contains(out.String(), "TENANT-ADMIN-SENTINEL") {
+			t.Fatal("tenant-admin-token bytes leaked")
+		}
+
+		// 6d. Custom tenant-scoped JWT does NOT emit a project-scope warning.
+		ports, out, errOut = testPorts(nil)
+		ports.Files = fs
+		if code := cli.RunWithDeps(context.Background(), jwtCfg, []string{"mcp", "install", "claude", "--print"}, ports, cli.CommandDeps{ExplicitCredentialFile: true}); code != cli.ExitSuccess {
+			t.Fatalf("custom tenant-scoped jwt exit = %d; stderr=%q", code, errOut.String())
+		}
+		if strings.Contains(errOut.String(), "project_create") || strings.Contains(errOut.String(), "scoped to project") {
+			t.Fatalf("custom tenant-scoped jwt unexpectedly emitted project-scope warning:\n%s", errOut.String())
 		}
 	})
 

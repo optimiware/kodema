@@ -40,10 +40,11 @@ Flags:
 	},
 	"whoami": {
 		usage:   "kodema whoami [--offline]",
-		summary: "Show current principal identity, kind, scope, and roles",
+		summary: "Show current principal identity, kind, scope, roles, and memberships",
 		description: `Displays the caller's Kodema principal identity (oidc-<hash>), kind, tenant,
-project, and roles. Queries principal.whoami on the server; a failed query is an
-error. --offline derives oidc-<hash> from the saved session / JWT claims instead.
+project, roles, and project memberships. Queries principal.whoami on the server; a
+failed query is an error. --offline derives oidc-<hash> from the saved session / JWT
+claims instead.
 
 Flags:
   --offline   Derive principal identity locally from session/JWT without calling the server`,
@@ -377,7 +378,8 @@ A request that cannot be delivered is answered with a JSON-RPC error; the bridge
 		summary: "Print or install the kodema MCP server entry for an AI coding tool",
 		description: `Configures an MCP client to invoke 'kodema --url <url> [--ca-file <path>] [--session <path>] mcp stdio'.
 Preserves an explicit --session path and prefers a refreshing human session over an ambient
-KODEMA_CREDENTIAL_FILE when available. Warns on stderr if embedding a short-lived local admin token.
+KODEMA_CREDENTIAL_FILE when available. Warns on stderr if embedding a short-lived local admin token,
+an expiring JWT, or a project-scoped JWT pinned to a single project.
 
 Targets:
   claude     ~/.claude.json (or .mcp.json with --local)

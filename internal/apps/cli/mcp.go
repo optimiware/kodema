@@ -305,7 +305,7 @@ func runMCPInstall(ctx context.Context, config Config, args []string, ports Port
 		mcpArgs = append(mcpArgs, "--session", absSessionPath)
 	case credPath != "" && !deps.ExplicitCredentialFile && hasUsableHumanSession(ctx, config.ServerURL, deps.Login.Store, ports.Now):
 		// Prefer an already-logged-in refreshing human session over an ambient
-		// KODEMA_CREDENTIAL_FILE (such as env.sh's 24h admin-token).
+		// KODEMA_CREDENTIAL_FILE (such as env.sh's 24h admin token).
 		if ports.Err != nil {
 			fmt.Fprintf(ports.Err, "note: using existing human session instead of KODEMA_CREDENTIAL_FILE (%s); pass --credential-file explicitly to embed a static token file\n", credPath)
 		}
@@ -404,20 +404,22 @@ func hasUsableHumanSession(ctx context.Context, serverURL string, store SessionR
 	return record.Usable(now())
 }
 
-// warnExpiringCredentialFile emits a diagnostic on errOut when mcp install
-// embeds a short-lived local admin token (such as kodema up's 24h admin-token)
-// or a credential file carrying a JWT with an explicit exp claim. Token bytes
-// are never rendered.
+// warnExpiringCredentialFile emits diagnostics on errOut when mcp install
+// embeds a short-lived local admin token (such as kodema up's 24h admin-token
+// or tenant-admin-token), a credential file carrying a JWT with an explicit exp
+// claim, or a project-scoped JWT pinned to a single project. Token bytes are
+// never rendered.
 func warnExpiringCredentialFile(errOut io.Writer, credPath string, files FileSystem) {
 	if errOut == nil {
 		return
 	}
+	warnedLocalAdmin := false
 	switch filepath.Base(credPath) {
 	case "admin-token", "tenant-admin-token":
 		fmt.Fprintf(errOut,
 			"warning: embedding --credential-file %s (short-lived local admin token expires in 24h and carries broad admin roles); run 'kodema login' and re-run without KODEMA_CREDENTIAL_FILE to use a refreshing human session\n",
 			credPath)
-		return
+		warnedLocalAdmin = true
 	}
 	if files == nil {
 		return
@@ -426,10 +428,20 @@ func warnExpiringCredentialFile(errOut io.Writer, credPath string, files FileSys
 	if err != nil {
 		return
 	}
-	if expiresAt, ok := credentialTokenExpiry(strings.TrimSpace(string(data))); ok {
-		fmt.Fprintf(errOut,
-			"warning: embedding --credential-file %s which contains an expiring token (expires %s); prefer 'kodema login' with a refreshing human session\n",
-			credPath, formatSessionTime(expiresAt))
+	raw := strings.TrimSpace(string(data))
+	if !warnedLocalAdmin {
+		if expiresAt, ok := credentialTokenExpiry(raw); ok {
+			fmt.Fprintf(errOut,
+				"warning: embedding --credential-file %s which contains an expiring token (expires %s); prefer 'kodema login' with a refreshing human session\n",
+				credPath, formatSessionTime(expiresAt))
+		}
+	}
+	if !strings.HasPrefix(raw, "kodsvc.") && !strings.HasPrefix(raw, "kodex.") {
+		if projectID, ok := parseJWTProjectID(raw); ok {
+			fmt.Fprintf(errOut,
+				"warning: credential file %s is scoped to project %q; the MCP server is pinned to %q and cannot run project_create or see other projects (use 'kodema login' or a tenant-scoped credential such as $KODEMA_TENANT_ADMIN_CREDENTIAL_FILE)\n",
+				credPath, projectID, projectID)
+		}
 	}
 }
 
