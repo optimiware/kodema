@@ -56,14 +56,21 @@ config:
     budgets:
       defaultExecution:
         maxTokens: 250000
+      pricing:
+        - model: "anthropic/*"
+          inputUSDPerMillionTokens: 3.0
+          outputUSDPerMillionTokens: 15.0
+        - model: "*"
+          inputUSDPerMillionTokens: 3.0
+          outputUSDPerMillionTokens: 15.0
   secretRules:
     rules:
       - tenantID: tenant-a
         names: ["NPM_TOKEN"]
 ```
 
-- `environment: "production"` keeps both `config.models` and `config.secretRules` fail-closed/off by default and refuses `allowAll: true` secret rules and non-`https://` provider URLs.
-- `environment: "test"` (including [`deploy/k3s/values.yaml`](../../deploy/k3s/values.yaml)) defaults `config.secretRules.allowAllInTest: true` for declared tenants and enables `config.models.defaultProviders: true` in the k3s reference values.
+- `environment: "production"` keeps both `config.models` and `config.secretRules` fail-closed/off by default (with zero implicit `budgets.pricing`) and refuses `allowAll: true` secret rules and non-`https://` provider URLs.
+- `environment: "test"` (including [`deploy/k3s/values.yaml`](../../deploy/k3s/values.yaml)) defaults `config.secretRules.allowAllInTest: true` for declared tenants, enables `config.models.defaultProviders: true`, and seeds conservative wildcard `budgets.pricing` estimate rates in the k3s reference values.
 - To supply an operator-managed ConfigMap instead of inline values, set `config.models.existingConfigMap` or `config.secretRules.existingConfigMap` (mutually exclusive with inline fields).
 
 ## Recommended in-container pattern: `kodema harness exec -- <cmd>`
@@ -141,7 +148,44 @@ Active budgets are enforced **live inside the LLM proxy** before dialing upstrea
 2. **Per-execution:** top-level `budget: {max_tokens, max_cost_usd}` on a pipeline (combined with installation defaults in `models.json`; the stricter bound applies).
 3. **Per-task:** installation default task budget accumulated across all sibling executions of the same task.
 
-When any active limit is reached or exceeded, Kodema immediately rejects the call with HTTP `429` (`budget_exceeded`) and records a `model.budget.exceeded` event. Cost budgets (`max_cost_usd`) fail closed if a model has no configured pricing rate in `models.json`.
+When any active limit is reached or exceeded, Kodema immediately rejects the call with HTTP `429` (`budget_exceeded`) and records a `model.budget.exceeded` event.
+
+Cost budgets (`max_cost_usd`) look up per-million-token rates from `budgets.pricing` in `models.json` in specificity order: exact model name, `upstream_model`, `provider/*` wildcard, and `*` fallback:
+
+```json
+{
+  "providers": [
+    {
+      "tenant_id": "tenant-a",
+      "name": "opencode",
+      "base_url": "https://opencode.ai/zen/v1",
+      "secret_name": "OPENCODE_API_KEY"
+    }
+  ],
+  "budgets": {
+    "pricing": [
+      {
+        "model": "opencode/gemini-4-neon",
+        "input_usd_per_million_tokens": 2.5,
+        "output_usd_per_million_tokens": 10.0
+      },
+      {
+        "model": "opencode/*",
+        "input_usd_per_million_tokens": 3.0,
+        "output_usd_per_million_tokens": 15.0
+      },
+      {
+        "model": "*",
+        "input_usd_per_million_tokens": 3.0,
+        "output_usd_per_million_tokens": 15.0
+      }
+    ]
+  }
+}
+```
+
+- **Local development (`kodema up` and `deploy/k3s/values.yaml`):** seeds conservative wildcard estimate rates (`$3.00` input / `$15.00` output per 1M tokens for `openai/*`, `anthropic/*`, `opencode/*`, and `*`) when generating the default `models.json`, so shipped pipelines declaring `max_cost_usd` enforce a real spend guardrail out of the box. Passing an explicit `--models-file` to `kodema up` preserves that file verbatim without injecting default pricing.
+- **Production (`kodema serve --profile production` and `deploy/charts/kodema/values.yaml`):** emits zero implicit pricing and fails closed with HTTP `501` (`unsupported_capability`) whenever `max_cost_usd` is active for a model with no matching `budgets.pricing` entry.
 
 ## Minimal coding-harness base image
 

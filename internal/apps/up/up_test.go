@@ -2442,6 +2442,58 @@ func TestUpLLMProxyConfiguration(t *testing.T) {
 			!slices.Equal(parsed.SecretRules[0].Names, []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENCODE_API_KEY"}) {
 			t.Fatalf("secret_rules = %+v", parsed.SecretRules)
 		}
+		if parsed.Budgets == nil {
+			t.Fatalf("default models.json missing budgets.pricing:\n%s", data)
+		}
+		wantPricing := DefaultLocalModelPricing()
+		if !slices.Equal(parsed.Budgets.Pricing, wantPricing) {
+			t.Fatalf("budgets.pricing = %+v; want %+v", parsed.Budgets.Pricing, wantPricing)
+		}
+		pricingByModel := make(map[string]LocalModelPricing, len(parsed.Budgets.Pricing))
+		for _, entry := range parsed.Budgets.Pricing {
+			pricingByModel[entry.Model] = entry
+		}
+		for _, pattern := range []string{"openai/*", "anthropic/*", "opencode/*", "*"} {
+			rate, ok := pricingByModel[pattern]
+			if !ok {
+				t.Fatalf("default models.json missing budgets.pricing entry for %q: %+v", pattern, parsed.Budgets.Pricing)
+			}
+			if rate.InputUSDPerMillionTokens <= 0 || rate.OutputUSDPerMillionTokens <= 0 {
+				t.Fatalf("pricing for %q has non-positive rates: %+v", pattern, rate)
+			}
+		}
+		// Mutating DefaultLocalModelPricing() return slice must not affect subsequent calls.
+		wantPricing[0].Model = "mutated/*"
+		if fresh := DefaultLocalModelPricing(); fresh[0].Model != "openai/*" {
+			t.Fatalf("DefaultLocalModelPricing() returned a shared slice: %+v", fresh)
+		}
+	})
+
+	t.Run("explicit --models-file is preserved verbatim without injecting default pricing", func(t *testing.T) {
+		home := t.TempDir()
+		customContent := "{\n  \"providers\": [\n    {\n      \"tenant_id\": \"tenant-local\",\n      \"name\": \"custom-gw\",\n      \"base_url\": \"https://gw.example.com/v1\",\n      \"secret_name\": \"CUSTOM_GW_KEY\"\n    }\n  ],\n  \"secret_rules\": [\n    {\"tenant_id\": \"tenant-local\", \"names\": [\"CUSTOM_GW_KEY\"]}\n  ]\n}\n"
+		customPath := filepath.Join(t.TempDir(), "custom-models.json")
+		if err := os.WriteFile(customPath, []byte(customContent), 0o600); err != nil {
+			t.Fatalf("write custom models.json: %v", err)
+		}
+		desc, engine, _, err := runMockUp(t, home, UpConfig{ModelsFile: customPath})
+		if err != nil {
+			t.Fatalf("Up with explicit ModelsFile: %v", err)
+		}
+		modelsPath := filepath.Join(desc.StateDir, modelsFileName)
+		if env := engine.containerEnv(t, "kodema-llm-server"); !slices.Contains(env, "KODEMA_MODELS_FILE="+modelsPath) {
+			t.Fatalf("server env missing KODEMA_MODELS_FILE=%s: %v", modelsPath, env)
+		}
+		got, err := os.ReadFile(modelsPath)
+		if err != nil {
+			t.Fatalf("read copied models.json: %v", err)
+		}
+		if string(got) != customContent {
+			t.Fatalf("explicit --models-file was modified:\ngot:\n%s\nwant:\n%s", got, customContent)
+		}
+		if strings.Contains(string(got), `"budgets"`) || strings.Contains(string(got), `"pricing"`) {
+			t.Fatalf("explicit --models-file unexpectedly had default pricing injected:\n%s", got)
+		}
 	})
 
 	t.Run("custom LLMProviders adds provider and overrides built-in; DisableLLMProxy removes stale file", func(t *testing.T) {
@@ -2476,6 +2528,9 @@ func TestUpLLMProxyConfiguration(t *testing.T) {
 		}
 		if p := byName["openrouter"]; p.BaseURL != "https://openrouter.ai/api/v1" || p.SecretName != "OPENROUTER_API_KEY" {
 			t.Fatalf("openrouter = %+v", p)
+		}
+		if parsed.Budgets == nil || !slices.Equal(parsed.Budgets.Pricing, DefaultLocalModelPricing()) {
+			t.Fatalf("custom LLMProviders budgets.pricing = %+v; want %+v", parsed.Budgets, DefaultLocalModelPricing())
 		}
 		if env := engine.containerEnv(t, "kodema-llm-server"); !slices.Contains(env, "KODEMA_MODELS_FILE="+modelsPath) {
 			t.Fatalf("server env missing KODEMA_MODELS_FILE: %v", env)

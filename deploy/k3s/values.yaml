@@ -58,6 +58,24 @@ kodema:
     # secrets, never in Helm values.
     models:
       defaultProviders: true
+      budgets:
+        # Conservative local estimate rates ($3/1M input, $15/1M output) so
+        # example pipelines declaring budget.max_cost_usd enforce a real spend
+        # guardrail out of the box. Production charts leave budgets.pricing
+        # empty and fail closed (HTTP 501) until explicit rates are configured.
+        pricing:
+          - model: "openai/*"
+            inputUSDPerMillionTokens: 3.0
+            outputUSDPerMillionTokens: 15.0
+          - model: "anthropic/*"
+            inputUSDPerMillionTokens: 3.0
+            outputUSDPerMillionTokens: 15.0
+          - model: "opencode/*"
+            inputUSDPerMillionTokens: 3.0
+            outputUSDPerMillionTokens: 15.0
+          - model: "*"
+            inputUSDPerMillionTokens: 3.0
+            outputUSDPerMillionTokens: 15.0
     extraEnv:
       KODEMA_OIDC_ISSUER: "https://oauthsonas.kodema-system.svc.cluster.local:8443"
       KODEMA_OIDC_AUDIENCE: "https://kodema.kodema-system.svc.cluster.local:8443"

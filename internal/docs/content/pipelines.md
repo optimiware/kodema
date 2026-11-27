@@ -71,7 +71,7 @@ actions:
 - `inputs` (optional): declared admission input keys (string names or `{key, kind, required}` specs).
 - `env` (optional): pipeline-level literal string environment variables inherited by container actions.
 - `completes_task` (optional boolean, default `true`): when `false`, succeeding leaves an associated open task `open` so later stages can run on the same task before explicit `task.complete`.
-- `budget` (optional): execution-level active LLM budget with at least one of `max_tokens` (positive integer, up to `1000000000`) or `max_cost_usd` (positive finite number, up to `1000000.0`). Combined with installation defaults (stricter limit wins) and enforced live by the LLM proxy before upstream calls (`429` / `budget_exceeded`).
+- `budget` (optional): execution-level active LLM budget with at least one of `max_tokens` (positive integer, up to `1000000000`) or `max_cost_usd` (positive finite number, up to `1000000.0`). Combined with installation defaults (stricter limit wins) and enforced live by the LLM proxy before upstream calls (`429` / `budget_exceeded`). Cost budgets match pricing rates from `budgets.pricing` in `models.json` by exact model, `provider/*`, or `*`; `kodema up` (and `deploy/k3s/values.yaml`) seeds conservative local estimate rates by default (while preserving explicit `--models-file` verbatim), whereas production fails closed (`501` / `unsupported_capability`) until explicit pricing is configured.
 - `repository`, `service`, `on.push` (optional): Git push trigger binding (see below).
 
 ## Container actions

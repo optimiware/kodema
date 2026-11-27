@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/optimiware/kodema/internal/server"
 )
 
 // TestK3sReferenceValuesRenderCleanly proves deploy/k3s/values.yaml renders a
@@ -63,7 +65,60 @@ func TestK3sReferenceValuesRenderCleanly(t *testing.T) {
 		t.Errorf("k3s stack rendered %d Deployments; expected kodema + oauthsonas", count)
 	}
 	_ = renderedObjectNamed(t, rendered, "ConfigMap", "kodema-secret-rules")
-	_ = renderedObjectNamed(t, rendered, "ConfigMap", "kodema-models")
+	modelsCM := renderedObjectNamed(t, rendered, "ConfigMap", "kodema-models")
+	rawModelsJSON := stringAtKey(t, objectAtKey(t, modelsCM, "data"), "models.json")
+	modelsPath := writeTempConfigFile(t, "k3s-models.json", rawModelsJSON)
+	loadedModels, err := server.LoadModelsConfigFile(modelsPath, server.ProfileTest)
+	if err != nil {
+		t.Fatalf("server.LoadModelsConfigFile(ProfileTest) rejected k3s models.json: %v\n%s", err, rawModelsJSON)
+	}
+	pricingByModel := make(map[string]struct{ in, out float64 }, len(loadedModels.Budgets.Pricing))
+	for _, entry := range loadedModels.Budgets.Pricing {
+		pricingByModel[entry.Model] = struct{ in, out float64 }{
+			in:  entry.InputUSDPerMillionTokens,
+			out: entry.OutputUSDPerMillionTokens,
+		}
+	}
+	for _, wantModel := range []string{"openai/*", "anthropic/*", "opencode/*", "*"} {
+		rate, ok := pricingByModel[wantModel]
+		if !ok {
+			t.Errorf("k3s models.json missing budgets.pricing entry %q (got %+v)", wantModel, loadedModels.Budgets.Pricing)
+			continue
+		}
+		if rate.in != 3.0 || rate.out != 15.0 {
+			t.Errorf("k3s budgets.pricing[%q] = (%v, %v); want (3.0, 15.0)", wantModel, rate.in, rate.out)
+		}
+	}
+
+	// Production chart defaults MUST emit zero implicit pricing (staying fail-closed)
+	// both by default and when defaultProviders: true is enabled without explicit pricing.
+	_, charts := stagedCharts(t)
+	kodemaChart := filepath.Join(charts, "kodema")
+	prodDefault, err := renderChartArgs(t, helm, "kodema", kodemaChart, kodemaProductionArgs()...)
+	if err != nil {
+		t.Fatalf("helm template kodema production default: %v\n%s", err, prodDefault)
+	}
+	if count := renderedKindCount(prodDefault, "ConfigMap"); count != 0 {
+		t.Errorf("production default rendered %d ConfigMaps; want 0 (fail-closed)", count)
+	}
+	prodDefaultProviders, err := renderWorkloadValues(t, helm, kodemaChart, productionConfigValues(map[string]any{
+		"models": map[string]any{
+			"defaultProviders": true,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("helm template kodema production with defaultProviders: %v\n%s", err, prodDefaultProviders)
+	}
+	prodModelsCM := renderedObjectNamed(t, prodDefaultProviders, "ConfigMap", "kodema-models")
+	prodRawJSON := stringAtKey(t, objectAtKey(t, prodModelsCM, "data"), "models.json")
+	prodPath := writeTempConfigFile(t, "prod-models.json", prodRawJSON)
+	loadedProd, err := server.LoadModelsConfigFile(prodPath, server.ProfileProduction)
+	if err != nil {
+		t.Fatalf("server.LoadModelsConfigFile(ProfileProduction) failed: %v\n%s", err, prodRawJSON)
+	}
+	if len(loadedProd.Budgets.Pricing) != 0 {
+		t.Errorf("production defaultProviders emitted unexpected implicit budgets.pricing: %+v", loadedProd.Budgets.Pricing)
+	}
 
 	// Passing an explicit image.digest still pins KODEMA_TOOLBOX_IMAGE by digest.
 	digest := "sha256:" + strings.Repeat("b", 64)

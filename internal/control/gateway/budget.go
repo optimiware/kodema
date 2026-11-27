@@ -307,7 +307,7 @@ func (tracker *BudgetTracker) CheckAndAcquire(ctx context.Context, req BudgetChe
 		if _, ok := tracker.lookupPricing(req.Scope, req.Model, req.UpstreamModel); !ok {
 			release()
 			return noop, fault.New(fault.UnsupportedCapability,
-				fmt.Sprintf("cost budget enforcement cannot price model %q: no matching pricing rate is configured", req.Model))
+				fmt.Sprintf("cost budget enforcement cannot price model %q: no matching pricing rate is configured %s", req.Model, missingPricingHint(req.Model)))
 		}
 	}
 
@@ -364,7 +364,7 @@ func (tracker *BudgetTracker) CheckAndAcquire(ctx context.Context, req BudgetChe
 		if !priced && rowNeedsPrice && (prompt > 0 || completion > 0) {
 			release()
 			return noop, fault.New(fault.UnsupportedCapability,
-				fmt.Sprintf("cost budget enforcement cannot price recorded usage for model %q: no matching pricing rate is configured", row.Model))
+				fmt.Sprintf("cost budget enforcement cannot price recorded usage for model %q: no matching pricing rate is configured %s", row.Model, missingPricingHint(row.Model)))
 		}
 
 		taskTokens = saturatingAddInt64(taskTokens, tokens)
@@ -525,6 +525,20 @@ func (tracker *BudgetTracker) lookupPricing(scope tenancy.Scope, model, upstream
 		return rate, true
 	}
 	return ModelPricing{}, false
+}
+
+func missingPricingHint(model string) string {
+	trimmed := strings.TrimSpace(model)
+	var example string
+	if provider, _, hasSlash := strings.Cut(trimmed, "/"); hasSlash && provider != "" {
+		example = provider + "/*"
+	} else if trimmed != "" && trimmed != "*" {
+		example = trimmed
+	}
+	if example == "" {
+		return `(add a budgets.pricing entry such as "*" in models.json, or remove budget.max_cost_usd)`
+	}
+	return fmt.Sprintf(`(add a budgets.pricing entry such as %q or "*" in models.json, or remove budget.max_cost_usd)`, example)
 }
 
 func clampNonNegative(v int64) int64 {

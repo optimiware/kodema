@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/apps/up"
 	"github.com/optimiware/kodema/internal/id"
 	app "github.com/optimiware/kodema/internal/server"
 )
@@ -201,6 +202,41 @@ func TestConfiguredGatewayFiles(t *testing.T) {
 		absent := filepath.Join(t.TempDir(), "absent.json")
 		if models, err := app.LoadModelsConfigFile(absent, app.ProfileDevelopment); err == nil || models != nil {
 			t.Fatalf("an absent models file loaded: %+v", models)
+		}
+	})
+
+	t.Run("loads kodema up generated models.json strictly while keeping production files free of implicit pricing", func(t *testing.T) {
+		rawLocal, _, err := up.BuildDefaultModelsJSON(tenantID, nil)
+		if err != nil {
+			t.Fatalf("up.BuildDefaultModelsJSON: %v", err)
+		}
+		localPath := writeGatewayFile(t, "local-up-models.json", string(rawLocal))
+		loadedLocal, err := app.LoadModelsConfigFile(localPath, app.ProfileTest)
+		if err != nil {
+			t.Fatalf("LoadModelsConfigFile(ProfileTest) rejected kodema up models.json: %v\n%s", err, rawLocal)
+		}
+		seenPricing := make(map[string]bool, len(loadedLocal.Budgets.Pricing))
+		for _, entry := range loadedLocal.Budgets.Pricing {
+			seenPricing[entry.Model] = true
+			if entry.InputUSDPerMillionTokens <= 0 || entry.OutputUSDPerMillionTokens <= 0 {
+				t.Errorf("pricing entry %+v has non-positive rates", entry)
+			}
+		}
+		for _, wantPattern := range []string{"openai/*", "anthropic/*", "opencode/*", "*"} {
+			if !seenPricing[wantPattern] {
+				t.Errorf("kodema up models.json missing budgets.pricing pattern %q (got %+v)", wantPattern, loadedLocal.Budgets.Pricing)
+			}
+		}
+
+		// A production models.json omitting budgets.pricing MUST load with zero implicit pricing.
+		prodPath := writeGatewayFile(t, "prod-models.json",
+			modelsConfigFile("https://api.openai.com/v1/chat/completions"))
+		loadedProd, err := app.LoadModelsConfigFile(prodPath, app.ProfileProduction)
+		if err != nil {
+			t.Fatalf("LoadModelsConfigFile(ProfileProduction): %v", err)
+		}
+		if len(loadedProd.Budgets.Pricing) != 0 {
+			t.Fatalf("production models.json loaded unexpected implicit budgets.pricing: %+v", loadedProd.Budgets.Pricing)
 		}
 	})
 }

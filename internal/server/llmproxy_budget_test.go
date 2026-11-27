@@ -17,6 +17,7 @@ import (
 	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/internal/adapter/store/memory"
 	"github.com/optimiware/kodema/internal/adapter/store/units/execution/snapshotdoc"
+	"github.com/optimiware/kodema/internal/apps/up"
 	"github.com/optimiware/kodema/internal/control/authorize"
 	"github.com/optimiware/kodema/internal/control/event"
 	"github.com/optimiware/kodema/internal/control/gateway"
@@ -986,5 +987,189 @@ func TestLLMProxy_MultiActionAndPipelineBudgetIsolation(t *testing.T) {
 	}
 	if evData.ScopeKind != "execution" || evData.UsedTokens != 8500 || evData.MaxTokens != 8000 {
 		t.Fatalf("event payload = %+v; want execution 8500/8000", evData)
+	}
+}
+
+func TestLLMProxy_LocalUpModelsJSONAllowsOpenCodeAndEnforcesCostCeiling(t *testing.T) {
+	scope := tenancy.Scope{TenantID: id.TenantID(up.DefaultTenantID), ProjectID: id.ProjectID(up.DefaultProjectID)}
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	clk := budgetTestClock{now: now}
+
+	rawJSON, _, err := up.BuildDefaultModelsJSON(up.DefaultTenantID, nil)
+	if err != nil {
+		t.Fatalf("up.BuildDefaultModelsJSON: %v", err)
+	}
+	modelsPath := filepath.Join(t.TempDir(), "models.json")
+	if err := os.WriteFile(modelsPath, rawJSON, 0o600); err != nil {
+		t.Fatalf("write generated models.json: %v", err)
+	}
+
+	loaded, err := LoadModelsConfigFile(modelsPath, ProfileTest)
+	if err != nil {
+		t.Fatalf("LoadModelsConfigFile(ProfileTest) rejected kodema up models.json: %v\n%s", err, rawJSON)
+	}
+	if _, err := LoadModelsConfigFile(modelsPath, ProfileProduction); err != nil {
+		t.Fatalf("LoadModelsConfigFile(ProfileProduction) rejected kodema up models.json: %v\n%s", err, rawJSON)
+	}
+	if len(loaded.Budgets.Pricing) != 4 {
+		t.Fatalf("loaded budgets.pricing = %+v; want 4 wildcard entries", loaded.Budgets.Pricing)
+	}
+
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// 10,000 prompt @ $3/1M ($0.03) + 2,000 completion @ $15/1M ($0.03) = $0.06/call
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-zen-1","model":"gemini-4-neon","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":10000,"completion_tokens":2000,"total_tokens":12000}}`))
+	}))
+	defer upstream.Close()
+
+	// Point the loaded opencode provider at the local test upstream while
+	// keeping the exact Budgets.Pricing loaded from kodema up's models.json.
+	for i := range loaded.Providers {
+		if loaded.Providers[i].Name == "opencode" {
+			loaded.Providers[i].BaseURL = upstream.URL
+		}
+	}
+
+	mem := memory.NewWithClock(clk.Now)
+	execID := id.ExecutionID("exec-opencode-budget")
+	actionID := id.ActionID("act-opencode-budget")
+	principalID := id.PrincipalID("principal-opencode-budget")
+	tok := "kodex.exec-opencode-budget.mac"
+
+	// Pipeline declares max_cost_usd: 0.05 (first call spends $0.06 -> second call blocked).
+	seedBudgetExecution(t, mem, scope, execID, actionID, principalID, "",
+		&definition.Budget{MaxCostUSD: 0.05},
+		nil,
+	)
+
+	principal := identity.Principal{
+		ID:          principalID,
+		Kind:        identity.KindExecution,
+		Scope:       scope,
+		Enabled:     true,
+		Version:     1,
+		ExecutionID: execID,
+	}
+	admitted := authorize.AdmittedExecution{
+		Principal:   principal,
+		ExecutionID: execID,
+		ActionID:    actionID,
+		Permission:  authorize.ExecConfiguredModels,
+		Deadline:    now.Add(10 * time.Minute),
+	}
+
+	var usageSeq, eventSeq atomic.Int64
+	cipher := newTestCipher(t)
+	handler, stop, err := newLLMProxyHandler(llmProxyDependencies{
+		Config:         loaded,
+		Profile:        ProfileDevelopment,
+		InstallationID: "installation-1",
+		Executions:     fixedExecutionReader{admitted: admitted},
+		Principals:     staticPrincipalResolver{byToken: map[string]identity.Principal{tok: principal}},
+		Authority:      budgetTestAllowAuthority{},
+		Lookup: mapSecretLookup{
+			cipher: cipher,
+			values: map[id.SecretName]string{"OPENCODE_API_KEY": "sk-opencode-test"},
+		},
+		Cipher:     cipher,
+		Store:      mem,
+		Scanner:    mem,
+		NewUsageID: func() (gateway.UsageID, error) { return gateway.UsageID(fmt.Sprintf("u-oc-%d", usageSeq.Add(1))), nil },
+		NewEventID: func() (id.EventID, error) { return id.EventID(fmt.Sprintf("ev-oc-%d", eventSeq.Add(1))), nil },
+		Clock:      clk,
+	})
+	if err != nil {
+		t.Fatalf("newLLMProxyHandler: %v", err)
+	}
+	if stop != nil {
+		defer func() { _ = stop(context.Background()) }()
+	}
+
+	// Call 1: opencode/gemini-4-neon is matched by opencode/* wildcard pricing and succeeds.
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "/llm/opencode/v1/chat/completions", strings.NewReader(`{"model":"gemini-4-neon","messages":[{"role":"user","content":"hi"}]}`))
+	req1.Header.Set("Authorization", "Bearer "+tok)
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("call 1 status = %d body=%s; want 200", rec1.Code, rec1.Body.String())
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls after call 1 = %d; want 1", upstreamCalls.Load())
+	}
+
+	// Call 2: cumulative spend ($0.06) >= $0.05 -> rejected with 429 budget_exceeded before dialing upstream.
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/llm/opencode/v1/chat/completions", strings.NewReader(`{"model":"gemini-4-neon","messages":[{"role":"user","content":"again"}]}`))
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("call 2 status = %d body=%s; want 429 budget_exceeded", rec2.Code, rec2.Body.String())
+	}
+	var apiErr api.Error
+	if err := json.Unmarshal(rec2.Body.Bytes(), &apiErr); err != nil {
+		t.Fatalf("unmarshal 429 body: %v (%s)", err, rec2.Body.String())
+	}
+	if apiErr.Code != api.CodeBudgetExceeded {
+		t.Fatalf("call 2 error code = %q; want %q", apiErr.Code, api.CodeBudgetExceeded)
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("upstream calls after budget exceeded = %d; want 1", upstreamCalls.Load())
+	}
+
+	// Negative check: a config with zero pricing stays strictly fail-closed (HTTP 501)
+	// and includes the budgets.pricing remediation hint.
+	unpricedCfg := &ModelsConfig{
+		Providers: []ModelProviderConfig{{
+			Scope:      scope,
+			Name:       "opencode",
+			BaseURL:    upstream.URL,
+			SecretName: "OPENCODE_API_KEY",
+		}},
+	}
+	unpricedHandler, stopUnpriced, err := newLLMProxyHandler(llmProxyDependencies{
+		Config:         unpricedCfg,
+		Profile:        ProfileDevelopment,
+		InstallationID: "installation-1",
+		Executions:     fixedExecutionReader{admitted: admitted},
+		Principals:     staticPrincipalResolver{byToken: map[string]identity.Principal{tok: principal}},
+		Authority:      budgetTestAllowAuthority{},
+		Lookup: mapSecretLookup{
+			cipher: cipher,
+			values: map[id.SecretName]string{"OPENCODE_API_KEY": "sk-opencode-test"},
+		},
+		Cipher:     cipher,
+		Store:      mem,
+		Scanner:    mem,
+		NewUsageID: func() (gateway.UsageID, error) { return gateway.UsageID(fmt.Sprintf("u-np-%d", usageSeq.Add(1))), nil },
+		NewEventID: func() (id.EventID, error) { return id.EventID(fmt.Sprintf("ev-np-%d", eventSeq.Add(1))), nil },
+		Clock:      clk,
+	})
+	if err != nil {
+		t.Fatalf("newLLMProxyHandler(unpriced): %v", err)
+	}
+	if stopUnpriced != nil {
+		defer func() { _ = stopUnpriced(context.Background()) }()
+	}
+	rec501 := httptest.NewRecorder()
+	req501 := httptest.NewRequest(http.MethodPost, "/llm/opencode/v1/chat/completions", strings.NewReader(`{"model":"gemini-4-neon","messages":[{"role":"user","content":"hi"}]}`))
+	req501.Header.Set("Authorization", "Bearer "+tok)
+	unpricedHandler.ServeHTTP(rec501, req501)
+	if rec501.Code != http.StatusNotImplemented {
+		t.Fatalf("unpriced status = %d body=%s; want 501", rec501.Code, rec501.Body.String())
+	}
+	var err501 api.Error
+	if err := json.Unmarshal(rec501.Body.Bytes(), &err501); err != nil {
+		t.Fatalf("unmarshal 501 body: %v (%s)", err, rec501.Body.String())
+	}
+	if err501.Code != api.CodeUnsupportedCapability {
+		t.Fatalf("501 error code = %q; want %q", err501.Code, api.CodeUnsupportedCapability)
+	}
+	for _, wantSub := range []string{"budgets.pricing", `"opencode/*"`, `"*"`, "models.json", "budget.max_cost_usd"} {
+		if !strings.Contains(err501.Message, wantSub) {
+			t.Errorf("501 message = %q; want substring %q", err501.Message, wantSub)
+		}
 	}
 }

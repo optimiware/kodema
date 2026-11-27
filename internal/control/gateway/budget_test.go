@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -700,24 +701,39 @@ func TestGatewayBudget_MissingPricingFailsClosedOnActiveCostBudget(t *testing.T)
 	scope := testScope()
 	reader := &staticBudgetReader{}
 
-	t.Run("rejects unpriced model when MaxCostUSD is active", func(t *testing.T) {
+	t.Run("rejects unpriced model when MaxCostUSD is active with remediation hint", func(t *testing.T) {
 		tracker, err := gateway.NewBudgetTracker(gateway.BudgetConfig{
 			DefaultExecution: gateway.BudgetLimits{MaxCostUSD: 1.0},
 		}, nil, reader, nil)
 		if err != nil {
 			t.Fatalf("NewBudgetTracker: %v", err)
 		}
-		_, err = tracker.CheckAndAcquire(context.Background(), gateway.BudgetCheckRequest{
-			Scope:       scope,
-			PrincipalID: testPrincipal,
-			ExecutionID: testExecution,
-			Model:       "openai/unpriced-model",
-		})
-		if err == nil {
-			t.Fatal("CheckAndAcquire succeeded for unpriced model under active MaxCostUSD; want fail-closed error")
-		}
-		if class, ok := fault.ClassOf(err); !ok || class != fault.UnsupportedCapability {
-			t.Fatalf("err class = %q (%v); want unsupported_capability (err=%v)", class, ok, err)
+		for _, tc := range []struct {
+			model       string
+			wantExample string
+		}{
+			{model: "openai/unpriced-model", wantExample: `"openai/*"`},
+			{model: "opencode/gemini-4-neon", wantExample: `"opencode/*"`},
+			{model: "custom-model", wantExample: `"custom-model"`},
+		} {
+			_, err = tracker.CheckAndAcquire(context.Background(), gateway.BudgetCheckRequest{
+				Scope:       scope,
+				PrincipalID: testPrincipal,
+				ExecutionID: testExecution,
+				Model:       tc.model,
+			})
+			if err == nil {
+				t.Fatalf("CheckAndAcquire(%q) succeeded for unpriced model under active MaxCostUSD; want fail-closed error", tc.model)
+			}
+			if class, ok := fault.ClassOf(err); !ok || class != fault.UnsupportedCapability {
+				t.Fatalf("CheckAndAcquire(%q) err class = %q (%v); want unsupported_capability (err=%v)", tc.model, class, ok, err)
+			}
+			msg := err.Error()
+			for _, wantSub := range []string{"budgets.pricing", tc.wantExample, `"*"`, "models.json", "budget.max_cost_usd"} {
+				if !strings.Contains(msg, wantSub) {
+					t.Errorf("CheckAndAcquire(%q) err = %q; want substring %q", tc.model, msg, wantSub)
+				}
+			}
 		}
 	})
 
@@ -743,7 +759,7 @@ func TestGatewayBudget_MissingPricingFailsClosedOnActiveCostBudget(t *testing.T)
 		release()
 	})
 
-	t.Run("rejects unpriced historical usage row when MaxCostUSD is active", func(t *testing.T) {
+	t.Run("rejects unpriced historical usage row when MaxCostUSD is active with remediation hint", func(t *testing.T) {
 		histReader := &staticBudgetReader{
 			usageByScope: map[tenancy.Scope][]gateway.UsageSummaryRow{
 				scope: {{
@@ -772,6 +788,12 @@ func TestGatewayBudget_MissingPricingFailsClosedOnActiveCostBudget(t *testing.T)
 		})
 		if class, ok := fault.ClassOf(err); !ok || class != fault.UnsupportedCapability {
 			t.Fatalf("err = %v; want unsupported_capability for unpriced historical usage", err)
+		}
+		msg := err.Error()
+		for _, wantSub := range []string{"budgets.pricing", `"anthropic/*"`, `"*"`, "models.json", "budget.max_cost_usd"} {
+			if !strings.Contains(msg, wantSub) {
+				t.Errorf("historical unpriced err = %q; want substring %q", msg, wantSub)
+			}
 		}
 	})
 }
