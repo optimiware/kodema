@@ -30,7 +30,7 @@ func TestRenderWhoamiServerResultAndTaskListTable(t *testing.T) {
 	}
 
 	out.Reset()
-	tenantWhoamiBody := json.RawMessage(`{"principal_id":"oidc-00112233445566778899aabbccddeeff","kind":"human","tenant_id":"tenant-1","roles":["admin"]}`)
+	tenantWhoamiBody := json.RawMessage(`{"principal_id":"oidc-00112233445566778899aabbccddeeff","kind":"human","tenant_id":"tenant-1","roles":["admin"],"memberships":[{"project_id":"project-local","roles":["engineer","reviewer","operator"]},{"project_id":"empty-proj","roles":[]}]}`)
 	if err := renderWhoamiServerResult(&out, OutputTable, api.Result{Operation: "principal.whoami", Body: tenantWhoamiBody}, whoamiView{}); err != nil {
 		t.Fatalf("renderWhoamiServerResult(tenant table): %v", err)
 	}
@@ -38,6 +38,7 @@ func TestRenderWhoamiServerResultAndTaskListTable(t *testing.T) {
 		"scope\ttenant (tenant-1)",
 		"tenant_id\ttenant-1",
 		"roles\tadmin",
+		"memberships\tproject-local: engineer,reviewer,operator; empty-proj: -",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("tenant whoami table missing %q:\n%s", want, out.String())

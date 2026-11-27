@@ -23,17 +23,18 @@ func DeriveOIDCPrincipalID(issuer, subject string) (string, error) {
 }
 
 type whoamiView struct {
-	Server      string   `json:"server,omitempty"`
-	PrincipalID string   `json:"principal_id"`
-	Kind        string   `json:"kind,omitempty"`
-	TenantID    string   `json:"tenant_id,omitempty"`
-	ProjectID   string   `json:"project_id,omitempty"`
-	Roles       []string `json:"roles,omitempty"`
-	Issuer      string   `json:"issuer,omitempty"`
-	Subject     string   `json:"subject,omitempty"`
-	Username    string   `json:"username,omitempty"`
-	Email       string   `json:"email,omitempty"`
-	Name        string   `json:"name,omitempty"`
+	Server      string                        `json:"server,omitempty"`
+	PrincipalID string                        `json:"principal_id"`
+	Kind        string                        `json:"kind,omitempty"`
+	TenantID    string                        `json:"tenant_id,omitempty"`
+	ProjectID   string                        `json:"project_id,omitempty"`
+	Roles       []string                      `json:"roles,omitempty"`
+	Memberships []api.PrincipalMembershipView `json:"memberships,omitempty"`
+	Issuer      string                        `json:"issuer,omitempty"`
+	Subject     string                        `json:"subject,omitempty"`
+	Username    string                        `json:"username,omitempty"`
+	Email       string                        `json:"email,omitempty"`
+	Name        string                        `json:"name,omitempty"`
 }
 
 // runWhoami displays the caller's principal identity via principal.whoami, or
@@ -116,12 +117,13 @@ func renderWhoamiServerResult(out io.Writer, format OutputFormat, result api.Res
 		return renderResult(out, OutputJSON, result)
 	}
 	var raw struct {
-		PrincipalID string   `json:"principal_id"`
-		ID          string   `json:"id"`
-		Kind        string   `json:"kind"`
-		TenantID    string   `json:"tenant_id"`
-		ProjectID   string   `json:"project_id"`
-		Roles       []string `json:"roles"`
+		PrincipalID string                        `json:"principal_id"`
+		ID          string                        `json:"id"`
+		Kind        string                        `json:"kind"`
+		TenantID    string                        `json:"tenant_id"`
+		ProjectID   string                        `json:"project_id"`
+		Roles       []string                      `json:"roles"`
+		Memberships []api.PrincipalMembershipView `json:"memberships"`
 		Principal   *struct {
 			ID   string `json:"id"`
 			Kind string `json:"kind"`
@@ -143,6 +145,7 @@ func renderWhoamiServerResult(out io.Writer, format OutputFormat, result api.Res
 		TenantID:    raw.TenantID,
 		ProjectID:   raw.ProjectID,
 		Roles:       raw.Roles,
+		Memberships: raw.Memberships,
 	}
 	if view.PrincipalID == "" && raw.ID != "" {
 		view.PrincipalID = raw.ID
@@ -217,6 +220,17 @@ func writeWhoamiTable(out io.Writer, view whoamiView) {
 		} else {
 			fmt.Fprintf(out, "roles\t%s\n", strings.Join(view.Roles, ","))
 		}
+	}
+	if len(view.Memberships) > 0 {
+		entries := make([]string, 0, len(view.Memberships))
+		for _, membership := range view.Memberships {
+			roles := "-"
+			if len(membership.Roles) > 0 {
+				roles = strings.Join(membership.Roles, ",")
+			}
+			entries = append(entries, fmt.Sprintf("%s: %s", membership.ProjectID, roles))
+		}
+		fmt.Fprintf(out, "memberships\t%s\n", strings.Join(entries, "; "))
 	}
 	if view.Username != "" {
 		fmt.Fprintf(out, "username\t%s\n", view.Username)

@@ -190,13 +190,16 @@ type EnvFileSpec struct {
 	AdminToken     string
 	TenantID       string
 	ProjectID      string
-	// TenantAdminTokenPath and TenantAdminToken are optional: a second admin
-	// credential scoped to the tenant, for membership and project administration.
+	// TenantAdminTokenPath and TenantAdminToken are optional: the tenant-scoped
+	// admin credential exported as KODEMA_CREDENTIAL_FILE / KODEMA_TOKEN in
+	// env.sh (and retained as KODEMA_TENANT_ADMIN_CREDENTIAL_FILE for backward
+	// compatibility).
 	TenantAdminTokenPath string
 	TenantAdminToken     string
 }
 
-// WriteEnvFiles writes <state-dir>/admin-token and <state-dir>/env.sh with 0600 permissions.
+// WriteEnvFiles writes <state-dir>/admin-token, <state-dir>/tenant-admin-token
+// (when configured), and <state-dir>/env.sh with 0600 permissions.
 func WriteEnvFiles(spec EnvFileSpec) error {
 	if spec.AdminTokenPath != "" {
 		if err := writeFileAtomic(spec.AdminTokenPath, []byte(spec.AdminToken+"\n"), 0o600); err != nil {
@@ -214,16 +217,23 @@ func WriteEnvFiles(spec EnvFileSpec) error {
 		fmt.Fprintf(&buf, "export KODEMA_URL=%s\n", shellSingleQuote(spec.PublicURL))
 		fmt.Fprintf(&buf, "export KODEMA_SERVER=%s\n", shellSingleQuote(spec.PublicURL))
 		fmt.Fprintf(&buf, "export KODEMA_CA_FILE=%s\n", shellSingleQuote(spec.CACertPath))
-		if spec.AdminTokenPath != "" {
-			fmt.Fprintf(&buf, "export KODEMA_CREDENTIAL_FILE=%s\n", shellSingleQuote(spec.AdminTokenPath))
+		credPath := spec.TenantAdminTokenPath
+		if credPath == "" {
+			credPath = spec.AdminTokenPath
 		}
-		fmt.Fprintf(&buf, "export KODEMA_TOKEN=%s\n", shellSingleQuote(spec.AdminToken))
+		if credPath != "" {
+			fmt.Fprintf(&buf, "export KODEMA_CREDENTIAL_FILE=%s\n", shellSingleQuote(credPath))
+		}
+		token := spec.TenantAdminToken
+		if token == "" {
+			token = spec.AdminToken
+		}
+		fmt.Fprintf(&buf, "export KODEMA_TOKEN=%s\n", shellSingleQuote(token))
 		fmt.Fprintf(&buf, "export KODEMA_TENANT=%s\n", shellSingleQuote(spec.TenantID))
 		fmt.Fprintf(&buf, "export KODEMA_PROJECT=%s\n", shellSingleQuote(spec.ProjectID))
 		if spec.TenantAdminTokenPath != "" {
-			buf.WriteString("# The default credential is scoped to the project. Tenant administration\n")
-			buf.WriteString("# (kodema member ...) needs the tenant-scoped one:\n")
-			buf.WriteString("#   kodema --credential-file \"$KODEMA_TENANT_ADMIN_CREDENTIAL_FILE\" member list\n")
+			buf.WriteString("# Retained for backward compatibility; KODEMA_CREDENTIAL_FILE already points\n")
+			buf.WriteString("# to this tenant-scoped admin token.\n")
 			fmt.Fprintf(&buf, "export KODEMA_TENANT_ADMIN_CREDENTIAL_FILE=%s\n", shellSingleQuote(spec.TenantAdminTokenPath))
 		}
 		if err := writeFileAtomic(spec.EnvFilePath, buf.Bytes(), 0o600); err != nil {
@@ -386,8 +396,8 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 	if err != nil {
 		return StackDescriptor{}, err
 	}
-	// Project operations need a project-scoped actor and tenant operations a
-	// tenant-scoped one, so the administrator gets a token for each.
+	// Mint a tenant-scoped admin token for env.sh (matching `kodema login`),
+	// plus a project-scoped admin-token file retained for backward compatibility.
 	adminToken, err := devIssuer.MintAccessToken("admin", 24*time.Hour)
 	if err != nil {
 		return StackDescriptor{}, err

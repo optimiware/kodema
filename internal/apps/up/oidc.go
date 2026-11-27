@@ -174,9 +174,9 @@ func (issuer *DevIssuer) MintAccessToken(persona string, ttl time.Duration) (str
 	return issuer.mintAccessToken(persona, ttl, true)
 }
 
-// MintTenantAdminToken signs an admin access token without a project claim.
-// Tenant operations (memberships, projects) require a tenant-scoped actor;
-// project operations require a project-scoped one.
+// MintTenantAdminToken signs an admin access token without a project_id claim.
+// Tenant-scoped tokens can invoke tenant operations (projects, memberships) as
+// well as project operations in every project where the principal holds roles.
 func (issuer *DevIssuer) MintTenantAdminToken(ttl time.Duration) (string, error) {
 	return issuer.mintAccessToken("admin", ttl, false)
 }
