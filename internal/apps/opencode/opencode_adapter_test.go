@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -851,5 +854,220 @@ func TestTruncateStringUTF8Safe(t *testing.T) {
 	httpErr := classifyOpenCodeHTTPError("send message", 500, []byte(overLimit))
 	if !utf8.ValidString(httpErr.Error()) {
 		t.Fatalf("classifyOpenCodeHTTPError produced invalid UTF-8: %q", httpErr.Error())
+	}
+}
+
+func TestOpenCodeAdapterConcurrentTurnsRouteViaXOpenCodeSession(t *testing.T) {
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	deadline := now.Add(time.Hour)
+
+	var (
+		upstreamMu     sync.Mutex
+		upstreamByExec = make(map[string]string) // execID -> actionID
+		leakedSession  atomic.Bool
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-OpenCode-Session") != "" {
+			leakedSession.Store(true)
+		}
+		execID := r.Header.Get("X-Kodema-Execution")
+		actID := r.Header.Get("X-Kodema-Action")
+		upstreamMu.Lock()
+		upstreamByExec[execID] = actID
+		upstreamMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	proxy, proxyURL := newTestProxy(t, upstream.URL, "concurrent-session-key", upstream.Client().Transport)
+	httpClient := &http.Client{Transport: defaultNoProxyTransport()}
+
+	var arrived atomic.Int32
+	bothRunning := make(chan struct{})
+	var checked atomic.Int32
+	bothChecked := make(chan struct{})
+	var sessMu sync.Mutex
+	seenSessions := make([]string, 0, 2)
+
+	ocClient := &fakeOpenCodeClient{
+		onSend: func(ctx context.Context, sessionID string, req OpenCodeMessageRequest) (OpenCodeMessageResponse, error) {
+			sessMu.Lock()
+			seenSessions = append(seenSessions, sessionID)
+			sessMu.Unlock()
+
+			// Synchronize both concurrent turns so both are bound simultaneously.
+			if arrived.Add(1) == 2 {
+				close(bothRunning)
+			}
+			select {
+			case <-bothRunning:
+			case <-ctx.Done():
+				return OpenCodeMessageResponse{}, ctx.Err()
+			}
+
+			// Simulate stock OpenCode v2 + http.request plugin calling the static
+			// provider baseURL (/llm/openai/v1/chat/completions) with X-OpenCode-Session.
+			callProxy := func(sessionHeader string) int {
+				httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, proxyURL+"/llm/openai/v1/chat/completions", strings.NewReader(`{}`))
+				if err != nil {
+					t.Errorf("NewRequest: %v", err)
+					return 0
+				}
+				httpReq.Header.Set("Authorization", "Bearer "+proxy.LocalAPIKey())
+				if sessionHeader != "" {
+					httpReq.Header.Set("X-OpenCode-Session", sessionHeader)
+				}
+				resp, err := httpClient.Do(httpReq)
+				if err != nil {
+					t.Errorf("Do: %v", err)
+					return 0
+				}
+				_ = resp.Body.Close()
+				return resp.StatusCode
+			}
+
+			var checkErr error
+			if status := callProxy(sessionID); status != http.StatusOK {
+				checkErr = fmt.Errorf("session-routed proxy status = %d; want 200", status)
+			} else if status := callProxy(""); status != http.StatusConflict {
+				// Without X-OpenCode-Session while both turns overlap, proxy must fail closed with 409.
+				checkErr = fmt.Errorf("unattributed concurrent proxy status = %d; want 409", status)
+			} else if status := callProxy("oc-sess-unknown"); status != http.StatusForbidden {
+				// Unknown session must fail closed with 403.
+				checkErr = fmt.Errorf("unknown session proxy status = %d; want 403", status)
+			}
+
+			// Departure barrier: keep both turns registered until both finish
+			// overlap assertions so turn 1 cannot unregister before turn 2
+			// observes 409 Conflict.
+			if checked.Add(1) == 2 {
+				close(bothChecked)
+			}
+			select {
+			case <-bothChecked:
+			case <-ctx.Done():
+				return OpenCodeMessageResponse{}, ctx.Err()
+			}
+			if checkErr != nil {
+				return OpenCodeMessageResponse{}, checkErr
+			}
+
+			return OpenCodeMessageResponse{Text: "done " + req.TaskID, MessageID: "msg-" + req.TaskID}, nil
+		},
+	}
+
+	resolvedCh := make(chan api.ExecutionRequestResolveRequest, 4)
+	handler := &fakeOpenCodeHandler{
+		inboxItems: []api.InboxItem{
+			{
+				Kind:        "request",
+				ExecutionID: "exec-conc-1",
+				ActionID:    "act-conc-1",
+				TaskID:      "task-conc-1",
+				Assignment:  "service/opencode-1",
+				Version:     1,
+				At:          deadline,
+				Subject:     makeImplementSubject("app"),
+				Outputs:     []string{OpenCodeOutputSessionID},
+			},
+			{
+				Kind:        "request",
+				ExecutionID: "exec-conc-2",
+				ActionID:    "act-conc-2",
+				TaskID:      "task-conc-2",
+				Assignment:  "service/opencode-1",
+				Version:     1,
+				At:          deadline,
+				Subject:     makeImplementSubject("app"),
+				Outputs:     []string{OpenCodeOutputSessionID},
+			},
+		},
+		executions: map[string]api.ExecutionInspectResult{
+			"exec-conc-1": makeTestExecution("exec-conc-1", "act-conc-1", "task-conc-1", 1, deadline, makeImplementSubject("app")),
+			"exec-conc-2": makeTestExecution("exec-conc-2", "act-conc-2", "task-conc-2", 1, deadline, makeImplementSubject("app")),
+		},
+		onResolve: func(req api.ExecutionRequestResolveRequest, _ *uint64) error {
+			resolvedCh <- req
+			return nil
+		},
+	}
+
+	store, err := NewFileOpenCodeStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileOpenCodeStateStore: %v", err)
+	}
+	adapter, err := NewOpenCodeAdapter(OpenCodeAdapterConfig{
+		ServiceID:           "opencode-1",
+		TenantID:            "tenant-1",
+		ProjectID:           "project-1",
+		Handler:             handler,
+		OpenCode:            ocClient,
+		Store:               store,
+		Worktrees:           &fakeWorktreeManager{},
+		Proxy:               proxy,
+		PerTurnProxyRouting: true,
+		MaxConcurrentTurns:  2,
+		Clock:               &fixedClock{now: now},
+		RescanInterval:      time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenCodeAdapter: %v", err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- adapter.Run(runCtx)
+	}()
+
+	resolved := make(map[string]api.ExecutionRequestResolveRequest, 2)
+	for i := 0; i < 2; i++ {
+		select {
+		case req := <-resolvedCh:
+			resolved[req.ExecutionID] = req
+		case <-time.After(10 * time.Second):
+			cancelRun()
+			t.Fatalf("timed out waiting for concurrent turn %d/2 to resolve", i+1)
+		}
+	}
+	cancelRun()
+	if err := <-runDone; err != nil {
+		t.Fatalf("adapter.Run: %v", err)
+	}
+
+	if leakedSession.Load() {
+		t.Fatal("X-OpenCode-Session header leaked upstream")
+	}
+	upstreamMu.Lock()
+	if upstreamByExec["exec-conc-1"] != "act-conc-1" || upstreamByExec["exec-conc-2"] != "act-conc-2" {
+		upstreamMu.Unlock()
+		t.Fatalf("upstream attribution = %+v; want exec-conc-1->act-conc-1 and exec-conc-2->act-conc-2", upstreamByExec)
+	}
+	upstreamMu.Unlock()
+
+	if resolved["exec-conc-1"].Decision != servicekit.DecisionPass || resolved["exec-conc-2"].Decision != servicekit.DecisionPass {
+		t.Fatalf("resolved = %+v; want both pass", resolved)
+	}
+
+	// After turns end, replaying either ended session ID MUST fail closed with 403.
+	sessMu.Lock()
+	endedSessions := append([]string(nil), seenSessions...)
+	sessMu.Unlock()
+	if len(endedSessions) != 2 {
+		t.Fatalf("seenSessions = %v; want 2 distinct sessions", endedSessions)
+	}
+	for _, sessID := range endedSessions {
+		req, _ := http.NewRequest(http.MethodPost, proxyURL+"/llm/openai/v1/chat/completions", strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer "+proxy.LocalAPIKey())
+		req.Header.Set("X-OpenCode-Session", sessID)
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			t.Fatalf("post-turn Do(%s): %v", sessID, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("ended session %q status = %d; want 403", sessID, resp.StatusCode)
+		}
 	}
 }

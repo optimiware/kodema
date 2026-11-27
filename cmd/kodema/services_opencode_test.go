@@ -439,4 +439,21 @@ func TestServicesOpenCodePasswordFlagsAndEnvFallbacks(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("help documents #variant on --model and X-OpenCode-Session proxy routing", func(t *testing.T) {
+		var stdout, stderr lockedBuffer
+		code := runServicesEntry(context.Background(), []string{"--help"}, &stdout, &stderr)
+		if code != 2 {
+			t.Fatalf("--help exit code = %d; want 2", code)
+		}
+		helpText := stdout.String() + "\n" + stderr.String()
+		for _, want := range []string{
+			"providerID/modelID#variant",
+			"X-OpenCode-Session",
+		} {
+			if !strings.Contains(helpText, want) {
+				t.Fatalf("services --help missing %q:\n%s", want, helpText)
+			}
+		}
+	})
 }

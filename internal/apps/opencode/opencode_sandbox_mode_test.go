@@ -41,33 +41,313 @@ func (f testAPIHandlerFunc) Invoke(ctx context.Context, inv api.Invocation) (api
 }
 
 func TestSandboxOpenCodeConfigDisablesLocalTools(t *testing.T) {
-	raw, err := GenerateSandboxOpenCodeConfig(OpenCodeSandboxConfig{}, "http://127.0.0.1:4100", "ocproxy.localkey123456")
+	raw, err := GenerateSandboxOpenCodeConfig(OpenCodeSandboxConfig{}, "http://127.0.0.1:4100/", "ocproxy.localkey123456")
 	if err != nil {
 		t.Fatalf("GenerateSandboxOpenCodeConfig: %v", err)
 	}
 	if err := ValidateSandboxOpenCodeConfig(raw); err != nil {
-		t.Fatalf("ValidateSandboxOpenCodeConfig rejected valid generated config: %v", err)
-	}
-	if !strings.Contains(string(raw), `"bash": false`) || !strings.Contains(string(raw), `"write": false`) {
-		t.Fatalf("generated sandbox config missing disabled local tools:\n%s", string(raw))
+		t.Fatalf("ValidateSandboxOpenCodeConfig rejected valid generated v2 config: %v\n%s", err, string(raw))
 	}
 
-	// Enabling bash must be rejected by ValidateSandboxOpenCodeConfig.
-	bad := strings.Replace(string(raw), `"bash": false`, `"bash": true`, 1)
-	if err := ValidateSandboxOpenCodeConfig([]byte(bad)); err == nil {
-		t.Fatal("ValidateSandboxOpenCodeConfig accepted config with bash enabled")
+	// Verify OpenCode v2 JSON structure and absence of legacy v1 keys.
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal generated config: %v", err)
 	}
-	// Allowing bash in permission map must also be rejected.
-	badPerm := strings.Replace(string(raw), `"bash": "deny"`, `"bash": "allow"`, 1)
-	if err := ValidateSandboxOpenCodeConfig([]byte(badPerm)); err == nil {
-		t.Fatal("ValidateSandboxOpenCodeConfig accepted config with bash permission=allow")
+	if doc["$schema"] != "https://opencode.ai/config.json" {
+		t.Fatalf("$schema = %v; want https://opencode.ai/config.json", doc["$schema"])
 	}
-	// Omitting permission map entirely must be rejected.
-	if err := ValidateSandboxOpenCodeConfig([]byte(`{"tools":{"bash":false,"write":false,"edit":false,"read":false,"glob":false,"grep":false}}`)); err == nil {
-		t.Fatal("ValidateSandboxOpenCodeConfig accepted config missing permission map")
+	for _, legacy := range []string{"tools", "permission", "provider"} {
+		if _, present := doc[legacy]; present {
+			t.Fatalf("generated v2 sandbox config must not emit legacy v1 key %q:\n%s", legacy, string(raw))
+		}
 	}
-	if err := ValidateSandboxOpenCodeConfig([]byte(`{"tools":{}}`)); err == nil {
-		t.Fatal("ValidateSandboxOpenCodeConfig accepted empty tools map")
+
+	providers, ok := doc["providers"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing v2 providers object:\n%s", string(raw))
+	}
+	kodemaProvider, ok := providers["kodema"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing providers.kodema:\n%s", string(raw))
+	}
+	if _, hasLegacyOpts := kodemaProvider["options"]; hasLegacyOpts {
+		t.Fatalf("providers.kodema must not emit legacy v1 options key:\n%s", string(raw))
+	}
+	settings, ok := kodemaProvider["settings"].(map[string]any)
+	if !ok || settings["baseURL"] != "http://127.0.0.1:4100" || settings["apiKey"] != "ocproxy.localkey123456" {
+		t.Fatalf("providers.kodema.settings = %+v; want baseURL and apiKey", settings)
+	}
+	headers, ok := kodemaProvider["headers"].(map[string]any)
+	if !ok || headers["Authorization"] != "Bearer ocproxy.localkey123456" {
+		t.Fatalf("providers.kodema.headers = %+v; want Authorization Bearer header", headers)
+	}
+
+	// Omitting proxyBaseURL omits providers; omitting localAPIKey omits apiKey and headers.
+	noProxyRaw, err := GenerateSandboxOpenCodeConfig(OpenCodeSandboxConfig{}, "", "")
+	if err != nil {
+		t.Fatalf("GenerateSandboxOpenCodeConfig(no proxy): %v", err)
+	}
+	if err := ValidateSandboxOpenCodeConfig(noProxyRaw); err != nil {
+		t.Fatalf("ValidateSandboxOpenCodeConfig(no proxy): %v", err)
+	}
+	if strings.Contains(string(noProxyRaw), `"providers"`) {
+		t.Fatalf("no-proxy config unexpectedly included providers:\n%s", string(noProxyRaw))
+	}
+	noKeyRaw, err := GenerateSandboxOpenCodeConfig(OpenCodeSandboxConfig{}, "http://127.0.0.1:4100", "")
+	if err != nil {
+		t.Fatalf("GenerateSandboxOpenCodeConfig(no key): %v", err)
+	}
+	if err := ValidateSandboxOpenCodeConfig(noKeyRaw); err != nil {
+		t.Fatalf("ValidateSandboxOpenCodeConfig(no key): %v", err)
+	}
+	if strings.Contains(string(noKeyRaw), `"apiKey"`) || strings.Contains(string(noKeyRaw), `"headers"`) {
+		t.Fatalf("no-key config unexpectedly included apiKey or headers:\n%s", string(noKeyRaw))
+	}
+
+	// Non-conflicting MCP tool allow rules after local tool denies remain valid,
+	// including inside agents.<name>.permissions.
+	withMCPAllow := `{
+		"$schema": "https://opencode.ai/config.json",
+		"permissions": [
+			{"action": "edit", "resource": "*", "effect": "deny"},
+			{"action": "glob", "resource": "*", "effect": "deny"},
+			{"action": "grep", "resource": "*", "effect": "deny"},
+			{"action": "read", "resource": "*", "effect": "deny"},
+			{"action": "shell", "resource": "*", "effect": "deny"},
+			{"action": "sandbox_*", "resource": "*", "effect": "allow"}
+		],
+		"agents": {
+			"build": {
+				"model": "kodema/claude-sonnet-4#high",
+				"permissions": [
+					{"action": "sandbox_*", "resource": "*", "effect": "allow"}
+				]
+			}
+		}
+	}`
+	if err := ValidateSandboxOpenCodeConfig([]byte(withMCPAllow)); err != nil {
+		t.Fatalf("ValidateSandboxOpenCodeConfig rejected valid v2 config with sandbox_* allow: %v", err)
+	}
+
+	invalidCases := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "shell effect allow instead of deny",
+			data: strings.Replace(string(raw), `"action": "shell",`+"\n      "+`"resource": "*",`+"\n      "+`"effect": "deny"`, `"action": "shell","resource": "*","effect": "allow"`, 1),
+		},
+		{
+			name: "later allow rule overrides shell deny",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"git status *","effect":"allow"}
+			]}`,
+		},
+		{
+			name: "later wildcard allow overrides all denies",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"},
+				{"action":"*","resource":"*","effect":"allow"}
+			]}`,
+		},
+		{
+			name: "narrowed shell resource instead of wildcard",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"rm *","effect":"deny"}
+			]}`,
+		},
+		{
+			name: "missing shell permission",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"}
+			]}`,
+		},
+		{
+			name: "v1 action names bash/write instead of v2 shell/edit",
+			data: `{"permissions":[
+				{"action":"bash","resource":"*","effect":"deny"},
+				{"action":"write","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"}
+			]}`,
+		},
+		{
+			name: "legacy v1 tools and permission maps",
+			data: `{"tools":{"bash":false,"write":false,"edit":false,"read":false,"glob":false,"grep":false},"permission":{"bash":"deny","write":"deny","edit":"deny","read":"deny","glob":"deny","grep":"deny"}}`,
+		},
+		{
+			name: "legacy v1 provider key alongside v2 permissions",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"provider":{"kodema":{"options":{"baseURL":"http://127.0.0.1:4100"}}}}`,
+		},
+		{
+			name: "legacy v1 options inside v2 providers",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"providers":{"kodema":{"options":{"baseURL":"http://127.0.0.1:4100"}}}}`,
+		},
+		{
+			name: "empty permissions array",
+			data: `{"permissions":[]}`,
+		},
+		{
+			name: "missing permissions key",
+			data: `{"$schema":"https://opencode.ai/config.json"}`,
+		},
+		{
+			name: "invalid effect value",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"block"}
+			]}`,
+		},
+		{
+			name: "agent permissions override re-enables shell",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":[{"action":"shell","resource":"*","effect":"allow"}]}}}`,
+		},
+		{
+			name: "agent permissions override narrows shell ask",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":[{"action":"shell","resource":"git status *","effect":"ask"}]}}}`,
+		},
+		{
+			name: "agent permissions wildcard allow weakens top-level denies",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":[{"action":"*","resource":"*","effect":"allow"}]}}}`,
+		},
+		{
+			name: "legacy v1 agent key at top level",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agent":{"build":{}}}`,
+		},
+		{
+			name: "legacy v1 tools inside agent entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"tools":{"bash":true}}}}`,
+		},
+		{
+			name: "legacy v1 permission inside agent entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permission":{"bash":"allow"}}}}`,
+		},
+		{
+			name: "null agents map",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":null}`,
+		},
+		{
+			name: "null agent entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":null}}`,
+		},
+		{
+			name: "null agent permissions",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":null}}}`,
+		},
+		{
+			name: "null providers map",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"providers":null}`,
+		},
+		{
+			name: "null provider entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"providers":{"kodema":null}}`,
+		},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateSandboxOpenCodeConfig([]byte(tc.data)); err == nil {
+				t.Fatalf("ValidateSandboxOpenCodeConfig unexpectedly accepted %s:\n%s", tc.name, tc.data)
+			}
+		})
 	}
 }
 

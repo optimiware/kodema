@@ -217,9 +217,13 @@ Before dialing upstream, Kodema verifies that the service account is enabled in 
 
 ## Agentic Service Option 1: Per-project OpenCode service (`--mode worktree`)
 
-Option 1 runs a persistent per-project OpenCode service (`kodema services --kind opencode --mode worktree`, the default mode) against an OpenCode v2 server (`opencode serve`, e.g. `v2.3.2+`, authenticated via HTTP Basic Auth `opencode:<password>` using `OPENCODE_PASSWORD`) that answers explicit `request: service/<id>` pipeline actions using durable per-task sessions and hardened local Git worktrees:
+Option 1 runs a persistent per-project OpenCode service (`kodema services --kind opencode --mode worktree`, the default mode) against an OpenCode v2 server (`opencode serve`, e.g. `v2.3.2+`, authenticated via HTTP Basic Auth `opencode:<password>` using `OPENCODE_PASSWORD`) that answers explicit `request: service/<id>` pipeline actions using durable per-task sessions and hardened local Git worktrees.
+
+Run `opencode serve` with isolated `XDG_DATA_HOME` and `XDG_CONFIG_HOME` directories so saved credentials in `~/.local/share/opencode/opencode.db` never override `settings.apiKey`, send a conflicting second auth header (`Authorization` vs `X-Api-Key`), or inherit built-in `opencode` catalog overrides:
 
 ```sh
+XDG_DATA_HOME=/var/lib/kodema/opencode-shop/xdg-data \
+XDG_CONFIG_HOME=/var/lib/kodema/opencode-shop/xdg-config \
 OPENCODE_PASSWORD="$(cat /path/to/opencode-server.password)" \
   opencode serve --hostname 127.0.0.1 --port 4096
 
@@ -236,11 +240,29 @@ kodema services --kind opencode \
   --opencode-url http://127.0.0.1:4096 \
   --opencode-password-file /path/to/opencode-server.password \
   --llm-proxy-listen 127.0.0.1:18080 \
-  --per-turn-proxy-routing \
-  --max-concurrency 4
+  --max-concurrency 1
 ```
 
-> **OpenCode v2 authentication:** Pass `--opencode-password-file` (`KODEMA_OPENCODE_PASSWORD_FILE`, recommended) or `--opencode-password` (`KODEMA_OPENCODE_PASSWORD` / `OPENCODE_PASSWORD`) to match the password configured on `opencode serve`.
+Configure `$XDG_CONFIG_HOME/opencode/opencode.json` with the OpenCode v2 schema (`providers`, `settings.baseURL`, `settings.apiKey`, and `headers`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "openai": {
+      "settings": {
+        "baseURL": "http://127.0.0.1:18080/llm/openai/v1",
+        "apiKey": "{env:KODEMA_OPENCODE_LLM_PROXY_API_KEY}"
+      },
+      "headers": {
+        "Authorization": "Bearer {env:KODEMA_OPENCODE_LLM_PROXY_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+> **OpenCode v2 authentication & model selection:** Pass `--opencode-password-file` (`KODEMA_OPENCODE_PASSWORD_FILE`, recommended) or `--opencode-password` (`KODEMA_OPENCODE_PASSWORD` / `OPENCODE_PASSWORD`) to match the password configured on `opencode serve`. Use `--model providerID/modelID` or `--model providerID/modelID#variant` to select a default model per turn via OpenCode v2's session model API (`#variant` is honored on `agents.<name>.model` and the session model API, not on root `model` in `opencode.json`).
 
 How Option 1 works:
 
@@ -248,7 +270,22 @@ How Option 1 works:
 - **Durable task-to-session mapping:** Persists `task_id -> opencode_session_id` and per-action checkpoints under `--state-dir` so `plan`, `implement`, `fix`, `revise`, and `ai_review` turns share session continuity across retries and stages without double-pushing.
 - **Hardened per-task Git worktrees:** Prepares an isolated worktree per task checked out on `refs/heads/work/<task-id>` from `base_ref` (default `refs/heads/main`), commits changes, pushes to Git, stores long outputs in KV (`summary_key`, `plan_key`, `review_key`), and settles the request action with declared outputs (`branch`, `candidate`, `summary_key`, `plan_key`, `review_key`, `session_id`).
 - **Live SSE cancellation:** Subscribes to the project event stream and invokes OpenCode `AbortSession` immediately when an execution is cancelled.
-- **Concurrent turns:** Static loopback proxy routing (`--llm-proxy-listen` without `--per-turn-proxy-routing`) enforces `--max-concurrency <= 1`. Pass `--per-turn-proxy-routing` (routing calls via `/turn/{exec}/{action}/llm/*`) to run multiple concurrent turns cleanly.
+- **Concurrent turns (`--per-turn-proxy-routing`):** Against stock `opencode serve` with `--llm-proxy-listen`, keep `--max-concurrency 1` (without `--per-turn-proxy-routing`) because stock OpenCode sends all LLM calls to the provider's static `settings.baseURL` and the proxy fails closed with HTTP `409 Conflict` when multiple turns overlap without explicit attribution. To enable `--per-turn-proxy-routing --max-concurrency 4`, add a ~10-line OpenCode v2 plugin (for example `$XDG_CONFIG_HOME/opencode/plugins/kodema-session-header/index.ts`) that stamps every outbound provider request with `X-OpenCode-Session` (registering an `http.request` hook also keeps provider traffic on HTTP):
+
+```ts
+import { Plugin } from "@opencode/plugin"
+
+export default Plugin.define({
+  id: "kodema-session-header",
+  async setup(ctx) {
+    await ctx.session.hook("http.request", (e) => {
+      e.request.headers.set("x-opencode-session", e.sessionID)
+    })
+  },
+})
+```
+
+The loopback proxy binds each active `sessionID` to its `(executionID, actionID)` turn, strips `X-OpenCode-Session` before forwarding upstream, and fails closed with HTTP `403` on unknown or ended sessions (explicit `/turn/{exec}/{action}/llm/*` routing is also supported for custom clients).
 
 ## Agentic Service Option 2: Sandbox mode (`--mode sandbox` + `kodema sandbox serve`)
 
