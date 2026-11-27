@@ -1242,7 +1242,6 @@
                     "type": "string",
                     "enum": [
                       "ReadWriteOnce",
-                      "ReadOnlyMany",
                       "ReadWriteMany"
                     ]
                   }

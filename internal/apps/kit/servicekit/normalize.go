@@ -10,11 +10,11 @@ import (
 const maxDiagnosticNoteBytes = 512
 
 var (
-	reKodemaToken = regexp.MustCompile(`\b(?:kodex|kodsvc)\.[A-Za-z0-9._-]+\b`)
+	reKodemaToken = regexp.MustCompile(`\b(?:kodex|kodsvc)\.[A-Za-z0-9._-]*[A-Za-z0-9_-]`)
 	reAuthHeader  = regexp.MustCompile(`(?i)(Authorization\s*:\s*(?:Basic|Bearer)\s+)\S+`)
-	reURLUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/@]+)@`)
-	reJWT         = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
-	reSecretKV    = regexp.MustCompile(`(?i)\b(token|password|passwd|secret|api[_-]?key|credential)(=)([^\s&;,'"]+)`)
+	reURLUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/]+)@`)
+	reJWT         = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`)
+	reSecretKV    = regexp.MustCompile(`(?i)(["']?\b(?:token|password|passwd|secret|api[_-]?key|credential)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s&;,'"]+)`)
 	reInvalidUTF8 = func(s string) string { return strings.ToValidUTF8(s, "") }
 )
 
@@ -26,7 +26,7 @@ func SanitizeDiagnosticNote(raw string) string {
 	cleaned = reURLUserinfo.ReplaceAllString(cleaned, "${1}[redacted]@")
 	cleaned = reKodemaToken.ReplaceAllString(cleaned, "[redacted]")
 	cleaned = reJWT.ReplaceAllString(cleaned, "[redacted]")
-	cleaned = reSecretKV.ReplaceAllString(cleaned, "${1}${2}[redacted]")
+	cleaned = reSecretKV.ReplaceAllString(cleaned, "${1}[redacted]")
 
 	var builder strings.Builder
 	builder.Grow(len(cleaned))

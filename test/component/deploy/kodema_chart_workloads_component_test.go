@@ -1175,6 +1175,15 @@ func TestKodemaChartWorkloadSchemaRefusals(t *testing.T) {
 			},
 		},
 		{
+			name: "merge coordinator with ReadOnlyMany storage",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["services"])["entries"])[0])
+				entry["kind"] = "merge_coordinator"
+				entry["gitURL"] = "https://kodema-git-tenant-a.kodema-system.svc:8443"
+				entry["storage"] = map[string]any{"size": "1Gi", "accessMode": "ReadOnlyMany"}
+			},
+		},
+		{
 			name: "non-merge coordinator with storage",
 			mutate: func(values workloadValues) {
 				entry := workloadMap(workloadList(workloadMap(values["services"])["entries"])[0])
@@ -1597,11 +1606,20 @@ func TestKodemaChartMergeCoordinatorServiceDeployment(t *testing.T) {
 		t.Fatal("kodema-git-tenant-a NetworkPolicy did not admit merge-pvc")
 	}
 
-	// Template guard refuses missing gitURL even with --skip-schema-validation.
+	// Template guard refuses missing gitURL and ReadOnlyMany storage even with --skip-schema-validation.
 	bad := cloneWorkloadValues(values)
 	badEntries := workloadList(workloadMap(bad["services"])["entries"])
 	delete(workloadMap(badEntries[len(badEntries)-1]), "gitURL")
 	if badOut, badErr := renderWorkloadValuesWithArgs(t, helm, chart, bad, "--skip-schema-validation"); badErr == nil {
 		t.Fatalf("--skip-schema-validation accepted merge_coordinator without gitURL:\n%s", badOut)
+	}
+	badRO := cloneWorkloadValues(values)
+	badROEntries := workloadList(workloadMap(badRO["services"])["entries"])
+	workloadMap(badROEntries[len(badROEntries)-1])["storage"] = map[string]any{
+		"size":       "1Gi",
+		"accessMode": "ReadOnlyMany",
+	}
+	if badOut, badErr := renderWorkloadValuesWithArgs(t, helm, chart, badRO, "--skip-schema-validation"); badErr == nil {
+		t.Fatalf("--skip-schema-validation accepted merge_coordinator with ReadOnlyMany storage:\n%s", badOut)
 	}
 }

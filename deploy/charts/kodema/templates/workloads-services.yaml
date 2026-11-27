@@ -62,8 +62,8 @@ Git service.
 {{- if not (and (hasKey $entry.storage "size") (kindIs "string" $entry.storage.size) (regexMatch "^[1-9][0-9]*(Mi|Gi|Ti)$" $entry.storage.size)) }}
 {{- fail (printf "services entry %q storage.size must be a positive Mi/Gi/Ti quantity" $name) }}
 {{- end }}
-{{- if and (hasKey $entry.storage "accessMode") $entry.storage.accessMode (not (has (toString $entry.storage.accessMode) (list "ReadWriteOnce" "ReadOnlyMany" "ReadWriteMany"))) }}
-{{- fail (printf "services entry %q storage.accessMode %q is unsupported" $name (toString $entry.storage.accessMode)) }}
+{{- if and (hasKey $entry.storage "accessMode") $entry.storage.accessMode (not (has (toString $entry.storage.accessMode) (list "ReadWriteOnce" "ReadWriteMany"))) }}
+{{- fail (printf "services entry %q storage.accessMode %q is unsupported (want ReadWriteOnce or ReadWriteMany)" $name (toString $entry.storage.accessMode)) }}
 {{- end }}
 {{- end }}
 {{- else }}

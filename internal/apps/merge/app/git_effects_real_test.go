@@ -530,6 +530,79 @@ exit 0
 	}
 }
 
+// TestGitMergeEffectsRealNoOpRebaseRefusesWithoutBypassingPreReceive proves
+// with real native Git that when a candidate duplicates a patch already landed
+// on a moved remote ref, `git rebase --onto` drops the commit (HEAD == remote)
+// and Execute refuses with (EffectNotStarted, ErrMergeBaseMoved) without
+// writing a record or pushing a local no-op that would bypass pre-receive.
+func TestGitMergeEffectsRealNoOpRebaseRefusesWithoutBypassingPreReceive(t *testing.T) {
+	root := t.TempDir()
+	repository := "shop/web"
+	bare := filepath.Join(root, repository)
+	if err := os.MkdirAll(filepath.Dir(bare), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	runScratchGit(t, filepath.Dir(bare), "init", "--bare", "--quiet", "--initial-branch=main", bare)
+	runScratchGit(t, bare, "config", "receive.advertisePushOptions", "true")
+
+	seed := t.TempDir()
+	runScratchGit(t, seed, "init", "--quiet", "--initial-branch=main")
+	writeScratchFile(t, seed, "README.md", "base\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "base C0")
+	c0 := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch A lands duplicate.txt on main.
+	writeScratchFile(t, seed, "duplicate.txt", "same content\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "landed on main")
+	c1 := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch B from C0 makes the identical change so rebase --onto c1 c0 candB
+	// skips the commit and leaves HEAD == c1.
+	runScratchGit(t, seed, "checkout", "--quiet", "-b", "work/dup", c0)
+	writeScratchFile(t, seed, "duplicate.txt", "same content\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "duplicate patch")
+	candB := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	runScratchGit(t, seed, "push", "--quiet", bare, "main", "work/dup")
+
+	executor, err := mergeapp.NewOSGitExecutor(mergeapp.OSGitExecutorConfig{})
+	if err != nil {
+		t.Fatalf("NewOSGitExecutor: %v", err)
+	}
+	stateDir := t.TempDir()
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file://" + filepath.ToSlash(root),
+		StateDirectory:    stateDir,
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	obs, err := effects.Execute(context.Background(), merge.MergeOperation{
+		Key:         merge.MergeKey{Repository: repository, Ref: "refs/heads/main"},
+		OperationID: "merge-noop-1",
+		Base:        c0,
+		Candidate:   candB,
+	})
+	if !errors.Is(err, merge.ErrMergeBaseMoved) {
+		t.Fatalf("Execute error = %v; want ErrMergeBaseMoved", err)
+	}
+	if obs.State != merge.EffectNotStarted {
+		t.Fatalf("observation = %+v; want not_started", obs)
+	}
+	if head := runScratchGit(t, bare, "rev-parse", "refs/heads/main"); head != c1 {
+		t.Fatalf("remote main = %s; want unchanged %s", head, c1)
+	}
+	records, err := filepath.Glob(filepath.Join(stateDir, "*.json"))
+	if err != nil {
+		t.Fatalf("Glob effect records: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("effect records = %v; want none on refused no-op rebase", records)
+	}
+}
+
 func gitPktLine(payload string) string {
 	return fmt.Sprintf("%04x%s", len(payload)+4, payload)
 }

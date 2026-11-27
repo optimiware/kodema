@@ -226,6 +226,14 @@ func (effects *GitMergeEffects) Execute(ctx context.Context, operation MergeOper
 		if resultCommit == "" {
 			return MergeObservation{State: EffectNotStarted}, fmt.Errorf("rebase merge produced no commit")
 		}
+		// Never treat a no-op rebase onto a moved target ref as applied: pushing
+		// remoteCommit:ref would succeed locally as "Everything up-to-date" without
+		// invoking pre-receive approval or disjoint-rebase verification.
+		if resultCommit == remoteCommit {
+			return MergeObservation{State: EffectNotStarted}, fmt.Errorf(
+				"%w: rebase of %s onto %s produced no new commit",
+				ErrMergeBaseMoved, candidateCommit, remoteCommit)
+		}
 		targetBase = remoteCommit
 		rebasedOntoMovedBase = true
 	} else {

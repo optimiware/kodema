@@ -564,3 +564,48 @@ func TestMergeAdapterFailSettlementUnblocksSubsequentMerge(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeAdapterFailResolveTransientErrorDoesNotPrematurelySettleAndRetries
+// proves that if resolving a confirmed not_started refusal as `fail` encounters
+// a transient transport error, the assignment remains held (not prematurely
+// settled), and a subsequent scan retries with the identical idempotency key
+// and settles once the fail resolution succeeds.
+func TestMergeAdapterFailResolveTransientErrorDoesNotPrematurelySettleAndRetries(t *testing.T) {
+	fixture := newMergeTestFixture(t, singleMergeItem(validMergeInboxItem()), nil)
+	fixture.effects.executeFunc = func(merge.MergeOperation) (merge.MergeObservation, error) {
+		return merge.MergeObservation{State: merge.EffectNotStarted}, fmt.Errorf("%w: conflict in app.go", merge.ErrMergeConflict)
+	}
+	transientErr := errors.New("temporary 503 while resolving fail")
+	fixture.handler.resolveFunc = func(api.ExecutionRequestResolveRequest, api.Request, int) error {
+		return transientErr
+	}
+
+	if err := fixture.adapter.RunOnce(context.Background()); !errors.Is(err, transientErr) {
+		t.Fatalf("first RunOnce error = %v; want %v", err, transientErr)
+	}
+	held, ok := fixture.store.record(t, testTenant, mergeTestKey())
+	if !ok || held.Released || held.State != merge.EffectNotStarted {
+		t.Fatalf("record after transient fail-resolve error = %+v; want unreleased not_started record", held)
+	}
+
+	// Next scan succeeds in resolving `fail` with the exact same idempotency key
+	// and immediately releases the claim.
+	fixture.handler.resolveFunc = nil
+	if err := fixture.adapter.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+	resolves := fixture.handler.resolvesSnapshot()
+	if len(resolves) != 2 {
+		t.Fatalf("resolve submissions = %d; want 2 (initial attempt + retry)", len(resolves))
+	}
+	if resolves[0].input.Decision != servicekit.DecisionFail || resolves[1].input.Decision != servicekit.DecisionFail {
+		t.Fatalf("decisions = %q, %q; want fail, fail", resolves[0].input.Decision, resolves[1].input.Decision)
+	}
+	if resolves[0].request.IdempotencyKey != resolves[1].request.IdempotencyKey {
+		t.Fatalf("retry idempotency key = %q; want stable %q", resolves[1].request.IdempotencyKey, resolves[0].request.IdempotencyKey)
+	}
+	released, ok := fixture.store.record(t, testTenant, mergeTestKey())
+	if !ok || !released.Released || released.State != merge.EffectNotStarted {
+		t.Fatalf("record after retry = %+v; want released not_started record", released)
+	}
+}

@@ -855,3 +855,60 @@ func TestGitMergeEffectsPreReceiveRejectionReturnsErrMergeRejected(t *testing.T)
 		}
 	})
 }
+
+// TestGitMergeEffectsNoOpRebaseOntoMovedBaseRefusesWithoutPush proves that if
+// rebasing onto a moved target ref yields HEAD == remoteCommit (e.g. a patch
+// already landed on remoteCommit or candidate == base), Execute refuses with
+// (EffectNotStarted, ErrMergeBaseMoved) without writing a record or pushing a
+// no-op that would bypass pre-receive approval and disjoint-rebase checks.
+func TestGitMergeEffectsNoOpRebaseOntoMovedBaseRefusesWithoutPush(t *testing.T) {
+	movedRemote := strings.Repeat("4", 40)
+	executor := &scriptedGitExecutor{remote: movedRemote}
+	executor.handle = func(command merge.GitCommand) (merge.GitCommandResult, error) {
+		switch command.Args[0] {
+		case "init", "remote", "fetch", "checkout", "rebase":
+			return okGit()
+		case "rev-parse":
+			switch command.Args[len(command.Args)-1] {
+			case "HEAD":
+				// No-op rebase: HEAD equals movedRemote.
+				return gitOutput(movedRemote)
+			case gitTestBase + "^{commit}":
+				return gitOutput(gitTestBase)
+			case gitTestCandidate + "^{commit}":
+				return gitOutput(gitTestCandidate)
+			}
+		case "merge-base":
+			return okGit()
+		case "ls-remote":
+			return gitOutput(movedRemote + "\trefs/heads/main")
+		}
+		t.Fatalf("unexpected git command %+v", command.Args)
+		return merge.GitCommandResult{}, nil
+	}
+
+	stateDir := t.TempDir()
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file:///srv/git",
+		StateDirectory:    stateDir,
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	observation, err := effects.Execute(context.Background(), gitTestOperation())
+	if !errors.Is(err, merge.ErrMergeBaseMoved) {
+		t.Fatalf("Execute error = %v; want ErrMergeBaseMoved", err)
+	}
+	if observation.State != merge.EffectNotStarted {
+		t.Fatalf("observation = %+v; want not_started", observation)
+	}
+	if executor.called("push") {
+		t.Fatal("no-op rebase onto moved base must never invoke push")
+	}
+	observed, err := effects.Observe(context.Background(), gitTestOperation())
+	if err != nil || observed.State != merge.EffectNotStarted {
+		t.Fatalf("Observe after no-op rebase = %+v, %v; want not_started (no record persisted)", observed, err)
+	}
+}

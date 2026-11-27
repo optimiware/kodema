@@ -868,8 +868,8 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 		return StackDescriptor{}, err
 	}
 
+	mergeContainer := prefix + "-merge-coordinator"
 	if cfg.MergeCoordinator {
-		mergeContainer := prefix + "-merge-coordinator"
 		mergeStateDir := filepath.Join(stateDir, "merge-coordinator")
 		if err := os.MkdirAll(mergeStateDir, 0o700); err != nil {
 			return StackDescriptor{}, err
@@ -928,6 +928,8 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 		}); err != nil {
 			return StackDescriptor{}, err
 		}
+	} else {
+		_ = engine.RemoveContainer(ctx, mergeContainer)
 	}
 
 	if cfg.Foreground {

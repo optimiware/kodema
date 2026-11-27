@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1367,9 +1369,11 @@ func TestAdapterFailResolutionSanitizesDiagnosticNote(t *testing.T) {
 	}
 	rawNote := "push failed:\nAuthorization: Basic dXNlcjpzZWNyZXQ= " +
 		"https://kodema:super-secret@git.example.test/shop/web " +
-		"kodsvc.svc1.abcdef123456 kodex.exec1.9876543210 " +
+		"https://user:p@ss99@git.example.test/shop/web " +
+		"kodsvc.svc1.abcdef123456- kodex.exec1.9876543210- " +
 		"token=mysecretvalue password=topsecret " +
-		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signaturevalue123 " +
+		`token="quotedsecret" password='singlequoted' token: colonsecret "secret":"jsonsecret" ` +
+		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signaturevalue123- " +
 		"\x00\x1b[31mconflict\x7f"
 
 	config := validAdapterConfig(handler, &fakeEventSource{}, &fakeClock{now: testNow})
@@ -1402,10 +1406,18 @@ func TestAdapterFailResolutionSanitizesDiagnosticNote(t *testing.T) {
 	for _, secret := range []string{
 		"dXNlcjpzZWNyZXQ=",
 		"super-secret",
+		"p@ss99",
+		"ss99",
 		"kodsvc.svc1.abcdef123456",
+		"abcdef123456-",
 		"kodex.exec1.9876543210",
+		"9876543210-",
 		"mysecretvalue",
 		"topsecret",
+		"quotedsecret",
+		"singlequoted",
+		"colonsecret",
+		"jsonsecret",
 		"signaturevalue123",
 		"\n",
 		"\r",
@@ -1478,5 +1490,78 @@ func TestAdapterRunWakesImmediatelyOnLiveSSEEvent(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not exit after cancellation")
+	}
+}
+
+type failingNextEventStreamer struct {
+	dials  atomic.Int32
+	dialCh chan time.Time
+}
+
+func (streamer *failingNextEventStreamer) StreamEvents(_ context.Context, _ client.EventStreamRequest) (client.EventStream, error) {
+	streamer.dials.Add(1)
+	select {
+	case streamer.dialCh <- time.Now():
+	default:
+	}
+	return streamer, nil
+}
+
+func (streamer *failingNextEventStreamer) Next(context.Context) (api.StreamEvent, error) {
+	return api.StreamEvent{}, io.EOF
+}
+
+func (streamer *failingNextEventStreamer) Close() error { return nil }
+
+// TestAdapterRunEventStreamBacksOffOnImmediateNextFailure proves that when
+// StreamEvents connects cleanly but Next immediately fails (e.g. io.EOF or
+// malformed SSE payload), the event-stream loop backs off exponentially rather
+// than spinning tightly, and exits promptly on cancellation.
+func TestAdapterRunEventStreamBacksOffOnImmediateNextFailure(t *testing.T) {
+	log := &callLog{}
+	handler := &fakeHandler{log: log}
+	handler.inboxFunc = func(api.TaskInboxRequest) (api.TaskInboxResult, error) {
+		return api.TaskInboxResult{}, nil
+	}
+	streamer := &failingNextEventStreamer{dialCh: make(chan time.Time, 8)}
+	config := validAdapterConfig(handler, &fakeEventSource{}, &fakeClock{now: testNow})
+	config.Stream = streamer
+	config.RescanInterval = time.Hour
+	adapter, err := servicekit.NewAdapter(config)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- adapter.Run(ctx) }()
+
+	var firstDial, secondDial time.Time
+	select {
+	case firstDial = <-streamer.dialCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial StreamEvents dial")
+	}
+	select {
+	case secondDial = <-streamer.dialCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second StreamEvents dial after backoff")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v after cancellation; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit promptly after cancellation")
+	}
+
+	if gap := secondDial.Sub(firstDial); gap < 75*time.Millisecond {
+		t.Fatalf("reconnect gap = %v; want exponential backoff (>= 75ms) instead of a spin-loop", gap)
+	}
+	if total := streamer.dials.Load(); total > 4 {
+		t.Fatalf("total dials = %d; expected bounded retries under backoff", total)
 	}
 }

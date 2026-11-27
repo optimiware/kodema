@@ -151,12 +151,27 @@ func (adapter *Adapter) triggerWake() {
 	}
 }
 
+const (
+	defaultStreamInitialBackoff = 100 * time.Millisecond
+	defaultStreamMaxBackoff     = 5 * time.Second
+)
+
 // runEventStreamLoop maintains a live SSE subscription with reconnect backoff
 // and Last-Event-ID resume. Every received event is treated strictly as a hint
 // that wakes the periodic inbox scan loop; events never grant authority.
 func (adapter *Adapter) runEventStreamLoop(ctx context.Context) {
-	backoff := 100 * time.Millisecond
-	const maxBackoff = 5 * time.Second
+	backoff := defaultStreamInitialBackoff
+	waitBackoff := func() bool {
+		timer := time.NewTimer(backoff)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			backoff = min(backoff*2, defaultStreamMaxBackoff)
+			return true
+		}
+	}
 
 	var lastCursor string
 	for {
@@ -174,20 +189,11 @@ func (adapter *Adapter) runEventStreamLoop(ctx context.Context) {
 			},
 		})
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || !waitBackoff() {
 				return
 			}
-			timer := time.NewTimer(backoff)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
-			backoff = min(backoff*2, maxBackoff)
 			continue
 		}
-		backoff = 100 * time.Millisecond
 		// Reconcile once upon (re)connect in case requests arrived during a gap.
 		adapter.triggerWake()
 
@@ -197,10 +203,14 @@ func (adapter *Adapter) runEventStreamLoop(ctx context.Context) {
 				_ = stream.Close()
 				break
 			}
+			backoff = defaultStreamInitialBackoff
 			if evt.Cursor != "" {
 				lastCursor = evt.Cursor
 			}
 			adapter.triggerWake()
+		}
+		if ctx.Err() != nil || !waitBackoff() {
+			return
 		}
 	}
 }
