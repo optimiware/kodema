@@ -557,24 +557,24 @@ inspects the execution to read its current version and generates an idempotency 
 	},
 	"service": {
 		usage:   "kodema service <create|list|update|enable|disable|credential> [arguments]",
-		summary: "Manage project service accounts and service credentials",
+		summary: "Manage project or tenant-wide service accounts and service credentials",
 		description: `Subcommands:
-  create      kodema service create <service-id> [--project <id>] [--role <r>[,<r>...]]
-  list        kodema service list [--project <id>]
+  create      kodema service create <service-id> [--project <id> | --tenant-wide] [--role <r>[,<r>...]]
+  list        kodema service list [--project <id> | --tenant-wide]
   update      kodema service update <service-id> [--project <id>] [--role <r>[,<r>...]] [--expected-version <v>]
   enable      kodema service enable <service-id> [--project <id>] [--expected-version <v>]
   disable     kodema service disable <service-id> [--project <id>] [--expected-version <v>]
   credential  kodema service credential <issue|rotate|revoke> <service-id> [flags]`,
 	},
 	"service create": {
-		usage:       "kodema service create <service-id> [--project <id>] [--role <r>[,<r>...]] [--output <table|json>]",
-		summary:     "Create a project service account",
-		description: `Creates a service account via service.create with an auto-generated idempotency key.`,
+		usage:       "kodema service create <service-id> [--project <id> | --tenant-wide] [--role <r>[,<r>...]] [--output <table|json>]",
+		summary:     "Create a project or tenant-wide service account",
+		description: `Creates a service account via service.create with an auto-generated idempotency key. Pass --tenant-wide (requires tenant admin) to create a tenant-scoped service account.`,
 	},
 	"service list": {
-		usage:       "kodema service list [--project <id>] [--output <table|json>]",
-		summary:     "List project service accounts",
-		description: `Lists service accounts for --project (or KODEMA_PROJECT) via service.list.`,
+		usage:       "kodema service list [--project <id> | --tenant-wide] [--output <table|json>]",
+		summary:     "List project or tenant-wide service accounts",
+		description: `Lists service accounts for --project (or KODEMA_PROJECT), or tenant-wide service accounts with --tenant-wide, via service.list.`,
 	},
 	"service update": {
 		usage:       "kodema service update <service-id> [--project <id>] [--role <r>[,<r>...]] [--expected-version <v>]",

@@ -466,10 +466,10 @@ func TestAdminRefusesWithoutCommit(t *testing.T) {
 			want: fault.Forbidden,
 		},
 		{
-			name: "tenant-only command scope",
+			name: "project-scoped actor on tenant-only command scope",
 			mutate: func(fixture *adminFixture) {
 			},
-			want: fault.InvalidInput,
+			want: fault.Forbidden,
 		},
 	}
 
@@ -485,9 +485,8 @@ func TestAdminRefusesWithoutCommit(t *testing.T) {
 				if testCase.name == "cross-scope actor" {
 					command.Actor.Scope = tenancy.Scope{TenantID: id.TenantID("tenant-b"), ProjectID: id.ProjectID("project-2")}
 				}
-				if testCase.name == "tenant-only command scope" {
+				if testCase.name == "project-scoped actor on tenant-only command scope" {
 					command.Scope = tenancy.Scope{TenantID: id.TenantID("tenant-a")}
-					command.Actor.Scope = command.Scope
 				}
 				_, err = fixture.admin.Create(context.Background(), command)
 			}
@@ -835,6 +834,62 @@ func TestAdminDisableInvalidationFailureReportsUncertain(t *testing.T) {
 	}
 	if fixture.ports.statusCalls != 1 || fixture.invalidator.calls != 1 {
 		t.Fatalf("status/invalidation calls = %d/%d; want 1/1", fixture.ports.statusCalls, fixture.invalidator.calls)
+	}
+}
+
+func TestAdminTenantScopedServiceLifecycle(t *testing.T) {
+	tenantScope := tenancy.Scope{TenantID: id.TenantID("tenant-a")}
+	fixture := newAdminFixture(t)
+	fixture.principals.principal = adminPrincipal(tenantScope, tenancy.RoleAdmin)
+
+	var gotCreate service.CreateUnit
+	fixture.ports.create = func(_ context.Context, unit service.CreateUnit) (service.CreateResult, error) {
+		gotCreate = unit
+		return service.CreateResult{ServiceID: unit.Service.ID, Version: unit.Service.Version}, nil
+	}
+	createCmd := createCommand()
+	createCmd.Scope = tenantScope
+	createCmd.Actor = adminPrincipal(tenantScope, tenancy.RoleAdmin)
+	created, err := fixture.admin.Create(context.Background(), createCmd)
+	if err != nil {
+		t.Fatalf("tenant-scoped Create: %v", err)
+	}
+	if created.ServiceID != createCmd.ID || created.Version != 1 {
+		t.Fatalf("created = %+v; want (%s, v1)", created, createCmd.ID)
+	}
+	if gotCreate.Owner != tenantScope || gotCreate.Service.Scope != tenantScope {
+		t.Fatalf("create unit scope = (%+v, %+v); want %+v",
+			gotCreate.Owner, gotCreate.Service.Scope, tenantScope)
+	}
+
+	var gotUpdate service.UpdateUnit
+	fixture.ports.update = func(_ context.Context, unit service.UpdateUnit) (service.UpdateResult, error) {
+		gotUpdate = unit
+		return service.UpdateResult{Version: unit.Service.Version}, nil
+	}
+	fixture.services.current = adminService(t, tenantScope, service.StateEnabled, 1)
+	updateCmd := updateCommand()
+	updateCmd.Scope = tenantScope
+	updateCmd.Actor = adminPrincipal(tenantScope, tenancy.RoleAdmin)
+	updated, err := fixture.admin.Update(context.Background(), updateCmd)
+	if err != nil {
+		t.Fatalf("tenant-scoped Update: %v", err)
+	}
+	if updated.Version != 2 || gotUpdate.Owner != tenantScope {
+		t.Fatalf("updated = %+v, owner = %+v", updated, gotUpdate.Owner)
+	}
+
+	fixture.services.current = adminService(t, tenantScope, service.StateEnabled, 2)
+	disableCmd := statusCommand()
+	disableCmd.Scope = tenantScope
+	disableCmd.Actor = adminPrincipal(tenantScope, tenancy.RoleAdmin)
+	disableCmd.ExpectedVersion = 2
+	disabled, err := fixture.admin.Disable(context.Background(), disableCmd)
+	if err != nil {
+		t.Fatalf("tenant-scoped Disable: %v", err)
+	}
+	if disabled.State != service.StateDisabled || disabled.Version != 3 {
+		t.Fatalf("disabled = %+v; want disabled v3", disabled)
 	}
 }
 

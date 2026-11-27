@@ -237,13 +237,16 @@ func newOperationCodec(route Route, spec operationCodecSpec) OperationCodec {
 
 // mcpRouteParamOverrides restricts the MCP-required route fields of an
 // operation whose input can default a route field from caller scope or select
-// a task-free alternate binding. A stored pipeline selection still needs
-// pipeline_id, enforced by the DTO's exclusive-selection validation; project
-// creation/listing default tenant_id from the authenticated caller's tenant.
+// an alternate binding. A stored pipeline selection still needs pipeline_id,
+// enforced by the DTO's exclusive-selection validation; project creation and
+// listing default tenant_id from the authenticated caller's tenant; service
+// creation and listing omit project_id for tenant-scoped service accounts.
 var mcpRouteParamOverrides = map[string][]string{
 	"pipeline.start": {"project"},
 	"project.create": {},
 	"project.list":   {},
+	"service.create": {},
+	"service.list":   {},
 }
 
 // mcpRouteParamsFor returns the route fields an MCP caller must supply for one

@@ -787,6 +787,7 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 		TenantToken:  tenantAdminToken,
 		ProjectToken: adminToken,
 		GitOrigins:   []string{publicURL, workloadOrigin},
+		Stderr:       stderr,
 	})
 	if err != nil {
 		if !shouldAttachServerLogTail(err) {

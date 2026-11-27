@@ -47,21 +47,26 @@ func runServiceCreate(ctx context.Context, config Config, args []string, ports P
 	}
 	var (
 		projectFlag        string
+		tenantWideFlag     bool
 		roleFlags          []string
 		idempotencyKeyFlag string
 		outputFlag         string
 	)
 	spec := newArgSpec()
 	spec.stringFlag(&projectFlag, "--project", "-p")
+	spec.boolFlag(&tenantWideFlag, "--tenant-wide")
 	spec.listFlag(&roleFlags, "--role", "--roles", "-r")
 	spec.stringFlag(&idempotencyKeyFlag, "--idempotency-key")
 	spec.stringFlag(&outputFlag, "--output")
-	positionals, _, err := spec.parse(args)
+	positionals, seen, err := spec.parse(args)
 	if err != nil {
 		return usage(ports.Err, err.Error())
 	}
 	if len(positionals) != 1 || strings.TrimSpace(positionals[0]) == "" {
 		return usage(ports.Err, "service create requires <service-id>")
+	}
+	if tenantWideFlag && (seen["--project"] || deps.ExplicitProject) {
+		return usage(ports.Err, "--tenant-wide cannot be combined with --project")
 	}
 	serviceID := strings.TrimSpace(positionals[0])
 	format, err := resolveOutputFormat(outputFlag, config)
@@ -71,9 +76,12 @@ func runServiceCreate(ctx context.Context, config Config, args []string, ports P
 	if err := config.Validate(); err != nil {
 		return usage(ports.Err, err.Error())
 	}
-	projectID := resolveProject(projectFlag, config, deps)
-	if projectID == "" {
-		return usage(ports.Err, "service create requires --project <id> or KODEMA_PROJECT")
+	var projectID string
+	if !tenantWideFlag {
+		projectID = resolveProject(projectFlag, config, deps)
+		if projectID == "" {
+			return usage(ports.Err, "service create requires --project <id>, KODEMA_PROJECT, or --tenant-wide")
+		}
 	}
 	roles := parseCommaSeparatedList(roleFlags)
 	if roles == nil {
@@ -131,18 +139,23 @@ func runServiceList(ctx context.Context, config Config, args []string, ports Por
 		return runHelp(ports.Out, ports.Err, []string{"service", "list"})
 	}
 	var (
-		projectFlag string
-		outputFlag  string
+		projectFlag    string
+		tenantWideFlag bool
+		outputFlag     string
 	)
 	spec := newArgSpec()
 	spec.stringFlag(&projectFlag, "--project", "-p")
+	spec.boolFlag(&tenantWideFlag, "--tenant-wide")
 	spec.stringFlag(&outputFlag, "--output")
-	positionals, _, err := spec.parse(args)
+	positionals, seen, err := spec.parse(args)
 	if err != nil {
 		return usage(ports.Err, err.Error())
 	}
 	if len(positionals) > 0 {
 		return usage(ports.Err, fmt.Sprintf("unexpected argument %q", positionals[0]))
+	}
+	if tenantWideFlag && (seen["--project"] || deps.ExplicitProject) {
+		return usage(ports.Err, "--tenant-wide cannot be combined with --project")
 	}
 	format, err := resolveOutputFormat(outputFlag, config)
 	if err != nil {
@@ -151,9 +164,12 @@ func runServiceList(ctx context.Context, config Config, args []string, ports Por
 	if err := config.Validate(); err != nil {
 		return usage(ports.Err, err.Error())
 	}
-	projectID := resolveProject(projectFlag, config, deps)
-	if projectID == "" {
-		return usage(ports.Err, "service list requires --project <id> or KODEMA_PROJECT")
+	var projectID string
+	if !tenantWideFlag {
+		projectID = resolveProject(projectFlag, config, deps)
+		if projectID == "" {
+			return usage(ports.Err, "service list requires --project <id>, KODEMA_PROJECT, or --tenant-wide")
+		}
 	}
 	if err := (api.ServiceListRequest{ProjectID: projectID}).Validate(); err != nil {
 		return usage(ports.Err, publicMessage(err))

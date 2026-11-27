@@ -2,6 +2,7 @@ package up
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -1426,6 +1427,11 @@ func TestProvisionCreatesWhatIsMissingAndRenewsTheGitCredential(t *testing.T) {
 		mu.Lock()
 		calls = append(calls, route.Operation+" "+strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 		mu.Unlock()
+		if route.Operation == "service.create" || route.Operation == "service.list" {
+			if r.URL.Path != "/api/v1/services" {
+				t.Errorf("%s hit path %q; want tenant-scoped /api/v1/services", route.Operation, r.URL.Path)
+			}
+		}
 		w.Header().Set("Content-Type", api.MediaType)
 		body := `{}`
 		switch route.Operation {
@@ -1470,13 +1476,86 @@ func TestProvisionCreatesWhatIsMissingAndRenewsTheGitCredential(t *testing.T) {
 		"membership.grant tenant-token", "membership.grant tenant-token",
 		"project.create tenant-token",
 		"resource.binding.register project-token",
-		"service.create project-token",
-		"service.credential.issue project-token",
-		"service.credential.rotate project-token",
-		"service.list project-token",
+		"service.create tenant-token",
+		"service.credential.issue tenant-token",
+		"service.credential.rotate tenant-token",
+		"service.list tenant-token",
 	}
 	if !slices.Equal(calls, want) {
 		t.Fatalf("operations = %q, want %q", calls, want)
+	}
+}
+
+// TestProvisionFallsBackToLegacyProjectScopedGitService verifies that an
+// existing state directory whose service/git was provisioned under
+// project-local before tenant-scoped services still starts cleanly with a
+// warning instead of failing.
+func TestProvisionFallsBackToLegacyProjectScopedGitService(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			return
+		}
+		route, _, ok := api.Match(api.Method(r.Method), r.URL.Path)
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		calls = append(calls, route.Operation+" "+r.URL.Path+" "+tok)
+		mu.Unlock()
+		w.Header().Set("Content-Type", api.MediaType)
+		body := `{}`
+		switch route.Operation {
+		case "project.create", "service.create", "resource.binding.register", "membership.grant":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"code":"version_conflict","message":"already exists"}`))
+			return
+		case "service.list":
+			if r.URL.Path == "/api/v1/services" {
+				body = `{"services":[]}`
+			} else {
+				body = `{"services":[{"service_id":"git","state":"enabled","roles":["viewer"],"version":7}]}`
+			}
+		case "service.credential.rotate":
+			body = `{"state":"current","version":8,"token":"kodsvc.legacy-rotated"}`
+		}
+		_, _ = fmt.Fprintf(w, `{"operation":%q,"body":%s}`, route.Operation, body)
+	}))
+	defer server.Close()
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+
+	var warnBuf bytes.Buffer
+	token, err := provision(context.Background(), provisionConfig{
+		PublicURL:    server.URL,
+		RootCAs:      pool,
+		Issuer:       "https://127.0.0.1:8443/auth",
+		TenantID:     "tenant-local",
+		ProjectID:    "project-local",
+		TenantToken:  "tenant-token",
+		ProjectToken: "project-token",
+		GitOrigins:   []string{"https://127.0.0.1:8443"},
+		Stderr:       &warnBuf,
+	})
+	if err != nil {
+		t.Fatalf("legacy provision: %v", err)
+	}
+	if token != "kodsvc.legacy-rotated" {
+		t.Fatalf("token = %q; want kodsvc.legacy-rotated", token)
+	}
+	if !strings.Contains(warnBuf.String(), "legacy project-scoped git service") {
+		t.Fatalf("warning = %q; want legacy project-scoped git service warning", warnBuf.String())
+	}
+	foundTenantList := slices.Contains(calls, "service.list /api/v1/services tenant-token")
+	foundProjectList := slices.Contains(calls, "service.list /api/v1/projects/project-local/services project-token")
+	foundRotate := slices.Contains(calls, "service.credential.rotate /api/v1/services/git/credentials/rotate project-token")
+	if !foundTenantList || !foundProjectList || !foundRotate {
+		t.Fatalf("unexpected legacy fallback calls: %v", calls)
 	}
 }
 
@@ -2342,8 +2421,7 @@ func TestProvisionIdempotencyKeysAreProjectScopedAndBounded(t *testing.T) {
 		"project.create:kodema-up-project-project-b",
 		"membership.grant:kodema-up-member-admin-project-a",
 		"membership.grant:kodema-up-member-admin-project-b",
-		"service.create:kodema-up-service-git-project-a",
-		"service.create:kodema-up-service-git-project-b",
+		"service.create:kodema-up-service-git-tenant-local",
 		"resource.binding.register:kodema-up-binding-git-admin-project-a",
 		"resource.binding.register:kodema-up-binding-git-admin-project-b",
 	} {

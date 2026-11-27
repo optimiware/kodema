@@ -322,23 +322,24 @@ type harness struct {
 	pipes   *work.Pipelines
 	execs   *storeexecution.Store
 
-	tenancy     *tenancyadmin.Service
-	bindings    *resource.Service
-	management  *pipeline.Management
-	admission   *pipeline.AdmissionService
-	executions  *execution.Service
-	secrets     *secret.Manager
-	kv          *kv.Service
-	services    *service.Admin
-	credentials *token.CredentialAdmin
-	taskService *task.Service
-	inboxQuery  *inbox.Service
-	requests    *shellrequest.Service
-	verifier    *verify.Verifier
-	reporter    *verify.Reporter
-	ingress     *event.Ingress
-	eventRead   *event.Reader
-	subscribe   *event.Subscriber
+	tenancy      *tenancyadmin.Service
+	bindings     *resource.Service
+	management   *pipeline.Management
+	admission    *pipeline.AdmissionService
+	executions   *execution.Service
+	secrets      *secret.Manager
+	kv           *kv.Service
+	services     *service.Admin
+	tokenManager *token.Manager
+	credentials  *token.CredentialAdmin
+	taskService  *task.Service
+	inboxQuery   *inbox.Service
+	requests     *shellrequest.Service
+	verifier     *verify.Verifier
+	reporter     *verify.Reporter
+	ingress      *event.Ingress
+	eventRead    *event.Reader
+	subscribe    *event.Subscriber
 
 	principals staticPrincipals
 	facts      *executionFacts
@@ -683,6 +684,7 @@ func newHarness(t *testing.T) *harness {
 		secrets:       secretManager,
 		kv:            kvService,
 		services:      serviceAdmin,
+		tokenManager:  credentialManager,
 		credentials:   credentialAdmin,
 		taskService:   taskService,
 		inboxQuery:    inboxService,

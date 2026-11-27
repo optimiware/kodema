@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/adapter/store/units/readers"
 	"github.com/optimiware/kodema/internal/control/authorize"
 	"github.com/optimiware/kodema/internal/control/identity"
 	"github.com/optimiware/kodema/internal/control/log"
@@ -21,6 +22,7 @@ import (
 	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/internal/control/tenancy"
 	"github.com/optimiware/kodema/internal/control/token"
+	"github.com/optimiware/kodema/internal/control/verify"
 	"github.com/optimiware/kodema/internal/engine"
 	"github.com/optimiware/kodema/internal/engine/definition"
 	"github.com/optimiware/kodema/internal/fault"
@@ -1107,6 +1109,227 @@ func TestIssue94ProjectOnlyHumanOIDCReceivesForbiddenOnTenantAdminOps(t *testing
 	if afterRevoke.status != http.StatusUnauthorized {
 		t.Fatalf("engineer membership.list after last membership revoked = %d %s; want 401",
 			afterRevoke.status, afterRevoke.body.String())
+	}
+}
+
+// TestIssue111TenantScopedEnforcingServiceMultiProjectOIDC exercises Issue #111
+// through the real token.Resolver (real HMAC kodsvc. service credentials +
+// tenant-scoped human OIDC sessions), real identitystore.Adapter, real
+// verify.Verifier/Reporter, and real REST/MCP edges:
+//   - tenant-wide admin creates tenant-scoped service/git via POST /api/v1/services
+//     and issues a real kodsvc.git.<mac> token;
+//   - project-only human (even holding project RoleAdmin in project-local) is
+//     refused 403 on tenant-scoped service.create/list and cannot mutate
+//     tenant-scoped service/git, and receives immediate 403 (no existence
+//     oracle) on actor.verify / resource.report;
+//   - service/git verifies human OIDC actors and commits resource.report across
+//     both project-local and demo2;
+//   - target-project actor evaluation (authorize.WithTargetProject) strictly
+//     isolates memberships per owning project: a human member of project-local
+//     only is refused when verified against demo2's bound resource.
+func TestIssue111TenantScopedEnforcingServiceMultiProjectOIDC(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.invokeKey(t, "token-admin", "tenant.create",
+		`{"tenant_id":"`+testTenant+`","name":"Local Tenant"}`, "id111-tenant", nil); err != nil {
+		t.Fatalf("tenant.create: %v", err)
+	}
+	for _, proj := range []string{"project-local", "demo2"} {
+		if _, err := h.invokeKey(t, "token-admin", "project.create",
+			`{"project_id":"`+proj+`","name":"`+proj+`"}`, "id111-proj-"+proj,
+			map[string]string{"tenant": testTenant}); err != nil {
+			t.Fatalf("project.create %s: %v", proj, err)
+		}
+	}
+
+	adminID := id.PrincipalID("oidc-111-admin")
+	projAdminID := id.PrincipalID("oidc-111-proj-admin")
+	engLocalOnlyID := id.PrincipalID("oidc-111-eng-local")
+	engDemo2ID := id.PrincipalID("oidc-111-eng-demo2")
+
+	h.seedMembership(t, tenancy.Scope{TenantID: testTenant}, "membership-111-admin-tenant", adminID, 1, tenancy.RoleAdmin)
+	for _, grant := range []struct {
+		key, proj string
+		principal id.PrincipalID
+		roles     string
+	}{
+		{"id111-g-pa", "project-local", projAdminID, `["admin"]`},
+		{"id111-g-el", "project-local", engLocalOnlyID, `["engineer"]`},
+		{"id111-g-ed", "demo2", engDemo2ID, `["engineer"]`},
+	} {
+		if _, err := h.invokeKey(t, "token-admin", "membership.grant",
+			`{"roles":`+grant.roles+`}`, grant.key,
+			map[string]string{"project": grant.proj, "principal": string(grant.principal)}); err != nil {
+			t.Fatalf("membership.grant %s: %v", grant.key, err)
+		}
+	}
+
+	exp := fixedClock{}.Now().Add(time.Hour)
+	verifier := mapOIDCVerifier{
+		tokens: map[string]identity.Principal{
+			"jwt-tenant-admin": identity.Principal{
+				ID: adminID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-proj-admin": identity.Principal{
+				ID: projAdminID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-eng-local": identity.Principal{
+				ID: engLocalOnlyID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+			"jwt-eng-demo2": identity.Principal{
+				ID: engDemo2ID, Kind: identity.KindHuman, Scope: tenancy.Scope{TenantID: testTenant}, Enabled: true,
+			}.WithVerifiedExpiry(exp),
+		},
+	}
+
+	realResolver, err := token.NewResolver(token.ResolverConfig{
+		Lookup:      h.store,
+		Credentials: h.tokenManager,
+		OIDC:        verifier,
+		Principals:  h.adapter,
+		Clock:       fixedClock{},
+	})
+	if err != nil {
+		t.Fatalf("token.NewResolver: %v", err)
+	}
+
+	bindingReader, err := readers.NewBindingReader(h.store)
+	if err != nil {
+		t.Fatalf("readers.NewBindingReader: %v", err)
+	}
+	realVerifier, err := verify.New(verify.Config{
+		Principals: realResolver,
+		Bindings:   bindingReader,
+		Evidence:   mustEvidenceReader(t, h.store),
+		Decisions:  mustDecisionReader(t, h.store),
+		Membership: h.adapter,
+		Records:    mustRecordAdapter(t, h.store),
+		Clock:      fixedClock{},
+		NewID:      func() (verify.VerificationID, error) { return h.ids.NewVerificationID() },
+	})
+	if err != nil {
+		t.Fatalf("verify.New: %v", err)
+	}
+	h.verifier = realVerifier
+	h.buildRouter(t)
+
+	oidcRouter, err := ops.NewRouter(ops.Config{
+		Principals: realResolver,
+		Scopes:     h.ownership,
+		Executions: h.ownership,
+		Bindings:   h.bindingsTable,
+	})
+	if err != nil {
+		t.Fatalf("ops.NewRouter: %v", err)
+	}
+	restEdge, err := httpapi.NewEdge(oidcRouter)
+	if err != nil {
+		t.Fatalf("httpapi.NewEdge: %v", err)
+	}
+	callREST := func(cred, method, path, body string) *responseRecorder {
+		req, err := http.NewRequest(method, path, bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("new request %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+cred)
+		rec := &responseRecorder{header: make(http.Header)}
+		restEdge.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Tenant admin creates tenant-scoped service/git via POST /api/v1/services
+	// and issues a real HMAC kodsvc.git.<mac> token.
+	rec := callREST("jwt-tenant-admin", http.MethodPost, "/api/v1/services",
+		`{"idempotency_key":"id111-create-git","input":{"service_id":"git","roles":["viewer"]}}`)
+	if rec.status != http.StatusOK {
+		t.Fatalf("POST /api/v1/services = %d %s; want 200", rec.status, rec.body.String())
+	}
+	rec = callREST("jwt-tenant-admin", http.MethodPost, "/api/v1/services/git/credentials",
+		`{"idempotency_key":"id111-issue-git","expected_version":1,"input":{"ttl_seconds":3600}}`)
+	if rec.status != http.StatusOK {
+		t.Fatalf("POST /api/v1/services/git/credentials = %d %s; want 200", rec.status, rec.body.String())
+	}
+	var issueEnv struct {
+		Body api.ServiceCredentialIssueResult `json:"body"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &issueEnv); err != nil || issueEnv.Body.Token == nil || *issueEnv.Body.Token == "" {
+		t.Fatalf("decode git credential issue %s: %v", rec.body.String(), err)
+	}
+	gitToken := *issueEnv.Body.Token
+
+	// 2. Register bound resources for service/git in both project-local and demo2.
+	for _, spec := range []struct{ proj, resID string }{
+		{"project-local", "git-local-app"},
+		{"demo2", "git-demo2-app"},
+	} {
+		h.seedResource(t, tenancy.Scope{TenantID: testTenant, ProjectID: id.ProjectID(spec.proj)}, spec.resID, 1)
+		rec = callREST("jwt-tenant-admin", http.MethodPost, "/api/v1/projects/"+spec.proj+"/bindings",
+			fmt.Sprintf(`{"idempotency_key":"id111-bind-%s","input":{"binding_id":%q,"resource_id":%q,"enforcing_service":"git","trusted_origins":["https://git.local"],"operations":["git.read","git.ref.update"],"reportable_events":["git.ref.updated"]}}`,
+				spec.proj, spec.resID, spec.resID))
+		if rec.status != http.StatusOK {
+			t.Fatalf("register binding in %s = %d %s", spec.proj, rec.status, rec.body.String())
+		}
+	}
+
+	// 3. Project-only human (even holding project RoleAdmin in project-local)
+	// cannot create/list tenant-scoped services, cannot mutate tenant-scoped git,
+	// and gets immediate 403 on actor.verify / resource.report for both existing
+	// and nonexistent resources.
+	if rec := callREST("jwt-proj-admin", http.MethodPost, "/api/v1/services",
+		`{"idempotency_key":"id111-pa-svc","input":{"service_id":"rogue","roles":["viewer"]}}`); rec.status != http.StatusForbidden {
+		t.Fatalf("project-only admin POST /api/v1/services = %d %s; want 403", rec.status, rec.body.String())
+	}
+	if rec := callREST("jwt-proj-admin", http.MethodGet, "/api/v1/services", ""); rec.status != http.StatusForbidden {
+		t.Fatalf("project-only admin GET /api/v1/services = %d %s; want 403", rec.status, rec.body.String())
+	}
+	if rec := callREST("jwt-proj-admin", http.MethodPatch, "/api/v1/services/git",
+		`{"idempotency_key":"id111-pa-upd","expected_version":2,"input":{"roles":["engineer"]}}`); rec.status != http.StatusNotFound {
+		t.Fatalf("project-only admin PATCH /api/v1/services/git = %d %s; want 404", rec.status, rec.body.String())
+	}
+	for _, resID := range []string{"git-demo2-app", "git-no-such-repo"} {
+		if rec := callREST("jwt-proj-admin", http.MethodPost, "/api/v1/verify",
+			fmt.Sprintf(`{"input":{"actor_credential":"jwt-eng-demo2","resource_id":%q,"operation":"git.read","subject":{}}}`, resID)); rec.status != http.StatusForbidden {
+			t.Fatalf("project-only admin POST /api/v1/verify(%s) = %d %s; want 403", resID, rec.status, rec.body.String())
+		}
+	}
+
+	// 4. Tenant-scoped service/git (authenticated with real kodsvc.git.<mac>)
+	// verifies demo2 engineer on git-demo2-app and reports git.ref.updated, while
+	// project-local-only engineer is refused on git-demo2-app (project isolation).
+	subjectJSON := `{"fields":[{"name":"ref","kind":"string","value":"refs/heads/work/f1"},{"name":"expected_base","kind":"string","value":"0000000000000000000000000000000000000000"},{"name":"candidate","kind":"string","value":"2222222222222222222222222222222222222222"}]}`
+	rec = callREST(gitToken, http.MethodPost, "/api/v1/verify",
+		`{"input":{"actor_credential":"jwt-eng-demo2","resource_id":"git-demo2-app","operation":"git.ref.update","subject":`+subjectJSON+`}}`)
+	if rec.status != http.StatusOK {
+		t.Fatalf("git POST /api/v1/verify(demo2, eng-demo2) = %d %s; want 200", rec.status, rec.body.String())
+	}
+	var verifyEnv struct {
+		Body api.VerifyResponse `json:"body"`
+	}
+	if err := json.Unmarshal(rec.body.Bytes(), &verifyEnv); err != nil {
+		t.Fatalf("decode verify response: %v", err)
+	}
+	if verifyEnv.Body.Principal.ID != string(engDemo2ID) || !reflect.DeepEqual(verifyEnv.Body.Roles, []string{"engineer"}) {
+		t.Fatalf("verify response = %+v; want (%s, [engineer])", verifyEnv.Body, engDemo2ID)
+	}
+
+	rec = callREST(gitToken, http.MethodPost, "/api/v1/reports",
+		fmt.Sprintf(`{"idempotency_key":"id111-src-demo2","input":{"resource_id":"git-demo2-app","source_event_id":"id111-src-demo2","event_type":"git.ref.updated","operation":"git.ref.update","verification_id":%q,"subject":%s}}`,
+			verifyEnv.Body.VerificationID, subjectJSON))
+	if rec.status != http.StatusOK {
+		t.Fatalf("git POST /api/v1/reports(demo2) = %d %s; want 200", rec.status, rec.body.String())
+	}
+
+	// Cross-project actor isolation: eng-local (member of project-local ONLY) is
+	// refused when service/git verifies them against demo2's git-demo2-app.
+	rec = callREST(gitToken, http.MethodPost, "/api/v1/verify",
+		`{"input":{"actor_credential":"jwt-eng-local","resource_id":"git-demo2-app","operation":"git.read","subject":{}}}`)
+	if rec.status != http.StatusUnauthorized && rec.status != http.StatusForbidden {
+		t.Fatalf("git verify eng-local on demo2 = %d %s; want 401 or 403", rec.status, rec.body.String())
+	}
+	// And eng-local succeeds on project-local's git-local-app.
+	rec = callREST(gitToken, http.MethodPost, "/api/v1/verify",
+		`{"input":{"actor_credential":"jwt-eng-local","resource_id":"git-local-app","operation":"git.read","subject":{}}}`)
+	if rec.status != http.StatusOK {
+		t.Fatalf("git verify eng-local on project-local = %d %s; want 200", rec.status, rec.body.String())
 	}
 }
 

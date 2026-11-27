@@ -158,32 +158,16 @@ func (transport *HTTPTransport) prepare(invocation api.Invocation) (api.Route, [
 
 // selectBinding chooses the concrete REST binding of one invocation. Most
 // operations keep their canonical route. pipeline.start uses its additive
-// task-free executions binding for inline YAML, and project.create/project.list
-// use their tenant-omitted /api/v1/projects binding when tenant_id is omitted.
+// task-free executions binding for inline YAML, project.create/project.list
+// use their tenant-omitted /api/v1/projects binding when tenant_id is omitted,
+// and service.create/service.list use their project-omitted /api/v1/services
+// binding when project_id is omitted.
 func selectBinding(canonical api.Route, request api.Request) (api.Route, error) {
 	switch canonical.Operation {
 	case "project.create", "project.list":
-		var fields map[string]json.RawMessage
-		trimmed := bytes.TrimSpace(request.Input)
-		if len(trimmed) > 0 && string(trimmed) != "null" {
-			if err := json.Unmarshal(trimmed, &fields); err == nil {
-				if raw, ok := fields["tenant_id"]; ok && string(bytes.TrimSpace(raw)) != "null" {
-					var tenantID string
-					if err := json.Unmarshal(raw, &tenantID); err != nil {
-						return api.Route{}, fmt.Errorf("input field \"tenant_id\" (route parameter \"tenant\") must be a string")
-					}
-					if strings.TrimSpace(tenantID) != "" {
-						return canonical, nil
-					}
-				}
-			}
-		}
-		for _, alternate := range api.AlternateRoutes() {
-			if alternate.Operation == canonical.Operation {
-				return alternate, nil
-			}
-		}
-		return canonical, nil
+		return selectOptionalParamBinding(canonical, request.Input, "tenant_id", "tenant")
+	case "service.create", "service.list":
+		return selectOptionalParamBinding(canonical, request.Input, "project_id", "project")
 	case "pipeline.start":
 	default:
 		return canonical, nil
@@ -212,6 +196,33 @@ func selectBinding(canonical api.Route, request api.Request) (api.Route, error) 
 			}
 		}
 		return api.Route{}, fmt.Errorf("pipeline.start has no alternate binding")
+	}
+	return canonical, nil
+}
+
+// selectOptionalParamBinding picks the canonical route when field is present
+// and non-empty in input, and falls back to the operation's additive alternate
+// route when field is omitted or empty.
+func selectOptionalParamBinding(canonical api.Route, input json.RawMessage, field, param string) (api.Route, error) {
+	var fields map[string]json.RawMessage
+	trimmed := bytes.TrimSpace(input)
+	if len(trimmed) > 0 && string(trimmed) != "null" {
+		if err := json.Unmarshal(trimmed, &fields); err == nil {
+			if raw, ok := fields[field]; ok && string(bytes.TrimSpace(raw)) != "null" {
+				var value string
+				if err := json.Unmarshal(raw, &value); err != nil {
+					return api.Route{}, fmt.Errorf("input field %q (route parameter %q) must be a string", field, param)
+				}
+				if strings.TrimSpace(value) != "" {
+					return canonical, nil
+				}
+			}
+		}
+	}
+	for _, alternate := range api.AlternateRoutes() {
+		if alternate.Operation == canonical.Operation {
+			return alternate, nil
+		}
 	}
 	return canonical, nil
 }

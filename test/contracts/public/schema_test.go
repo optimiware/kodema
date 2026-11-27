@@ -504,7 +504,7 @@ func TestOperationInputSchemaServiceRequiredFieldsMatchRuntime(t *testing.T) {
 		gotInput := optionalSchemaStringSet(t, input, "required", op+" input required")
 		requireSameSet(t, gotInput, wantInput, op+" input required")
 	}
-	check("service.create", []string{"idempotency_key", "input"}, []string{"project_id", "roles", "service_id"})
+	check("service.create", []string{"idempotency_key", "input"}, []string{"roles", "service_id"})
 	check("service.credential.issue", []string{"expected_version", "idempotency_key", "input"}, []string{"service_id", "ttl_seconds"})
 }
 
