@@ -83,37 +83,50 @@ func NormalizeSandboxConfig(cfg OpenCodeSandboxConfig) (OpenCodeSandboxConfig, e
 	return out, nil
 }
 
-// GenerateSandboxOpenCodeConfig builds a sandbox-mode `opencode.json` policy
-// document that disables every local shell/filesystem tool and optionally
-// points the LLM provider at the local loopback attribution proxy (never
-// embedding raw LLM API keys).
+type openCodeV2SandboxConfigDoc struct {
+	Schema      string                            `json:"$schema"`
+	Permissions []openCodePermissionRule          `json:"permissions"`
+	Providers   map[string]openCodeV2ProviderConf `json:"providers,omitempty"`
+}
+
+type openCodeV2ProviderConf struct {
+	Settings *openCodeV2ProviderSettings `json:"settings,omitempty"`
+	Headers  map[string]string           `json:"headers,omitempty"`
+}
+
+type openCodeV2ProviderSettings struct {
+	BaseURL string `json:"baseURL,omitempty"`
+	APIKey  string `json:"apiKey,omitempty"`
+}
+
+// GenerateSandboxOpenCodeConfig builds an OpenCode v2 sandbox-mode `opencode.json`
+// policy document that denies every local shell/filesystem tool permission
+// (`shell`, `edit`, `read`, `glob`, `grep`) and optionally points the `kodema`
+// provider at the local loopback attribution proxy (never embedding raw
+// upstream LLM provider API keys).
 func GenerateSandboxOpenCodeConfig(cfg OpenCodeSandboxConfig, proxyBaseURL, localAPIKey string) ([]byte, error) {
 	norm, err := NormalizeSandboxConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	tools := make(map[string]bool, len(norm.DisabledLocalTools))
-	permission := make(map[string]string, len(norm.DisabledLocalTools))
-	for _, tool := range norm.DisabledLocalTools {
-		tools[tool] = false
-		permission[tool] = "deny"
+	doc := openCodeV2SandboxConfigDoc{
+		Schema:      "https://opencode.ai/config.json",
+		Permissions: mapOpenCodeDisabledToolsToPermissions(norm.DisabledLocalTools),
 	}
-	doc := map[string]any{
-		"$schema":    "https://opencode.ai/config.json",
-		"tools":      tools,
-		"permission": permission,
-	}
-	if strings.TrimSpace(proxyBaseURL) != "" {
-		providerOpts := map[string]any{
-			"baseURL": strings.TrimRight(strings.TrimSpace(proxyBaseURL), "/"),
-		}
-		if strings.TrimSpace(localAPIKey) != "" {
-			providerOpts["apiKey"] = strings.TrimSpace(localAPIKey)
-		}
-		doc["provider"] = map[string]any{
-			"kodema": map[string]any{
-				"options": providerOpts,
+	if baseURL := strings.TrimRight(strings.TrimSpace(proxyBaseURL), "/"); baseURL != "" {
+		provider := openCodeV2ProviderConf{
+			Settings: &openCodeV2ProviderSettings{
+				BaseURL: baseURL,
 			},
+		}
+		if key := strings.TrimSpace(localAPIKey); key != "" {
+			provider.Settings.APIKey = key
+			provider.Headers = map[string]string{
+				"Authorization": "Bearer " + key,
+			}
+		}
+		doc.Providers = map[string]openCodeV2ProviderConf{
+			"kodema": provider,
 		}
 	}
 	encoded, err := json.MarshalIndent(doc, "", "  ")
@@ -123,34 +136,123 @@ func GenerateSandboxOpenCodeConfig(cfg OpenCodeSandboxConfig, proxyBaseURL, loca
 	return append(encoded, '\n'), nil
 }
 
-// ValidateSandboxOpenCodeConfig verifies that an `opencode.json` policy document
-// explicitly disables all local shell and filesystem tools (in both `tools` and
-// `permission`) required for Option 2 sandbox mode.
+// ValidateSandboxOpenCodeConfig verifies that an OpenCode v2 `opencode.json`
+// policy document uses the v2 schema (`permissions` array and optional v2
+// `providers` with `settings`/`headers`, rejecting legacy v1 `tools`,
+// `permission`, `provider`, or `options` keys) and denies all required local
+// shell and filesystem permissions (`shell`, `edit`, `read`, `glob`, `grep`)
+// for resource `"*"` with no subsequent overriding allow/ask rule.
 func ValidateSandboxOpenCodeConfig(data []byte) error {
-	var parsed struct {
-		Tools      map[string]bool   `json:"tools"`
-		Permission map[string]string `json:"permission"`
-	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("decode opencode sandbox config: %w", err)
 	}
-	if len(parsed.Tools) == 0 {
-		return fmt.Errorf("opencode sandbox config must explicitly disable local tools")
+	if raw == nil {
+		return fmt.Errorf("opencode sandbox config must be a JSON object")
 	}
-	if len(parsed.Permission) == 0 {
+	for _, legacyKey := range []string{"tools", "permission", "provider"} {
+		if _, present := raw[legacyKey]; present {
+			return fmt.Errorf("opencode sandbox config uses legacy v1 key %q; use OpenCode v2 permissions/providers schema", legacyKey)
+		}
+	}
+
+	rawPerms, ok := raw["permissions"]
+	if !ok {
+		return fmt.Errorf("opencode sandbox config must declare OpenCode v2 permissions array")
+	}
+	var perms []openCodePermissionRule
+	if err := json.Unmarshal(rawPerms, &perms); err != nil {
+		return fmt.Errorf("decode opencode sandbox config permissions: %w", err)
+	}
+	if len(perms) == 0 {
 		return fmt.Errorf("opencode sandbox config must explicitly deny local tool permissions")
 	}
-	for _, required := range DefaultSandboxDisabledLocalTools {
-		enabled, present := parsed.Tools[required]
-		if !present || enabled {
-			return fmt.Errorf("opencode sandbox config must disable local tool %q (got present=%v enabled=%v)", required, present, enabled)
+	for i, rule := range perms {
+		if strings.TrimSpace(rule.Action) == "" {
+			return fmt.Errorf("opencode sandbox config permissions[%d] has empty action", i)
 		}
-		perm, permPresent := parsed.Permission[required]
-		if !permPresent || perm != "deny" {
-			return fmt.Errorf("opencode sandbox config must deny permission for local tool %q (got present=%v value=%q)", required, permPresent, perm)
+		if strings.TrimSpace(rule.Resource) == "" {
+			return fmt.Errorf("opencode sandbox config permissions[%d] has empty resource", i)
+		}
+		switch rule.Effect {
+		case "allow", "deny", "ask":
+		default:
+			return fmt.Errorf("opencode sandbox config permissions[%d] has invalid effect %q", i, rule.Effect)
+		}
+	}
+
+	requiredRules := mapOpenCodeDisabledToolsToPermissions(DefaultSandboxDisabledLocalTools)
+	for _, reqRule := range requiredRules {
+		deniedAll := false
+		for _, rule := range perms {
+			if !matchOpenCodePattern(rule.Action, reqRule.Action) {
+				continue
+			}
+			if rule.Effect == "deny" && rule.Resource == "*" {
+				deniedAll = true
+			} else if rule.Effect != "deny" {
+				// OpenCode v2 evaluates rules in order (last match wins), so
+				// any later allow/ask rule matching this action weakens the
+				// full-wildcard deny.
+				deniedAll = false
+			}
+		}
+		if !deniedAll {
+			return fmt.Errorf("opencode sandbox config must deny local tool permission %q for resource \"*\" with no overriding allow/ask rule", reqRule.Action)
+		}
+	}
+
+	if rawProviders, hasProviders := raw["providers"]; hasProviders {
+		var providers map[string]map[string]json.RawMessage
+		if err := json.Unmarshal(rawProviders, &providers); err != nil {
+			return fmt.Errorf("decode opencode sandbox config providers: %w", err)
+		}
+		for name, entry := range providers {
+			if _, hasLegacyOpts := entry["options"]; hasLegacyOpts {
+				return fmt.Errorf("opencode sandbox config provider %q uses legacy v1 key \"options\"; use OpenCode v2 \"settings\" and \"headers\"", name)
+			}
+			if rawSettings, hasSettings := entry["settings"]; hasSettings {
+				var settings map[string]any
+				if err := json.Unmarshal(rawSettings, &settings); err != nil || settings == nil {
+					return fmt.Errorf("opencode sandbox config provider %q has invalid settings object", name)
+				}
+			}
+			if rawHeaders, hasHeaders := entry["headers"]; hasHeaders {
+				var headers map[string]string
+				if err := json.Unmarshal(rawHeaders, &headers); err != nil || headers == nil {
+					return fmt.Errorf("opencode sandbox config provider %q has invalid headers map", name)
+				}
+			}
 		}
 	}
 	return nil
+}
+
+// matchOpenCodePattern matches OpenCode v2 whole-value wildcard patterns where
+// '*' matches zero or more characters and '?' matches any single character.
+func matchOpenCodePattern(pattern, value string) bool {
+	p, v := 0, 0
+	starIdx, matchIdx := -1, 0
+	for v < len(value) {
+		if p < len(pattern) && (pattern[p] == '?' || pattern[p] == value[v]) {
+			p++
+			v++
+		} else if p < len(pattern) && pattern[p] == '*' {
+			starIdx = p
+			matchIdx = v
+			p++
+		} else if starIdx != -1 {
+			p = starIdx + 1
+			matchIdx++
+			v = matchIdx
+		} else {
+			return false
+		}
+	}
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
+	}
+	return p == len(pattern)
 }
 
 func validSandboxImage(image string) bool {

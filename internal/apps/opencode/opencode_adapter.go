@@ -829,6 +829,8 @@ func (a *OpenCodeAdapter) executeRegisteredTurn(turnCtx context.Context, turn *a
 		return err
 	}
 	turn.setSessionID(sessionID)
+	unbindSession := a.proxy.BindSession(sessionID, scanned.ExecutionID, scanned.ActionID)
+	defer unbindSession()
 	if deathErr := getSandboxDeath(); deathErr != nil && callCtx.Err() == nil {
 		turn.abortSession(a.opencode)
 		return a.handleSandboxFailure(callCtx, scanned, current, action, subject, taskID, sessionID, deathErr)

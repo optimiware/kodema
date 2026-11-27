@@ -29,7 +29,7 @@ flowchart LR
 | **Session persistence** | Stateless per action (handoffs via Git + KV) | Durable `task_id -> opencode_session_id` across turns | Durable `task_id -> opencode_session_id` across turns |
 | **Toolchains** | Any custom harness image | Local toolchain inside the OpenCode service host/pod | Stock upstream images per stage (`golang:1.24`, `node:22`, `python:3.12`) |
 | **Service-account roles** | None (execution token `kodex.*` only) | **No `engineer` role** (`roles: []` + `RW+ refs/heads/work/`) | **Requires `engineer` role** (inline sandbox `pipeline.start` / `execution.cancel` / ephemeral token secrets) |
-| **Concurrency** | Unlimited (Kubernetes Jobs / Podman) | `--max-concurrency > 1` with `--per-turn-proxy-routing` | `--max-concurrency 1` per OpenCode v2 server instance |
+| **Concurrency** | Unlimited (Kubernetes Jobs / Podman) | `--max-concurrency 1` (stock `opencode serve`); `--max-concurrency > 1` with `--per-turn-proxy-routing` + `X-OpenCode-Session` plugin | `--max-concurrency 1` per OpenCode v2 server instance |
 | **Best fit** | Maximum isolation, zero long-lived agent pods | Fast iterative multi-turn coding on one repo | Polyglot repos & strict blast-radius separation on Kubernetes |
 
 ---
@@ -129,11 +129,17 @@ a human `role/reviewer` gate:
 <details>
 <summary>Launch command for Option 1 worktree service (OpenCode v2)</summary>
 
-Start `opencode serve --hostname 127.0.0.1 --port 4096` with the server
-password from `/var/run/kodema/opencode-server.password`, then launch the
-Kodema service:
+Start `opencode serve --hostname 127.0.0.1 --port 4096` with isolated
+`XDG_DATA_HOME` / `XDG_CONFIG_HOME` (so `~/.local/share/opencode/opencode.db`
+credentials never collide with the local proxy key) and the server password
+from `/var/run/kodema/opencode-server.password`, then launch the Kodema
+service:
 
 ```sh
+XDG_DATA_HOME=/var/lib/kodema/opencode-shop/xdg-data \
+XDG_CONFIG_HOME=/var/lib/kodema/opencode-shop/xdg-config \
+  opencode serve --hostname 127.0.0.1 --port 4096
+
 kodema services --kind opencode \
   --mode worktree \
   --service opencode-shop \
@@ -147,9 +153,17 @@ kodema services --kind opencode \
   --opencode-url http://127.0.0.1:4096 \
   --opencode-password-file /var/run/kodema/opencode-server.password \
   --llm-proxy-listen 127.0.0.1:18080 \
-  --per-turn-proxy-routing \
-  --max-concurrency 4
+  --max-concurrency 1
 ```
+
+To run concurrent turns (`--per-turn-proxy-routing --max-concurrency 4`), load
+an OpenCode v2 plugin that sets `x-opencode-session` via
+`ctx.session.hook("http.request", (e) => { e.request.headers.set("x-opencode-session", e.sessionID) })`
+(see [`docs/runbooks/llm-proxy-harnesses.md`](../../docs/runbooks/llm-proxy-harnesses.md)).
+Optional `--model providerID/modelID#variant` selects both model and variant
+via OpenCode v2's session model API (note that `#variant` is honored on
+`agents.<name>.model` and the session model API, not root `model` in
+`opencode.json`).
 
 </details>
 

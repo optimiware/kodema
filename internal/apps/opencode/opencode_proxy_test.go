@@ -2,16 +2,19 @@ package opencode
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/optimiware/kodema/api"
 	"github.com/optimiware/kodema/client"
 )
 
@@ -455,4 +458,296 @@ func TestOpenCodeLLMProxyStartUsesConfiguredListenAddr(t *testing.T) {
 			t.Fatalf("unexpected bound URL %q", gotURL)
 		}
 	})
+}
+
+func TestOpenCodeLLMProxyAuthenticateLocalCallerDiagnostics(t *testing.T) {
+	const (
+		configuredKey = "ocproxy.configured-secret-9999"
+		wrongKey      = "ocproxy.wrong-presented-1111"
+		otherKey      = "ocproxy.conflicting-db-2222"
+	)
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p, proxyURL := newTestProxy(t, upstream.URL, configuredKey, upstream.Client().Transport)
+	unreg := p.RegisterTurn(context.Background(), "exec-diag-1", "act-diag-1")
+	defer unreg()
+
+	clientHTTP := &http.Client{Transport: defaultNoProxyTransport()}
+
+	cases := []struct {
+		name        string
+		headers     http.Header
+		wantSubstr  string
+		wantSecrets []string
+	}{
+		{
+			name:        "missing auth",
+			headers:     http.Header{},
+			wantSubstr:  "missing local LLM proxy API key",
+			wantSecrets: []string{configuredKey},
+		},
+		{
+			name:        "non-bearer authorization scheme",
+			headers:     http.Header{"Authorization": []string{"Basic dXNlcjpzZWNyZXQ="}},
+			wantSubstr:  "expected Bearer token",
+			wantSecrets: []string{configuredKey, "dXNlcjpzZWNyZXQ="},
+		},
+		{
+			name:        "empty bearer token",
+			headers:     http.Header{"Authorization": []string{"Bearer   "}},
+			wantSubstr:  "expected Bearer token",
+			wantSecrets: []string{configuredKey},
+		},
+		{
+			name:        "conflicting Authorization and X-Api-Key headers",
+			headers:     http.Header{"Authorization": []string{"Bearer " + configuredKey}, "X-Api-Key": []string{otherKey}},
+			wantSubstr:  "conflicting Authorization and X-Api-Key",
+			wantSecrets: []string{configuredKey, otherKey},
+		},
+		{
+			name:        "conflicting multiple Authorization headers",
+			headers:     http.Header{"Authorization": []string{"Bearer " + configuredKey, "Bearer " + otherKey}},
+			wantSubstr:  "conflicting Authorization headers",
+			wantSecrets: []string{configuredKey, otherKey},
+		},
+		{
+			name:        "conflicting multiple X-Api-Key headers",
+			headers:     http.Header{"X-Api-Key": []string{configuredKey, otherKey}},
+			wantSubstr:  "conflicting X-Api-Key headers",
+			wantSecrets: []string{configuredKey, otherKey},
+		},
+		{
+			name:        "mismatched bearer key",
+			headers:     http.Header{"Authorization": []string{"Bearer " + wrongKey}},
+			wantSubstr:  "mismatched local LLM proxy API key",
+			wantSecrets: []string{configuredKey, wrongKey},
+		},
+		{
+			name:        "mismatched x-api-key",
+			headers:     http.Header{"X-Api-Key": []string{wrongKey}},
+			wantSubstr:  "mismatched local LLM proxy API key",
+			wantSecrets: []string{configuredKey, wrongKey},
+		},
+		{
+			name:        "matching wrong Authorization and X-Api-Key",
+			headers:     http.Header{"Authorization": []string{"Bearer " + wrongKey}, "X-Api-Key": []string{wrongKey}},
+			wantSubstr:  "mismatched local LLM proxy API key",
+			wantSecrets: []string{configuredKey, wrongKey},
+		},
+	}
+
+	seenByCategory := make(map[string]string)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, proxyURL+"/llm/openai/v1/chat/completions", strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			for k, vals := range tc.headers {
+				for _, v := range vals {
+					req.Header.Add(k, v)
+				}
+			}
+			resp, err := clientHTTP.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d; want 401 (body=%s)", resp.StatusCode, string(body))
+			}
+			var apiErr api.Error
+			if err := json.Unmarshal(body, &apiErr); err != nil {
+				t.Fatalf("decode error JSON: %v (body=%s)", err, string(body))
+			}
+			if apiErr.Code != api.CodeUnauthenticated {
+				t.Fatalf("code = %q; want %q", apiErr.Code, api.CodeUnauthenticated)
+			}
+			if !strings.Contains(apiErr.Message, tc.wantSubstr) {
+				t.Fatalf("message = %q; want substring %q", apiErr.Message, tc.wantSubstr)
+			}
+			for _, secret := range tc.wantSecrets {
+				if strings.Contains(string(body), secret) {
+					t.Fatalf("401 response leaked secret %q in body: %s", secret, string(body))
+				}
+			}
+			seenByCategory[tc.name] = apiErr.Message
+		})
+	}
+
+	// Verify the three primary diagnostic classes are mutually distinct.
+	missingMsg := seenByCategory["missing auth"]
+	conflictMsg := seenByCategory["conflicting Authorization and X-Api-Key headers"]
+	mismatchMsg := seenByCategory["mismatched bearer key"]
+	if missingMsg == conflictMsg || missingMsg == mismatchMsg || conflictMsg == mismatchMsg {
+		t.Fatalf("expected distinct 401 diagnostics, got missing=%q conflict=%q mismatch=%q", missingMsg, conflictMsg, mismatchMsg)
+	}
+	if upstreamHits.Load() != 0 {
+		t.Fatalf("upstream received %d hits on unauthorized calls; want 0", upstreamHits.Load())
+	}
+
+	// Matching Authorization + X-Api-Key equal to configuredKey must succeed.
+	req, _ := http.NewRequest(http.MethodPost, proxyURL+"/llm/openai/v1/chat/completions", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+configuredKey)
+	req.Header.Set("X-Api-Key", configuredKey)
+	resp, err := clientHTTP.Do(req)
+	if err != nil {
+		t.Fatalf("Do matching both headers: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("matching Authorization + X-Api-Key status = %d; want 200", resp.StatusCode)
+	}
+}
+
+func TestOpenCodeLLMProxySessionHeaderRoutingStrippingAndFailClosed(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		seenHits    []http.Header
+		upstreamCnt atomic.Int32
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCnt.Add(1)
+		mu.Lock()
+		seenHits = append(seenHits, r.Header.Clone())
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	p, proxyURL := newTestProxy(t, upstream.URL, "session-routing-key", upstream.Client().Transport)
+	clientHTTP := &http.Client{Transport: defaultNoProxyTransport()}
+
+	doReq := func(headers http.Header) (int, string) {
+		req, err := http.NewRequest(http.MethodPost, proxyURL+"/llm/openai/v1/chat/completions", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer session-routing-key")
+		for k, vals := range headers {
+			for _, v := range vals {
+				req.Header.Add(k, v)
+			}
+		}
+		resp, err := clientHTTP.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(body)
+	}
+
+	// BindSession before RegisterTurn is a no-op; session must fail closed (403).
+	noopUnbind := p.BindSession("ses-unregistered", "exec-none", "act-none")
+	defer noopUnbind()
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-unregistered"}}); status != http.StatusForbidden {
+		t.Fatalf("unregistered session status = %d; want 403 (body=%s)", status, body)
+	}
+
+	// Register turn 1 and bind ses-1.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	unreg1 := p.RegisterTurn(ctx1, "exec-1", "act-1")
+	unbind1 := p.BindSession("ses-1", "exec-1", "act-1")
+
+	// Even with only 1 active turn, an unknown X-OpenCode-Session MUST fail closed with 403 (never fall back to implicit attribution).
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-unknown"}}); status != http.StatusForbidden {
+		t.Fatalf("unknown X-OpenCode-Session with 1 active turn status = %d; want 403 (body=%s)", status, body)
+	}
+	// Empty or duplicate X-OpenCode-Session headers fail closed with 403.
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"   "}}); status != http.StatusForbidden {
+		t.Fatalf("blank X-OpenCode-Session status = %d; want 403 (body=%s)", status, body)
+	}
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-1", "ses-1"}}); status != http.StatusForbidden {
+		t.Fatalf("duplicate X-OpenCode-Session status = %d; want 403 (body=%s)", status, body)
+	}
+
+	// Register concurrent turn 2 and bind ses-2.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	unreg2 := p.RegisterTurn(ctx2, "exec-2", "act-2")
+	unbind2 := p.BindSession("ses-2", "exec-2", "act-2")
+
+	// Unattributed call during 2 concurrent turns still fails closed with 409 Conflict.
+	if status, body := doReq(nil); status != http.StatusConflict {
+		t.Fatalf("unattributed concurrent call status = %d; want 409 (body=%s)", status, body)
+	}
+
+	// Route turn 1 and turn 2 concurrently via X-OpenCode-Session on the static /llm/ path.
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-2"}}); status != http.StatusOK {
+		t.Fatalf("ses-2 status = %d; want 200 (body=%s)", status, body)
+	}
+	if status, body := doReq(http.Header{"x-opencode-session": []string{"ses-1"}}); status != http.StatusOK {
+		t.Fatalf("ses-1 status = %d; want 200 (body=%s)", status, body)
+	}
+
+	// Consistent X-Kodema-Execution + X-Kodema-Action + X-OpenCode-Session succeeds; mismatched fails closed (403).
+	if status, body := doReq(http.Header{
+		"X-Kodema-Execution": []string{"exec-1"},
+		"X-Kodema-Action":    []string{"act-1"},
+		"X-OpenCode-Session": []string{"ses-1"},
+	}); status != http.StatusOK {
+		t.Fatalf("consistent headers status = %d; want 200 (body=%s)", status, body)
+	}
+	if status, body := doReq(http.Header{
+		"X-Kodema-Execution": []string{"exec-1"},
+		"X-Kodema-Action":    []string{"act-1"},
+		"X-OpenCode-Session": []string{"ses-2"},
+	}); status != http.StatusForbidden {
+		t.Fatalf("conflicting X-OpenCode-Session vs X-Kodema-* status = %d; want 403 (body=%s)", status, body)
+	}
+
+	// Verify exact attribution and strict header stripping on every upstream hit.
+	mu.Lock()
+	if len(seenHits) != 3 {
+		mu.Unlock()
+		t.Fatalf("upstream hit count = %d; want 3", len(seenHits))
+	}
+	wantPairs := [][2]string{
+		{"exec-2", "act-2"},
+		{"exec-1", "act-1"},
+		{"exec-1", "act-1"},
+	}
+	for i, h := range seenHits {
+		if h.Get("X-Kodema-Execution") != wantPairs[i][0] || h.Get("X-Kodema-Action") != wantPairs[i][1] {
+			mu.Unlock()
+			t.Fatalf("hit %d attribution = (%q, %q); want (%q, %q)", i, h.Get("X-Kodema-Execution"), h.Get("X-Kodema-Action"), wantPairs[i][0], wantPairs[i][1])
+		}
+		if got := h.Get("X-OpenCode-Session"); got != "" {
+			mu.Unlock()
+			t.Fatalf("hit %d leaked X-OpenCode-Session upstream: %q", i, got)
+		}
+	}
+	mu.Unlock()
+
+	// Cancelling turn 1 rejects ses-1 with 408 while ses-2 remains active (200).
+	cancel1()
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-1"}}); status != http.StatusRequestTimeout {
+		t.Fatalf("cancelled ses-1 status = %d; want 408 (body=%s)", status, body)
+	}
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-2"}}); status != http.StatusOK {
+		t.Fatalf("active ses-2 after turn 1 cancel status = %d; want 200 (body=%s)", status, body)
+	}
+
+	// Unbinding ses-1 fails closed with 403; unregistering turn 2 also cleans up ses-2 -> 403.
+	unbind1()
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-1"}}); status != http.StatusForbidden {
+		t.Fatalf("unbound ses-1 status = %d; want 403 (body=%s)", status, body)
+	}
+	unreg1()
+	unreg2()
+	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-2"}}); status != http.StatusForbidden {
+		t.Fatalf("unregistered turn 2 ses-2 status = %d; want 403 (body=%s)", status, body)
+	}
+	unbind2()
 }

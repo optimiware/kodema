@@ -55,8 +55,9 @@ type OpenCodeLLMProxy struct {
 
 	server *http.Server
 
-	mu    sync.RWMutex
-	turns map[string]*proxyTurnBinding // "exec/action" -> binding
+	mu       sync.RWMutex
+	turns    map[string]*proxyTurnBinding // "exec/action" -> binding
+	sessions map[string]*proxyTurnBinding // sessionID -> binding
 }
 
 var errProxyRedirectRefused = errors.New("opencode llm proxy refuses redirects")
@@ -116,8 +117,9 @@ func NewOpenCodeLLMProxy(config OpenCodeLLMProxyConfig) (*OpenCodeLLMProxy, erro
 				return errProxyRedirectRefused
 			},
 		},
-		clock: config.Clock,
-		turns: make(map[string]*proxyTurnBinding),
+		clock:    config.Clock,
+		turns:    make(map[string]*proxyTurnBinding),
+		sessions: make(map[string]*proxyTurnBinding),
 	}
 	p.server = &http.Server{
 		Handler:           p,
@@ -204,6 +206,45 @@ func (p *OpenCodeLLMProxy) RegisterTurn(turnCtx context.Context, executionID, ac
 		if p.turns[key] == binding {
 			delete(p.turns, key)
 		}
+		for sessID, sessBinding := range p.sessions {
+			if sessBinding == binding {
+				delete(p.sessions, sessID)
+			}
+		}
+		p.mu.Unlock()
+	}
+}
+
+// BindSession associates an active OpenCode session ID with an already
+// registered (executionID, actionID) turn so inbound requests carrying
+// `X-OpenCode-Session: <sessionID>` route deterministically even under
+// concurrent turns. The returned unbind func removes the session binding when
+// the turn finishes.
+func (p *OpenCodeLLMProxy) BindSession(sessionID, executionID, actionID string) func() {
+	if p == nil {
+		return func() {}
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return func() {}
+	}
+	key := executionID + "/" + actionID
+	p.mu.Lock()
+	binding, ok := p.turns[key]
+	if !ok {
+		p.mu.Unlock()
+		return func() {}
+	}
+	if p.sessions == nil {
+		p.sessions = make(map[string]*proxyTurnBinding)
+	}
+	p.sessions[sessionID] = binding
+	p.mu.Unlock()
+	return func() {
+		p.mu.Lock()
+		if p.sessions[sessionID] == binding {
+			delete(p.sessions, sessionID)
+		}
 		p.mu.Unlock()
 	}
 }
@@ -214,8 +255,8 @@ func (p *OpenCodeLLMProxy) RegisterTurn(turnCtx context.Context, executionID, ac
 // Kodema's `/llm/{provider}/*` endpoint with live `kodsvc.` auth and
 // attribution headers.
 func (p *OpenCodeLLMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !p.authenticateLocalCaller(r.Header) {
-		writeProxyJSONError(w, http.StatusUnauthorized, api.CodeUnauthenticated, "missing or invalid local LLM proxy API key")
+	if err := p.authenticateLocalCaller(r.Header); err != nil {
+		writeProxyJSONError(w, http.StatusUnauthorized, api.CodeUnauthenticated, err.Error())
 		return
 	}
 
@@ -324,9 +365,9 @@ func (p *OpenCodeLLMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *OpenCodeLLMProxy) authenticateLocalCaller(header http.Header) bool {
+func (p *OpenCodeLLMProxy) authenticateLocalCaller(header http.Header) error {
 	if p == nil || p.localAPIKey == "" {
-		return false
+		return errors.New("local LLM proxy authentication is not configured")
 	}
 	var bearer string
 	for _, value := range header.Values("Authorization") {
@@ -335,14 +376,14 @@ func (p *OpenCodeLLMProxy) authenticateLocalCaller(header http.Header) bool {
 			continue
 		}
 		if len(trimmed) < len("Bearer ") || !strings.EqualFold(trimmed[:len("Bearer ")], "Bearer ") {
-			return false
+			return errors.New("invalid Authorization header for local LLM proxy: expected Bearer token")
 		}
 		tok := strings.TrimSpace(trimmed[len("Bearer "):])
 		if tok == "" {
-			return false
+			return errors.New("invalid Authorization header for local LLM proxy: expected Bearer token")
 		}
-		if bearer != "" && bearer != tok {
-			return false
+		if bearer != "" && subtle.ConstantTimeCompare([]byte(bearer), []byte(tok)) != 1 {
+			return errors.New("conflicting Authorization headers presented to local LLM proxy")
 		}
 		bearer = tok
 	}
@@ -353,8 +394,8 @@ func (p *OpenCodeLLMProxy) authenticateLocalCaller(header http.Header) bool {
 		if trimmed == "" {
 			continue
 		}
-		if apiKey != "" && apiKey != trimmed {
-			return false
+		if apiKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(trimmed)) != 1 {
+			return errors.New("conflicting X-Api-Key headers presented to local LLM proxy")
 		}
 		apiKey = trimmed
 	}
@@ -362,8 +403,8 @@ func (p *OpenCodeLLMProxy) authenticateLocalCaller(header http.Header) bool {
 	var presented string
 	switch {
 	case bearer != "" && apiKey != "":
-		if bearer != apiKey {
-			return false
+		if subtle.ConstantTimeCompare([]byte(bearer), []byte(apiKey)) != 1 {
+			return errors.New("conflicting Authorization and X-Api-Key headers presented to local LLM proxy (check isolated XDG_DATA_HOME / opencode.db credentials)")
 		}
 		presented = bearer
 	case bearer != "":
@@ -371,9 +412,12 @@ func (p *OpenCodeLLMProxy) authenticateLocalCaller(header http.Header) bool {
 	case apiKey != "":
 		presented = apiKey
 	default:
-		return false
+		return errors.New("missing local LLM proxy API key: supply Authorization: Bearer or X-Api-Key")
 	}
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(p.localAPIKey)) == 1
+	if subtle.ConstantTimeCompare([]byte(presented), []byte(p.localAPIKey)) != 1 {
+		return errors.New("mismatched local LLM proxy API key")
+	}
+	return nil
 }
 
 func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBinding, string, int, string, string) {
@@ -436,16 +480,38 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 	// attribution headers always fail closed).
 	execVals := r.Header.Values("X-Kodema-Execution")
 	actVals := r.Header.Values("X-Kodema-Action")
+	sessVals := r.Header.Values("X-OpenCode-Session")
 	if len(execVals) > 0 || len(actVals) > 0 {
 		execHdr, okExec := singleTrimmedProxyHeader(execVals)
 		actHdr, okAct := singleTrimmedProxyHeader(actVals)
 		if !okExec || !okAct {
 			return nil, "", http.StatusForbidden, api.CodeForbidden, "explicit LLM proxy attribution requires single X-Kodema-Execution and X-Kodema-Action headers"
 		}
-		if binding, ok := p.turns[execHdr+"/"+actHdr]; ok {
+		binding, ok := p.turns[execHdr+"/"+actHdr]
+		if !ok {
+			return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn matches attribution headers"
+		}
+		if len(sessVals) > 0 {
+			sessHdr, okSess := singleTrimmedProxyHeader(sessVals)
+			if !okSess {
+				return nil, "", http.StatusForbidden, api.CodeForbidden, "explicit LLM proxy session attribution requires a single non-empty X-OpenCode-Session header"
+			}
+			sessBinding, okSessBind := p.sessions[sessHdr]
+			if !okSessBind || sessBinding != binding {
+				return nil, "", http.StatusForbidden, api.CodeForbidden, "X-OpenCode-Session header does not match active attribution headers"
+			}
+		}
+		return binding, path, 0, "", ""
+	}
+	if len(sessVals) > 0 {
+		sessHdr, okSess := singleTrimmedProxyHeader(sessVals)
+		if !okSess {
+			return nil, "", http.StatusForbidden, api.CodeForbidden, "explicit LLM proxy session attribution requires a single non-empty X-OpenCode-Session header"
+		}
+		if binding, ok := p.sessions[sessHdr]; ok {
 			return binding, path, 0, "", ""
 		}
-		return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn matches attribution headers"
+		return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn matches X-OpenCode-Session header"
 	}
 
 	// Implicit attribution is permitted ONLY when exactly one turn is active.
@@ -459,7 +525,7 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 			return binding, path, 0, "", ""
 		}
 	default:
-		return nil, "", http.StatusConflict, api.CodeVersionConflict, "ambiguous LLM proxy request: multiple active Kodema turns require explicit turn routing or attribution headers"
+		return nil, "", http.StatusConflict, api.CodeVersionConflict, "ambiguous LLM proxy request: multiple active Kodema turns require X-OpenCode-Session, explicit turn routing, or attribution headers"
 	}
 	return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn for LLM proxy request"
 }
@@ -549,6 +615,7 @@ func isStrippedProxyRequestHeader(lower string) bool {
 		"x-api-key",
 		"x-kodema-execution",
 		"x-kodema-action",
+		"x-opencode-session",
 		"host",
 		"cookie",
 		"proxy-authorization",
