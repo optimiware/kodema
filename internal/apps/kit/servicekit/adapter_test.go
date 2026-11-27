@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/client"
 	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
 	"github.com/optimiware/kodema/internal/id"
 )
@@ -1328,5 +1331,237 @@ func assertLegalIdempotencyKey(t *testing.T, key string, version uint64) {
 	}
 	if err := envelope.Validate(); err != nil {
 		t.Fatalf("idempotency key %q is not a legal public key: %v", key, err)
+	}
+}
+
+// fakeEventStreamer delivers live SSE events on a channel without any sleep.
+type fakeEventStreamer struct {
+	ch chan api.StreamEvent
+}
+
+func (streamer *fakeEventStreamer) StreamEvents(_ context.Context, _ client.EventStreamRequest) (client.EventStream, error) {
+	return streamer, nil
+}
+
+func (streamer *fakeEventStreamer) Next(ctx context.Context) (api.StreamEvent, error) {
+	select {
+	case <-ctx.Done():
+		return api.StreamEvent{}, ctx.Err()
+	case evt, ok := <-streamer.ch:
+		if !ok {
+			return api.StreamEvent{}, context.Canceled
+		}
+		return evt, nil
+	}
+}
+
+func (streamer *fakeEventStreamer) Close() error { return nil }
+
+func TestAdapterFailResolutionSanitizesDiagnosticNote(t *testing.T) {
+	request := validServedRequest()
+	log := &callLog{}
+	handler := &fakeHandler{log: log}
+	handler.inboxFunc = func(api.TaskInboxRequest) (api.TaskInboxResult, error) {
+		return api.TaskInboxResult{Items: []api.InboxItem{request.inboxItem()}}, nil
+	}
+	handler.inspectFunc = func(api.ExecutionInspectRequest) (api.ExecutionInspectResult, error) {
+		return request.inspectResult(), nil
+	}
+	rawNote := "push failed:\nAuthorization: Basic dXNlcjpzZWNyZXQ= " +
+		"https://kodema:super-secret@git.example.test/shop/web " +
+		"https://user:p@ss99@git.example.test/shop/web " +
+		"kodsvc.svc1.abcdef123456- kodex.exec1.9876543210- " +
+		"token=mysecretvalue password=topsecret " +
+		`token="quotedsecret" password='singlequoted' token: colonsecret "secret":"jsonsecret" ` +
+		"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signaturevalue123- " +
+		"\x00\x1b[31mconflict\x7f"
+
+	config := validAdapterConfig(handler, &fakeEventSource{}, &fakeClock{now: testNow})
+	config.Kind = servicekit.KindMergeCoordinator
+	config.HandleRequest = func(ctx context.Context, _ api.InboxItem, _ api.ExecutionInspectResult, _ api.ExecutionAction, resolve servicekit.RequestResolver) error {
+		return resolve.Fail(ctx, rawNote)
+	}
+	adapter, err := servicekit.NewAdapter(config)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+	if err := adapter.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	resolves := handler.resolvesSnapshot()
+	if len(resolves) != 1 {
+		t.Fatalf("resolve calls = %d; want 1", len(resolves))
+	}
+	resolved := resolves[0]
+	if resolved.input.Decision != servicekit.DecisionFail {
+		t.Fatalf("decision = %q; want %q", resolved.input.Decision, servicekit.DecisionFail)
+	}
+	if len(resolved.input.Outputs) != 0 {
+		t.Fatalf("outputs = %v; want none on fail decision", resolved.input.Outputs)
+	}
+	note := resolved.input.Note
+	if note == "" {
+		t.Fatal("fail decision note is empty")
+	}
+	for _, secret := range []string{
+		"dXNlcjpzZWNyZXQ=",
+		"super-secret",
+		"p@ss99",
+		"ss99",
+		"kodsvc.svc1.abcdef123456",
+		"abcdef123456-",
+		"kodex.exec1.9876543210",
+		"9876543210-",
+		"mysecretvalue",
+		"topsecret",
+		"quotedsecret",
+		"singlequoted",
+		"colonsecret",
+		"jsonsecret",
+		"signaturevalue123",
+		"\n",
+		"\r",
+		"\x00",
+		"\x1b",
+		"\x7f",
+	} {
+		if strings.Contains(note, secret) {
+			t.Fatalf("sanitized note leaked %q: %q", secret, note)
+		}
+	}
+	if !strings.Contains(note, "conflict") {
+		t.Fatalf("sanitized note lost safe diagnostic text: %q", note)
+	}
+	// Oversized notes are bounded cleanly.
+	longNote := servicekit.SanitizeDiagnosticNote(strings.Repeat("é", 400))
+	if len(longNote) > 512 {
+		t.Fatalf("SanitizeDiagnosticNote length = %d; want <= 512", len(longNote))
+	}
+}
+
+func TestAdapterRunWakesImmediatelyOnLiveSSEEvent(t *testing.T) {
+	request := validServedRequest()
+	log := &callLog{}
+	handler := &fakeHandler{log: log, resolved: make(chan struct{}, 4)}
+
+	arrived := make(chan struct{})
+	handler.inboxFunc = func(api.TaskInboxRequest) (api.TaskInboxResult, error) {
+		select {
+		case <-arrived:
+			return api.TaskInboxResult{Items: []api.InboxItem{request.inboxItem()}}, nil
+		default:
+			return api.TaskInboxResult{}, nil
+		}
+	}
+	handler.inspectFunc = func(api.ExecutionInspectRequest) (api.ExecutionInspectResult, error) {
+		return request.inspectResult(), nil
+	}
+
+	streamer := &fakeEventStreamer{ch: make(chan api.StreamEvent, 4)}
+	config := validAdapterConfig(handler, &fakeEventSource{}, &fakeClock{now: testNow})
+	config.Stream = streamer
+	// Set a very long ticker so only the live SSE wakeup can trigger the scan.
+	config.RescanInterval = time.Hour
+	adapter, err := servicekit.NewAdapter(config)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- adapter.Run(ctx) }()
+
+	// Publish the request into the inbox and send a live SSE hint.
+	close(arrived)
+	streamer.ch <- api.StreamEvent{
+		ID:       "evt-1",
+		Type:     "action.requested",
+		Cursor:   "1",
+		Sequence: 1,
+	}
+
+	waitForResolves(t, handler, 1)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v after cancellation; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after cancellation")
+	}
+}
+
+type failingNextEventStreamer struct {
+	dials  atomic.Int32
+	dialCh chan time.Time
+}
+
+func (streamer *failingNextEventStreamer) StreamEvents(_ context.Context, _ client.EventStreamRequest) (client.EventStream, error) {
+	streamer.dials.Add(1)
+	select {
+	case streamer.dialCh <- time.Now():
+	default:
+	}
+	return streamer, nil
+}
+
+func (streamer *failingNextEventStreamer) Next(context.Context) (api.StreamEvent, error) {
+	return api.StreamEvent{}, io.EOF
+}
+
+func (streamer *failingNextEventStreamer) Close() error { return nil }
+
+// TestAdapterRunEventStreamBacksOffOnImmediateNextFailure proves that when
+// StreamEvents connects cleanly but Next immediately fails (e.g. io.EOF or
+// malformed SSE payload), the event-stream loop backs off exponentially rather
+// than spinning tightly, and exits promptly on cancellation.
+func TestAdapterRunEventStreamBacksOffOnImmediateNextFailure(t *testing.T) {
+	log := &callLog{}
+	handler := &fakeHandler{log: log}
+	handler.inboxFunc = func(api.TaskInboxRequest) (api.TaskInboxResult, error) {
+		return api.TaskInboxResult{}, nil
+	}
+	streamer := &failingNextEventStreamer{dialCh: make(chan time.Time, 8)}
+	config := validAdapterConfig(handler, &fakeEventSource{}, &fakeClock{now: testNow})
+	config.Stream = streamer
+	config.RescanInterval = time.Hour
+	adapter, err := servicekit.NewAdapter(config)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- adapter.Run(ctx) }()
+
+	var firstDial, secondDial time.Time
+	select {
+	case firstDial = <-streamer.dialCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial StreamEvents dial")
+	}
+	select {
+	case secondDial = <-streamer.dialCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second StreamEvents dial after backoff")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v after cancellation; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit promptly after cancellation")
+	}
+
+	if gap := secondDial.Sub(firstDial); gap < 75*time.Millisecond {
+		t.Fatalf("reconnect gap = %v; want exponential backoff (>= 75ms) instead of a spin-loop", gap)
+	}
+	if total := streamer.dials.Load(); total > 4 {
+		t.Fatalf("total dials = %d; expected bounded retries under backoff", total)
 	}
 }

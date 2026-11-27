@@ -2,6 +2,7 @@ package merge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -177,10 +178,12 @@ func (coordinator *Coordinator) Execute(ctx context.Context, claim Claim) (Merge
 		observation = MergeObservation{State: EffectUncertain}
 	}
 	target := observationTarget(observation, effectErr)
+	confirmedNotStarted := target == EffectNotStarted && IsConfirmedNotStartedFailure(effectErr)
 	result := observedResult(record.Claim.Key, target, observation)
 	next := inFlight
 	next.State = target
 	next.Result = result
+	next.Reconciled = confirmedNotStarted
 	next.UpdatedAt = servicekit.NormalizedTime(coordinator.clock.Now())
 	if err := coordinator.store.Transition(ctx, coordinator.tenant, inFlight, next); err != nil {
 		return MergeResult{}, err
@@ -189,6 +192,9 @@ func (coordinator *Coordinator) Execute(ctx context.Context, claim Claim) (Merge
 	case EffectApplied:
 		return result, nil
 	case EffectNotStarted:
+		if confirmedNotStarted {
+			return result, effectErr
+		}
 		return result, fmt.Errorf("%w: effect did not start", ErrUncertain)
 	default:
 		if effectErr != nil {
@@ -427,8 +433,20 @@ func (coordinator *Coordinator) operation(record CoordinationRecord) MergeOperat
 	}
 }
 
+// IsConfirmedNotStartedFailure reports whether err is a permanent merge refusal
+// for which effects.Execute affirmatively verified that the remote target ref
+// was not mutated. Only confirmed not_started failures may resolve a request as
+// `fail` and immediately release the `(repo, ref)` claim; uncertain or unknown
+// failures stay held in EffectUncertain.
+func IsConfirmedNotStartedFailure(err error) bool {
+	return errors.Is(err, ErrMergeBaseMoved) ||
+		errors.Is(err, ErrMergeConflict) ||
+		errors.Is(err, ErrMergeRejected)
+}
+
 // observationTarget classifies one observation. Only an applied observation is
-// a settled effect; a not_started observation after an effect error is unknown.
+// a settled effect; a not_started observation after an effect error remains
+// uncertain unless the error is a confirmed permanent not_started refusal.
 func observationTarget(observation MergeObservation, effectErr error) EffectState {
 	if err := observation.Validate(); err != nil {
 		return EffectUncertain
@@ -440,6 +458,9 @@ func observationTarget(observation MergeObservation, effectErr error) EffectStat
 		return EffectUncertain
 	default:
 		if effectErr != nil {
+			if IsConfirmedNotStartedFailure(effectErr) {
+				return EffectNotStarted
+			}
 			return EffectUncertain
 		}
 		return EffectNotStarted

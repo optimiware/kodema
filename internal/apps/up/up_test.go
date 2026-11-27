@@ -2950,3 +2950,143 @@ func TestWriteEnvFilesTenantAdminAndFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestUpStartsMergeCoordinatorWhenEnabled(t *testing.T) {
+	home := t.TempDir()
+	engine := newMockEngine(t)
+	port, err := allocateLoopbackPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gwCtx, stopGW := context.WithCancel(context.Background())
+	t.Cleanup(stopGW)
+
+	mergeProvisioned := false
+	var out strings.Builder
+	desc, err := Up(context.Background(), UpConfig{
+		Instance:   "mc",
+		ListenAddr: fmt.Sprintf("127.0.0.1:%d", port),
+		GOOS:       "darwin",
+		HomeDir:    home,
+		DetectOpts: &DetectOptions{
+			ExplicitSocket: "/mock/podman.sock",
+			GOOS:           "darwin",
+			HomeDir:        home,
+			StatSocket:     func(string) bool { return true },
+			PingSocket:     func(context.Context, string) (RuntimeKind, error) { return KindPodman, nil },
+		},
+		EngineHTTP: engine.client,
+		SpawnGateway: func(stateDir string) (int, error) {
+			go func() { _ = ServeStackGateway(gwCtx, stateDir) }()
+			return os.Getpid(), nil
+		},
+		Provision: func(context.Context, provisionConfig) (string, error) {
+			return "kodsvc.git-local", nil
+		},
+		MergeCoordinator: true,
+		ProvisionMergeCoordinator: func(context.Context, provisionConfig) (string, error) {
+			mergeProvisioned = true
+			return "kodsvc.merge-local", nil
+		},
+	}, &out)
+	if err != nil {
+		t.Fatalf("Up(MergeCoordinator: true): %v", err)
+	}
+	if !mergeProvisioned {
+		t.Fatal("expected ProvisionMergeCoordinator to be called")
+	}
+	if !desc.MergeCoordinator {
+		t.Fatal("StackDescriptor.MergeCoordinator = false; want true")
+	}
+	if !strings.Contains(out.String(), "service/merge-coordinator") {
+		t.Fatalf("stdout missing merge coordinator summary:\n%s", out.String())
+	}
+	engine.mu.Lock()
+	created, ok := engine.created["kodema-mc-merge-coordinator"]
+	engine.mu.Unlock()
+	if !ok {
+		t.Fatalf("merge-coordinator container not created; created=%v", engine.created)
+	}
+	rawCmd, _ := created["Cmd"].([]any)
+	cmdParts := make([]string, 0, len(rawCmd))
+	for _, entry := range rawCmd {
+		if s, ok := entry.(string); ok {
+			cmdParts = append(cmdParts, s)
+		}
+	}
+	joined := strings.Join(cmdParts, " ")
+	for _, want := range []string{
+		"services",
+		"--kind merge_coordinator",
+		"--service merge-coordinator",
+		"--base-url https://kodema-mc-server:8443",
+		"--git-url http://kodema-mc-git:8081",
+		"--state-dir",
+		"--credential-file",
+		"--ca-file",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("merge-coordinator Cmd = %q; missing %q", joined, want)
+		}
+	}
+	// Healthy() requires merge-coordinator running when MergeCoordinator is true.
+	report := StatusReport{
+		GatewayAlive:     true,
+		Ready:            true,
+		MergeCoordinator: true,
+		Containers: map[string]ContainerInfo{
+			"postgres": {Running: true},
+			"nats":     {Running: true},
+			"server":   {Running: true},
+			"git":      {Running: true},
+		},
+	}
+	if report.Healthy() {
+		t.Fatal("StatusReport.Healthy() = true while merge-coordinator is not running")
+	}
+	report.Containers["merge-coordinator"] = ContainerInfo{Running: true}
+	if !report.Healthy() {
+		t.Fatal("StatusReport.Healthy() = false while all containers including merge-coordinator are running")
+	}
+
+	// Re-running Up without --merge-coordinator removes the stale container.
+	var out2 strings.Builder
+	desc2, err := Up(context.Background(), UpConfig{
+		Instance:   "mc",
+		ListenAddr: fmt.Sprintf("127.0.0.1:%d", port),
+		GOOS:       "darwin",
+		HomeDir:    home,
+		DetectOpts: &DetectOptions{
+			ExplicitSocket: "/mock/podman.sock",
+			GOOS:           "darwin",
+			HomeDir:        home,
+			StatSocket:     func(string) bool { return true },
+			PingSocket:     func(context.Context, string) (RuntimeKind, error) { return KindPodman, nil },
+		},
+		EngineHTTP: engine.client,
+		SpawnGateway: func(stateDir string) (int, error) {
+			return os.Getpid(), nil
+		},
+		Provision: func(context.Context, provisionConfig) (string, error) {
+			return "kodsvc.git-local", nil
+		},
+		MergeCoordinator: false,
+	}, &out2)
+	if err != nil {
+		t.Fatalf("Up(MergeCoordinator: false): %v", err)
+	}
+	if desc2.MergeCoordinator {
+		t.Fatal("StackDescriptor.MergeCoordinator = true after disabling; want false")
+	}
+	engClient, err := NewEngineClient("/mock/podman.sock", engine.client)
+	if err != nil {
+		t.Fatalf("NewEngineClient: %v", err)
+	}
+	info, err := engClient.InspectContainer(context.Background(), "kodema-mc-merge-coordinator")
+	if err != nil {
+		t.Fatalf("InspectContainer: %v", err)
+	}
+	if info.Running || info.Status == "running" {
+		t.Fatalf("stale merge-coordinator container still present/running after disabling: %+v", info)
+	}
+}

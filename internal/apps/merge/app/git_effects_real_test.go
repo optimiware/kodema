@@ -261,9 +261,9 @@ func TestGitMergeEffectsRealStaleBaseIsNotStarted(t *testing.T) {
 		t.Fatalf("effect records = %v; want none before any push", records)
 	}
 
-	// The same stale request through the coordinator leaves an uncertain
-	// in-flight marker; observation proves it never started, so the held
-	// assignment is released rather than wedged.
+	// The same stale request through the coordinator confirms EffectNotStarted
+	// (Reconciled = true) so Settle immediately releases the claim instead of
+	// wedging subsequent merges.
 	store, err := merge.NewFileCoordinationStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewFileCoordinationStore: %v", err)
@@ -289,28 +289,317 @@ func TestGitMergeEffectsRealStaleBaseIsNotStarted(t *testing.T) {
 		t.Fatalf("NewCoordinator: %v", err)
 	}
 	result, err := coordinator.Merge(context.Background(), request)
-	if err == nil {
-		t.Fatalf("Merge settled a stale-base request as %q", result.State)
+	if !errors.Is(err, merge.ErrMergeBaseMoved) {
+		t.Fatalf("Merge error = %v; want ErrMergeBaseMoved", err)
 	}
-	if result.State != merge.EffectUncertain {
-		t.Fatalf("held result = %+v; want uncertain pending release", result)
+	if result.State != merge.EffectNotStarted {
+		t.Fatalf("result = %+v; want confirmed not_started", result)
 	}
 	if head := runScratchGit(t, bare, "rev-parse", "refs/heads/main"); head != advanced {
 		t.Fatalf("remote main = %s; want the advanced commit %s (nothing pushed)", head, advanced)
 	}
-	released, err := coordinator.ReleaseObserved(context.Background(), request)
-	if err != nil {
-		t.Fatalf("ReleaseObserved: %v", err)
-	}
-	if released.State != merge.EffectNotStarted {
-		t.Fatalf("released result = %+v; want not_started", released)
+	if err := coordinator.Settle(context.Background(), request, merge.EffectNotStarted); err != nil {
+		t.Fatalf("Settle(not_started): %v", err)
 	}
 	record, ok, err := store.Load(context.Background(), id.TenantID("tenant-stale"), request.Key)
 	if err != nil {
 		t.Fatalf("store.Load: %v", err)
 	}
-	if !ok || !record.Released {
-		t.Fatalf("record = %+v; want the assignment released", record)
+	if !ok || !record.Released || record.State != merge.EffectNotStarted {
+		t.Fatalf("record = %+v; want the assignment released as not_started", record)
+	}
+}
+
+// TestGitMergeEffectsRealParallelWaveDisjointRebase exercises real native Git
+// over a parallel wave where tasks A, B, C, D, and E all branch from C0:
+//   - Task A fast-forwards main C0 -> C1 (touching a.txt).
+//   - Task B (disjoint b.txt) rebases C0..B onto C1 with kodema.approved_base
+//     and kodema.approved_candidate push options and succeeds.
+//   - Task C (conflicting edit to a.txt) aborts rebase with ErrMergeConflict
+//     and settles immediately without wedging (repo, ref).
+//   - Task D (non-conflicting edit to a.txt, rejected by pre-receive for path
+//     overlap) returns ErrMergeRejected confirmed by observeRecord and settles
+//     immediately without wedging (repo, ref).
+//   - Task E (disjoint e.txt) then rebases onto B' and succeeds immediately.
+func TestGitMergeEffectsRealParallelWaveDisjointRebase(t *testing.T) {
+	root := t.TempDir()
+	repository := "shop/web"
+	bare := filepath.Join(root, repository)
+	if err := os.MkdirAll(filepath.Dir(bare), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	runScratchGit(t, filepath.Dir(bare), "init", "--bare", "--quiet", "--initial-branch=main", bare)
+	runScratchGit(t, bare, "config", "receive.advertisePushOptions", "true")
+
+	seed := t.TempDir()
+	runScratchGit(t, seed, "init", "--quiet", "--initial-branch=main")
+	writeScratchFile(t, seed, "a.txt", "line1\nline2\nline3\nline4\nline5\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "base C0")
+	c0 := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch A: modifies top of a.txt.
+	runScratchGit(t, seed, "checkout", "--quiet", "-b", "work/a", c0)
+	writeScratchFile(t, seed, "a.txt", "line1-from-A\nline2\nline3\nline4\nline5\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "task A")
+	candA := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch B: disjoint file b.txt.
+	runScratchGit(t, seed, "checkout", "--quiet", "-b", "work/b", c0)
+	writeScratchFile(t, seed, "b.txt", "from B\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "task B")
+	candB := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch C: conflicting edit to top of a.txt.
+	runScratchGit(t, seed, "checkout", "--quiet", "-b", "work/c", c0)
+	writeScratchFile(t, seed, "a.txt", "line1-from-C\nline2\nline3\nline4\nline5\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "task C")
+	candC := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch D: non-conflicting edit to bottom of a.txt (rebases cleanly, but
+	// overlaps a.txt modified on main since C0).
+	runScratchGit(t, seed, "checkout", "--quiet", "-b", "work/d", c0)
+	writeScratchFile(t, seed, "a.txt", "line1\nline2\nline3\nline4\nline5-from-D\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "task D")
+	candD := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch E: disjoint file e.txt.
+	runScratchGit(t, seed, "checkout", "--quiet", "-b", "work/e", c0)
+	writeScratchFile(t, seed, "e.txt", "from E\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "task E")
+	candE := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	runScratchGit(t, seed, "push", "--quiet", bare, "main", "work/a", "work/b", "work/c", "work/d", "work/e")
+
+	// Install a real pre-receive hook recording push options and rejecting
+	// rebased pushes whose touched paths overlap approved_base..old_oid.
+	optsLog := filepath.Join(t.TempDir(), "push-options.log")
+	hookScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+count="${GIT_PUSH_OPTION_COUNT:-0}"
+approved_base=""
+approved_cand=""
+i=0
+while [ "$i" -lt "$count" ]; do
+  eval "opt=\${GIT_PUSH_OPTION_${i}:-}"
+  printf '%%s\n' "$opt" >> %q
+  case "$opt" in
+    kodema.approved_base=*) approved_base="${opt#kodema.approved_base=}" ;;
+    kodema.approved_candidate=*) approved_cand="${opt#kodema.approved_candidate=}" ;;
+  esac
+  i=$((i + 1))
+done
+while read -r old new ref; do
+  if [ -n "$approved_base" ] && [ "$approved_base" != "$old" ]; then
+    target_files=$(git diff-tree -r --no-commit-id --name-only "$approved_base" "$old")
+    cand_files=$(git diff-tree -r --no-commit-id --name-only "$old" "$new")
+    for f in $cand_files; do
+      for tf in $target_files; do
+        if [ "$f" = "$tf" ]; then
+          echo "kodema git: update rejected: disjoint rebase refused: overlapping path $f" >&2
+          exit 1
+        fi
+      done
+    done
+  fi
+done
+exit 0
+`, optsLog)
+	hookPath := filepath.Join(bare, "hooks", "pre-receive")
+	if err := os.WriteFile(hookPath, []byte(hookScript), 0o755); err != nil {
+		t.Fatalf("write pre-receive hook: %v", err)
+	}
+
+	executor, err := mergeapp.NewOSGitExecutor(mergeapp.OSGitExecutorConfig{})
+	if err != nil {
+		t.Fatalf("NewOSGitExecutor: %v", err)
+	}
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file://" + filepath.ToSlash(root),
+		StateDirectory:    t.TempDir(),
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	store, err := merge.NewFileCoordinationStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileCoordinationStore: %v", err)
+	}
+	opCounter := 0
+	coordinator, err := merge.NewCoordinator(merge.CoordinatorConfig{
+		TenantID: "tenant-wave",
+		Owner:    "wave-worker",
+		Lease:    time.Minute,
+		Store:    store,
+		Effects:  effects,
+		Clock:    servicekit.SystemClock{},
+		NewOperationID: func() (id.OperationID, error) {
+			opCounter++
+			return id.OperationID(fmt.Sprintf("merge-wave-%d", opCounter)), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewCoordinator: %v", err)
+	}
+	key := merge.MergeKey{Repository: repository, Ref: "refs/heads/main"}
+	makeReq := func(execID, cand string, dec id.DecisionID) merge.MergeRequest {
+		return merge.MergeRequest{
+			Key:        key,
+			Assignment: merge.MergeAssignment{ExecutionID: id.ExecutionID(execID), ActionID: "act-merge"},
+			Base:       c0,
+			Candidate:  cand,
+			DecisionID: dec,
+		}
+	}
+
+	// 1. Task A fast-forwards C0 -> candA.
+	reqA := makeReq("exec-a", candA, "dec_wave_a")
+	resA, err := coordinator.Merge(context.Background(), reqA)
+	if err != nil || resA.State != merge.EffectApplied || resA.ObservedOutput != candA {
+		t.Fatalf("Task A Merge = %+v, %v; want applied output=%s", resA, err, candA)
+	}
+	if err := coordinator.Settle(context.Background(), reqA, merge.EffectApplied); err != nil {
+		t.Fatalf("Task A Settle: %v", err)
+	}
+
+	// 2. Task B rebases C0..candB onto candA with disjoint-rebase push options.
+	reqB := makeReq("exec-b", candB, "dec_wave_b")
+	resB, err := coordinator.Merge(context.Background(), reqB)
+	if err != nil || resB.State != merge.EffectApplied {
+		t.Fatalf("Task B Merge = %+v, %v; want applied", resB, err)
+	}
+	if resB.ObservedBase != candA || resB.ObservedOutput == candB || resB.ObservedOutput == candA {
+		t.Fatalf("Task B result = %+v; want rebased commit onto %s", resB, candA)
+	}
+	if err := coordinator.Settle(context.Background(), reqB, merge.EffectApplied); err != nil {
+		t.Fatalf("Task B Settle: %v", err)
+	}
+	loggedOpts, err := os.ReadFile(optsLog)
+	if err != nil {
+		t.Fatalf("read push-options.log: %v", err)
+	}
+	for _, want := range []string{
+		"kodema.decision_id=dec_wave_b",
+		"kodema.approved_base=" + c0,
+		"kodema.approved_candidate=" + candB,
+	} {
+		if !strings.Contains(string(loggedOpts), want) {
+			t.Fatalf("push options log missing %q:\n%s", want, loggedOpts)
+		}
+	}
+
+	// 3. Task C hits rebase conflict -> confirmed not_started -> immediate settle.
+	reqC := makeReq("exec-c", candC, "dec_wave_c")
+	resC, err := coordinator.Merge(context.Background(), reqC)
+	if !errors.Is(err, merge.ErrMergeConflict) || resC.State != merge.EffectNotStarted {
+		t.Fatalf("Task C Merge = %+v, %v; want not_started ErrMergeConflict", resC, err)
+	}
+	if err := coordinator.Settle(context.Background(), reqC, merge.EffectNotStarted); err != nil {
+		t.Fatalf("Task C Settle: %v", err)
+	}
+
+	// 4. Task D rebases cleanly locally, but pre-receive rejects overlap ->
+	//    confirmed not_started -> immediate settle.
+	reqD := makeReq("exec-d", candD, "dec_wave_d")
+	resD, err := coordinator.Merge(context.Background(), reqD)
+	if !errors.Is(err, merge.ErrMergeRejected) || resD.State != merge.EffectNotStarted {
+		t.Fatalf("Task D Merge = %+v, %v; want not_started ErrMergeRejected", resD, err)
+	}
+	if err := coordinator.Settle(context.Background(), reqD, merge.EffectNotStarted); err != nil {
+		t.Fatalf("Task D Settle: %v", err)
+	}
+	if head := runScratchGit(t, bare, "rev-parse", "refs/heads/main"); head != resB.ObservedOutput {
+		t.Fatalf("main mutated after rejected Task D: got %s, want %s", head, resB.ObservedOutput)
+	}
+
+	// 5. Task E (disjoint e.txt) succeeds immediately after C and D settled.
+	reqE := makeReq("exec-e", candE, "dec_wave_e")
+	resE, err := coordinator.Merge(context.Background(), reqE)
+	if err != nil || resE.State != merge.EffectApplied {
+		t.Fatalf("Task E Merge = %+v, %v; want applied", resE, err)
+	}
+	if err := coordinator.Settle(context.Background(), reqE, merge.EffectApplied); err != nil {
+		t.Fatalf("Task E Settle: %v", err)
+	}
+	if content := runScratchGit(t, bare, "show", "refs/heads/main:b.txt"); content != "from B" {
+		t.Fatalf("main:b.txt = %q; want 'from B'", content)
+	}
+	if content := runScratchGit(t, bare, "show", "refs/heads/main:e.txt"); content != "from E" {
+		t.Fatalf("main:e.txt = %q; want 'from E'", content)
+	}
+}
+
+// TestGitMergeEffectsRealNoOpRebaseRefusesWithoutBypassingPreReceive proves
+// with real native Git that when a candidate duplicates a patch already landed
+// on a moved remote ref, `git rebase --onto` drops the commit (HEAD == remote)
+// and Execute refuses with (EffectNotStarted, ErrMergeBaseMoved) without
+// writing a record or pushing a local no-op that would bypass pre-receive.
+func TestGitMergeEffectsRealNoOpRebaseRefusesWithoutBypassingPreReceive(t *testing.T) {
+	root := t.TempDir()
+	repository := "shop/web"
+	bare := filepath.Join(root, repository)
+	if err := os.MkdirAll(filepath.Dir(bare), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	runScratchGit(t, filepath.Dir(bare), "init", "--bare", "--quiet", "--initial-branch=main", bare)
+	runScratchGit(t, bare, "config", "receive.advertisePushOptions", "true")
+
+	seed := t.TempDir()
+	runScratchGit(t, seed, "init", "--quiet", "--initial-branch=main")
+	writeScratchFile(t, seed, "README.md", "base\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "base C0")
+	c0 := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch A lands duplicate.txt on main.
+	writeScratchFile(t, seed, "duplicate.txt", "same content\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "landed on main")
+	c1 := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	// Branch B from C0 makes the identical change so rebase --onto c1 c0 candB
+	// skips the commit and leaves HEAD == c1.
+	runScratchGit(t, seed, "checkout", "--quiet", "-b", "work/dup", c0)
+	writeScratchFile(t, seed, "duplicate.txt", "same content\n")
+	runScratchGit(t, seed, "commit", "--quiet", "-m", "duplicate patch")
+	candB := runScratchGit(t, seed, "rev-parse", "HEAD")
+
+	runScratchGit(t, seed, "push", "--quiet", bare, "main", "work/dup")
+
+	executor, err := mergeapp.NewOSGitExecutor(mergeapp.OSGitExecutorConfig{})
+	if err != nil {
+		t.Fatalf("NewOSGitExecutor: %v", err)
+	}
+	stateDir := t.TempDir()
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file://" + filepath.ToSlash(root),
+		StateDirectory:    stateDir,
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	obs, err := effects.Execute(context.Background(), merge.MergeOperation{
+		Key:         merge.MergeKey{Repository: repository, Ref: "refs/heads/main"},
+		OperationID: "merge-noop-1",
+		Base:        c0,
+		Candidate:   candB,
+	})
+	if !errors.Is(err, merge.ErrMergeBaseMoved) {
+		t.Fatalf("Execute error = %v; want ErrMergeBaseMoved", err)
+	}
+	if obs.State != merge.EffectNotStarted {
+		t.Fatalf("observation = %+v; want not_started", obs)
+	}
+	if head := runScratchGit(t, bare, "rev-parse", "refs/heads/main"); head != c1 {
+		t.Fatalf("remote main = %s; want unchanged %s", head, c1)
+	}
+	records, err := filepath.Glob(filepath.Join(stateDir, "*.json"))
+	if err != nil {
+		t.Fatalf("Glob effect records: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("effect records = %v; want none on refused no-op rebase", records)
 	}
 }
 

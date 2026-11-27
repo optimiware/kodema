@@ -19,7 +19,8 @@ import (
 )
 
 const (
-	gitServiceID = "git"
+	gitServiceID              = "git"
+	mergeCoordinatorServiceID = "merge-coordinator"
 	// gitCredentialTTL is the longest lifetime a service credential may have.
 	gitCredentialTTL = 8 * time.Hour
 )
@@ -196,6 +197,69 @@ func provision(ctx context.Context, cfg provisionConfig) (string, error) {
 	var issued api.ServiceCredentialIssueResult
 	if err := json.Unmarshal(body, &issued); err != nil || issued.Token == nil {
 		return "", fmt.Errorf("the Git service credential was not returned")
+	}
+	return *issued.Token, nil
+}
+
+// provisionMergeCoordinator ensures the local `merge-coordinator` service
+// account exists in cfg.ProjectID and issues/rotates its service credential.
+func provisionMergeCoordinator(ctx context.Context, cfg provisionConfig) (string, error) {
+	roundTripper := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: cfg.RootCAs, MinVersion: tls.VersionTLS12}}
+	defer roundTripper.CloseIdleConnections()
+	call := func(token, operation, key string, expected uint64, input any) (json.RawMessage, error) {
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			return nil, err
+		}
+		request := api.Request{Input: encoded, IdempotencyKey: key}
+		if expected > 0 {
+			request.ExpectedVersion = &expected
+		}
+		transport := &client.HTTPTransport{
+			BaseURL:      cfg.PublicURL,
+			RoundTripper: roundTripper,
+			Source:       bearerToken(token),
+			Retry:        client.RetryPolicy{MaxAttempts: 3, BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second},
+		}
+		result, err := transport.Invoke(ctx, api.Invocation{Operation: operation, Request: request})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", operation, err)
+		}
+		return result.Body, nil
+	}
+	if _, err := call(cfg.ProjectToken, "service.create", provisionIdempotencyKey("kodema-up-service-merge-coordinator", cfg.ProjectID), 0, api.ServiceCreateRequest{
+		ProjectID: cfg.ProjectID, ServiceID: mergeCoordinatorServiceID, Roles: []string{"viewer"},
+	}); err != nil {
+		if class, _ := fault.ClassOf(err); class != fault.VersionConflict {
+			return "", err
+		}
+	}
+	listed, err := call(cfg.ProjectToken, "service.list", "", 0, api.ServiceListRequest{ProjectID: cfg.ProjectID})
+	if err != nil {
+		return "", err
+	}
+	var services api.ServiceListResult
+	if err := json.Unmarshal(listed, &services); err != nil {
+		return "", fmt.Errorf("service.list: %w", err)
+	}
+	var version uint64
+	for _, service := range services.Services {
+		if service.ServiceID == mergeCoordinatorServiceID {
+			version = service.Version
+		}
+	}
+	credential := api.ServiceCredentialRotateRequest{ServiceID: mergeCoordinatorServiceID, TTLSeconds: int(gitCredentialTTL / time.Second)}
+	key := fmt.Sprintf("kodema-up-merge-credential-%d", time.Now().UnixNano())
+	body, err := call(cfg.ProjectToken, "service.credential.rotate", key, version, credential)
+	if err != nil {
+		body, err = call(cfg.ProjectToken, "service.credential.issue", key+"-issue", version, credential)
+	}
+	if err != nil {
+		return "", err
+	}
+	var issued api.ServiceCredentialIssueResult
+	if err := json.Unmarshal(body, &issued); err != nil || issued.Token == nil {
+		return "", fmt.Errorf("the merge coordinator service credential was not returned")
 	}
 	return *issued.Token, nil
 }

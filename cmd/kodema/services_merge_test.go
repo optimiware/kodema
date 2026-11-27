@@ -116,8 +116,40 @@ func TestServicesMergeCoordinatorForwardsCAFile(t *testing.T) {
 			if captured.CAFile != caFile {
 				t.Fatalf("MergeConfig.CAFile = %q; want %q", captured.CAFile, caFile)
 			}
+			if captured.DisableRebaseOnMovedBase {
+				t.Fatal("MergeConfig.DisableRebaseOnMovedBase = true by default; want false")
+			}
 		})
 	}
+
+	t.Run("rebase-on-moved-base=false disables moved-base rebase", func(t *testing.T) {
+		var captured mergeapp.MergeConfig
+		orig := runMergeCoordinator
+		runMergeCoordinator = func(_ context.Context, cfg mergeapp.MergeConfig) error {
+			captured = cfg
+			return nil
+		}
+		t.Cleanup(func() { runMergeCoordinator = orig })
+
+		args := []string{
+			"--kind", "merge_coordinator",
+			"--service", "merge-svc",
+			"--tenant", "tenant-1",
+			"--project", "project-1",
+			"--base-url", "https://127.0.0.1:8443",
+			"--credential-file", credential,
+			"--state-dir", filepath.Join(dir, "state"),
+			"--git-url", "https://127.0.0.1:8443/git",
+			"--rebase-on-moved-base=false",
+		}
+		var stderr lockedBuffer
+		if code := runServicesEntry(context.Background(), args, &lockedBuffer{}, &stderr); code != 0 {
+			t.Fatalf("exit code = %d; want 0 (stderr=%q)", code, stderr.String())
+		}
+		if !captured.DisableRebaseOnMovedBase {
+			t.Fatal("MergeConfig.DisableRebaseOnMovedBase = false; want true with --rebase-on-moved-base=false")
+		}
+	})
 }
 
 func writeTestSelfSignedCA(t *testing.T, path string) string {

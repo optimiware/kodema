@@ -17,7 +17,9 @@ package merge_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -485,5 +487,125 @@ func TestMergeAdapterUncertainEffectIsNotAnswered(t *testing.T) {
 	record, _ := fixture.store.record(t, testTenant, mergeTestKey())
 	if record.Released {
 		t.Fatal("an uncertain effect was released")
+	}
+}
+
+// TestMergeAdapterFailSettlementUnblocksSubsequentMerge proves that a confirmed
+// not_started refusal (conflict, base moved, or pre-receive rejection) resolves
+// the request with decision "fail" + a sanitized diagnostic note and settles
+// (repo, ref) immediately so the next queued merge in the same scan succeeds
+// without waiting for request expiry.
+func TestMergeAdapterFailSettlementUnblocksSubsequentMerge(t *testing.T) {
+	cases := map[string]error{
+		"rebase conflict": fmt.Errorf("%w: conflict in app.go (Authorization: Basic dXNlcjpwYXNz)", merge.ErrMergeConflict),
+		"base moved":      fmt.Errorf("%w: refs/heads/work/merge-1 diverged from https://kodema:secret@git.example.test/shop/web", merge.ErrMergeBaseMoved),
+		"pre-receive":     fmt.Errorf("%w: remote: kodema git: update rejected: overlapping paths kodsvc.svc1.leakedtoken", merge.ErrMergeRejected),
+	}
+
+	for name, refusal := range cases {
+		t.Run(name, func(t *testing.T) {
+			first := validMergeInboxItem()
+			first.ExecutionID = "exec-1"
+			first.ActionID = "action-1"
+			second := validMergeInboxItem()
+			second.ExecutionID = "exec-2"
+			second.ActionID = "action-2"
+			second.Subject = mergeSubject(mergeSubjectFields("shop/web", "refs/heads/work/merge-1", "base-1111111", "candidate-3333333"))
+
+			fixture := newMergeTestFixture(t,
+				func(api.TaskInboxRequest) (api.TaskInboxResult, error) {
+					return api.TaskInboxResult{Items: []api.InboxItem{first, second}}, nil
+				},
+				func(req api.ExecutionInspectRequest) (api.ExecutionInspectResult, error) {
+					if req.ExecutionID == second.ExecutionID {
+						return mergeInspect(second.ExecutionID, second.ActionID, second.Version, "running", ""), nil
+					}
+					return mergeInspect(first.ExecutionID, first.ActionID, first.Version, "running", ""), nil
+				},
+			)
+			fixture.effects.executeFunc = func(op merge.MergeOperation) (merge.MergeObservation, error) {
+				if op.Candidate == "candidate-2222222" {
+					return merge.MergeObservation{State: merge.EffectNotStarted}, refusal
+				}
+				return appliedObservation(op, "merged-candidate-3333333"), nil
+			}
+
+			if err := fixture.adapter.RunOnce(context.Background()); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			resolves := fixture.handler.resolvesSnapshot()
+			if len(resolves) != 2 {
+				t.Fatalf("resolve submissions = %d; want 2 (fail first, pass second)", len(resolves))
+			}
+			if resolves[0].input.ExecutionID != "exec-1" || resolves[0].input.Decision != servicekit.DecisionFail {
+				t.Fatalf("first resolve = %+v; want exec-1 decision=fail", resolves[0].input)
+			}
+			if len(resolves[0].input.Outputs) != 0 {
+				t.Fatalf("first resolve outputs = %v; want none on fail", resolves[0].input.Outputs)
+			}
+			if resolves[0].input.Note == "" {
+				t.Fatal("first resolve missing diagnostic note")
+			}
+			for _, secret := range []string{"dXNlcjpwYXNz", "secret@", "kodsvc.svc1.leakedtoken"} {
+				if strings.Contains(resolves[0].input.Note, secret) {
+					t.Fatalf("fail note leaked secret %q: %q", secret, resolves[0].input.Note)
+				}
+			}
+			if resolves[1].input.ExecutionID != "exec-2" || resolves[1].input.Decision != servicekit.DecisionPass {
+				t.Fatalf("second resolve = %+v; want exec-2 decision=pass", resolves[1].input)
+			}
+			if resolves[1].input.Outputs[merge.MergeOutputResult] != "merged-candidate-3333333" {
+				t.Fatalf("second resolve outputs = %v; want merged-candidate-3333333", resolves[1].input.Outputs)
+			}
+			record, ok := fixture.store.record(t, testTenant, mergeTestKey())
+			if !ok || !record.Released || record.State != merge.EffectApplied || record.Request.Assignment.ExecutionID != "exec-2" {
+				t.Fatalf("final record = %+v; want released applied exec-2", record)
+			}
+		})
+	}
+}
+
+// TestMergeAdapterFailResolveTransientErrorDoesNotPrematurelySettleAndRetries
+// proves that if resolving a confirmed not_started refusal as `fail` encounters
+// a transient transport error, the assignment remains held (not prematurely
+// settled), and a subsequent scan retries with the identical idempotency key
+// and settles once the fail resolution succeeds.
+func TestMergeAdapterFailResolveTransientErrorDoesNotPrematurelySettleAndRetries(t *testing.T) {
+	fixture := newMergeTestFixture(t, singleMergeItem(validMergeInboxItem()), nil)
+	fixture.effects.executeFunc = func(merge.MergeOperation) (merge.MergeObservation, error) {
+		return merge.MergeObservation{State: merge.EffectNotStarted}, fmt.Errorf("%w: conflict in app.go", merge.ErrMergeConflict)
+	}
+	transientErr := errors.New("temporary 503 while resolving fail")
+	fixture.handler.resolveFunc = func(api.ExecutionRequestResolveRequest, api.Request, int) error {
+		return transientErr
+	}
+
+	if err := fixture.adapter.RunOnce(context.Background()); !errors.Is(err, transientErr) {
+		t.Fatalf("first RunOnce error = %v; want %v", err, transientErr)
+	}
+	held, ok := fixture.store.record(t, testTenant, mergeTestKey())
+	if !ok || held.Released || held.State != merge.EffectNotStarted {
+		t.Fatalf("record after transient fail-resolve error = %+v; want unreleased not_started record", held)
+	}
+
+	// Next scan succeeds in resolving `fail` with the exact same idempotency key
+	// and immediately releases the claim.
+	fixture.handler.resolveFunc = nil
+	if err := fixture.adapter.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+	resolves := fixture.handler.resolvesSnapshot()
+	if len(resolves) != 2 {
+		t.Fatalf("resolve submissions = %d; want 2 (initial attempt + retry)", len(resolves))
+	}
+	if resolves[0].input.Decision != servicekit.DecisionFail || resolves[1].input.Decision != servicekit.DecisionFail {
+		t.Fatalf("decisions = %q, %q; want fail, fail", resolves[0].input.Decision, resolves[1].input.Decision)
+	}
+	if resolves[0].request.IdempotencyKey != resolves[1].request.IdempotencyKey {
+		t.Fatalf("retry idempotency key = %q; want stable %q", resolves[1].request.IdempotencyKey, resolves[0].request.IdempotencyKey)
+	}
+	released, ok := fixture.store.record(t, testTenant, mergeTestKey())
+	if !ok || !released.Released || released.State != merge.EffectNotStarted {
+		t.Fatalf("record after retry = %+v; want released not_started record", released)
 	}
 }

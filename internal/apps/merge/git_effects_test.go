@@ -579,3 +579,336 @@ func TestGitMergeEffectsRemoteEnvironmentPlainHTTPOmitsCAFile(t *testing.T) {
 		t.Fatalf("remoteCalls = %d; want at least 4 (Execute + Observe)", remoteCalls)
 	}
 }
+
+// TestGitMergeEffectsDisjointRebaseOnMovedBasePushesApprovedOptions proves that
+// when RebaseOnMovedBase is enabled and the remote target ref fast-forwarded
+// past the request base, Execute verifies ancestry, rebases with
+// `git rebase --onto <remote> <base> <candidate>`, persists record.Base = remote,
+// and pushes with --force-with-lease=<ref>:<remote> plus
+// -o kodema.approved_base=<base> -o kodema.approved_candidate=<candidate>
+// (and -o kodema.decision_id=<id>).
+func TestGitMergeEffectsDisjointRebaseOnMovedBasePushesApprovedOptions(t *testing.T) {
+	movedRemote := strings.Repeat("4", 40)
+	executor := &scriptedGitExecutor{remote: movedRemote}
+	var pushArgs []string
+	executor.handle = func(command merge.GitCommand) (merge.GitCommandResult, error) {
+		switch command.Args[0] {
+		case "init", "remote", "fetch", "checkout", "rebase":
+			return okGit()
+		case "rev-parse":
+			switch command.Args[len(command.Args)-1] {
+			case "HEAD":
+				return gitOutput(gitTestRebased)
+			case gitTestBase + "^{commit}":
+				return gitOutput(gitTestBase)
+			case gitTestCandidate + "^{commit}":
+				return gitOutput(gitTestCandidate)
+			}
+		case "merge-base":
+			if command.Args[2] == gitTestBase && command.Args[3] == movedRemote {
+				return okGit()
+			}
+			return merge.GitCommandResult{ExitCode: 1}, nil
+		case "push":
+			pushArgs = append([]string(nil), command.Args...)
+			executor.mu.Lock()
+			executor.remote = gitTestRebased
+			executor.mu.Unlock()
+			return okGit()
+		case "ls-remote":
+			executor.mu.Lock()
+			remote := executor.remote
+			executor.mu.Unlock()
+			return gitOutput(remote + "\trefs/heads/main")
+		}
+		t.Fatalf("unexpected git command %+v", command.Args)
+		return merge.GitCommandResult{}, nil
+	}
+
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file:///srv/git",
+		StateDirectory:    t.TempDir(),
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	op := gitTestOperation()
+	op.DecisionID = "dec_disjoint_1"
+	observation, err := effects.Execute(context.Background(), op)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if observation.State != merge.EffectApplied || observation.Base != movedRemote || observation.Candidate != gitTestCandidate || observation.Output != gitTestRebased {
+		t.Fatalf("observation = %+v; want applied with base=%s candidate=%s output=%s", observation, movedRemote, gitTestCandidate, gitTestRebased)
+	}
+	if !executor.called("checkout", "--quiet", "--detach", gitTestCandidate) {
+		t.Fatalf("git calls = %+v; want detached checkout of candidate before rebase", executor.calls)
+	}
+	if !executor.called("rebase", "--onto", movedRemote, gitTestBase, gitTestCandidate) {
+		t.Fatalf("git calls = %+v; want rebase --onto %s %s %s", executor.calls, movedRemote, gitTestBase, gitTestCandidate)
+	}
+	wantPush := []string{
+		"push", "--porcelain",
+		"-o", "kodema.decision_id=dec_disjoint_1",
+		"-o", "kodema.approved_base=" + gitTestBase,
+		"-o", "kodema.approved_candidate=" + gitTestCandidate,
+		"--force-with-lease=refs/heads/main:" + movedRemote,
+		"origin", gitTestRebased + ":refs/heads/main",
+	}
+	if !slices.Equal(pushArgs, wantPush) {
+		t.Fatalf("push args = %v; want %v", pushArgs, wantPush)
+	}
+}
+
+// TestGitMergeEffectsMovedBaseDivergedReturnsErrMergeBaseMoved proves that when
+// the remote target ref diverged or rewound from baseCommit, Execute refuses
+// with ErrMergeBaseMoved without rebasing or pushing.
+func TestGitMergeEffectsMovedBaseDivergedReturnsErrMergeBaseMoved(t *testing.T) {
+	divergedRemote := strings.Repeat("5", 40)
+	executor := &scriptedGitExecutor{remote: divergedRemote}
+	executor.handle = func(command merge.GitCommand) (merge.GitCommandResult, error) {
+		switch command.Args[0] {
+		case "init", "remote", "fetch":
+			return okGit()
+		case "rev-parse":
+			return gitOutput(gitTestBase)
+		case "ls-remote":
+			return gitOutput(divergedRemote + "\trefs/heads/main")
+		case "merge-base":
+			return merge.GitCommandResult{ExitCode: 1}, nil
+		}
+		t.Fatalf("unexpected git command %+v", command.Args)
+		return merge.GitCommandResult{}, nil
+	}
+
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file:///srv/git",
+		StateDirectory:    t.TempDir(),
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	observation, err := effects.Execute(context.Background(), gitTestOperation())
+	if !errors.Is(err, merge.ErrMergeBaseMoved) {
+		t.Fatalf("Execute error = %v; want ErrMergeBaseMoved", err)
+	}
+	if observation.State != merge.EffectNotStarted {
+		t.Fatalf("observation = %+v; want not_started", observation)
+	}
+	if executor.called("rebase") || executor.called("push") {
+		t.Fatalf("diverged base must not rebase or push: %+v", executor.calls)
+	}
+}
+
+// TestGitMergeEffectsRebaseConflictAbortsAndReturnsErrMergeConflict proves that
+// a rebase conflict runs `git rebase --abort`, writes no effect record, never
+// pushes, and returns (EffectNotStarted, ErrMergeConflict).
+func TestGitMergeEffectsRebaseConflictAbortsAndReturnsErrMergeConflict(t *testing.T) {
+	movedRemote := strings.Repeat("4", 40)
+	executor := &scriptedGitExecutor{remote: movedRemote}
+	executor.handle = func(command merge.GitCommand) (merge.GitCommandResult, error) {
+		switch command.Args[0] {
+		case "init", "remote", "fetch", "checkout":
+			return okGit()
+		case "rev-parse":
+			if strings.HasPrefix(command.Args[len(command.Args)-1], gitTestCandidate) {
+				return gitOutput(gitTestCandidate)
+			}
+			return gitOutput(gitTestBase)
+		case "ls-remote":
+			return gitOutput(movedRemote + "\trefs/heads/main")
+		case "merge-base":
+			return okGit()
+		case "rebase":
+			if len(command.Args) >= 2 && command.Args[1] == "--abort" {
+				return okGit()
+			}
+			return merge.GitCommandResult{ExitCode: 1, Stderr: []byte("CONFLICT (content): Merge conflict in app.go")}, nil
+		}
+		t.Fatalf("unexpected git command %+v", command.Args)
+		return merge.GitCommandResult{}, nil
+	}
+
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file:///srv/git",
+		StateDirectory:    t.TempDir(),
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	observation, err := effects.Execute(context.Background(), gitTestOperation())
+	if !errors.Is(err, merge.ErrMergeConflict) {
+		t.Fatalf("Execute error = %v; want ErrMergeConflict", err)
+	}
+	if observation.State != merge.EffectNotStarted {
+		t.Fatalf("observation = %+v; want not_started", observation)
+	}
+	if !executor.called("rebase", "--abort") {
+		t.Fatalf("git calls = %+v; want rebase --abort after conflict", executor.calls)
+	}
+	if executor.called("push") {
+		t.Fatal("rebase conflict still attempted a push")
+	}
+	observed, err := effects.Observe(context.Background(), gitTestOperation())
+	if err != nil || observed.State != merge.EffectNotStarted {
+		t.Fatalf("Observe after conflict = %+v, %v; want not_started", observed, err)
+	}
+}
+
+// TestGitMergeEffectsPreReceiveRejectionReturnsErrMergeRejected proves that a
+// pre-receive hook rejection confirmed by observeRecord returns
+// (EffectNotStarted, ErrMergeRejected), while a transient transport failure
+// does not.
+func TestGitMergeEffectsPreReceiveRejectionReturnsErrMergeRejected(t *testing.T) {
+	t.Run("pre-receive rejection confirmed by observeRecord", func(t *testing.T) {
+		movedRemote := strings.Repeat("4", 40)
+		executor := &scriptedGitExecutor{remote: movedRemote}
+		executor.handle = func(command merge.GitCommand) (merge.GitCommandResult, error) {
+			switch command.Args[0] {
+			case "init", "remote", "fetch", "checkout", "rebase":
+				return okGit()
+			case "rev-parse":
+				switch command.Args[len(command.Args)-1] {
+				case "HEAD":
+					return gitOutput(gitTestRebased)
+				case gitTestBase + "^{commit}":
+					return gitOutput(gitTestBase)
+				case gitTestCandidate + "^{commit}":
+					return gitOutput(gitTestCandidate)
+				}
+			case "merge-base":
+				return okGit()
+			case "push":
+				return merge.GitCommandResult{
+					ExitCode: 1,
+					Stdout:   []byte("To file:///srv/git/shop/web\n!\t" + gitTestRebased + ":refs/heads/main\t[remote rejected] (pre-receive hook declined)\nDone\n"),
+					Stderr:   []byte("remote: kodema git: update rejected: disjoint rebase refused: overlapping paths\n"),
+				}, nil
+			case "ls-remote":
+				return gitOutput(movedRemote + "\trefs/heads/main")
+			}
+			t.Fatalf("unexpected git command %+v", command.Args)
+			return merge.GitCommandResult{}, nil
+		}
+
+		effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+			RemoteBaseURL:     "file:///srv/git",
+			StateDirectory:    t.TempDir(),
+			RebaseOnMovedBase: true,
+			Executor:          executor,
+		})
+		if err != nil {
+			t.Fatalf("NewGitMergeEffects: %v", err)
+		}
+		observation, err := effects.Execute(context.Background(), gitTestOperation())
+		if !errors.Is(err, merge.ErrMergeRejected) {
+			t.Fatalf("Execute error = %v; want ErrMergeRejected", err)
+		}
+		if observation.State != merge.EffectNotStarted {
+			t.Fatalf("observation = %+v; want not_started", observation)
+		}
+	})
+
+	t.Run("transient transport failure is not classified as ErrMergeRejected", func(t *testing.T) {
+		executor := &scriptedGitExecutor{remote: gitTestBase}
+		executor.handle = func(command merge.GitCommand) (merge.GitCommandResult, error) {
+			switch command.Args[0] {
+			case "init", "remote", "fetch":
+				return okGit()
+			case "rev-parse":
+				if strings.HasPrefix(command.Args[len(command.Args)-1], gitTestCandidate) {
+					return gitOutput(gitTestCandidate)
+				}
+				return gitOutput(gitTestBase)
+			case "merge-base":
+				if command.Args[2] == gitTestCandidate {
+					return merge.GitCommandResult{ExitCode: 1}, nil
+				}
+				return okGit()
+			case "push":
+				return merge.GitCommandResult{
+					ExitCode: 128,
+					Stderr:   []byte("fatal: unable to access 'https://git.example.test/shop/web': The requested URL returned error: 503"),
+				}, nil
+			case "ls-remote":
+				return gitOutput(gitTestBase + "\trefs/heads/main")
+			}
+			t.Fatalf("unexpected git command %+v", command.Args)
+			return merge.GitCommandResult{}, nil
+		}
+		effects := newScriptedMergeEffects(t, executor)
+		observation, err := effects.Execute(context.Background(), gitTestOperation())
+		if err == nil {
+			t.Fatal("Execute succeeded on 503 push failure")
+		}
+		if errors.Is(err, merge.ErrMergeRejected) {
+			t.Fatalf("transient 503 push failure was misclassified as ErrMergeRejected: %v", err)
+		}
+		if observation.State != merge.EffectNotStarted {
+			t.Fatalf("observation = %+v; want not_started", observation)
+		}
+	})
+}
+
+// TestGitMergeEffectsNoOpRebaseOntoMovedBaseRefusesWithoutPush proves that if
+// rebasing onto a moved target ref yields HEAD == remoteCommit (e.g. a patch
+// already landed on remoteCommit or candidate == base), Execute refuses with
+// (EffectNotStarted, ErrMergeBaseMoved) without writing a record or pushing a
+// no-op that would bypass pre-receive approval and disjoint-rebase checks.
+func TestGitMergeEffectsNoOpRebaseOntoMovedBaseRefusesWithoutPush(t *testing.T) {
+	movedRemote := strings.Repeat("4", 40)
+	executor := &scriptedGitExecutor{remote: movedRemote}
+	executor.handle = func(command merge.GitCommand) (merge.GitCommandResult, error) {
+		switch command.Args[0] {
+		case "init", "remote", "fetch", "checkout", "rebase":
+			return okGit()
+		case "rev-parse":
+			switch command.Args[len(command.Args)-1] {
+			case "HEAD":
+				// No-op rebase: HEAD equals movedRemote.
+				return gitOutput(movedRemote)
+			case gitTestBase + "^{commit}":
+				return gitOutput(gitTestBase)
+			case gitTestCandidate + "^{commit}":
+				return gitOutput(gitTestCandidate)
+			}
+		case "merge-base":
+			return okGit()
+		case "ls-remote":
+			return gitOutput(movedRemote + "\trefs/heads/main")
+		}
+		t.Fatalf("unexpected git command %+v", command.Args)
+		return merge.GitCommandResult{}, nil
+	}
+
+	stateDir := t.TempDir()
+	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
+		RemoteBaseURL:     "file:///srv/git",
+		StateDirectory:    stateDir,
+		RebaseOnMovedBase: true,
+		Executor:          executor,
+	})
+	if err != nil {
+		t.Fatalf("NewGitMergeEffects: %v", err)
+	}
+	observation, err := effects.Execute(context.Background(), gitTestOperation())
+	if !errors.Is(err, merge.ErrMergeBaseMoved) {
+		t.Fatalf("Execute error = %v; want ErrMergeBaseMoved", err)
+	}
+	if observation.State != merge.EffectNotStarted {
+		t.Fatalf("observation = %+v; want not_started", observation)
+	}
+	if executor.called("push") {
+		t.Fatal("no-op rebase onto moved base must never invoke push")
+	}
+	observed, err := effects.Observe(context.Background(), gitTestOperation())
+	if err != nil || observed.State != merge.EffectNotStarted {
+		t.Fatalf("Observe after no-op rebase = %+v, %v; want not_started (no record persisted)", observed, err)
+	}
+}

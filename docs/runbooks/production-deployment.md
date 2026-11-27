@@ -229,11 +229,14 @@ NetworkPolicy whose ingress peers are exactly the declared
 `gitService.tenants[].clients[]` and whose egress is only cluster DNS and the
 Kodema API. `services.enabled` deploys one `kodema services --kind <kind>`
 Deployment per `services.entries[]` entry; the accepted kinds are `webhook`,
-`email`, `timer` and `responder` (the chart still refuses `merge_coordinator`:
-the `kodema services --kind merge_coordinator` entry exists, but the chart does
-not render its `--state-dir` and `--git-url` settings), a timer
-needs `schedule`, and every adapter has only DNS and Kodema API egress and
-denies all ingress (it opens no listener; both probes are exec-based).
+`email`, `timer`, `responder` and `merge_coordinator`. A `timer` entry needs
+`schedule`; a `merge_coordinator` entry needs `gitURL` (and optionally
+`storage` for a durable `/var/lib/kodema/merge` PVC, defaulting to `emptyDir`),
+passes `--ca-file=/etc/kodema/api-ca/ca.crt`, and receives a NetworkPolicy
+egress rule to its tenant's Git service (with a matching ingress rule on the
+tenant's Git NetworkPolicy). Every adapter denies all ingress (it opens no
+listener; both probes are exec-based) and allows egress only to cluster DNS,
+the Kodema API, and—for `merge_coordinator`—its tenant's Git service.
 
 Prerequisites: an existing service-credential Secret for every Git tenant and
 service entry (`credential.existingSecret` plus `credential.key`), an existing

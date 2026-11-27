@@ -24,8 +24,19 @@ import (
 )
 
 // ErrMergeBaseMoved reports that the remote target ref no longer points at the
-// request base. Nothing was recorded and nothing was pushed.
+// request base (or diverged/rewound from it). Nothing was recorded and nothing
+// was pushed.
 var ErrMergeBaseMoved = errors.New("merge base moved on the remote")
+
+// ErrMergeConflict reports that rebasing the candidate onto the target ref
+// encountered a conflict and was aborted cleanly. Nothing was recorded and
+// nothing was pushed.
+var ErrMergeConflict = errors.New("merge candidate conflicts with target ref")
+
+// ErrMergeRejected reports that the remote rejected the push (for example via
+// pre-receive policy or disjoint-rebase verification) and observation confirmed
+// the remote target ref remained untouched.
+var ErrMergeRejected = errors.New("merge push rejected by remote")
 
 // GitMergeEffectsConfig is the complete concrete Git effects configuration.
 type GitMergeEffectsConfig struct {
@@ -45,18 +56,25 @@ type GitMergeEffectsConfig struct {
 	// CAFile optionally configures http.<origin>.sslCAInfo via GIT_CONFIG_*
 	// for HTTPS Git remotes using a private CA bundle.
 	CAFile string
+	// RebaseOnMovedBase, when true, rebases the candidate onto a fast-forwarded
+	// remote target ref and pushes with kodema.approved_base and
+	// kodema.approved_candidate push options so `kodema git serve` can verify
+	// `option approve-rebase.<ref> = disjoint` in pre-receive. When false, any
+	// moved remote target ref returns ErrMergeBaseMoved.
+	RebaseOnMovedBase bool
 	// Executor is the injected native Git boundary. It is required.
 	Executor GitCommandExecutor
 }
 
 // GitMergeEffects is the concrete merge/rebase effect boundary.
 type GitMergeEffects struct {
-	remoteBaseURL string
-	stateDir      string
-	workDir       string
-	credential    string
-	caFile        string
-	executor      GitCommandExecutor
+	remoteBaseURL     string
+	stateDir          string
+	workDir           string
+	credential        string
+	caFile            string
+	rebaseOnMovedBase bool
+	executor          GitCommandExecutor
 }
 
 var _ MergeEffects = (*GitMergeEffects)(nil)
@@ -115,12 +133,13 @@ func NewGitMergeEffects(config GitMergeEffectsConfig) (*GitMergeEffects, error) 
 		return nil, err
 	}
 	return &GitMergeEffects{
-		remoteBaseURL: strings.TrimRight(base, "/"),
-		stateDir:      stateDir,
-		workDir:       workDir,
-		credential:    strings.TrimSpace(config.CredentialFile),
-		caFile:        caFile,
-		executor:      config.Executor,
+		remoteBaseURL:     strings.TrimRight(base, "/"),
+		stateDir:          stateDir,
+		workDir:           workDir,
+		credential:        strings.TrimSpace(config.CredentialFile),
+		caFile:            caFile,
+		rebaseOnMovedBase: config.RebaseOnMovedBase,
+		executor:          config.Executor,
 	}, nil
 }
 
@@ -158,47 +177,46 @@ func (effects *GitMergeEffects) Execute(ctx context.Context, operation MergeOper
 	if err != nil {
 		return MergeObservation{State: EffectNotStarted}, fmt.Errorf("resolve merge base: %w", err)
 	}
-	// Refuse a stale request before computing or recording an effect. A
-	// remote that already moved past the request base would only be rejected
-	// by the push lease after the durable record was written, and that record
-	// would then observe as uncertain forever. Nothing has started here.
 	remoteCommit, err := effects.remoteRef(ctx, workDir, env, operation.Key.Ref)
 	if err != nil {
 		return MergeObservation{State: EffectNotStarted}, fmt.Errorf("observe remote target: %w", err)
 	}
+	targetBase := baseCommit
+	rebasedOntoMovedBase := false
+	var candidateCommit string
+	var resultCommit string
+
 	if remoteCommit != "" && remoteCommit != baseCommit {
-		return MergeObservation{State: EffectNotStarted}, fmt.Errorf(
-			"%w: %s is %s but the request base is %s",
-			ErrMergeBaseMoved, operation.Key.Ref, remoteCommit, baseCommit)
-	}
-	candidateCommit, err := effects.resolveCommit(ctx, workDir, operation.Candidate)
-	if err != nil {
-		return MergeObservation{State: EffectNotStarted}, fmt.Errorf("resolve merge candidate: %w", err)
-	}
-	candidateInBase, err := effects.isAncestor(ctx, workDir, candidateCommit, baseCommit)
-	if err != nil {
-		return MergeObservation{State: EffectNotStarted}, err
-	}
-	baseInCandidate, err := effects.isAncestor(ctx, workDir, baseCommit, candidateCommit)
-	if err != nil {
-		return MergeObservation{State: EffectNotStarted}, err
-	}
-	resultCommit := ""
-	switch {
-	case candidateInBase:
-		// The candidate is already contained in the base: there is nothing to
-		// merge and the base is the settled result.
-		resultCommit = baseCommit
-	case baseInCandidate:
-		// The base is an ancestor of the candidate: fast-forward.
-		resultCommit = candidateCommit
-	default:
+		if !effects.rebaseOnMovedBase {
+			return MergeObservation{State: EffectNotStarted}, fmt.Errorf(
+				"%w: %s is %s but the request base is %s",
+				ErrMergeBaseMoved, operation.Key.Ref, remoteCommit, baseCommit)
+		}
+		baseInRemote, err := effects.isAncestor(ctx, workDir, baseCommit, remoteCommit)
+		if err != nil {
+			return MergeObservation{State: EffectNotStarted}, err
+		}
+		if !baseInRemote {
+			return MergeObservation{State: EffectNotStarted}, fmt.Errorf(
+				"%w: %s diverged from request base %s (remote is %s)",
+				ErrMergeBaseMoved, operation.Key.Ref, baseCommit, remoteCommit)
+		}
+		candidateCommit, err = effects.resolveCommit(ctx, workDir, operation.Candidate)
+		if err != nil {
+			return MergeObservation{State: EffectNotStarted}, fmt.Errorf("resolve merge candidate: %w", err)
+		}
 		if _, err := effects.require(ctx, workDir, nil, "checkout", "--quiet", "--detach", candidateCommit); err != nil {
 			return MergeObservation{State: EffectNotStarted}, err
 		}
-		if _, err := effects.require(ctx, workDir, nil, "rebase", baseCommit); err != nil {
-			_, _ = effects.require(ctx, workDir, nil, "rebase", "--abort")
-			return MergeObservation{State: EffectNotStarted}, fmt.Errorf("rebase merge candidate: %w", err)
+		rebaseResult, rebaseErr := effects.command(ctx, workDir, nil, "rebase", "--onto", remoteCommit, baseCommit, candidateCommit)
+		if rebaseErr != nil {
+			return MergeObservation{State: EffectNotStarted}, rebaseErr
+		}
+		if rebaseResult.ExitCode != 0 {
+			_, _ = effects.command(ctx, workDir, nil, "rebase", "--abort")
+			return MergeObservation{State: EffectNotStarted}, fmt.Errorf(
+				"%w: git rebase exited %d: %s",
+				ErrMergeConflict, rebaseResult.ExitCode, servicekit.CommandDetail(rebaseResult))
 		}
 		rebased, err := effects.require(ctx, workDir, nil, "rev-parse", "HEAD")
 		if err != nil {
@@ -208,19 +226,79 @@ func (effects *GitMergeEffects) Execute(ctx context.Context, operation MergeOper
 		if resultCommit == "" {
 			return MergeObservation{State: EffectNotStarted}, fmt.Errorf("rebase merge produced no commit")
 		}
+		// Never treat a no-op rebase onto a moved target ref as applied: pushing
+		// remoteCommit:ref would succeed locally as "Everything up-to-date" without
+		// invoking pre-receive approval or disjoint-rebase verification.
+		if resultCommit == remoteCommit {
+			return MergeObservation{State: EffectNotStarted}, fmt.Errorf(
+				"%w: rebase of %s onto %s produced no new commit",
+				ErrMergeBaseMoved, candidateCommit, remoteCommit)
+		}
+		targetBase = remoteCommit
+		rebasedOntoMovedBase = true
+	} else {
+		candidateCommit, err = effects.resolveCommit(ctx, workDir, operation.Candidate)
+		if err != nil {
+			return MergeObservation{State: EffectNotStarted}, fmt.Errorf("resolve merge candidate: %w", err)
+		}
+		candidateInBase, err := effects.isAncestor(ctx, workDir, candidateCommit, baseCommit)
+		if err != nil {
+			return MergeObservation{State: EffectNotStarted}, err
+		}
+		baseInCandidate, err := effects.isAncestor(ctx, workDir, baseCommit, candidateCommit)
+		if err != nil {
+			return MergeObservation{State: EffectNotStarted}, err
+		}
+		switch {
+		case candidateInBase:
+			// The candidate is already contained in the base: there is nothing to
+			// merge and the base is the settled result.
+			resultCommit = baseCommit
+		case baseInCandidate:
+			// The base is an ancestor of the candidate: fast-forward.
+			resultCommit = candidateCommit
+		default:
+			if _, err := effects.require(ctx, workDir, nil, "checkout", "--quiet", "--detach", candidateCommit); err != nil {
+				return MergeObservation{State: EffectNotStarted}, err
+			}
+			rebaseResult, rebaseErr := effects.command(ctx, workDir, nil, "rebase", baseCommit)
+			if rebaseErr != nil {
+				return MergeObservation{State: EffectNotStarted}, rebaseErr
+			}
+			if rebaseResult.ExitCode != 0 {
+				_, _ = effects.command(ctx, workDir, nil, "rebase", "--abort")
+				return MergeObservation{State: EffectNotStarted}, fmt.Errorf(
+					"%w: git rebase exited %d: %s",
+					ErrMergeConflict, rebaseResult.ExitCode, servicekit.CommandDetail(rebaseResult))
+			}
+			rebased, err := effects.require(ctx, workDir, nil, "rev-parse", "HEAD")
+			if err != nil {
+				return MergeObservation{State: EffectNotStarted}, err
+			}
+			resultCommit = strings.TrimSpace(string(rebased.Stdout))
+			if resultCommit == "" {
+				return MergeObservation{State: EffectNotStarted}, fmt.Errorf("rebase merge produced no commit")
+			}
+		}
 	}
 
-	record := gitEffectRecord{Base: baseCommit, Candidate: candidateCommit, Result: resultCommit}
+	record := gitEffectRecord{Base: targetBase, Candidate: candidateCommit, Result: resultCommit}
 	if err := effects.writeRecord(operation.OperationID, record); err != nil {
 		return MergeObservation{State: EffectNotStarted}, err
 	}
-	expected := baseCommit
+	expected := targetBase
 	if remoteCommit == "" {
 		expected = ""
 	}
 	pushArgs := []string{"push", "--porcelain"}
 	if operation.DecisionID != "" {
 		pushArgs = append(pushArgs, "-o", "kodema.decision_id="+string(operation.DecisionID))
+	}
+	if rebasedOntoMovedBase {
+		pushArgs = append(pushArgs,
+			"-o", "kodema.approved_base="+baseCommit,
+			"-o", "kodema.approved_candidate="+candidateCommit,
+		)
 	}
 	pushArgs = append(pushArgs,
 		"--force-with-lease="+operation.Key.Ref+":"+expected,
@@ -245,12 +323,41 @@ func (effects *GitMergeEffects) Execute(ctx context.Context, operation MergeOper
 		return observation, nil
 	}
 	if observation.State == EffectNotStarted {
+		if pushErr == nil && isRemotePushRejection(pushResult) {
+			return observation, fmt.Errorf("%w: %v", ErrMergeRejected, pushFailure)
+		}
 		return observation, pushFailure
 	}
 	if observeErr != nil {
 		return MergeObservation{State: EffectUncertain}, fmt.Errorf("%w: %v", pushFailure, observeErr)
 	}
 	return MergeObservation{State: EffectUncertain}, pushFailure
+}
+
+// isRemotePushRejection reports whether a non-zero `git push --porcelain`
+// command output indicates a remote ref/hook refusal rather than a transient
+// transport or process failure.
+func isRemotePushRejection(result GitCommandResult) bool {
+	for _, line := range strings.Split(string(result.Stdout), "\n") {
+		if strings.HasPrefix(line, "!\t") &&
+			(strings.Contains(line, "[remote rejected]") || strings.Contains(line, "[rejected]")) {
+			return true
+		}
+	}
+	combined := strings.ToLower(string(result.Stderr) + "\n" + string(result.Stdout))
+	for _, marker := range []string{
+		"[remote rejected]",
+		"[rejected]",
+		"pre-receive hook declined",
+		"hook declined",
+		"kodema git: update rejected",
+		"does not support push options",
+	} {
+		if strings.Contains(combined, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // Observe reports what the remote ref settled as without executing. It never

@@ -100,7 +100,7 @@ func TestAdapterConfigRejectsIncompleteConfiguration(t *testing.T) {
 
 	mergeHook := base
 	mergeHook.Kind = servicekit.KindMergeCoordinator
-	mergeHook.HandleRequest = func(context.Context, api.InboxItem, api.ExecutionInspectResult, api.ExecutionAction, servicekit.RequestResolveFunc) error {
+	mergeHook.HandleRequest = func(context.Context, api.InboxItem, api.ExecutionInspectResult, api.ExecutionAction, servicekit.RequestResolver) error {
 		return nil
 	}
 	if _, err := servicekit.NewAdapter(mergeHook); err != nil {

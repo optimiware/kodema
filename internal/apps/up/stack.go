@@ -46,17 +46,18 @@ const (
 // StackDescriptor persists the non-secret runtime metadata of one `kodema up`
 // instance in <state-dir>/stack.json (mode 0600).
 type StackDescriptor struct {
-	Instance       string          `json:"instance"`
-	StateDir       string          `json:"state_dir"`
-	ListenAddr     string          `json:"listen_addr"`
-	PublicURL      string          `json:"public_url"`
-	TenantID       string          `json:"tenant_id"`
-	ProjectID      string          `json:"project_id"`
-	Runtime        DetectedRuntime `json:"runtime"`
-	CACertPath     string          `json:"ca_cert_path"`
-	ServerUpstream string          `json:"server_upstream"`
-	GitUpstream    string          `json:"git_upstream"`
-	GatewayPID     int             `json:"gateway_pid,omitempty"`
+	Instance         string          `json:"instance"`
+	StateDir         string          `json:"state_dir"`
+	ListenAddr       string          `json:"listen_addr"`
+	PublicURL        string          `json:"public_url"`
+	TenantID         string          `json:"tenant_id"`
+	ProjectID        string          `json:"project_id"`
+	Runtime          DetectedRuntime `json:"runtime"`
+	CACertPath       string          `json:"ca_cert_path"`
+	ServerUpstream   string          `json:"server_upstream"`
+	GitUpstream      string          `json:"git_upstream"`
+	GatewayPID       int             `json:"gateway_pid,omitempty"`
+	MergeCoordinator bool            `json:"merge_coordinator,omitempty"`
 }
 
 // UpConfig configures `kodema up`.
@@ -102,16 +103,20 @@ type UpConfig struct {
 	// LLMProviders adds custom OpenAI-compatible (or Anthropic-compatible)
 	// streaming LLM proxy providers, or overrides a built-in provider by name.
 	LLMProviders []LLMProviderSpec
+	// MergeCoordinator starts an optional local `kodema services --kind merge_coordinator`
+	// container wired to the stack's server and Git service.
+	MergeCoordinator bool
 	// Stderr receives concise startup progress lines (defaults to io.Discard).
 	Stderr io.Writer
 
 	// Optional test seams.
-	GOOS         string
-	HomeDir      string
-	DetectOpts   *DetectOptions
-	EngineHTTP   *http.Client
-	SpawnGateway func(stateDir string) (int, error)
-	Provision    func(context.Context, provisionConfig) (string, error)
+	GOOS                      string
+	HomeDir                   string
+	DetectOpts                *DetectOptions
+	EngineHTTP                *http.Client
+	SpawnGateway              func(stateDir string) (int, error)
+	Provision                 func(context.Context, provisionConfig) (string, error)
+	ProvisionMergeCoordinator func(context.Context, provisionConfig) (string, error)
 }
 
 // DownConfig configures `kodema down`.
@@ -143,14 +148,15 @@ type StatusConfig struct {
 
 // StatusReport summarizes the observed health of a `kodema up` instance.
 type StatusReport struct {
-	Instance     string                   `json:"instance"`
-	StateDir     string                   `json:"state_dir"`
-	PublicURL    string                   `json:"public_url"`
-	Runtime      DetectedRuntime          `json:"runtime"`
-	GatewayAlive bool                     `json:"gateway_alive"`
-	GatewayPID   int                      `json:"gateway_pid,omitempty"`
-	Ready        bool                     `json:"ready"`
-	Containers   map[string]ContainerInfo `json:"containers"`
+	Instance         string                   `json:"instance"`
+	StateDir         string                   `json:"state_dir"`
+	PublicURL        string                   `json:"public_url"`
+	Runtime          DetectedRuntime          `json:"runtime"`
+	GatewayAlive     bool                     `json:"gateway_alive"`
+	GatewayPID       int                      `json:"gateway_pid,omitempty"`
+	Ready            bool                     `json:"ready"`
+	MergeCoordinator bool                     `json:"merge_coordinator,omitempty"`
+	Containers       map[string]ContainerInfo `json:"containers"`
 }
 
 // Healthy reports whether all managed containers, the TLS gateway and /readyz are up.
@@ -158,7 +164,11 @@ func (r StatusReport) Healthy() bool {
 	if !r.GatewayAlive || !r.Ready {
 		return false
 	}
-	for _, component := range []string{"postgres", "nats", "server", "git"} {
+	components := []string{"postgres", "nats", "server", "git"}
+	if r.MergeCoordinator {
+		components = append(components, "merge-coordinator")
+	}
+	for _, component := range components {
 		info, ok := r.Containers[component]
 		if !ok || !info.Running {
 			return false
@@ -572,16 +582,17 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 	}
 
 	desc := StackDescriptor{
-		Instance:       instance,
-		StateDir:       stateDir,
-		ListenAddr:     listenAddr,
-		PublicURL:      publicURL,
-		TenantID:       tenantID,
-		ProjectID:      projectID,
-		Runtime:        detected,
-		CACertPath:     tlsBundle.CACertPath,
-		ServerUpstream: fmt.Sprintf("https://127.0.0.1:%d", serverPort),
-		GitUpstream:    fmt.Sprintf("http://127.0.0.1:%d", gitPort),
+		Instance:         instance,
+		StateDir:         stateDir,
+		ListenAddr:       listenAddr,
+		PublicURL:        publicURL,
+		TenantID:         tenantID,
+		ProjectID:        projectID,
+		Runtime:          detected,
+		CACertPath:       tlsBundle.CACertPath,
+		ServerUpstream:   fmt.Sprintf("https://127.0.0.1:%d", serverPort),
+		GitUpstream:      fmt.Sprintf("http://127.0.0.1:%d", gitPort),
+		MergeCoordinator: cfg.MergeCoordinator,
 	}
 	if err := saveStackDescriptor(stateDir, desc); err != nil {
 		return StackDescriptor{}, err
@@ -857,6 +868,70 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 		return StackDescriptor{}, err
 	}
 
+	mergeContainer := prefix + "-merge-coordinator"
+	if cfg.MergeCoordinator {
+		mergeStateDir := filepath.Join(stateDir, "merge-coordinator")
+		if err := os.MkdirAll(mergeStateDir, 0o700); err != nil {
+			return StackDescriptor{}, err
+		}
+		_ = os.Chmod(mergeStateDir, 0o700)
+		provisionMerge := cfg.ProvisionMergeCoordinator
+		if provisionMerge == nil {
+			provisionMerge = provisionMergeCoordinator
+		}
+		mergeToken, err := provisionMerge(ctx, provisionConfig{
+			PublicURL:    publicURL,
+			RootCAs:      pool,
+			Issuer:       disc.Issuer,
+			TenantID:     tenantID,
+			ProjectID:    projectID,
+			TenantToken:  tenantAdminToken,
+			ProjectToken: adminToken,
+			GitOrigins:   []string{publicURL, workloadOrigin},
+		})
+		if err != nil {
+			return StackDescriptor{}, fmt.Errorf("provision merge coordinator: %w", err)
+		}
+		mergeTokenPath := filepath.Join(secretsDir, "merge-coordinator-token")
+		if err := writeFileAtomic(mergeTokenPath, []byte(mergeToken+"\n"), 0o600); err != nil {
+			return StackDescriptor{}, err
+		}
+		fmt.Fprintf(stderr, "starting merge coordinator (%s)...\n", mergeContainer)
+		_ = engine.RemoveContainer(ctx, mergeContainer)
+		if _, err := engine.StartDetached(ctx, ContainerSpec{
+			Name:    mergeContainer,
+			Image:   kodemaImage,
+			User:    kodemaContainerUser,
+			Labels:  map[string]string{LabelInstance: instance, LabelComponent: "merge-coordinator"},
+			Network: networkName,
+			Cmd: []string{
+				"services",
+				"--kind", "merge_coordinator",
+				"--service", mergeCoordinatorServiceID,
+				"--tenant", tenantID,
+				"--project", projectID,
+				"--base-url", "https://" + serverContainer + ":8443",
+				"--git-url", "http://" + gitContainer + ":8081",
+				"--state-dir", mergeStateDir,
+				"--credential-file", mergeTokenPath,
+				"--ca-file", tlsBundle.CACertPath,
+			},
+			Env: []string{
+				"SSL_CERT_FILE=" + tlsBundle.CACertPath,
+			},
+			Mounts: []MountBind{
+				{Source: mergeStateDir, Target: mergeStateDir},
+				{Source: mergeTokenPath, Target: mergeTokenPath, ReadOnly: true},
+				{Source: tlsBundle.CACertPath, Target: tlsBundle.CACertPath, ReadOnly: true},
+			},
+			SecurityOpt: hostMountSecurityOpt,
+		}); err != nil {
+			return StackDescriptor{}, err
+		}
+	} else {
+		_ = engine.RemoveContainer(ctx, mergeContainer)
+	}
+
 	if cfg.Foreground {
 		stopTempGateway()
 		fmt.Fprintf(stdout, "Kodema stack %q ready at %s (Ctrl-C to stop gateway)\n", instance, publicURL)
@@ -868,6 +943,9 @@ func Up(ctx context.Context, cfg UpConfig, stdout io.Writer) (_ StackDescriptor,
 	fmt.Fprintf(stdout, "  API & MCP:  %s  (%s/mcp)\n", publicURL, publicURL)
 	fmt.Fprintf(stdout, "  OIDC Auth:  %s/auth/.well-known/openid-configuration\n", publicURL)
 	fmt.Fprintf(stdout, "  Git HTTP:   %s/git/\n", publicURL)
+	if cfg.MergeCoordinator {
+		fmt.Fprintf(stdout, "  Merge:      service/%s\n", mergeCoordinatorServiceID)
+	}
 	if len(llmProviderNames) > 0 {
 		fmt.Fprintf(stdout, "  LLM Proxy:  %s/llm/{%s}/*\n", publicURL, strings.Join(llmProviderNames, ","))
 	}
@@ -959,7 +1037,7 @@ func Down(ctx context.Context, cfg DownConfig, stdout io.Writer) error {
 					_ = engine.RemoveContainer(ctx, c.Name)
 				}
 			}
-			for _, known := range []string{prefix + "-git", prefix + "-server", prefix + "-nats", prefix + "-postgres"} {
+			for _, known := range []string{prefix + "-merge-coordinator", prefix + "-git", prefix + "-server", prefix + "-nats", prefix + "-postgres"} {
 				_ = engine.RemoveContainer(ctx, known)
 			}
 			_ = engine.RemoveNetwork(ctx, prefix+"-net")
@@ -1023,6 +1101,7 @@ func Status(ctx context.Context, cfg StatusConfig) (StatusReport, error) {
 		if desc.GatewayPID > 0 && processAlive(desc.GatewayPID) {
 			report.GatewayAlive = true
 		}
+		report.MergeCoordinator = desc.MergeCoordinator
 	}
 	if pid := readPIDFile(filepath.Join(stateDir, "gateway.pid")); pid > 0 && processAlive(pid) {
 		report.GatewayPID = pid
@@ -1030,7 +1109,11 @@ func Status(ctx context.Context, cfg StatusConfig) (StatusReport, error) {
 	}
 
 	prefix := "kodema-" + instance
-	for _, component := range []string{"postgres", "nats", "server", "git"} {
+	components := []string{"postgres", "nats", "server", "git"}
+	if report.MergeCoordinator {
+		components = append(components, "merge-coordinator")
+	}
+	for _, component := range components {
 		info, inspectErr := engine.InspectContainer(ctx, prefix+"-"+component)
 		if inspectErr != nil {
 			return report, inspectErr

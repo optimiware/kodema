@@ -49,11 +49,19 @@ type MergeConfig struct {
 	// Lease bounds one claim. A zero value uses DefaultMergeLease.
 	Lease          time.Duration
 	RescanInterval time.Duration
+	// DisableRebaseOnMovedBase disables rebasing candidates onto a moved remote
+	// target ref. By default (false), RunMergeCoordinator enables
+	// RebaseOnMovedBase so disjoint rebases are verified by `kodema git serve`.
+	DisableRebaseOnMovedBase bool
 
 	Transport client.Transport
 	Handler   api.Handler
 	Events    servicekit.EventSource
-	Clock     servicekit.Clock
+	// Stream is the optional live SSE project event stream used to wake scans
+	// without waiting for RescanInterval. When nil and Transport implements
+	// client.EventStreamer, Transport is used automatically.
+	Stream client.EventStreamer
+	Clock  servicekit.Clock
 	// Executor is the native Git boundary. A nil value builds the operating
 	// system executor.
 	Executor merge.GitCommandExecutor
@@ -120,13 +128,20 @@ func RunMergeCoordinator(ctx context.Context, config MergeConfig) error {
 	if strings.TrimSpace(workDirectory) == "" {
 		workDirectory = filepath.Join(stateDirectory, "work")
 	}
+	stream := config.Stream
+	if stream == nil && config.Transport != nil {
+		if streamer, ok := config.Transport.(client.EventStreamer); ok {
+			stream = streamer
+		}
+	}
 	effects, err := merge.NewGitMergeEffects(merge.GitMergeEffectsConfig{
-		RemoteBaseURL:  config.GitURL,
-		StateDirectory: filepath.Join(stateDirectory, "effects"),
-		WorkDirectory:  workDirectory,
-		CredentialFile: config.CredentialFile,
-		CAFile:         config.CAFile,
-		Executor:       executor,
+		RemoteBaseURL:     config.GitURL,
+		StateDirectory:    filepath.Join(stateDirectory, "effects"),
+		WorkDirectory:     workDirectory,
+		CredentialFile:    config.CredentialFile,
+		CAFile:            config.CAFile,
+		RebaseOnMovedBase: !config.DisableRebaseOnMovedBase,
+		Executor:          executor,
 	})
 	if err != nil {
 		return err
@@ -172,6 +187,7 @@ func RunMergeCoordinator(ctx context.Context, config MergeConfig) error {
 		ProjectID:      config.ProjectID,
 		Handler:        handler,
 		Events:         events,
+		Stream:         stream,
 		Clock:          clock,
 		RescanInterval: config.RescanInterval,
 		Merges:         coordinator,

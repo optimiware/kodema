@@ -82,6 +82,8 @@ func runUpEntry(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	modelsFile := flags.String("models-file", envOr("KODEMA_UP_MODELS_FILE", ""), "custom models.json file for the local LLM proxy (env KODEMA_UP_MODELS_FILE)")
 	var llmProvidersRaw stringList
 	flags.Var(&llmProvidersRaw, "llm-provider", "add or override an LLM proxy provider: <name>=<base_url>[,secret=<NAME>][,auth=<Authorization|x-api-key>] (repeatable)")
+	defaultMergeCoordinator, mergeCoordinatorEnvErr := envBoolStrict("KODEMA_UP_MERGE_COORDINATOR", false)
+	mergeCoordinator := flags.Bool("merge-coordinator", defaultMergeCoordinator, "start a local merge_coordinator service container (env KODEMA_UP_MERGE_COORDINATOR)")
 	configureDoubleDashUsage(flags, args, stdout, stderr, "kodema up [flags]", "Start a local Kodema installation on Podman")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -110,6 +112,10 @@ func runUpEntry(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	}
 	if llmProxyEnvErr != nil {
 		usage(stderr, llmProxyEnvErr.Error())
+		return 2
+	}
+	if mergeCoordinatorEnvErr != nil {
+		usage(stderr, mergeCoordinatorEnvErr.Error())
 		return 2
 	}
 	if !*allowProjectSecrets && len(allowSecrets) > 0 {
@@ -239,6 +245,7 @@ func runUpEntry(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		DisableLLMProxy:       !*llmProxy,
 		ModelsFile:            strings.TrimSpace(*modelsFile),
 		LLMProviders:          llmProviders,
+		MergeCoordinator:      *mergeCoordinator,
 		Stderr:                stderr,
 	}, stdout)
 	if err != nil {
@@ -332,7 +339,11 @@ func runStatusEntry(ctx context.Context, args []string, stdout, stderr io.Writer
 		fmt.Fprintf(stdout, "public_url:  %s\n", report.PublicURL)
 		fmt.Fprintf(stdout, "gateway:     alive=%t (pid=%d)\n", report.GatewayAlive, report.GatewayPID)
 		fmt.Fprintf(stdout, "readyz:      %t\n", report.Ready)
-		for _, comp := range []string{"postgres", "nats", "server", "git"} {
+		components := []string{"postgres", "nats", "server", "git"}
+		if report.MergeCoordinator {
+			components = append(components, "merge-coordinator")
+		}
+		for _, comp := range components {
 			info := report.Containers[comp]
 			fmt.Fprintf(stdout, "container %-8s %s\n", comp+":", info.Status)
 		}
