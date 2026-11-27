@@ -191,8 +191,8 @@ func TestPipelineStartAlternateRouteInventory(t *testing.T) {
 	}
 
 	alternates := api.AlternateRoutes()
-	if len(alternates) != 3 {
-		t.Fatalf("api.AlternateRoutes() has %d rows; want 3", len(alternates))
+	if len(alternates) != 5 {
+		t.Fatalf("api.AlternateRoutes() has %d rows; want 5", len(alternates))
 	}
 	alternate := alternates[0]
 	if alternate.Operation != "pipeline.start" ||

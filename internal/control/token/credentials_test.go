@@ -357,17 +357,16 @@ func TestCredentialAdminRefusesWithoutMutation(t *testing.T) {
 			want: fault.Forbidden,
 		},
 		{
-			name: "tenant-only command scope",
+			name: "project-scoped actor on tenant-only command scope",
 			mutate: func(fixture *credentialFixture) {
 			},
 			call: func(fixture *credentialFixture) error {
 				command := credentialCommand(fixture.env)
 				command.Scope = tenancy.Scope{TenantID: fixture.env.scope.TenantID}
-				command.Actor.Scope = command.Scope
 				_, err := fixture.admin.Issue(context.Background(), command)
 				return err
 			},
-			want: fault.InvalidInput,
+			want: fault.Forbidden,
 		},
 		{
 			name: "disabled target service",
@@ -576,5 +575,33 @@ func TestCredentialAdminEnableDoesNotRestoreCredential(t *testing.T) {
 	requireCredentialClass(t, err, fault.Unauthenticated)
 	if len(fixture.env.mutations.units) != 0 {
 		t.Fatalf("mutation units = %d; want 0", len(fixture.env.mutations.units))
+	}
+}
+
+func TestCredentialAdminTenantScopedService(t *testing.T) {
+	fixture := newCredentialFixture(t)
+	tenantScope := tenancy.Scope{TenantID: fixture.env.scope.TenantID}
+	fixture.env.scope = tenantScope
+	fixture.env.principals.principal = credentialActor(tenantScope)
+	fixture.env.services.service.Scope = tenantScope
+	fixture.env.creds.fact = serviceCredentialFact(fixture.env, false)
+
+	cmd := credentialCommand(fixture.env)
+	issued, err := fixture.admin.Issue(context.Background(), cmd)
+	if err != nil {
+		t.Fatalf("tenant-scoped Issue: %v", err)
+	}
+	if issued.State != token.StateCurrent || issued.Token == "" {
+		t.Fatalf("issued = %+v; want current token", issued)
+	}
+	if len(fixture.env.mutations.units) != 1 || fixture.env.mutations.units[0].Owner != tenantScope {
+		t.Fatalf("mutation units = %+v; want owner %+v", fixture.env.mutations.units, tenantScope)
+	}
+
+	fixture.env.creds.fact = serviceCredentialFact(fixture.env, true)
+	revokeCmd := revokeCommand(fixture.env)
+	revokeCmd.ExpectedVersion = 3
+	if _, err := fixture.admin.Revoke(context.Background(), revokeCmd); err != nil {
+		t.Fatalf("tenant-scoped Revoke: %v", err)
 	}
 }

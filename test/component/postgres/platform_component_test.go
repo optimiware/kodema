@@ -10,7 +10,9 @@ import (
 	"time"
 
 	storepg "github.com/optimiware/kodema/internal/adapter/store/postgres"
+	identitystore "github.com/optimiware/kodema/internal/adapter/store/units/identity"
 	"github.com/optimiware/kodema/internal/adapter/store/units/platform"
+	"github.com/optimiware/kodema/internal/adapter/store/units/readers"
 	"github.com/optimiware/kodema/internal/control/authorize"
 	"github.com/optimiware/kodema/internal/control/event"
 	"github.com/optimiware/kodema/internal/control/identity"
@@ -500,4 +502,150 @@ func TestRealEventIngressOnPostgreSQL(t *testing.T) {
 	}
 	pgtest.RequireRowCount(t, ctx, shard.Admin(),
 		`SELECT count(*)::text FROM events WHERE type = 'observation.custom'`, 1, "denied ingress event rows")
+}
+
+// TestTenantScopedServiceVerifyAndReportPostgreSQLRLS proves under real
+// PostgreSQL forced RLS that a tenant-scoped enforcing service (services row
+// with project_id IS NULL) cleanly locks its tenant-wide services row during
+// both actor.verify and resource.report in a second project (project-b), while
+// a project-a-scoped service cannot verify in project-b.
+func TestTenantScopedServiceVerifyAndReportPostgreSQLRLS(t *testing.T) {
+	ctx := context.Background()
+	shard := migratedShard(t)
+	tenantScope := tenancy.Scope{TenantID: "tenant-1"}
+	scopeA := pgtest.Scope("tenant-1", "project-a")
+	scopeB := pgtest.Scope("tenant-1", "project-b")
+
+	shard.SeedScope(ctx, "tenant-1", "project-a")
+	shard.SeedProject(ctx, "tenant-1", "project-b")
+	shard.SeedMembership(ctx, scopeB, "membership-b", "principal-b", 1, string(tenancy.RoleEngineer))
+	// Tenant-scoped enforcing service (project_id IS NULL).
+	shard.SeedService(ctx, tenantScope, "service-git", "service-git", string(tenancy.RoleViewer))
+	// Project-a-scoped service (must NOT be lockable/usable in project-b).
+	shard.SeedService(ctx, scopeA, "service-proj-a", "service-proj-a", string(tenancy.RoleViewer))
+	shard.SeedResource(ctx, scopeB, "git-repo-b")
+	shard.SeedBinding(ctx, scopeB, "binding-repo-b", "git-repo-b", "service-git")
+	if _, err := pgtest.ExecSQL(ctx, shard.Admin(),
+		`UPDATE resource_bindings SET origins = '["https://git.local"]'::jsonb, operations = '["git.read","git.ref.update"]'::jsonb, reportable_events = '["git.ref.updated"]'::jsonb WHERE id = $1`,
+		"binding-repo-b"); err != nil {
+		t.Fatalf("update binding operations: %v", err)
+	}
+
+	runtime := shard.Runtime(4)
+	t.Cleanup(runtime.Close)
+	scoped := storepg.New(runtime)
+
+	identityAdapter, err := identitystore.New(identitystore.Config{
+		Executor: scoped,
+		Scanner:  scoped,
+		Clock:    platformClock{},
+	})
+	if err != nil {
+		t.Fatalf("identitystore.New: %v", err)
+	}
+	records, err := platform.NewRecordAdapter(scoped, scoped)
+	if err != nil {
+		t.Fatalf("NewRecordAdapter: %v", err)
+	}
+	reports, err := platform.NewReportAdapter(scoped, scoped)
+	if err != nil {
+		t.Fatalf("NewReportAdapter: %v", err)
+	}
+	verificationReader, err := readers.NewVerificationReader(scoped)
+	if err != nil {
+		t.Fatalf("readers.NewVerificationReader: %v", err)
+	}
+
+	humanB := identity.Principal{
+		ID: "principal-b", Kind: identity.KindHuman, Scope: scopeB,
+		Roles: []tenancy.Role{tenancy.RoleEngineer}, Enabled: true, Version: 1,
+	}
+	tenantGitService := identity.Principal{
+		ID: "service-git", Kind: identity.KindService, Scope: tenantScope,
+		Roles: []tenancy.Role{tenancy.RoleViewer}, Enabled: true, Version: 1,
+	}
+	projAService := identity.Principal{
+		ID: "service-proj-a", Kind: identity.KindService, Scope: scopeA,
+		Roles: []tenancy.Role{tenancy.RoleViewer}, Enabled: true, Version: 1,
+	}
+
+	next := 0
+	verifier, err := verify.New(verify.Config{
+		Principals: platformPrincipals{principal: humanB},
+		Bindings:   scoped,
+		Evidence:   platformEvidence{},
+		Membership: identityAdapter,
+		Records:    records,
+		Clock:      platformClock{},
+		NewID: func() (verify.VerificationID, error) {
+			next++
+			return verify.VerificationID(fmt.Sprintf("ver-rls-%d", next)), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("verify.New: %v", err)
+	}
+	ids := &platformIDs{}
+	reporter, err := verify.NewReporter(verify.ReportConfig{
+		Authorizer:    authorize.NewMatrix(),
+		Authority:     identityAdapter,
+		Bindings:      scoped,
+		Verifications: verificationReader,
+		Reports:       reports,
+		Clock:         platformClock{},
+		IDs:           ids,
+	})
+	if err != nil {
+		t.Fatalf("verify.NewReporter: %v", err)
+	}
+
+	// 1. Tenant-scoped service-git verifies humanB on git-repo-b in project-b
+	// under PostgreSQL forced RLS, locking the project_id IS NULL services row.
+	record, err := verifier.Verify(ctx, verify.Attempt{
+		Scope:      scopeB,
+		Service:    tenantGitService,
+		Credential: "credential-b",
+		ResourceID: "git-repo-b",
+		Operation:  resource.OperationGitRefUpdate,
+		Subject:    platformSubject(),
+	})
+	if err != nil {
+		t.Fatalf("tenant-scoped Verify in project-b: %v%s", err, pgtest.CauseText(err))
+	}
+	if record.Result != verify.ResultApproved {
+		t.Fatalf("verify result = %q; want approved", record.Result)
+	}
+
+	// 2. Tenant-scoped service-git commits resource.report in project-b under
+	// PostgreSQL forced RLS, locking the project_id IS NULL services row again.
+	reported, err := reporter.Report(ctx, verify.ReportCommand{
+		Scope:          scopeB,
+		Service:        tenantGitService,
+		SourceEventID:  "src-rls-b-1",
+		EventType:      "git.ref.updated",
+		VerificationID: record.ID,
+		ResourceID:     "git-repo-b",
+		Operation:      resource.OperationGitRefUpdate,
+		Subject:        platformSubject(),
+	})
+	if err != nil {
+		t.Fatalf("tenant-scoped Report in project-b: %v%s", err, pgtest.CauseText(err))
+	}
+	if reported.VerificationID != record.ID || reported.EventID == "" {
+		t.Fatalf("reported = %+v; want verification %q and non-empty event id", reported, record.ID)
+	}
+
+	// 3. Negative: project-a-scoped service-proj-a cannot verify in project-b.
+	if _, err := verifier.Verify(ctx, verify.Attempt{
+		Scope:      scopeB,
+		Service:    projAService,
+		Credential: "credential-b",
+		ResourceID: "git-repo-b",
+		Operation:  resource.OperationGitRefUpdate,
+		Subject:    platformSubject(),
+	}); err == nil {
+		t.Fatal("project-a service unexpectedly verified resource in project-b")
+	} else if class, ok := fault.ClassOf(err); !ok || (class != fault.NotFound && class != fault.Forbidden) {
+		t.Fatalf("project-a service verify in project-b error = %v; want not_found or forbidden", err)
+	}
 }

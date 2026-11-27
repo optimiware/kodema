@@ -8,9 +8,13 @@ import (
 	"testing"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/adapter/store/units/readers"
+	"github.com/optimiware/kodema/internal/control/identity"
 	"github.com/optimiware/kodema/internal/control/store"
 	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/verify"
 	"github.com/optimiware/kodema/internal/fault"
+	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/transport/httpapi"
 	"github.com/optimiware/kodema/internal/transport/mcp"
 )
@@ -201,6 +205,281 @@ func TestRESTAndMCPParity(t *testing.T) {
 	}
 	if restResult.Operation != mcpResult.Operation || !bytes.Equal(restResult.Body, mcpResult.Body) {
 		t.Fatalf("REST result %+v differs from MCP result %+v", restResult, mcpResult)
+	}
+}
+
+// TestTenantScopedEnforcingServiceVerifyAndReportScope pins Ownership.Resolve
+// for actor.verify and resource.report:
+//   - a tenant-scoped enforcing service resolves bound resources across
+//     multiple projects in its tenant and succeeds on both actor.verify and
+//     resource.report;
+//   - a project-scoped service cannot verify or report on resources in another
+//     project (uniform not_found);
+//   - a tenant-scoped enforcing service receives uniform not_found for unknown,
+//     unbound (bound to a different service), or cross-tenant resources;
+//   - humans and roleless/unauthorized tenant services receive immediate 403
+//     forbidden for both existing and nonexistent resource_ids (zero existence
+//     oracle);
+//   - missing or malformed resource_id returns invalid_input.
+func TestTenantScopedEnforcingServiceVerifyAndReportScope(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.invokeKey(t, "token-admin", "tenant.create",
+		`{"tenant_id":"`+testTenant+`","name":"Tenant A"}`, "vr-scope-tenant", nil); err != nil {
+		t.Fatalf("tenant.create: %v", err)
+	}
+	for _, proj := range []string{testProject, "project-b"} {
+		if _, err := h.invokeKey(t, "token-admin", "project.create",
+			`{"project_id":"`+proj+`","name":"Project `+proj+`"}`, "vr-scope-"+proj,
+			map[string]string{"tenant": testTenant}); err != nil {
+			t.Fatalf("project.create %s: %v", proj, err)
+		}
+	}
+
+	// Create tenant-scoped enforcing service "git", project-a-scoped service "git-proj-a",
+	// tenant-scoped "other-svc", and tenant-scoped roleless service "roleless-svc".
+	if _, err := h.invokeKey(t, "token-admin", "service.create",
+		`{"service_id":"git","roles":["viewer"]}`, "vr-svc-git", nil); err != nil {
+		t.Fatalf("create tenant git service: %v", err)
+	}
+	if _, err := h.invokeKey(t, testToken, "service.create",
+		`{"service_id":"git-proj-a","roles":["viewer"]}`, "vr-svc-git-proj-a", map[string]string{"project": testProject}); err != nil {
+		t.Fatalf("create project-a git service: %v", err)
+	}
+	if _, err := h.invokeKey(t, "token-admin", "service.create",
+		`{"service_id":"other-svc","roles":["viewer"]}`, "vr-svc-other", nil); err != nil {
+		t.Fatalf("create tenant other-svc: %v", err)
+	}
+	if _, err := h.invokeKey(t, "token-admin", "service.create",
+		`{"service_id":"roleless-svc","roles":[]}`, "vr-svc-roleless", nil); err != nil {
+		t.Fatalf("create tenant roleless-svc: %v", err)
+	}
+
+	h.principals.principals["token-git-tenant"] = identity.Principal{
+		ID:      "git",
+		Kind:    identity.KindService,
+		Scope:   tenancy.Scope{TenantID: testTenant},
+		Roles:   []tenancy.Role{tenancy.RoleViewer},
+		Enabled: true,
+		Version: 1,
+	}
+	h.principals.principals["token-git-proj-a"] = identity.Principal{
+		ID:      "git-proj-a",
+		Kind:    identity.KindService,
+		Scope:   tenancy.Scope{TenantID: testTenant, ProjectID: testProject},
+		Roles:   []tenancy.Role{tenancy.RoleViewer},
+		Enabled: true,
+		Version: 1,
+	}
+	h.principals.principals["token-other-svc"] = identity.Principal{
+		ID:      "other-svc",
+		Kind:    identity.KindService,
+		Scope:   tenancy.Scope{TenantID: testTenant},
+		Roles:   []tenancy.Role{tenancy.RoleViewer},
+		Enabled: true,
+		Version: 1,
+	}
+	h.principals.principals["token-roleless-svc"] = identity.Principal{
+		ID:      "roleless-svc",
+		Kind:    identity.KindService,
+		Scope:   tenancy.Scope{TenantID: testTenant},
+		Roles:   nil,
+		Enabled: true,
+		Version: 1,
+	}
+	bindingReader, err := readers.NewBindingReader(h.store)
+	if err != nil {
+		t.Fatalf("readers.NewBindingReader: %v", err)
+	}
+	h.verifier, err = verify.New(verify.Config{
+		Principals: h.principals,
+		Bindings:   bindingReader,
+		Evidence:   mustEvidenceReader(t, h.store),
+		Decisions:  mustDecisionReader(t, h.store),
+		Records:    mustRecordAdapter(t, h.store),
+		Clock:      fixedClock{},
+		NewID:      func() (verify.VerificationID, error) { return h.ids.NewVerificationID() },
+	})
+	if err != nil {
+		t.Fatalf("verify.New: %v", err)
+	}
+	h.buildRouter(t)
+
+	// Register bindings for service/git in BOTH project-a and project-b, plus a
+	// resource in project-b bound only to other-svc.
+	for _, spec := range []struct {
+		proj, bindingID, resID, svc, token string
+	}{
+		{testProject, "bind-repo-a", "git-repo-a", "git", testToken},
+		{"project-b", "bind-repo-b", "git-repo-b", "git", "token-engineer-b"},
+		{"project-b", "bind-other-b", "git-other-b", "other-svc", "token-engineer-b"},
+	} {
+		h.seedResource(t, tenancy.Scope{TenantID: testTenant, ProjectID: id.ProjectID(spec.proj)}, spec.resID, 1)
+		if _, err := h.invokeKey(t, spec.token, "resource.binding.register", jsonBody(t, map[string]any{
+			"binding_id":        spec.bindingID,
+			"resource_id":       spec.resID,
+			"enforcing_service": spec.svc,
+			"trusted_origins":   []string{"https://git.local"},
+			"operations":        []string{"git.read", "git.ref.update"},
+			"reportable_events": []string{"git.ref.updated"},
+		}), "vr-reg-"+spec.bindingID, map[string]string{"project": spec.proj}); err != nil {
+			t.Fatalf("register binding %s: %v", spec.bindingID, err)
+		}
+	}
+
+	// Seed a resource binding in a foreign tenant for service "git".
+	foreignScope := tenancy.Scope{TenantID: "tenant-z", ProjectID: "proj-z"}
+	if _, err := h.store.Execute(context.Background(), tenancy.Scope{TenantID: "tenant-z"}, store.Unit{
+		Writes: []store.Write{{
+			Table: "projects", ID: "proj-z", Insert: true,
+			Values: map[string]any{"name": "Proj Z", "version": int64(1), "created_at": fixedNow},
+		}},
+	}); err != nil {
+		t.Fatalf("seed foreign project: %v", err)
+	}
+	if _, err := h.store.Execute(context.Background(), foreignScope, store.Unit{
+		Writes: []store.Write{
+			{Table: "resources", ID: "git-foreign-z", Insert: true, Values: map[string]any{"version": int64(1), "created_at": fixedNow}},
+			{Table: "resource_bindings", ID: "bind-foreign-z", Insert: true, Values: map[string]any{
+				"resource_id": "git-foreign-z", "service_id": "git",
+				"origins": []byte(`["https://git.local"]`), "operations": []byte(`["git.read","git.ref.update"]`),
+				"reportable_events": []byte(`["git.ref.updated"]`), "metadata": []byte(`{}`),
+				"version": int64(1), "created_at": fixedNow,
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("seed foreign binding: %v", err)
+	}
+
+	subject := map[string]any{
+		"fields": []map[string]any{
+			{"name": "ref", "kind": "string", "value": "refs/heads/work/init"},
+			{"name": "expected_base", "kind": "string", "value": "0000000000000000000000000000000000000000"},
+			{"name": "candidate", "kind": "string", "value": "1111111111111111111111111111111111111111"},
+		},
+	}
+
+	// 1. Tenant-scoped service/git verifies and reports in BOTH project-a and project-b.
+	for _, tc := range []struct {
+		name, resID, actorTok, srcEvent string
+	}{
+		{"project-a", "git-repo-a", testToken, "src-evt-a-1"},
+		{"project-b", "git-repo-b", "token-engineer-b", "src-evt-b-1"},
+	} {
+		t.Run("tenant service verify+report in "+tc.name, func(t *testing.T) {
+			verifyRes, err := h.invoke(t, "token-git-tenant", "actor.verify", jsonBody(t, map[string]any{
+				"actor_credential": tc.actorTok,
+				"resource_id":      tc.resID,
+				"operation":        "git.ref.update",
+				"subject":          subject,
+			}), nil)
+			if err != nil {
+				t.Fatalf("actor.verify %s: %v", tc.name, err)
+			}
+			var verified api.VerifyResponse
+			decodeResult(t, verifyRes, &verified)
+			if verified.VerificationID == "" {
+				t.Fatalf("empty verification_id: %+v", verified)
+			}
+
+			reportRes, err := h.invokeKey(t, "token-git-tenant", "resource.report", jsonBody(t, map[string]any{
+				"resource_id":     tc.resID,
+				"source_event_id": tc.srcEvent,
+				"event_type":      "git.ref.updated",
+				"operation":       "git.ref.update",
+				"verification_id": verified.VerificationID,
+				"subject":         subject,
+			}), tc.srcEvent, nil)
+			if err != nil {
+				t.Fatalf("resource.report %s: %v", tc.name, err)
+			}
+			var reported api.ReportResponse
+			decodeResult(t, reportRes, &reported)
+			if reported.VerificationID != verified.VerificationID || reported.EventID == "" {
+				t.Fatalf("report response = %+v", reported)
+			}
+		})
+	}
+
+	// 2. Project-scoped service (project-a) CANNOT verify or report in project-b.
+	if _, err := h.invoke(t, "token-git-proj-a", "actor.verify", jsonBody(t, map[string]any{
+		"actor_credential": "token-engineer-b",
+		"resource_id":      "git-repo-b",
+		"operation":        "git.read",
+		"subject":          map[string]any{},
+	}), nil); err == nil {
+		t.Fatal("project-a service verified project-b resource")
+	} else if class, ok := fault.ClassOf(err); !ok || class != fault.NotFound {
+		t.Fatalf("project-a service cross-project verify = %v; want not_found", err)
+	}
+
+	// 3. Tenant-scoped service receives uniform not_found for unknown, unbound
+	// (bound to other-svc), and foreign-tenant resources on both verify and report.
+	for _, resID := range []string{"git-does-not-exist", "git-other-b", "git-foreign-z"} {
+		if _, err := h.invoke(t, "token-git-tenant", "actor.verify", jsonBody(t, map[string]any{
+			"actor_credential": "token-engineer-b",
+			"resource_id":      resID,
+			"operation":        "git.read",
+			"subject":          map[string]any{},
+		}), nil); err == nil {
+			t.Fatalf("tenant service verified %q", resID)
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.NotFound {
+			t.Fatalf("tenant service verify %q = %v; want not_found", resID, err)
+		}
+		if _, err := h.invokeKey(t, "token-git-tenant", "resource.report", jsonBody(t, map[string]any{
+			"resource_id":     resID,
+			"source_event_id": "src-miss-" + resID,
+			"event_type":      "git.ref.updated",
+			"operation":       "git.ref.update",
+			"verification_id": "ver-missing",
+			"subject":         subject,
+		}), "src-miss-"+resID, nil); err == nil {
+			t.Fatalf("tenant service reported %q", resID)
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.NotFound {
+			t.Fatalf("tenant service report %q = %v; want not_found", resID, err)
+		}
+	}
+
+	// 4. Humans and roleless services receive immediate 403 forbidden for BOTH
+	// existing and nonexistent resources (no existence oracle).
+	for _, caller := range []string{"token-admin", "token-roleless-svc"} {
+		for _, resID := range []string{"git-repo-b", "git-does-not-exist", "git-foreign-z"} {
+			if _, err := h.invoke(t, caller, "actor.verify", jsonBody(t, map[string]any{
+				"actor_credential": testToken,
+				"resource_id":      resID,
+				"operation":        "git.read",
+				"subject":          map[string]any{},
+			}), nil); err == nil {
+				t.Fatalf("%s actor.verify(%s) succeeded", caller, resID)
+			} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+				t.Fatalf("%s actor.verify(%s) = %v; want forbidden", caller, resID, err)
+			}
+			if _, err := h.invokeKey(t, caller, "resource.report", jsonBody(t, map[string]any{
+				"resource_id":     resID,
+				"source_event_id": "src-oracle-" + caller + "-" + resID,
+				"event_type":      "git.ref.updated",
+				"operation":       "git.ref.update",
+				"verification_id": "ver-1",
+				"subject":         subject,
+			}), "src-oracle-"+caller+"-"+resID, nil); err == nil {
+				t.Fatalf("%s resource.report(%s) succeeded", caller, resID)
+			} else if class, ok := fault.ClassOf(err); !ok || class != fault.Forbidden {
+				t.Fatalf("%s resource.report(%s) = %v; want forbidden", caller, resID, err)
+			}
+		}
+	}
+
+	// 5. Malformed or missing resource_id returns invalid_input.
+	for _, badBody := range []string{`{}`, `{"resource_id":"bad/id"}`, `{"resource_id":""}`} {
+		if _, err := h.invoke(t, "token-git-tenant", "actor.verify", badBody, nil); err == nil {
+			t.Fatalf("actor.verify(%s) succeeded", badBody)
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("actor.verify(%s) = %v; want invalid_input", badBody, err)
+		}
+		if _, err := h.invokeKey(t, "token-git-tenant", "resource.report", badBody, "bad-report-key", nil); err == nil {
+			t.Fatalf("resource.report(%s) succeeded", badBody)
+		} else if class, ok := fault.ClassOf(err); !ok || class != fault.InvalidInput {
+			t.Fatalf("resource.report(%s) = %v; want invalid_input", badBody, err)
+		}
 	}
 }
 

@@ -388,7 +388,8 @@ func TestHTTPTransportRefusesInvalidCanonicalRouteFields(t *testing.T) {
 		}
 		for _, param := range codec.RouteParams {
 			t.Run(codec.Operation+"/"+param.Name, func(t *testing.T) {
-				optionalTenantRoute := (codec.Operation == "project.create" || codec.Operation == "project.list") && param.Name == "tenant"
+				optionalRouteParam := ((codec.Operation == "project.create" || codec.Operation == "project.list") && param.Name == "tenant") ||
+					((codec.Operation == "service.create" || codec.Operation == "service.list") && param.Name == "project")
 				cases := []struct {
 					name  string
 					input func() json.RawMessage
@@ -410,7 +411,7 @@ func TestHTTPTransportRefusesInvalidCanonicalRouteFields(t *testing.T) {
 					}},
 				}
 				for _, testCase := range cases {
-					if optionalTenantRoute && testCase.name == "missing" {
+					if optionalRouteParam && testCase.name == "missing" {
 						continue
 					}
 					t.Run(testCase.name, func(t *testing.T) {
@@ -634,6 +635,70 @@ func TestHTTPTransportRefusesUnsafePathParameters(t *testing.T) {
 	}
 	if got := projRT.recorded()[0].url.Path; got != "/api/v1/projects" {
 		t.Fatalf("project.list without tenant_id path = %q; want /api/v1/projects", got)
+	}
+}
+
+// TestHTTPTransportServiceCreateAndListOptionalProjectRoute pins that
+// service.create and service.list select /api/v1/services when project_id is
+// omitted or empty and /api/v1/projects/{project}/services when project_id is
+// supplied.
+func TestHTTPTransportServiceCreateAndListOptionalProjectRoute(t *testing.T) {
+	cases := []struct {
+		name      string
+		operation string
+		input     string
+		key       string
+		wantPath  string
+		result    string
+	}{
+		{
+			name:      "service.create without project_id uses alternate /api/v1/services",
+			operation: "service.create",
+			input:     `{"service_id":"git","roles":["viewer"]}`,
+			key:       "k-svc-create-tenant",
+			wantPath:  "/api/v1/services",
+			result:    `{"service_id":"git","version":1}`,
+		},
+		{
+			name:      "service.create with project_id uses canonical project route",
+			operation: "service.create",
+			input:     `{"project_id":"prj-1","service_id":"ci","roles":["engineer"]}`,
+			key:       "k-svc-create-proj",
+			wantPath:  "/api/v1/projects/prj-1/services",
+			result:    `{"service_id":"ci","version":1}`,
+		},
+		{
+			name:      "service.list without project_id uses alternate /api/v1/services",
+			operation: "service.list",
+			input:     `{}`,
+			wantPath:  "/api/v1/services",
+			result:    `{"services":[]}`,
+		},
+		{
+			name:      "service.list with project_id uses canonical project route",
+			operation: "service.list",
+			input:     `{"project_id":"prj-1"}`,
+			wantPath:  "/api/v1/projects/prj-1/services",
+			result:    `{"services":[]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &recordingRoundTripper{respond: func(_ *http.Request, _ int) (*http.Response, error) {
+				return resultResponse(tc.operation, tc.result), nil
+			}}
+			transport := newTransport(rt, &fakeSource{credentials: []client.Credential{validCredential()}})
+			if _, err := transport.Invoke(context.Background(), api.Invocation{
+				Operation: tc.operation,
+				Request:   api.Request{Input: json.RawMessage(tc.input), IdempotencyKey: tc.key},
+			}); err != nil {
+				t.Fatalf("Invoke(%s): %v", tc.operation, err)
+			}
+			recorded := rt.recorded()
+			if len(recorded) != 1 || recorded[0].url.Path != tc.wantPath {
+				t.Fatalf("recorded = %+v; want path %q", recorded, tc.wantPath)
+			}
+		})
 	}
 }
 

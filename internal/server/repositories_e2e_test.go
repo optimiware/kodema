@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -739,5 +741,338 @@ func TestMultiTenantRepositoryOnboardingEndToEndRESTAndMCP(t *testing.T) {
 	}
 	if _, err := fixtures[0].gitServer.Service().ResolveResourceID(ctx, "tenant-b/service"); err == nil {
 		t.Fatal("tenant-a git companion unexpectedly contains tenant-b/service")
+	}
+}
+
+// TestMultiProjectTenantScopedGitServeEndToEnd reproduces and verifies the
+// Issue #111 fix end-to-end: a single tenant-scoped `kodema git serve`
+// authenticating with a real HMAC `kodsvc.git.<mac>` credential serves
+// repositories across two projects (project-a and project-b) on the same
+// Control Plane instance, enforcing per-project actor isolation for real
+// `git ls-remote`, `git clone`, and `git push` (with live pre-receive and
+// post-receive hooks reporting `git.ref.updated` into each owning project).
+func TestMultiProjectTenantScopedGitServeEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not installed")
+	}
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	// Compile the real kodema binary so git-receive-pack runs genuine
+	// `kodema git hook pre-receive` and `post-receive` callbacks.
+	kodemaBin := filepath.Join(tmp, "kodema")
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", kodemaBin, "../../cmd/kodema")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build kodema hook binary: %v\n%s", err, out)
+	}
+
+	const (
+		tenantID   = "tenant-mp-git"
+		projectA   = "project-a"
+		projectB   = "project-b"
+		adminToken = "dev-mp-tenant-admin"
+		engAToken  = "dev-mp-eng-a"
+		engBToken  = "dev-mp-eng-b"
+		provSecret = "mp-git-provision-secret"
+	)
+
+	storageRoot := filepath.Join(tmp, "git-repos")
+	journalDir := filepath.Join(tmp, "git-journal")
+	provTokenFile := filepath.Join(tmp, "git-provision-token")
+	if err := os.WriteFile(provTokenFile, []byte(provSecret+"\n"), 0o600); err != nil {
+		t.Fatalf("write provision token: %v", err)
+	}
+	if _, err := gitapp.ProvisionTenant(ctx, gitapp.ProvisionConfig{
+		TenantID:         id.TenantID(tenantID),
+		StorageRoot:      storageRoot,
+		JournalDirectory: journalDir,
+		HookBinary:       kodemaBin,
+	}); err != nil {
+		t.Fatalf("gitapp.ProvisionTenant: %v", err)
+	}
+
+	// Start the Git HTTP listener first so its concrete URL can be registered as
+	// trusted origin and clone URL in Shell, then swap in the real handler once
+	// the tenant-scoped git service credential is issued.
+	var gitHandler atomic.Value
+	gitHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, _ := gitHandler.Load().(http.Handler)
+		if h == nil {
+			http.Error(w, "git handler not ready", http.StatusServiceUnavailable)
+			return
+		}
+		h.ServeHTTP(w, r)
+	}))
+	defer gitHTTP.Close()
+
+	expiry := time.Now().Add(time.Hour)
+	app, err := shellapp.New(ctx, shellapp.Config{
+		Profile:        shellapp.ProfileDevelopment,
+		InstallationID: "inst-mp-git-e2e",
+		DataDir:        filepath.Join(tmp, "shell-data"),
+		Installation: installation.Config{
+			Environment: installation.EnvironmentDevelopment,
+			State:       installation.StateMemory,
+			Messaging:   installation.MessagingMemory,
+			Runtime:     installation.RuntimeProcess,
+			Keys:        installation.KeyEphemeral,
+			PublicURL:   "https://127.0.0.1:8443",
+		},
+		Dev: &shellapp.DevelopmentConfig{
+			Bootstrap: &shellapp.Bootstrap{
+				TenantID:       tenantID,
+				TenantName:     "Tenant MP Git",
+				ProjectID:      projectA,
+				ProjectName:    "Project A",
+				AdminPrincipal: "admin-1",
+				AdminRoles:     []string{"admin", "engineer", "reviewer", "operator", "viewer"},
+			},
+			Tokens: []shellapp.DevToken{
+				{
+					Credential: adminToken,
+					Principal: identity.Principal{
+						ID:      "admin-1",
+						Kind:    identity.KindHuman,
+						Scope:   tenancy.Scope{TenantID: tenantID},
+						Roles:   []tenancy.Role{tenancy.RoleAdmin, tenancy.RoleEngineer, tenancy.RoleReviewer, tenancy.RoleOperator, tenancy.RoleViewer},
+						Enabled: true,
+						Version: 1,
+					},
+					ExpiresAt: expiry,
+				},
+				{
+					Credential: engAToken,
+					Principal: identity.Principal{
+						ID:      "eng-a",
+						Kind:    identity.KindHuman,
+						Scope:   tenancy.Scope{TenantID: tenantID},
+						Enabled: true,
+						Version: 1,
+					},
+					ExpiresAt: expiry,
+				},
+				{
+					Credential: engBToken,
+					Principal: identity.Principal{
+						ID:      "eng-b",
+						Kind:    identity.KindHuman,
+						Scope:   tenancy.Scope{TenantID: tenantID},
+						Enabled: true,
+						Version: 1,
+					},
+					ExpiresAt: expiry,
+				},
+			},
+		},
+		GitCompanion: &shellapp.GitCompanionConfig{
+			AdminURL:       gitHTTP.URL,
+			PublicGitURL:   gitHTTP.URL,
+			ServiceID:      "git",
+			TrustedOrigins: []string{"https://127.0.0.1:8443"},
+			TokenFile:      provTokenFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("shellapp.New: %v", err)
+	}
+	defer func() { _ = app.Close(ctx) }()
+
+	shellHTTP := httptest.NewServer(app.Handler())
+	defer shellHTTP.Close()
+
+	restDo := func(method, path, token, body string) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(method, shellHTTP.URL+path, bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatalf("new request %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", api.MediaType)
+		resp, err := shellHTTP.Client().Do(req)
+		if err != nil {
+			t.Fatalf("do request %s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(resp.Body)
+		return resp.StatusCode, buf.Bytes()
+	}
+
+	// 1. Create project-b and grant project-isolated engineer memberships.
+	status, raw := restDo(http.MethodPost, "/api/v1/projects", adminToken,
+		`{"idempotency_key":"mp-git-proj-b","input":{"project_id":"`+projectB+`","name":"Project B"}}`)
+	if status != http.StatusOK {
+		t.Fatalf("create project-b status=%d body=%s", status, raw)
+	}
+	for _, grant := range []struct{ proj, user, key string }{
+		{projectA, "eng-a", "mp-git-grant-a"},
+		{projectB, "eng-b", "mp-git-grant-b"},
+	} {
+		status, raw = restDo(http.MethodPut, "/api/v1/projects/"+grant.proj+"/memberships/"+grant.user, adminToken,
+			`{"idempotency_key":"`+grant.key+`","input":{"roles":["engineer"]}}`)
+		if status != http.StatusOK {
+			t.Fatalf("grant %s in %s status=%d body=%s", grant.user, grant.proj, status, raw)
+		}
+	}
+
+	// 2. Create tenant-scoped service/git via POST /api/v1/services and issue its
+	// real kodsvc.git.<mac> credential.
+	status, raw = restDo(http.MethodPost, "/api/v1/services", adminToken,
+		`{"idempotency_key":"mp-git-create-svc","input":{"service_id":"git","roles":["viewer"]}}`)
+	if status != http.StatusOK {
+		t.Fatalf("create tenant service/git status=%d body=%s", status, raw)
+	}
+	status, raw = restDo(http.MethodPost, "/api/v1/services/git/credentials", adminToken,
+		`{"idempotency_key":"mp-git-issue-cred","expected_version":1,"input":{"ttl_seconds":3600}}`)
+	if status != http.StatusOK {
+		t.Fatalf("issue tenant service/git credential status=%d body=%s", status, raw)
+	}
+	var credEnv struct {
+		Body api.ServiceCredentialIssueResult `json:"body"`
+	}
+	if err := json.Unmarshal(raw, &credEnv); err != nil || credEnv.Body.Token == nil || *credEnv.Body.Token == "" {
+		t.Fatalf("decode service/git credential: %v (%s)", err, raw)
+	}
+	gitCredFile := filepath.Join(tmp, "git-service-token")
+	if err := os.WriteFile(gitCredFile, []byte(*credEnv.Body.Token+"\n"), 0o600); err != nil {
+		t.Fatalf("write git service token: %v", err)
+	}
+
+	// 3. Start the single tenant-scoped Git companion wired to Shell via the real
+	// public HTTP transport and hook Unix socket.
+	shortSocketDir, err := os.MkdirTemp("", "kodema-mp-git-")
+	if err != nil {
+		t.Fatalf("mkdirtemp hook socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortSocketDir) })
+
+	gitTransport, err := gitapp.NewTransport(gitapp.TransportConfig{
+		BaseURL:        shellHTTP.URL,
+		CredentialFile: gitCredFile,
+		RoundTripper:   shellHTTP.Client().Transport,
+	})
+	if err != nil {
+		t.Fatalf("gitapp.NewTransport: %v", err)
+	}
+	verifyClient, err := gitapp.NewVerificationClient(gitTransport)
+	if err != nil {
+		t.Fatalf("gitapp.NewVerificationClient: %v", err)
+	}
+	readVerifier, err := git.NewReadVerifier(verifyClient, func(repository string) (string, error) {
+		return "", git.UnregisteredRepositoryError(repository)
+	})
+	if err != nil {
+		t.Fatalf("git.NewReadVerifier: %v", err)
+	}
+	registry, err := actors.NewRegistry(actors.Config{TenantID: id.TenantID(tenantID)})
+	if err != nil {
+		t.Fatalf("actors.NewRegistry: %v", err)
+	}
+	defer func() { _ = registry.Close() }()
+
+	gitServer, err := gitapp.New(gitapp.Config{
+		TenantID:           id.TenantID(tenantID),
+		StorageRoot:        storageRoot,
+		JournalDirectory:   journalDir,
+		HookBinary:         kodemaBin,
+		HookSocketPath:     filepath.Join(shortSocketDir, "h.sock"),
+		ProvisionTokenFile: provTokenFile,
+		ResourceIDs:        map[string]string{"admin": "git-admin"},
+		Verify:             verifyClient,
+		Actors:             readVerifier,
+		ActorHandles:       registry,
+		HookActors:         registry,
+	})
+	if err != nil {
+		t.Fatalf("gitapp.New: %v", err)
+	}
+	if err := gitServer.StartHooks(ctx); err != nil {
+		t.Fatalf("gitServer.StartHooks: %v", err)
+	}
+	defer func() { _ = gitServer.Close() }()
+	gitHandler.Store(gitServer.Handler())
+
+	// 4. Create repositories in project-a and project-b via repository.create.
+	for _, repo := range []struct{ proj, name, key string }{
+		{projectA, "project-a/app-a", "mp-git-repo-a"},
+		{projectB, "project-b/app-b", "mp-git-repo-b"},
+	} {
+		status, raw = restDo(http.MethodPost, "/api/v1/projects/"+repo.proj+"/repositories", adminToken,
+			`{"idempotency_key":"`+repo.key+`","input":{"name":"`+repo.name+`","default_branch":"main"}}`)
+		if status != http.StatusOK {
+			t.Fatalf("repository.create %s in %s status=%d body=%s", repo.name, repo.proj, status, raw)
+		}
+	}
+
+	runGit := func(dir, token string, args ...string) (string, error) {
+		fullArgs := []string{"-c", "http.extraHeader=Authorization: Bearer " + token}
+		fullArgs = append(fullArgs, args...)
+		cmd := exec.CommandContext(ctx, "git", fullArgs...)
+		if dir != "" {
+			cmd.Dir = dir
+		}
+		cmd.Env = []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOME=" + tmp,
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_AUTHOR_NAME=Kodema Test",
+			"GIT_AUTHOR_EMAIL=test@kodema.local",
+			"GIT_COMMITTER_NAME=Kodema Test",
+			"GIT_COMMITTER_EMAIL=test@kodema.local",
+		}
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	repoAURL := gitHTTP.URL + "/project-a/app-a.git"
+	repoBURL := gitHTTP.URL + "/project-b/app-b.git"
+
+	// 5. Real git ls-remote, clone, and push succeed in BOTH project-a and project-b.
+	for _, tc := range []struct {
+		name, proj, repoURL, token, workDir string
+	}{
+		{"project-a", projectA, repoAURL, engAToken, filepath.Join(tmp, "clone-a")},
+		{"project-b", projectB, repoBURL, engBToken, filepath.Join(tmp, "clone-b")},
+	} {
+		if out, err := runGit("", tc.token, "ls-remote", tc.repoURL); err != nil {
+			t.Fatalf("%s git ls-remote failed: %v\n%s", tc.name, err, out)
+		}
+		if out, err := runGit("", tc.token, "clone", tc.repoURL, tc.workDir); err != nil {
+			t.Fatalf("%s git clone failed: %v\n%s", tc.name, err, out)
+		}
+		if err := os.WriteFile(filepath.Join(tc.workDir, "README.md"), []byte("hello "+tc.name+"\n"), 0o644); err != nil {
+			t.Fatalf("write README %s: %v", tc.name, err)
+		}
+		if out, err := runGit(tc.workDir, tc.token, "checkout", "-b", "work/init"); err != nil {
+			t.Fatalf("%s git checkout failed: %v\n%s", tc.name, err, out)
+		}
+		if out, err := runGit(tc.workDir, tc.token, "add", "README.md"); err != nil {
+			t.Fatalf("%s git add failed: %v\n%s", tc.name, err, out)
+		}
+		if out, err := runGit(tc.workDir, tc.token, "commit", "-m", "initial "+tc.name); err != nil {
+			t.Fatalf("%s git commit failed: %v\n%s", tc.name, err, out)
+		}
+		if out, err := runGit(tc.workDir, tc.token, "push", "origin", "HEAD:refs/heads/work/init"); err != nil {
+			t.Fatalf("%s git push failed: %v\n%s", tc.name, err, out)
+		}
+		if out, err := runGit("", tc.token, "ls-remote", "--heads", tc.repoURL, "refs/heads/work/init"); err != nil || !strings.Contains(out, "refs/heads/work/init") {
+			t.Fatalf("%s git ls-remote after push = %q, err=%v; want refs/heads/work/init", tc.name, out, err)
+		}
+
+		// Confirm verified resource.report (git.ref.updated) landed in the owning project.
+		status, raw = restDo(http.MethodGet, "/api/v1/projects/"+tc.proj+"/events", adminToken, "")
+		if status != http.StatusOK || !strings.Contains(string(raw), `"git.ref.updated"`) {
+			t.Fatalf("%s events status=%d body=%s; want git.ref.updated report", tc.name, status, raw)
+		}
+	}
+
+	// 6. Cross-project actor isolation: eng-a is denied on project-b/app-b and
+	// eng-b is denied on project-a/app-a.
+	if out, err := runGit("", engAToken, "ls-remote", repoBURL); err == nil {
+		t.Fatalf("eng-a unexpectedly read project-b repo:\n%s", out)
+	}
+	if out, err := runGit("", engBToken, "ls-remote", repoAURL); err == nil {
+		t.Fatalf("eng-b unexpectedly read project-a repo:\n%s", out)
 	}
 }

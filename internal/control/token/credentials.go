@@ -292,9 +292,6 @@ func (admin *CredentialAdmin) authorizeCommand(
 	if err := scope.Validate(); err != nil {
 		return authorize.Operation{}, err
 	}
-	if !scope.ProjectScoped() {
-		return authorize.Operation{}, fault.New(fault.InvalidInput, "service credential operations require a project scope")
-	}
 	if !actor.Scope.Contains(scope) {
 		return authorize.Operation{}, fault.New(fault.Forbidden, "actor scope does not match the command scope")
 	}

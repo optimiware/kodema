@@ -121,12 +121,19 @@ func (ownership *Ownership) Resolve(ctx context.Context, principal authorize.Pri
 		scope = tenancy.Scope{TenantID: principal.Scope.TenantID}
 	case authorize.ScopeProject:
 		switch {
+		case (call.Operation == "service.create" || call.Operation == "service.list") && project == "":
+			// Omitting project_id on service.create or service.list targets
+			// tenant-scoped service accounts. Resolving to tenant scope before
+			// falling back to principal.Scope guarantees project-scoped
+			// principals are denied 403 rather than silently scoped to their
+			// project.
+			scope = tenancy.Scope{TenantID: principal.Scope.TenantID}
 		case principal.Scope.ProjectScoped():
 			scope = principal.Scope
 		case project != "":
 			scope = tenancy.Scope{TenantID: principal.Scope.TenantID, ProjectID: id.ProjectID(project)}
 		default:
-			resolved, err := ownership.resolveResourceScope(ctx, principal, call, targets)
+			resolved, err := ownership.resolveResourceScope(ctx, principal, operation, call, targets)
 			if err != nil {
 				return ops.Resolution{}, err
 			}
@@ -220,14 +227,19 @@ var resourceTargetSpecs = [...]resourceTargetSpec{
 
 // resolveResourceScope resolves the owning project of an ID-addressed project
 // operation invoked by a tenant-wide principal (for example, a human OIDC login
-// session or a tenant-admin token). Operations that name neither a project nor
-// a project-owned resource are still refused rather than widened to the tenant.
+// session, a tenant-admin token, or a tenant-scoped enforcing service).
+// Operations that name neither a project nor a project-owned resource are still
+// refused rather than widened to the tenant.
 func (ownership *Ownership) resolveResourceScope(
 	ctx context.Context,
 	principal authorize.Principal,
+	operation authorize.Operation,
 	call ops.Call,
 	targets map[string]string,
 ) (tenancy.Scope, error) {
+	if call.Operation == "actor.verify" || call.Operation == "resource.report" {
+		return ownership.resolveEnforcingBindingProject(ctx, principal, operation, call)
+	}
 	table, paramName, resourceID, hasResourceTarget := resourceRouteTarget(call, targets)
 	if !hasResourceTarget {
 		return tenancy.Scope{}, fault.New(fault.InvalidInput,
@@ -238,6 +250,77 @@ func (ownership *Ownership) resolveResourceScope(
 			fmt.Sprintf("operation requires route parameter %q", paramName))
 	}
 	return ownership.resolveResourceProject(ctx, principal, table, resourceID)
+}
+
+// resolveEnforcingBindingProject resolves the owning project of an
+// actor.verify or resource.report call invoked by a tenant-scoped enforcing
+// service. It validates resource_id syntactically first, immediately refuses
+// non-service or unauthorized principals with forbidden before touching the
+// store (preventing any existence oracle), and scans only projects in the
+// calling service's own tenant for a resource_bindings row matching
+// (resource_id, service_id = principal.ID). Unknown, foreign or unbound
+// resources all return uniform not_found.
+func (ownership *Ownership) resolveEnforcingBindingProject(
+	ctx context.Context,
+	principal authorize.Principal,
+	operation authorize.Operation,
+	call ops.Call,
+) (tenancy.Scope, error) {
+	resourceID, ok := jsonField(call.Request.Input, "resource_id")
+	if !ok || !id.Valid(resourceID) {
+		return tenancy.Scope{}, fault.New(fault.InvalidInput,
+			"operation requires a valid resource_id")
+	}
+	if principal.Kind != identity.KindService || !principal.Enabled || !operation.Requires.Allows(principal) {
+		return tenancy.Scope{}, fault.New(fault.Forbidden,
+			fmt.Sprintf("principal %q is not authorized for operation %q", principal.ID, call.Operation))
+	}
+	tenantScope := tenancy.Scope{TenantID: principal.Scope.TenantID}
+	if err := tenantScope.Validate(); err != nil {
+		return tenancy.Scope{}, err
+	}
+	var after string
+	for {
+		page, err := ownership.scanner.Query(ctx, tenantScope, store.ScanQuery{
+			Table:   "projects",
+			OrderBy: []store.Order{{Column: "id"}},
+			After:   after,
+			Limit:   store.MaxQueryLimit,
+		})
+		if err != nil {
+			return tenancy.Scope{}, err
+		}
+		for _, row := range page.Rows {
+			projectID, err := scanRowString(row, "id")
+			if err != nil {
+				return tenancy.Scope{}, err
+			}
+			projectScope := tenancy.Scope{
+				TenantID:  tenantScope.TenantID,
+				ProjectID: id.ProjectID(projectID),
+			}
+			bindingPage, err := ownership.scanner.Query(ctx, projectScope, store.ScanQuery{
+				Table: "resource_bindings",
+				Equals: map[string]any{
+					"resource_id": resourceID,
+					"service_id":  string(principal.ID),
+				},
+				OrderBy: []store.Order{{Column: "id"}},
+				Limit:   1,
+			})
+			if err != nil {
+				return tenancy.Scope{}, err
+			}
+			if len(bindingPage.Rows) > 0 {
+				return projectScope, nil
+			}
+		}
+		if !page.HasMore {
+			break
+		}
+		after = page.Next
+	}
+	return tenancy.Scope{}, fault.New(fault.NotFound, "resource is not visible")
 }
 
 // resourceRouteTarget reports whether call addresses one of the ID-only
@@ -279,6 +362,15 @@ func (ownership *Ownership) resolveResourceProject(
 		return tenancy.Scope{}, err
 	}
 	tenantWideAccess := len(principal.Roles) > 0
+	if table == "services" && tenantWideAccess {
+		found, err := resourceExistsInScope(ctx, ownership.scanner, tenantScope, table, resourceID)
+		if err != nil {
+			return tenancy.Scope{}, err
+		}
+		if found {
+			return tenantScope, nil
+		}
+	}
 	hasAnyProjectMembership := false
 
 	var after string
@@ -311,7 +403,7 @@ func (ownership *Ownership) resolveResourceProject(
 				}
 				hasAnyProjectMembership = true
 			}
-			found, err := resourceExistsInProject(ctx, ownership.scanner, projectScope, table, resourceID)
+			found, err := resourceExistsInScope(ctx, ownership.scanner, projectScope, table, resourceID)
 			if err != nil {
 				return tenancy.Scope{}, err
 			}
@@ -330,9 +422,10 @@ func (ownership *Ownership) resolveResourceProject(
 	return tenancy.Scope{}, fault.New(fault.NotFound, "resource is not visible")
 }
 
-// resourceExistsInProject reports whether a row with id=resourceID exists in
-// table inside the exact project scope.
-func resourceExistsInProject(
+// resourceExistsInScope reports whether a row with id=resourceID exists in
+// table inside the exact scope (project scope, or tenant scope for nullable
+// project tables such as services).
+func resourceExistsInScope(
 	ctx context.Context,
 	scanner store.Scanner,
 	scope tenancy.Scope,

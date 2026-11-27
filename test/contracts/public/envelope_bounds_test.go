@@ -243,8 +243,8 @@ func TestDecodeRouteRequestRequiresRegisteredBinding(t *testing.T) {
 		t.Fatal("the registry has no pipeline.start route")
 	}
 	alternates := api.AlternateRoutes()
-	if len(alternates) != 3 {
-		t.Fatalf("AlternateRoutes() has %d rows; want 3 alternates", len(alternates))
+	if len(alternates) != 5 {
+		t.Fatalf("AlternateRoutes() has %d rows; want 5 alternates", len(alternates))
 	}
 	alternate := alternates[0]
 
@@ -400,13 +400,13 @@ func TestYAMLOperationsAndRoutesReturnCopies(t *testing.T) {
 	}
 
 	alternates := api.AlternateRoutes()
-	if len(alternates) != 3 {
-		t.Fatalf("AlternateRoutes() has %d rows; want 3 alternates", len(alternates))
+	if len(alternates) != 5 {
+		t.Fatalf("AlternateRoutes() has %d rows; want 5 alternates", len(alternates))
 	}
 	alternates[0].Operation = "mutated"
 	_ = append(alternates, api.Route{Operation: "mutated"})
 	againAlternates := api.AlternateRoutes()
-	if len(againAlternates) != 3 || againAlternates[0].Operation != "pipeline.start" {
+	if len(againAlternates) != 5 || againAlternates[0].Operation != "pipeline.start" {
 		t.Errorf("AlternateRoutes() after caller mutation = %+v; want the unchanged alternates", againAlternates)
 	}
 }

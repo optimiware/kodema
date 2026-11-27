@@ -319,6 +319,85 @@ func TestRunServiceAndSecretSubcommands(t *testing.T) {
 		}
 	})
 
+	t.Run("service create and list --tenant-wide omit project_id and reject --project", func(t *testing.T) {
+		var sawCreate, sawList bool
+		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {
+			switch inv.Operation {
+			case "service.create":
+				sawCreate = true
+				var req api.ServiceCreateRequest
+				_ = json.Unmarshal(inv.Request.Input, &req)
+				if req.ProjectID != "" || req.ServiceID != "git" {
+					t.Fatalf("tenant-wide service.create req = %+v; want empty project_id and service_id=git", req)
+				}
+				body, _ := json.Marshal(api.ServiceCreateResult{ServiceID: "git", Version: 1})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			case "service.list":
+				sawList = true
+				var req api.ServiceListRequest
+				_ = json.Unmarshal(inv.Request.Input, &req)
+				if req.ProjectID != "" {
+					t.Fatalf("tenant-wide service.list req = %+v; want empty project_id", req)
+				}
+				body, _ := json.Marshal(api.ServiceListResult{
+					Services: []api.ServiceSummaryView{
+						{ServiceID: "git", State: "enabled", Roles: []string{"viewer"}, Version: 1},
+					},
+				})
+				return api.Result{Operation: inv.Operation, Body: body}, nil
+			default:
+				t.Fatalf("unexpected operation %s", inv.Operation)
+				return api.Result{}, nil
+			}
+		}}
+		cfg := testConfig()
+		cfg.Output = cli.OutputTable
+		// Even with cfg.Project set (like KODEMA_PROJECT), --tenant-wide omits project_id.
+		ports, out, errOut := testPorts(transport)
+		if code := cli.Run(context.Background(), cfg, []string{"service", "create", "git", "--tenant-wide", "--role", "viewer"}, ports); code != cli.ExitSuccess {
+			t.Fatalf("service create --tenant-wide exit=%d stderr=%q", code, errOut.String())
+		}
+		if !sawCreate || !strings.Contains(out.String(), "git") {
+			t.Fatalf("service create --tenant-wide saw=%v stdout=%q", sawCreate, out.String())
+		}
+
+		ports, out, errOut = testPorts(transport)
+		if code := cli.Run(context.Background(), cfg, []string{"service", "list", "--tenant-wide"}, ports); code != cli.ExitSuccess {
+			t.Fatalf("service list --tenant-wide exit=%d stderr=%q", code, errOut.String())
+		}
+		if !sawList || !strings.Contains(out.String(), "git") {
+			t.Fatalf("service list --tenant-wide saw=%v stdout=%q", sawList, out.String())
+		}
+
+		// Mutual exclusivity with --project / -p / global ExplicitProject.
+		for _, badArgs := range [][]string{
+			{"service", "create", "git", "--tenant-wide", "--project", "shop"},
+			{"service", "create", "git", "--tenant-wide", "-p", "shop"},
+			{"service", "list", "--tenant-wide", "--project", "shop"},
+			{"service", "list", "--tenant-wide", "-p", "shop"},
+		} {
+			ports, _, errOut = testPorts(transport)
+			if code := cli.Run(context.Background(), cfg, badArgs, ports); code != cli.ExitUsage {
+				t.Fatalf("args %v exit=%d stderr=%q; want ExitUsage", badArgs, code, errOut.String())
+			}
+			if !strings.Contains(errOut.String(), "--tenant-wide") {
+				t.Fatalf("args %v stderr=%q; want --tenant-wide message", badArgs, errOut.String())
+			}
+		}
+		for _, badArgs := range [][]string{
+			{"service", "create", "git", "--tenant-wide"},
+			{"service", "list", "--tenant-wide"},
+		} {
+			ports, _, errOut = testPorts(transport)
+			if code := cli.RunWithDeps(context.Background(), cfg, badArgs, ports, cli.CommandDeps{ExplicitProject: true}); code != cli.ExitUsage {
+				t.Fatalf("ExplicitProject args %v exit=%d stderr=%q; want ExitUsage", badArgs, code, errOut.String())
+			}
+			if !strings.Contains(errOut.String(), "--tenant-wide") {
+				t.Fatalf("ExplicitProject args %v stderr=%q; want --tenant-wide message", badArgs, errOut.String())
+			}
+		}
+	})
+
 	t.Run("secret set, list, delete with auto-version lookup", func(t *testing.T) {
 		const secretPlaintext = "super-secret-value-xyz"
 		transport := &scriptedTransport{respond: func(_ context.Context, _ int, inv api.Invocation) (api.Result, error) {

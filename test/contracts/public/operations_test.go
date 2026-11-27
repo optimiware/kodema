@@ -1794,7 +1794,8 @@ func TestRouteParamsAreRequestFields(t *testing.T) {
 					if _, err := codec.DecodeMCPRequest(stripped); err == nil {
 						t.Errorf("MCP decode accepted an input without route field %q", param.Field)
 					}
-				} else if codec.Operation == "project.create" || codec.Operation == "project.list" {
+				} else if codec.Operation == "project.create" || codec.Operation == "project.list" ||
+					codec.Operation == "service.create" || codec.Operation == "service.list" {
 					if _, err := codec.DecodeMCPRequest(stripped); err != nil {
 						t.Errorf("MCP decode refused optional route field %q: %v", param.Field, err)
 					}

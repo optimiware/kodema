@@ -117,6 +117,10 @@ var alternateRouteSpecs = []routeSpec{
 	// caller when invoked without a tenant path segment.
 	{"project.create", MethodPost, "/api/v1/projects"},
 	{"project.list", MethodGet, "/api/v1/projects"},
+	// service.create and service.list omit the project path segment when
+	// creating or listing tenant-scoped service accounts.
+	{"service.create", MethodPost, "/api/v1/services"},
+	{"service.list", MethodGet, "/api/v1/services"},
 }
 
 // routes is the derived immutable canonical route table.

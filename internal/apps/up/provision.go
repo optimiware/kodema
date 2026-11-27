@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -32,12 +33,16 @@ type provisionConfig struct {
 	Issuer    string
 	TenantID  string
 	ProjectID string
-	// TenantToken administers the tenant (project, memberships); ProjectToken
-	// administers the project (services, bindings).
+	// TenantToken administers the tenant (project, memberships, tenant-scoped
+	// git service); ProjectToken administers the project (bindings, and legacy
+	// project-scoped git service fallback).
 	TenantToken  string
 	ProjectToken string
 	// GitOrigins are the origins clients and workloads reach Git on.
 	GitOrigins []string
+	// Stderr receives non-fatal warnings (such as legacy project-scoped git
+	// service fallback). Optional.
+	Stderr io.Writer
 }
 
 type bearerToken string
@@ -122,8 +127,8 @@ func provision(ctx context.Context, cfg provisionConfig) (string, error) {
 		}
 	}
 
-	if err := ensure(cfg.ProjectToken, "service.create", provisionIdempotencyKey("kodema-up-service-git", cfg.ProjectID), api.ServiceCreateRequest{
-		ProjectID: cfg.ProjectID, ServiceID: gitServiceID, Roles: []string{"viewer"},
+	if err := ensure(cfg.TenantToken, "service.create", provisionIdempotencyKey("kodema-up-service-git", cfg.TenantID), api.ServiceCreateRequest{
+		ServiceID: gitServiceID, Roles: []string{"viewer"},
 	}); err != nil {
 		return "", err
 	}
@@ -139,26 +144,51 @@ func provision(ctx context.Context, cfg provisionConfig) (string, error) {
 		return "", err
 	}
 
-	listed, err := call(cfg.ProjectToken, "service.list", "", 0, api.ServiceListRequest{ProjectID: cfg.ProjectID})
+	findGitVersion := func(token string, req api.ServiceListRequest) (uint64, error) {
+		listed, err := call(token, "service.list", "", 0, req)
+		if err != nil {
+			return 0, err
+		}
+		var services api.ServiceListResult
+		if err := json.Unmarshal(listed, &services); err != nil {
+			return 0, fmt.Errorf("service.list: %w", err)
+		}
+		for _, svc := range services.Services {
+			if svc.ServiceID == gitServiceID {
+				return svc.Version, nil
+			}
+		}
+		return 0, nil
+	}
+
+	credToken := cfg.TenantToken
+	version, err := findGitVersion(cfg.TenantToken, api.ServiceListRequest{})
 	if err != nil {
 		return "", err
 	}
-	var services api.ServiceListResult
-	if err := json.Unmarshal(listed, &services); err != nil {
-		return "", fmt.Errorf("service.list: %w", err)
-	}
-	var version uint64
-	for _, service := range services.Services {
-		if service.ServiceID == gitServiceID {
-			version = service.Version
+	if version == 0 {
+		// Legacy state directories created before tenant-scoped services hold
+		// service/git inside cfg.ProjectID. Fall back gracefully and warn so
+		// existing single-project stacks keep starting cleanly.
+		legacyVersion, legacyErr := findGitVersion(cfg.ProjectToken, api.ServiceListRequest{ProjectID: cfg.ProjectID})
+		if legacyErr != nil {
+			return "", legacyErr
+		}
+		if legacyVersion == 0 {
+			return "", fmt.Errorf("service %q was not found after provisioning", gitServiceID)
+		}
+		version = legacyVersion
+		credToken = cfg.ProjectToken
+		if cfg.Stderr != nil {
+			fmt.Fprintf(cfg.Stderr, "warning: legacy project-scoped git service found in project %q; multi-project Git requires recreating the stack state so service/git is tenant-scoped\n", cfg.ProjectID)
 		}
 	}
 	// A service has a credential to rotate on every run but the first.
 	credential := api.ServiceCredentialRotateRequest{ServiceID: gitServiceID, TTLSeconds: int(gitCredentialTTL / time.Second)}
 	key := fmt.Sprintf("kodema-up-git-credential-%d", time.Now().UnixNano())
-	body, err := call(cfg.ProjectToken, "service.credential.rotate", key, version, credential)
+	body, err := call(credToken, "service.credential.rotate", key, version, credential)
 	if err != nil {
-		body, err = call(cfg.ProjectToken, "service.credential.issue", key+"-issue", version, credential)
+		body, err = call(credToken, "service.credential.issue", key+"-issue", version, credential)
 	}
 	if err != nil {
 		return "", err

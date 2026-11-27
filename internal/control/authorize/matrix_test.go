@@ -608,3 +608,100 @@ func TestPrincipalWhoamiAllowsAnyAuthenticatedPrincipal(t *testing.T) {
 		t.Fatalf("admitted execution principal.whoami = %q; want allow", decision)
 	}
 }
+
+// TestTenantScopedServiceAuthorization pins that FamilyService operations
+// accept tenant-wide scope only for tenant-wide principals holding the required
+// grant (tenant-wide RoleAdmin for mutations, tenant-wide roles or enabled
+// tenant service for service.list), while project-scoped principals,
+// project-only humans, and non-FamilyService project operations remain refused.
+func TestTenantScopedServiceAuthorization(t *testing.T) {
+	matrix := authorize.NewMatrix()
+	ctx := context.Background()
+
+	serviceAdminOps := []authorize.OperationName{
+		"service.create",
+		"service.update",
+		"service.enable",
+		"service.disable",
+		"service.credential.issue",
+		"service.credential.rotate",
+		"service.credential.revoke",
+	}
+
+	tenantAdmin := humanPrincipal(tenancy.RoleAdmin, tenantScope())
+	projectAdmin := humanPrincipal(tenancy.RoleAdmin, projectScope())
+	tenantEngineer := humanPrincipal(tenancy.RoleEngineer, tenantScope())
+	projectOnlyHuman := authorize.Principal{
+		ID:      testPrincipal,
+		Kind:    identity.KindHuman,
+		Scope:   tenantScope(),
+		Enabled: true,
+	}
+	tenantService := servicePrincipal([]tenancy.Role{tenancy.RoleViewer}, tenantScope())
+	projectService := servicePrincipal([]tenancy.Role{tenancy.RoleViewer}, projectScope())
+	foreignTenantAdmin := humanPrincipal(tenancy.RoleAdmin, otherTenantScope())
+
+	for _, op := range serviceAdminOps {
+		t.Run(string(op), func(t *testing.T) {
+			if decision, err := matrix.Authorize(ctx, tenantAdmin, op, tenantScope()); err != nil || decision != authorize.DecisionAllow {
+				t.Fatalf("tenant admin %s at tenant scope = (%q, %v); want allow", op, decision, err)
+			}
+			for name, denied := range map[string]authorize.Principal{
+				"project-scoped admin": projectAdmin,
+				"tenant engineer":      tenantEngineer,
+				"project-only human":   projectOnlyHuman,
+				"tenant service":       tenantService,
+				"project service":      projectService,
+				"foreign tenant admin": foreignTenantAdmin,
+			} {
+				decision, err := matrix.Authorize(ctx, denied, op, tenantScope())
+				if err != nil {
+					t.Fatalf("%s %s at tenant scope returned unexpected error: %v", name, op, err)
+				}
+				if decision != authorize.DecisionDeny {
+					t.Errorf("%s %s at tenant scope = %q; want deny", name, op, decision)
+				}
+			}
+		})
+	}
+
+	// service.list at tenant scope admits tenant-wide roles and enabled
+	// tenant-wide services, while denying project-scoped principals and
+	// project-only humans (zero tenant roles).
+	if decision, err := matrix.Authorize(ctx, tenantAdmin, "service.list", tenantScope()); err != nil || decision != authorize.DecisionAllow {
+		t.Fatalf("tenant admin service.list at tenant scope = (%q, %v); want allow", decision, err)
+	}
+	if decision, err := matrix.Authorize(ctx, tenantService, "service.list", tenantScope()); err != nil || decision != authorize.DecisionAllow {
+		t.Fatalf("tenant service service.list at tenant scope = (%q, %v); want allow", decision, err)
+	}
+	for name, denied := range map[string]authorize.Principal{
+		"project-scoped admin": projectAdmin,
+		"project service":      projectService,
+		"project-only human":   projectOnlyHuman,
+		"foreign tenant admin": foreignTenantAdmin,
+	} {
+		decision, err := matrix.Authorize(ctx, denied, "service.list", tenantScope())
+		if err != nil {
+			t.Fatalf("%s service.list at tenant scope unexpected error: %v", name, err)
+		}
+		if decision != authorize.DecisionDeny {
+			t.Errorf("%s service.list at tenant scope = %q; want deny", name, decision)
+		}
+	}
+
+	// Non-FamilyService project operations still refuse tenant scope as invalid_input.
+	for _, op := range []authorize.OperationName{"actor.verify", "resource.report", "secret.write", "resource.binding.register", "task.read"} {
+		decision, err := matrix.Authorize(ctx, tenantAdmin, op, tenantScope())
+		wantFaultClass(t, err, fault.InvalidInput)
+		if decision == authorize.DecisionAllow {
+			t.Errorf("%s allowed tenant scope", op)
+		}
+	}
+
+	// DenialMessage explains tenant-scoped credential requirement for
+	// project-scoped admin attempting tenant-scoped service.create.
+	msg := authorize.DenialMessage(projectAdmin, "service.create", tenantScope())
+	if !strings.Contains(msg, "tenant-scoped credential") {
+		t.Fatalf("DenialMessage(projectAdmin, service.create, tenantScope) = %q; want tenant-scoped credential hint", msg)
+	}
+}

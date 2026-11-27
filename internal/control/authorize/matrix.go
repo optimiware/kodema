@@ -142,7 +142,10 @@ func AdmitPrincipalKind(actor Principal, name OperationName) (Operation, error) 
 
 // operationScopeMatches refuses a target scope whose shape differs from the
 // operation's declared scope. A tenant operation has no project; a project
-// operation always names one.
+// operation always names one, except service-account administration/listing
+// (FamilyService), which also permits tenant-wide scope for tenant-scoped
+// enforcing services (still restricted by operationScopeContains and role
+// grants to tenant-wide principals).
 func operationScopeMatches(operation Operation, scope tenancy.Scope) error {
 	switch operation.Scope {
 	case ScopeTenant:
@@ -150,7 +153,7 @@ func operationScopeMatches(operation Operation, scope tenancy.Scope) error {
 			return fault.New(fault.InvalidInput, fmt.Sprintf("operation %q is tenant-scoped; project scope %q is not valid", operation.Name, scope.ProjectID))
 		}
 	case ScopeProject:
-		if !scope.ProjectScoped() {
+		if !scope.ProjectScoped() && operation.Family != FamilyService {
 			return fault.New(fault.InvalidInput, fmt.Sprintf("operation %q is project-scoped; a project is required", operation.Name))
 		}
 	default:
@@ -168,7 +171,7 @@ func operationScopeMatches(operation Operation, scope tenancy.Scope) error {
 func DenialMessage(principal Principal, name OperationName, scope tenancy.Scope) string {
 	if operation, ok := LookupOperation(name); ok &&
 		principal.Enabled &&
-		operation.Scope == ScopeTenant &&
+		(operation.Scope == ScopeTenant || operation.Family == FamilyService) &&
 		!scope.ProjectScoped() &&
 		principal.Scope.TenantID == scope.TenantID &&
 		principal.Scope.ProjectScoped() &&
