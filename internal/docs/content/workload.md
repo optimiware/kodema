@@ -70,7 +70,10 @@ Kodema enforces active token and USD spend budgets **live inside the LLM proxy**
 - **Per-execution:** top-level `budget: {max_tokens: ..., max_cost_usd: ...}` on a pipeline (combined with installation defaults; the stricter limit wins).
 - **Per-task:** installation default task budget accumulated across sibling executions of the same task.
 
-When any active limit is reached or exceeded, the LLM proxy rejects the call with HTTP `429` (`budget_exceeded`) and records an attributable `model.budget.exceeded` event. Cost budgets fail closed if a model has no configured pricing rate.
+When any active limit is reached or exceeded, the LLM proxy rejects the call with HTTP `429` (`budget_exceeded`) and records an attributable `model.budget.exceeded` event. Cost budgets (`max_cost_usd`) look up per-million-token rates from `budgets.pricing` in `models.json` (matching exact model names, `provider/*` wildcards, or `*`):
+
+- **Local dev (`kodema up` / `deploy/k3s/values.yaml`):** seeds conservative wildcard estimate rates (`$3.00` input / `$15.00` output per 1M tokens for `openai/*`, `anthropic/*`, `opencode/*`, and `*`) when generating the default `models.json` so pipelines with `max_cost_usd` enforce a real spend guardrail out of the box. Passing an explicit `--models-file` to `kodema up` preserves that file verbatim without injecting default pricing.
+- **Production (`kodema serve --profile production` / `deploy/charts/kodema/values.yaml`):** emits zero implicit pricing and fails closed with HTTP `501` (`unsupported_capability`) whenever `max_cost_usd` is active for a model without a matching `budgets.pricing` entry.
 
 ## Toolbox commands inside containers
 

@@ -26,6 +26,15 @@ const (
 	// DefaultOpenCodeBaseURL is the built-in upstream base URL for OpenCode Zen
 	// (/llm/opencode/*).
 	DefaultOpenCodeBaseURL = "https://opencode.ai/zen/v1"
+
+	// DefaultLocalInputUSDPerMillionTokens is the conservative default input
+	// token rate ($3.00 / 1M tokens) seeded into local `kodema up` stacks so
+	// pipelines declaring budget.max_cost_usd enforce a real spend guardrail
+	// without failing closed on every model.
+	DefaultLocalInputUSDPerMillionTokens = 3.0
+	// DefaultLocalOutputUSDPerMillionTokens is the conservative default output
+	// token rate ($15.00 / 1M tokens) seeded into local `kodema up` stacks.
+	DefaultLocalOutputUSDPerMillionTokens = 15.0
 )
 
 // LLMProviderSpec describes one streaming LLM proxy provider configured for a
@@ -37,8 +46,21 @@ type LLMProviderSpec struct {
 	AuthHeader string
 }
 
+// LocalModelPricing describes one USD per-million-token pricing entry seeded
+// into the default `kodema up` models.json file under budgets.pricing.
+type LocalModelPricing struct {
+	Model                     string  `json:"model"`
+	InputUSDPerMillionTokens  float64 `json:"input_usd_per_million_tokens"`
+	OutputUSDPerMillionTokens float64 `json:"output_usd_per_million_tokens"`
+}
+
+type localBudgetsFile struct {
+	Pricing []LocalModelPricing `json:"pricing,omitempty"`
+}
+
 type localModelsFile struct {
 	Providers   []localModelProvider     `json:"providers"`
+	Budgets     *localBudgetsFile        `json:"budgets,omitempty"`
 	SecretRules []localGatewaySecretRule `json:"secret_rules"`
 }
 
@@ -74,6 +96,37 @@ func DefaultLLMProviders() []LLMProviderSpec {
 			Name:       "opencode",
 			BaseURL:    DefaultOpenCodeBaseURL,
 			SecretName: "OPENCODE_API_KEY",
+		},
+	}
+}
+
+// DefaultLocalModelPricing returns conservative wildcard fallback pricing rates
+// seeded into the default `kodema up` models.json file so pipelines declaring
+// budget.max_cost_usd enforce a real spend guardrail out of the box across
+// built-in providers (openai/*, anthropic/*, opencode/*) and custom gateways (*).
+// Production installations never inherit these rates and stay strictly
+// fail-closed until explicit budgets.pricing entries are configured.
+func DefaultLocalModelPricing() []LocalModelPricing {
+	return []LocalModelPricing{
+		{
+			Model:                     "openai/*",
+			InputUSDPerMillionTokens:  DefaultLocalInputUSDPerMillionTokens,
+			OutputUSDPerMillionTokens: DefaultLocalOutputUSDPerMillionTokens,
+		},
+		{
+			Model:                     "anthropic/*",
+			InputUSDPerMillionTokens:  DefaultLocalInputUSDPerMillionTokens,
+			OutputUSDPerMillionTokens: DefaultLocalOutputUSDPerMillionTokens,
+		},
+		{
+			Model:                     "opencode/*",
+			InputUSDPerMillionTokens:  DefaultLocalInputUSDPerMillionTokens,
+			OutputUSDPerMillionTokens: DefaultLocalOutputUSDPerMillionTokens,
+		},
+		{
+			Model:                     "*",
+			InputUSDPerMillionTokens:  DefaultLocalInputUSDPerMillionTokens,
+			OutputUSDPerMillionTokens: DefaultLocalOutputUSDPerMillionTokens,
 		},
 	}
 }
@@ -236,37 +289,12 @@ func validateLLMProviders(specs []LLMProviderSpec) ([]LLMProviderSpec, error) {
 	return out, nil
 }
 
-// reconcileModelsFile writes or removes <state-dir>/models.json for the local
-// stack's server container. When disable is true it removes any stale file and
-// returns an empty path. When customModelsFile is non-empty it validates and
-// copies that file into stateDir (which is bind-mounted into the server
-// container). Otherwise it emits the built-in providers (openai, anthropic,
-// opencode) merged with any extraProviders (which may add custom providers or
-// override built-in ones) plus matching tenant-scoped gateway secret_rules.
-func reconcileModelsFile(
-	stateDir, tenantID string,
-	disable bool,
-	customModelsFile string,
-	extraProviders []LLMProviderSpec,
-) (string, []string, error) {
-	path := filepath.Join(stateDir, modelsFileName)
-	if disable {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return "", nil, fmt.Errorf("remove %s: %w", modelsFileName, err)
-		}
-		return "", nil, nil
-	}
-	if customPath := strings.TrimSpace(customModelsFile); customPath != "" {
-		data, names, err := readAndValidateCustomModelsFile(customPath)
-		if err != nil {
-			return "", nil, err
-		}
-		if err := writeFileAtomic(path, data, 0o600); err != nil {
-			return "", nil, fmt.Errorf("write %s: %w", modelsFileName, err)
-		}
-		return path, names, nil
-	}
-
+// BuildDefaultModelsJSON builds the default local `kodema up` models.json
+// payload combining DefaultLLMProviders() with any extraProviders (which may
+// add custom providers or override built-in ones), conservative wildcard
+// budgets.pricing defaults from DefaultLocalModelPricing(), and matching
+// tenant-scoped gateway secret_rules.
+func BuildDefaultModelsJSON(tenantID string, extraProviders []LLMProviderSpec) ([]byte, []string, error) {
 	merged := DefaultLLMProviders()
 	indexByName := make(map[string]int, len(merged))
 	for i, p := range merged {
@@ -303,6 +331,9 @@ func reconcileModelsFile(
 
 	doc := localModelsFile{
 		Providers: providers,
+		Budgets: &localBudgetsFile{
+			Pricing: DefaultLocalModelPricing(),
+		},
 		SecretRules: []localGatewaySecretRule{{
 			TenantID: tenantID,
 			Names:    secretNames,
@@ -310,9 +341,48 @@ func reconcileModelsFile(
 	}
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
-		return "", nil, fmt.Errorf("marshal %s: %w", modelsFileName, err)
+		return nil, nil, fmt.Errorf("marshal %s: %w", modelsFileName, err)
 	}
-	if err := writeFileAtomic(path, append(data, '\n'), 0o600); err != nil {
+	return append(data, '\n'), providerNames, nil
+}
+
+// reconcileModelsFile writes or removes <state-dir>/models.json for the local
+// stack's server container. When disable is true it removes any stale file and
+// returns an empty path. When customModelsFile is non-empty it validates and
+// copies that file verbatim into stateDir (which is bind-mounted into the
+// server container) without injecting default pricing. Otherwise it emits the
+// built-in providers (openai, anthropic, opencode) merged with any
+// extraProviders, conservative local wildcard budgets.pricing defaults, and
+// matching tenant-scoped gateway secret_rules.
+func reconcileModelsFile(
+	stateDir, tenantID string,
+	disable bool,
+	customModelsFile string,
+	extraProviders []LLMProviderSpec,
+) (string, []string, error) {
+	path := filepath.Join(stateDir, modelsFileName)
+	if disable {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return "", nil, fmt.Errorf("remove %s: %w", modelsFileName, err)
+		}
+		return "", nil, nil
+	}
+	if customPath := strings.TrimSpace(customModelsFile); customPath != "" {
+		data, names, err := readAndValidateCustomModelsFile(customPath)
+		if err != nil {
+			return "", nil, err
+		}
+		if err := writeFileAtomic(path, data, 0o600); err != nil {
+			return "", nil, fmt.Errorf("write %s: %w", modelsFileName, err)
+		}
+		return path, names, nil
+	}
+
+	data, providerNames, err := BuildDefaultModelsJSON(tenantID, extraProviders)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := writeFileAtomic(path, data, 0o600); err != nil {
 		return "", nil, fmt.Errorf("write %s: %w", modelsFileName, err)
 	}
 	return path, providerNames, nil
