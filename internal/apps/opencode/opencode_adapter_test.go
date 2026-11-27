@@ -885,6 +885,8 @@ func TestOpenCodeAdapterConcurrentTurnsRouteViaXOpenCodeSession(t *testing.T) {
 
 	var arrived atomic.Int32
 	bothRunning := make(chan struct{})
+	var checked atomic.Int32
+	bothChecked := make(chan struct{})
 	var sessMu sync.Mutex
 	seenSessions := make([]string, 0, 2)
 
@@ -925,16 +927,30 @@ func TestOpenCodeAdapterConcurrentTurnsRouteViaXOpenCodeSession(t *testing.T) {
 				return resp.StatusCode
 			}
 
+			var checkErr error
 			if status := callProxy(sessionID); status != http.StatusOK {
-				return OpenCodeMessageResponse{}, fmt.Errorf("session-routed proxy status = %d; want 200", status)
+				checkErr = fmt.Errorf("session-routed proxy status = %d; want 200", status)
+			} else if status := callProxy(""); status != http.StatusConflict {
+				// Without X-OpenCode-Session while both turns overlap, proxy must fail closed with 409.
+				checkErr = fmt.Errorf("unattributed concurrent proxy status = %d; want 409", status)
+			} else if status := callProxy("oc-sess-unknown"); status != http.StatusForbidden {
+				// Unknown session must fail closed with 403.
+				checkErr = fmt.Errorf("unknown session proxy status = %d; want 403", status)
 			}
-			// Without X-OpenCode-Session while both turns overlap, proxy must fail closed with 409.
-			if status := callProxy(""); status != http.StatusConflict {
-				return OpenCodeMessageResponse{}, fmt.Errorf("unattributed concurrent proxy status = %d; want 409", status)
+
+			// Departure barrier: keep both turns registered until both finish
+			// overlap assertions so turn 1 cannot unregister before turn 2
+			// observes 409 Conflict.
+			if checked.Add(1) == 2 {
+				close(bothChecked)
 			}
-			// Unknown session must fail closed with 403.
-			if status := callProxy("oc-sess-unknown"); status != http.StatusForbidden {
-				return OpenCodeMessageResponse{}, fmt.Errorf("unknown session proxy status = %d; want 403", status)
+			select {
+			case <-bothChecked:
+			case <-ctx.Done():
+				return OpenCodeMessageResponse{}, ctx.Err()
+			}
+			if checkErr != nil {
+				return OpenCodeMessageResponse{}, checkErr
 			}
 
 			return OpenCodeMessageResponse{Text: "done " + req.TaskID, MessageID: "msg-" + req.TaskID}, nil

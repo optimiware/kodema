@@ -627,10 +627,10 @@ func TestOpenCodeLLMProxySessionHeaderRoutingStrippingAndFailClosed(t *testing.T
 	p, proxyURL := newTestProxy(t, upstream.URL, "session-routing-key", upstream.Client().Transport)
 	clientHTTP := &http.Client{Transport: defaultNoProxyTransport()}
 
-	doReq := func(headers http.Header) (int, string) {
-		req, err := http.NewRequest(http.MethodPost, proxyURL+"/llm/openai/v1/chat/completions", strings.NewReader(`{}`))
+	doReqPath := func(path string, headers http.Header) (int, string) {
+		req, err := http.NewRequest(http.MethodPost, proxyURL+path, strings.NewReader(`{}`))
 		if err != nil {
-			t.Fatalf("NewRequest: %v", err)
+			t.Fatalf("NewRequest(%s): %v", path, err)
 		}
 		req.Header.Set("Authorization", "Bearer session-routing-key")
 		for k, vals := range headers {
@@ -640,11 +640,14 @@ func TestOpenCodeLLMProxySessionHeaderRoutingStrippingAndFailClosed(t *testing.T
 		}
 		resp, err := clientHTTP.Do(req)
 		if err != nil {
-			t.Fatalf("Do: %v", err)
+			t.Fatalf("Do(%s): %v", path, err)
 		}
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		return resp.StatusCode, string(body)
+	}
+	doReq := func(headers http.Header) (int, string) {
+		return doReqPath("/llm/openai/v1/chat/completions", headers)
 	}
 
 	// BindSession before RegisterTurn is a no-op; session must fail closed (403).
@@ -707,14 +710,36 @@ func TestOpenCodeLLMProxySessionHeaderRoutingStrippingAndFailClosed(t *testing.T
 		t.Fatalf("conflicting X-OpenCode-Session vs X-Kodema-* status = %d; want 403 (body=%s)", status, body)
 	}
 
+	// Turn-scoped /turn/{exec}/{action}/llm/* path must also enforce X-OpenCode-Session
+	// fail-closed when the header is present (consistent succeeds, unknown/blank/duplicate/conflicting -> 403).
+	if status, body := doReqPath("/turn/exec-1/act-1/llm/openai/v1/chat/completions", http.Header{
+		"X-OpenCode-Session": []string{"ses-1"},
+	}); status != http.StatusOK {
+		t.Fatalf("consistent /turn path + X-OpenCode-Session status = %d; want 200 (body=%s)", status, body)
+	}
+	for _, tc := range []struct {
+		name    string
+		headers http.Header
+	}{
+		{name: "conflicting session", headers: http.Header{"X-OpenCode-Session": []string{"ses-2"}}},
+		{name: "unknown session", headers: http.Header{"X-OpenCode-Session": []string{"ses-unknown"}}},
+		{name: "blank session", headers: http.Header{"X-OpenCode-Session": []string{"   "}}},
+		{name: "duplicate session", headers: http.Header{"X-OpenCode-Session": []string{"ses-1", "ses-1"}}},
+	} {
+		if status, body := doReqPath("/turn/exec-1/act-1/llm/openai/v1/chat/completions", tc.headers); status != http.StatusForbidden {
+			t.Fatalf("/turn path with %s status = %d; want 403 (body=%s)", tc.name, status, body)
+		}
+	}
+
 	// Verify exact attribution and strict header stripping on every upstream hit.
 	mu.Lock()
-	if len(seenHits) != 3 {
+	if len(seenHits) != 4 {
 		mu.Unlock()
-		t.Fatalf("upstream hit count = %d; want 3", len(seenHits))
+		t.Fatalf("upstream hit count = %d; want 4", len(seenHits))
 	}
 	wantPairs := [][2]string{
 		{"exec-2", "act-2"},
+		{"exec-1", "act-1"},
 		{"exec-1", "act-1"},
 		{"exec-1", "act-1"},
 	}
@@ -739,10 +764,14 @@ func TestOpenCodeLLMProxySessionHeaderRoutingStrippingAndFailClosed(t *testing.T
 		t.Fatalf("active ses-2 after turn 1 cancel status = %d; want 200 (body=%s)", status, body)
 	}
 
-	// Unbinding ses-1 fails closed with 403; unregistering turn 2 also cleans up ses-2 -> 403.
+	// Unbinding ses-1 fails closed with 403 (both on /llm/* and on /turn/*);
+	// unregistering turn 2 also cleans up ses-2 -> 403.
 	unbind1()
 	if status, body := doReq(http.Header{"X-OpenCode-Session": []string{"ses-1"}}); status != http.StatusForbidden {
 		t.Fatalf("unbound ses-1 status = %d; want 403 (body=%s)", status, body)
+	}
+	if status, body := doReqPath("/turn/exec-1/act-1/llm/openai/v1/chat/completions", http.Header{"X-OpenCode-Session": []string{"ses-1"}}); status != http.StatusForbidden {
+		t.Fatalf("/turn path with unbound ses-1 status = %d; want 403 (body=%s)", status, body)
 	}
 	unreg1()
 	unreg2()

@@ -105,7 +105,8 @@ func TestSandboxOpenCodeConfigDisablesLocalTools(t *testing.T) {
 		t.Fatalf("no-key config unexpectedly included apiKey or headers:\n%s", string(noKeyRaw))
 	}
 
-	// Non-conflicting MCP tool allow rules after local tool denies remain valid.
+	// Non-conflicting MCP tool allow rules after local tool denies remain valid,
+	// including inside agents.<name>.permissions.
 	withMCPAllow := `{
 		"$schema": "https://opencode.ai/config.json",
 		"permissions": [
@@ -115,7 +116,15 @@ func TestSandboxOpenCodeConfigDisablesLocalTools(t *testing.T) {
 			{"action": "read", "resource": "*", "effect": "deny"},
 			{"action": "shell", "resource": "*", "effect": "deny"},
 			{"action": "sandbox_*", "resource": "*", "effect": "allow"}
-		]
+		],
+		"agents": {
+			"build": {
+				"model": "kodema/claude-sonnet-4#high",
+				"permissions": [
+					{"action": "sandbox_*", "resource": "*", "effect": "allow"}
+				]
+			}
+		}
 	}`
 	if err := ValidateSandboxOpenCodeConfig([]byte(withMCPAllow)); err != nil {
 		t.Fatalf("ValidateSandboxOpenCodeConfig rejected valid v2 config with sandbox_* allow: %v", err)
@@ -221,6 +230,116 @@ func TestSandboxOpenCodeConfigDisablesLocalTools(t *testing.T) {
 				{"action":"read","resource":"*","effect":"deny"},
 				{"action":"shell","resource":"*","effect":"block"}
 			]}`,
+		},
+		{
+			name: "agent permissions override re-enables shell",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":[{"action":"shell","resource":"*","effect":"allow"}]}}}`,
+		},
+		{
+			name: "agent permissions override narrows shell ask",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":[{"action":"shell","resource":"git status *","effect":"ask"}]}}}`,
+		},
+		{
+			name: "agent permissions wildcard allow weakens top-level denies",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":[{"action":"*","resource":"*","effect":"allow"}]}}}`,
+		},
+		{
+			name: "legacy v1 agent key at top level",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agent":{"build":{}}}`,
+		},
+		{
+			name: "legacy v1 tools inside agent entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"tools":{"bash":true}}}}`,
+		},
+		{
+			name: "legacy v1 permission inside agent entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permission":{"bash":"allow"}}}}`,
+		},
+		{
+			name: "null agents map",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":null}`,
+		},
+		{
+			name: "null agent entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":null}}`,
+		},
+		{
+			name: "null agent permissions",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"agents":{"build":{"permissions":null}}}`,
+		},
+		{
+			name: "null providers map",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"providers":null}`,
+		},
+		{
+			name: "null provider entry",
+			data: `{"permissions":[
+				{"action":"edit","resource":"*","effect":"deny"},
+				{"action":"glob","resource":"*","effect":"deny"},
+				{"action":"grep","resource":"*","effect":"deny"},
+				{"action":"read","resource":"*","effect":"deny"},
+				{"action":"shell","resource":"*","effect":"deny"}
+			],"providers":{"kodema":null}}`,
 		},
 	}
 	for _, tc := range invalidCases {

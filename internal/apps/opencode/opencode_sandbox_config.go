@@ -138,10 +138,11 @@ func GenerateSandboxOpenCodeConfig(cfg OpenCodeSandboxConfig, proxyBaseURL, loca
 
 // ValidateSandboxOpenCodeConfig verifies that an OpenCode v2 `opencode.json`
 // policy document uses the v2 schema (`permissions` array and optional v2
-// `providers` with `settings`/`headers`, rejecting legacy v1 `tools`,
-// `permission`, `provider`, or `options` keys) and denies all required local
-// shell and filesystem permissions (`shell`, `edit`, `read`, `glob`, `grep`)
-// for resource `"*"` with no subsequent overriding allow/ask rule.
+// `agents` and `providers` with `settings`/`headers`, rejecting legacy v1
+// `tools`, `permission`, `provider`, `agent`, or `options` keys) and denies
+// all required local shell and filesystem permissions (`shell`, `edit`,
+// `read`, `glob`, `grep`) for resource `"*"` with no subsequent overriding
+// allow/ask rule (including within any `agents.<name>.permissions` list).
 func ValidateSandboxOpenCodeConfig(data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -150,9 +151,9 @@ func ValidateSandboxOpenCodeConfig(data []byte) error {
 	if raw == nil {
 		return fmt.Errorf("opencode sandbox config must be a JSON object")
 	}
-	for _, legacyKey := range []string{"tools", "permission", "provider"} {
+	for _, legacyKey := range []string{"tools", "permission", "provider", "agent"} {
 		if _, present := raw[legacyKey]; present {
-			return fmt.Errorf("opencode sandbox config uses legacy v1 key %q; use OpenCode v2 permissions/providers schema", legacyKey)
+			return fmt.Errorf("opencode sandbox config uses legacy v1 key %q; use OpenCode v2 permissions/providers/agents schema", legacyKey)
 		}
 	}
 
@@ -167,21 +168,98 @@ func ValidateSandboxOpenCodeConfig(data []byte) error {
 	if len(perms) == 0 {
 		return fmt.Errorf("opencode sandbox config must explicitly deny local tool permissions")
 	}
+	if err := validateOpenCodePermissionRules("permissions", perms); err != nil {
+		return err
+	}
+
+	requiredRules := mapOpenCodeDisabledToolsToPermissions(DefaultSandboxDisabledLocalTools)
+	if err := validateRequiredSandboxDenies("permissions", requiredRules, perms); err != nil {
+		return err
+	}
+
+	if rawAgents, hasAgents := raw["agents"]; hasAgents {
+		var agents map[string]map[string]json.RawMessage
+		if err := json.Unmarshal(rawAgents, &agents); err != nil || agents == nil {
+			return fmt.Errorf("opencode sandbox config agents must be a JSON object")
+		}
+		for agentName, entry := range agents {
+			if entry == nil {
+				return fmt.Errorf("opencode sandbox config agent %q must be a JSON object", agentName)
+			}
+			for _, legacyKey := range []string{"tools", "permission"} {
+				if _, present := entry[legacyKey]; present {
+					return fmt.Errorf("opencode sandbox config agent %q uses legacy v1 key %q; use OpenCode v2 \"permissions\"", agentName, legacyKey)
+				}
+			}
+			if rawAgentPerms, hasPerms := entry["permissions"]; hasPerms {
+				var agentPerms []openCodePermissionRule
+				if err := json.Unmarshal(rawAgentPerms, &agentPerms); err != nil || agentPerms == nil {
+					return fmt.Errorf("opencode sandbox config agent %q permissions must be a JSON array", agentName)
+				}
+				scope := fmt.Sprintf("agents.%s.permissions", agentName)
+				if err := validateOpenCodePermissionRules(scope, agentPerms); err != nil {
+					return err
+				}
+				// OpenCode v2 appends agent permissions after top-level
+				// permissions (last match wins), so evaluate the effective
+				// combined list to prevent agent-level local tool bypasses.
+				combined := make([]openCodePermissionRule, 0, len(perms)+len(agentPerms))
+				combined = append(combined, perms...)
+				combined = append(combined, agentPerms...)
+				if err := validateRequiredSandboxDenies(scope, requiredRules, combined); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if rawProviders, hasProviders := raw["providers"]; hasProviders {
+		var providers map[string]map[string]json.RawMessage
+		if err := json.Unmarshal(rawProviders, &providers); err != nil || providers == nil {
+			return fmt.Errorf("opencode sandbox config providers must be a JSON object")
+		}
+		for name, entry := range providers {
+			if entry == nil {
+				return fmt.Errorf("opencode sandbox config provider %q must be a JSON object", name)
+			}
+			if _, hasLegacyOpts := entry["options"]; hasLegacyOpts {
+				return fmt.Errorf("opencode sandbox config provider %q uses legacy v1 key \"options\"; use OpenCode v2 \"settings\" and \"headers\"", name)
+			}
+			if rawSettings, hasSettings := entry["settings"]; hasSettings {
+				var settings map[string]any
+				if err := json.Unmarshal(rawSettings, &settings); err != nil || settings == nil {
+					return fmt.Errorf("opencode sandbox config provider %q has invalid settings object", name)
+				}
+			}
+			if rawHeaders, hasHeaders := entry["headers"]; hasHeaders {
+				var headers map[string]string
+				if err := json.Unmarshal(rawHeaders, &headers); err != nil || headers == nil {
+					return fmt.Errorf("opencode sandbox config provider %q has invalid headers map", name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateOpenCodePermissionRules(scope string, perms []openCodePermissionRule) error {
 	for i, rule := range perms {
 		if strings.TrimSpace(rule.Action) == "" {
-			return fmt.Errorf("opencode sandbox config permissions[%d] has empty action", i)
+			return fmt.Errorf("opencode sandbox config %s[%d] has empty action", scope, i)
 		}
 		if strings.TrimSpace(rule.Resource) == "" {
-			return fmt.Errorf("opencode sandbox config permissions[%d] has empty resource", i)
+			return fmt.Errorf("opencode sandbox config %s[%d] has empty resource", scope, i)
 		}
 		switch rule.Effect {
 		case "allow", "deny", "ask":
 		default:
-			return fmt.Errorf("opencode sandbox config permissions[%d] has invalid effect %q", i, rule.Effect)
+			return fmt.Errorf("opencode sandbox config %s[%d] has invalid effect %q", scope, i, rule.Effect)
 		}
 	}
+	return nil
+}
 
-	requiredRules := mapOpenCodeDisabledToolsToPermissions(DefaultSandboxDisabledLocalTools)
+func validateRequiredSandboxDenies(scope string, requiredRules, perms []openCodePermissionRule) error {
 	for _, reqRule := range requiredRules {
 		deniedAll := false
 		for _, rule := range perms {
@@ -198,31 +276,7 @@ func ValidateSandboxOpenCodeConfig(data []byte) error {
 			}
 		}
 		if !deniedAll {
-			return fmt.Errorf("opencode sandbox config must deny local tool permission %q for resource \"*\" with no overriding allow/ask rule", reqRule.Action)
-		}
-	}
-
-	if rawProviders, hasProviders := raw["providers"]; hasProviders {
-		var providers map[string]map[string]json.RawMessage
-		if err := json.Unmarshal(rawProviders, &providers); err != nil {
-			return fmt.Errorf("decode opencode sandbox config providers: %w", err)
-		}
-		for name, entry := range providers {
-			if _, hasLegacyOpts := entry["options"]; hasLegacyOpts {
-				return fmt.Errorf("opencode sandbox config provider %q uses legacy v1 key \"options\"; use OpenCode v2 \"settings\" and \"headers\"", name)
-			}
-			if rawSettings, hasSettings := entry["settings"]; hasSettings {
-				var settings map[string]any
-				if err := json.Unmarshal(rawSettings, &settings); err != nil || settings == nil {
-					return fmt.Errorf("opencode sandbox config provider %q has invalid settings object", name)
-				}
-			}
-			if rawHeaders, hasHeaders := entry["headers"]; hasHeaders {
-				var headers map[string]string
-				if err := json.Unmarshal(rawHeaders, &headers); err != nil || headers == nil {
-					return fmt.Errorf("opencode sandbox config provider %q has invalid headers map", name)
-				}
-			}
+			return fmt.Errorf("opencode sandbox config (%s) must deny local tool permission %q for resource \"*\" with no overriding allow/ask rule", scope, reqRule.Action)
 		}
 	}
 	return nil

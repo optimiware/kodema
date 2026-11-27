@@ -448,6 +448,8 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	sessVals := r.Header.Values("X-OpenCode-Session")
+
 	// Explicit path-scoped routing: /turn/{exec}/{action}/llm/{provider}/...
 	if strings.HasPrefix(path, "/turn/") {
 		rest := strings.TrimPrefix(path, "/turn/")
@@ -469,6 +471,11 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 		if !ok {
 			return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn for LLM proxy request"
 		}
+		if len(sessVals) > 0 {
+			if status, code, msg := p.verifySessionBindingHeader(sessVals, binding, "X-OpenCode-Session header does not match turn-scoped LLM proxy path"); status != 0 {
+				return nil, "", status, code, msg
+			}
+		}
 		return binding, llmPath, 0, "", ""
 	}
 
@@ -480,7 +487,6 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 	// attribution headers always fail closed).
 	execVals := r.Header.Values("X-Kodema-Execution")
 	actVals := r.Header.Values("X-Kodema-Action")
-	sessVals := r.Header.Values("X-OpenCode-Session")
 	if len(execVals) > 0 || len(actVals) > 0 {
 		execHdr, okExec := singleTrimmedProxyHeader(execVals)
 		actHdr, okAct := singleTrimmedProxyHeader(actVals)
@@ -492,13 +498,8 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 			return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn matches attribution headers"
 		}
 		if len(sessVals) > 0 {
-			sessHdr, okSess := singleTrimmedProxyHeader(sessVals)
-			if !okSess {
-				return nil, "", http.StatusForbidden, api.CodeForbidden, "explicit LLM proxy session attribution requires a single non-empty X-OpenCode-Session header"
-			}
-			sessBinding, okSessBind := p.sessions[sessHdr]
-			if !okSessBind || sessBinding != binding {
-				return nil, "", http.StatusForbidden, api.CodeForbidden, "X-OpenCode-Session header does not match active attribution headers"
+			if status, code, msg := p.verifySessionBindingHeader(sessVals, binding, "X-OpenCode-Session header does not match active attribution headers"); status != 0 {
+				return nil, "", status, code, msg
 			}
 		}
 		return binding, path, 0, "", ""
@@ -528,6 +529,18 @@ func (p *OpenCodeLLMProxy) resolveTurnAndPath(r *http.Request) (*proxyTurnBindin
 		return nil, "", http.StatusConflict, api.CodeVersionConflict, "ambiguous LLM proxy request: multiple active Kodema turns require X-OpenCode-Session, explicit turn routing, or attribution headers"
 	}
 	return nil, "", http.StatusForbidden, api.CodeForbidden, "no active attributed Kodema turn for LLM proxy request"
+}
+
+func (p *OpenCodeLLMProxy) verifySessionBindingHeader(sessVals []string, expected *proxyTurnBinding, mismatchMsg string) (int, string, string) {
+	sessHdr, okSess := singleTrimmedProxyHeader(sessVals)
+	if !okSess {
+		return http.StatusForbidden, api.CodeForbidden, "explicit LLM proxy session attribution requires a single non-empty X-OpenCode-Session header"
+	}
+	sessBinding, okSessBind := p.sessions[sessHdr]
+	if !okSessBind || sessBinding != expected {
+		return http.StatusForbidden, api.CodeForbidden, mismatchMsg
+	}
+	return 0, "", ""
 }
 
 func hasUnsafeProxyPath(rawPath string) bool {
