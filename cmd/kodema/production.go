@@ -143,6 +143,10 @@ func buildProduction(options serverOptions, getenv productionEnv, kube driverkub
 	if err != nil {
 		return productionBuild{}, err
 	}
+	serviceMaxTTL, err := resolveServiceCredentialMaxTTL(options, getenv)
+	if err != nil {
+		return productionBuild{}, err
+	}
 	gitStorageRoot, err := resolveGitStorageRoot(options, getenv)
 	if err != nil {
 		return productionBuild{}, err
@@ -247,19 +251,20 @@ func buildProduction(options serverOptions, getenv productionEnv, kube driverkub
 		return productionBuild{}, err
 	}
 	config := shellapp.Config{
-		Profile:        shellapp.ProfileProduction,
-		Installation:   installationConfig,
-		InstallationID: options.InstallationID,
-		DataDir:        options.DataDir,
-		MCPPath:        options.MCPPath,
-		ServerVersion:  version,
-		LoopInterval:   loopInterval,
-		GitStorageRoot: gitStorageRoot,
-		GitCompanion:   gitCompanion,
-		SecretRules:    secretRules,
-		Models:         models,
-		ToolProxy:      toolProxy,
-		NATSAuth:       natsAuth,
+		Profile:                 shellapp.ProfileProduction,
+		Installation:            installationConfig,
+		InstallationID:          options.InstallationID,
+		DataDir:                 options.DataDir,
+		MCPPath:                 options.MCPPath,
+		ServerVersion:           version,
+		LoopInterval:            loopInterval,
+		ServiceCredentialMaxTTL: serviceMaxTTL,
+		GitStorageRoot:          gitStorageRoot,
+		GitCompanion:            gitCompanion,
+		SecretRules:             secretRules,
+		Models:                  models,
+		ToolProxy:               toolProxy,
+		NATSAuth:                natsAuth,
 		Production: &shellapp.ProductionConfig{
 			RuntimeCloser:    func(context.Context) error { return nil },
 			KMS:              kms,

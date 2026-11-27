@@ -129,13 +129,21 @@ a human `role/reviewer` gate:
 <details>
 <summary>Launch command for Option 1 worktree service (OpenCode v2)</summary>
 
-Start `opencode serve --hostname 127.0.0.1 --port 4096` with isolated
-`XDG_DATA_HOME` / `XDG_CONFIG_HOME` (so `~/.local/share/opencode/opencode.db`
-credentials never collide with the local proxy key) and the server password
-from `/var/run/kodema/opencode-server.password`, then launch the Kodema
-service:
+Provision the service account and credential (`0600` atomic write, omitting
+plaintext from stdout), start `opencode serve --hostname 127.0.0.1 --port 4096`
+with isolated `XDG_DATA_HOME` / `XDG_CONFIG_HOME` (so
+`~/.local/share/opencode/opencode.db` credentials never collide with the local
+proxy key) and the server password from `/var/run/kodema/opencode-server.password`,
+then launch the Kodema service:
 
 ```sh
+kodema service create opencode-shop --project project-local
+kodema service credential issue opencode-shop \
+  --project project-local \
+  --ttl 30d \
+  --rotate-if-present \
+  --out /var/run/kodema/opencode-shop-cred
+
 XDG_DATA_HOME=/var/lib/kodema/opencode-shop/xdg-data \
 XDG_CONFIG_HOME=/var/lib/kodema/opencode-shop/xdg-config \
   opencode serve --hostname 127.0.0.1 --port 4096
@@ -200,11 +208,16 @@ execution (sandboxes):
 <details>
 <summary>Launch command for Option 2 sandbox mode (OpenCode v2)</summary>
 
-Start `opencode serve --hostname 127.0.0.1 --port 4096` with the server
-password from `/var/run/kodema/opencode-server.password`, then launch the
-Kodema service:
+Provision the service account with `--role engineer` and issue its credential (`0600` atomic write, omitting plaintext from stdout), start `opencode serve --hostname 127.0.0.1 --port 4096` with the server password from `/var/run/kodema/opencode-server.password`, then launch the Kodema service:
 
 ```sh
+kodema service create opencode-shop --project project-local --role engineer
+kodema service credential issue opencode-shop \
+  --project project-local \
+  --ttl 30d \
+  --rotate-if-present \
+  --out /var/run/kodema/opencode-shop-cred
+
 kodema services --kind opencode \
   --mode sandbox \
   --service opencode-shop \

@@ -85,6 +85,10 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 	if err != nil {
 		return productionBuild{}, err
 	}
+	serviceMaxTTL, err := resolveServiceCredentialMaxTTL(options, getenv)
+	if err != nil {
+		return productionBuild{}, err
+	}
 	gitStorageRoot, err := resolveGitStorageRoot(options, getenv)
 	if err != nil {
 		return productionBuild{}, err
@@ -222,23 +226,24 @@ func buildTestProfileWithKube(options serverOptions, getenv productionEnv, kube 
 	}
 
 	config := shellapp.Config{
-		Profile:              shellapp.ProfileTest,
-		Installation:         installationConfig,
-		InstallationID:       options.InstallationID,
-		DataDir:              options.DataDir,
-		MCPPath:              options.MCPPath,
-		ServerVersion:        version,
-		LoopInterval:         loopInterval,
-		NATSAuth:             natsAuth,
-		GitStorageRoot:       gitStorageRoot,
-		GitCompanion:         gitCompanion,
-		DefaultActionTimeout: shellapp.DefaultActionTimeout,
-		Discovery:            discovery,
-		SecretRules:          secretRules,
-		Models:               models,
-		WorkloadURL:          workloadURL,
-		ToolProxy:            toolProxy,
-		Test:                 testConfig,
+		Profile:                 shellapp.ProfileTest,
+		Installation:            installationConfig,
+		InstallationID:          options.InstallationID,
+		DataDir:                 options.DataDir,
+		MCPPath:                 options.MCPPath,
+		ServerVersion:           version,
+		LoopInterval:            loopInterval,
+		ServiceCredentialMaxTTL: serviceMaxTTL,
+		NATSAuth:                natsAuth,
+		GitStorageRoot:          gitStorageRoot,
+		GitCompanion:            gitCompanion,
+		DefaultActionTimeout:    shellapp.DefaultActionTimeout,
+		Discovery:               discovery,
+		SecretRules:             secretRules,
+		Models:                  models,
+		WorkloadURL:             workloadURL,
+		ToolProxy:               toolProxy,
+		Test:                    testConfig,
 	}
 
 	workloadResources, err := resolveTestWorkloadResources(options, getenv)

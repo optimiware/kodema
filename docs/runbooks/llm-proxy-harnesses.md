@@ -219,6 +219,17 @@ Before dialing upstream, Kodema verifies that the service account is enabled in 
 
 Option 1 runs a persistent per-project OpenCode service (`kodema services --kind opencode --mode worktree`, the default mode) against an OpenCode v2 server (`opencode serve`, e.g. `v2.3.2+`, authenticated via HTTP Basic Auth `opencode:<password>` using `OPENCODE_PASSWORD`) that answers explicit `request: service/<id>` pipeline actions using durable per-task sessions and hardened local Git worktrees.
 
+Create the project service account and write its `kodsvc.` credential atomically (`0600`, without echoing the plaintext token to stdout; service credentials allow up to `30d` by default, configurable via `--service-credential-max-ttl` / `KODEMA_SERVICE_CREDENTIAL_MAX_TTL`):
+
+```sh
+kodema service create opencode-shop --project project-local
+kodema service credential issue opencode-shop \
+  --project project-local \
+  --ttl 30d \
+  --rotate-if-present \
+  --out /path/to/opencode-shop.token
+```
+
 Run `opencode serve` with isolated `XDG_DATA_HOME` and `XDG_CONFIG_HOME` directories so saved credentials in `~/.local/share/opencode/opencode.db` never override `settings.apiKey`, send a conflicting second auth header (`Authorization` vs `X-Api-Key`), or inherit built-in `opencode` catalog overrides:
 
 ```sh
@@ -298,6 +309,13 @@ Option 2 separates LLM reasoning and persistent sessions (the OpenCode service) 
 2. **OpenCode service (`--mode sandbox`):** Disables all built-in local shell/filesystem tools (`bash`, `write`, `edit`, `read`, `glob`, `grep`) in OpenCode config and attaches ephemeral per-task sandboxes created through Kodema's public API (`KodemaExecutionSandboxManager`):
 
 ```sh
+kodema service create opencode-shop --project project-local --role engineer
+kodema service credential issue opencode-shop \
+  --project project-local \
+  --ttl 30d \
+  --rotate-if-present \
+  --out /path/to/opencode-shop.token
+
 kodema services --kind opencode \
   --mode sandbox \
   --service opencode-shop \

@@ -1442,10 +1442,32 @@ func TestProvisionCreatesWhatIsMissingAndRenewsTheGitCredential(t *testing.T) {
 		case "service.list":
 			body = `{"services":[{"service_id":"git","state":"enabled","roles":["viewer"],"version":3}]}`
 		case "service.credential.rotate":
+			var env api.Request
+			if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+				t.Errorf("decode service.credential.rotate envelope: %v", err)
+			}
+			var req api.ServiceCredentialRotateRequest
+			if err := json.Unmarshal(env.Input, &req); err != nil {
+				t.Errorf("decode service.credential.rotate input: %v", err)
+			}
+			if want := int(gitCredentialTTL / time.Second); req.TTLSeconds != want || req.TTLSeconds <= int((8*time.Hour)/time.Second) {
+				t.Errorf("service.credential.rotate ttl_seconds = %d; want %d (> 8h)", req.TTLSeconds, want)
+			}
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"code":"unauthenticated","message":"no current service credential to rotate"}`))
 			return
 		case "service.credential.issue":
+			var env api.Request
+			if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+				t.Errorf("decode service.credential.issue envelope: %v", err)
+			}
+			var req api.ServiceCredentialIssueRequest
+			if err := json.Unmarshal(env.Input, &req); err != nil {
+				t.Errorf("decode service.credential.issue input: %v", err)
+			}
+			if want := int(gitCredentialTTL / time.Second); req.TTLSeconds != want || req.TTLSeconds <= int((8*time.Hour)/time.Second) {
+				t.Errorf("service.credential.issue ttl_seconds = %d; want %d (> 8h)", req.TTLSeconds, want)
+			}
 			body = `{"state":"current","version":4,"token":"kodsvc.issued"}`
 		}
 		_, _ = fmt.Fprintf(w, `{"operation":%q,"body":%s}`, route.Operation, body)

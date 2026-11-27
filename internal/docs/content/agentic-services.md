@@ -16,6 +16,17 @@ An enabled project service account can call Kodema's streaming LLM proxy (`/llm/
 
 `kodema services --kind opencode` defaults to `--mode worktree`: a long-lived per-project OpenCode service that answers explicit `request: service/<id>` actions in pipelines while keeping persistent per-task sessions and isolated local Git worktrees.
 
+Provision the service account and write its `kodsvc.` credential atomically with `0600` permissions (service credentials accept up to `30d` by default, configurable via `--service-credential-max-ttl` / `KODEMA_SERVICE_CREDENTIAL_MAX_TTL`; `--out` omits the plaintext token from stdout and `--rotate-if-present` rotates an existing credential in place):
+
+```sh
+kodema service create opencode-shop --project project-local
+kodema service credential issue opencode-shop \
+  --project project-local \
+  --ttl 30d \
+  --rotate-if-present \
+  --out /path/to/opencode-shop.token
+```
+
 Start `opencode serve` with `OPENCODE_PASSWORD` set from `/path/to/opencode.password` and isolated `XDG_DATA_HOME` / `XDG_CONFIG_HOME` directories so saved personal credentials in `~/.local/share/opencode/opencode.db` never collide with the local loopback proxy's `Authorization` / `X-Api-Key` header or override provider `baseURL` settings:
 
 ```sh
@@ -104,6 +115,13 @@ Option 2 separates long-lived LLM reasoning and session state (the OpenCode serv
 2. **OpenCode service (`--mode sandbox`):** Disables all built-in local shell and filesystem tools (`bash`, `write`, `edit`, `read`, `glob`, `grep`) in OpenCode config and dynamically spawns ephemeral per-task toolchain sandboxes via Kodema's public API (`KodemaExecutionSandboxManager`) using stock upstream images (for example `golang:1.24`, `node:22`, `python:3.12`):
 
 ```sh
+kodema service create opencode-shop --project project-local --role engineer
+kodema service credential issue opencode-shop \
+  --project project-local \
+  --ttl 30d \
+  --rotate-if-present \
+  --out /path/to/opencode-shop.token
+
 kodema services --kind opencode \
   --mode sandbox \
   --service opencode-shop \

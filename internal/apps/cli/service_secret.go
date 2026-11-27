@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/internal/fault"
 )
 
-const defaultServiceCredentialTTLSeconds = 3600
+const defaultServiceCredentialTTLSeconds = 86400
 
 // runService dispatches `kodema service <create|list|update|enable|disable|credential>`.
 func runService(ctx context.Context, config Config, args []string, ports Ports, deps CommandDeps) int {
@@ -252,7 +254,7 @@ func runServiceUpdate(ctx context.Context, config Config, args []string, ports P
 		return failure(ports.Err, fmt.Errorf("no public client is configured"))
 	}
 	if expectedVer == nil {
-		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, serviceID, "service update")
+		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, false, serviceID, "service update")
 		if code != ExitSuccess {
 			return code
 		}
@@ -340,7 +342,7 @@ func runServiceToggle(ctx context.Context, config Config, args []string, ports P
 		return failure(ports.Err, fmt.Errorf("no public client is configured"))
 	}
 	if expectedVer == nil {
-		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, serviceID, "service "+subcmd)
+		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, false, serviceID, "service "+subcmd)
 		if code != ExitSuccess {
 			return code
 		}
@@ -412,27 +414,43 @@ func runServiceCredentialIssueOrRotate(ctx context.Context, config Config, args 
 		return runHelp(ports.Out, ports.Err, []string{"service", "credential", subcmd})
 	}
 	var (
-		projectFlag        string
-		ttlFlag            string
-		ttlSecondsFlag     string
-		expectedVerRaw     string
-		idempotencyKeyFlag string
-		outputFlag         string
+		projectFlag         string
+		tenantWideFlag      bool
+		ttlFlag             string
+		ttlSecondsFlag      string
+		outFlag             string
+		rotateIfPresentFlag bool
+		expectedVerRaw      string
+		idempotencyKeyFlag  string
+		outputFlag          string
 	)
 	spec := newArgSpec()
 	spec.stringFlag(&projectFlag, "--project", "-p")
+	spec.boolFlag(&tenantWideFlag, "--tenant-wide")
 	spec.stringFlag(&ttlFlag, "--ttl")
 	spec.stringFlag(&ttlSecondsFlag, "--ttl-seconds")
+	spec.stringFlag(&outFlag, "--out")
+	spec.boolFlag(&rotateIfPresentFlag, "--rotate-if-present")
 	spec.stringFlag(&expectedVerRaw, "--expected-version")
 	spec.stringFlag(&idempotencyKeyFlag, "--idempotency-key")
 	spec.stringFlag(&outputFlag, "--output")
-	positionals, _, err := spec.parse(args)
+	positionals, seen, err := spec.parse(args)
 	if err != nil {
 		return usage(ports.Err, err.Error())
 	}
 	if len(positionals) != 1 || strings.TrimSpace(positionals[0]) == "" {
 		return usage(ports.Err, fmt.Sprintf("service credential %s requires <service-id>", subcmd))
 	}
+	if rotate && rotateIfPresentFlag {
+		return usage(ports.Err, "--rotate-if-present is only supported on service credential issue")
+	}
+	if tenantWideFlag && (seen["--project"] || deps.ExplicitProject) {
+		return usage(ports.Err, "--tenant-wide cannot be combined with --project")
+	}
+	if seen["--out"] && strings.TrimSpace(outFlag) == "" {
+		return usage(ports.Err, "--out requires a non-empty file path")
+	}
+	outPath := strings.TrimSpace(outFlag)
 	serviceID := strings.TrimSpace(positionals[0])
 	ttlSeconds, err := parseTTLSeconds(ttlFlag, ttlSecondsFlag)
 	if err != nil {
@@ -459,8 +477,11 @@ func runServiceCredentialIssueOrRotate(ctx context.Context, config Config, args 
 	if ports.Client == nil {
 		return failure(ports.Err, fmt.Errorf("no public client is configured"))
 	}
+	if outPath != "" && ports.Files == nil {
+		return failure(ports.Err, fmt.Errorf("no filesystem is configured"))
+	}
 	if expectedVer == nil {
-		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, serviceID, "service credential "+subcmd)
+		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, tenantWideFlag, serviceID, "service credential "+subcmd)
 		if code != ExitSuccess {
 			return code
 		}
@@ -470,24 +491,70 @@ func runServiceCredentialIssueOrRotate(ctx context.Context, config Config, args 
 	if err != nil {
 		return failure(ports.Err, err)
 	}
-	key, err := makeIdempotencyKey(idempotencyKeyFlag, op, deps.Login.Random)
-	if err != nil {
-		return failure(ports.Err, err)
+	buildInvocation := func(operation string) (api.Invocation, int) {
+		key, err := makeIdempotencyKey(idempotencyKeyFlag, operation, deps.Login.Random)
+		if err != nil {
+			return api.Invocation{}, failure(ports.Err, err)
+		}
+		invocation := api.Invocation{
+			Operation: operation,
+			Request: api.Request{
+				Input:           input,
+				ExpectedVersion: expectedVer,
+				IdempotencyKey:  key,
+			},
+		}
+		if err := invocation.Validate(); err != nil {
+			return api.Invocation{}, usage(ports.Err, publicMessage(err))
+		}
+		return invocation, ExitSuccess
 	}
-	invocation := api.Invocation{
-		Operation: op,
-		Request: api.Request{
-			Input:           input,
-			ExpectedVersion: expectedVer,
-			IdempotencyKey:  key,
-		},
-	}
-	if err := invocation.Validate(); err != nil {
-		return usage(ports.Err, publicMessage(err))
+	invocation, code := buildInvocation(op)
+	if code != ExitSuccess {
+		return code
 	}
 	result, err := ports.Client.Invoke(ctx, invocation)
+	if err != nil && !rotate && rotateIfPresentFlag && isCredentialAlreadyPresent(err) {
+		rotateInv, rotateCode := buildInvocation("service.credential.rotate")
+		if rotateCode != ExitSuccess {
+			return rotateCode
+		}
+		result, err = ports.Client.Invoke(ctx, rotateInv)
+	}
 	if err != nil {
 		return failure(ports.Err, err)
+	}
+	if outPath != "" {
+		var issued api.ServiceCredentialIssueResult
+		if err := json.Unmarshal(result.Body, &issued); err != nil {
+			return failure(ports.Err, fmt.Errorf("service credential %s returned an unreadable response", subcmd))
+		}
+		if issued.Token == nil || *issued.Token == "" {
+			return failure(ports.Err, fmt.Errorf("service credential %s returned no token to write to %q", subcmd, outPath))
+		}
+		if err := ports.Files.ReplaceFile(outPath, []byte(*issued.Token+"\n"), 0o600); err != nil {
+			return failure(ports.Err, fmt.Errorf("write %q: %w", outPath, err))
+		}
+		if format == OutputJSON {
+			redactedBody, err := json.Marshal(struct {
+				State   string `json:"state"`
+				Version uint64 `json:"version"`
+				Out     string `json:"out"`
+			}{
+				State:   issued.State,
+				Version: issued.Version,
+				Out:     outPath,
+			})
+			if err != nil {
+				return failure(ports.Err, err)
+			}
+			if err := renderResult(ports.Out, OutputJSON, api.Result{Operation: result.Operation, Body: redactedBody}); err != nil {
+				return failure(ports.Err, err)
+			}
+			return ExitSuccess
+		}
+		fmt.Fprintf(ports.Out, "service_id\t%s\nstate\t%s\nversion\t%d\nout\t%s\n", serviceID, orDash(issued.State), issued.Version, outPath)
+		return ExitSuccess
 	}
 	if format == OutputJSON {
 		if err := renderResult(ports.Out, OutputJSON, result); err != nil {
@@ -512,21 +579,26 @@ func runServiceCredentialRevoke(ctx context.Context, config Config, args []strin
 	}
 	var (
 		projectFlag        string
+		tenantWideFlag     bool
 		expectedVerRaw     string
 		idempotencyKeyFlag string
 		outputFlag         string
 	)
 	spec := newArgSpec()
 	spec.stringFlag(&projectFlag, "--project", "-p")
+	spec.boolFlag(&tenantWideFlag, "--tenant-wide")
 	spec.stringFlag(&expectedVerRaw, "--expected-version")
 	spec.stringFlag(&idempotencyKeyFlag, "--idempotency-key")
 	spec.stringFlag(&outputFlag, "--output")
-	positionals, _, err := spec.parse(args)
+	positionals, seen, err := spec.parse(args)
 	if err != nil {
 		return usage(ports.Err, err.Error())
 	}
 	if len(positionals) != 1 || strings.TrimSpace(positionals[0]) == "" {
 		return usage(ports.Err, "service credential revoke requires <service-id>")
+	}
+	if tenantWideFlag && (seen["--project"] || deps.ExplicitProject) {
+		return usage(ports.Err, "--tenant-wide cannot be combined with --project")
 	}
 	serviceID := strings.TrimSpace(positionals[0])
 	expectedVer, err := parsePositiveVersion(expectedVerRaw, "--expected-version")
@@ -548,7 +620,7 @@ func runServiceCredentialRevoke(ctx context.Context, config Config, args []strin
 		return failure(ports.Err, fmt.Errorf("no public client is configured"))
 	}
 	if expectedVer == nil {
-		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, serviceID, "service credential revoke")
+		ver, code := lookupServiceVersion(ctx, config, ports, deps, projectFlag, tenantWideFlag, serviceID, "service credential revoke")
 		if code != ExitSuccess {
 			return code
 		}
@@ -593,6 +665,14 @@ func runServiceCredentialRevoke(ctx context.Context, config Config, args []strin
 	return ExitSuccess
 }
 
+func isCredentialAlreadyPresent(err error) bool {
+	class, ok := fault.ClassOf(err)
+	if !ok || class != fault.InvalidInput {
+		return false
+	}
+	return strings.Contains(strings.ToLower(publicMessage(err)), "already has a current credential")
+}
+
 func parseTTLSeconds(ttlFlag, ttlSecondsFlag string) (int, error) {
 	ttlFlag = strings.TrimSpace(ttlFlag)
 	ttlSecondsFlag = strings.TrimSpace(ttlSecondsFlag)
@@ -613,13 +693,60 @@ func parseTTLSeconds(ttlFlag, ttlSecondsFlag string) (int, error) {
 			}
 			return secs, nil
 		}
-		dur, err := time.ParseDuration(ttlFlag)
+		dur, err := parseTTLDuration(ttlFlag)
 		if err != nil || dur < time.Second || dur%time.Second != 0 {
-			return 0, fmt.Errorf("--ttl %q must be a positive duration in whole seconds (e.g. 1h, 3600s, or 3600)", ttlFlag)
+			return 0, fmt.Errorf("--ttl %q must be a positive duration in whole seconds (e.g. 24h, 7d, 30d, 3600s, or 86400)", ttlFlag)
 		}
-		return int(dur / time.Second), nil
+		secs := int64(dur / time.Second)
+		if secs > math.MaxInt {
+			return 0, fmt.Errorf("--ttl %q exceeds maximum supported duration", ttlFlag)
+		}
+		return int(secs), nil
 	}
 	return defaultServiceCredentialTTLSeconds, nil
+}
+
+// parseTTLDuration parses a Go duration or day-prefixed duration such as "7d",
+// "30d", or "1d12h".
+func parseTTLDuration(raw string) (time.Duration, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	if idx := strings.IndexByte(s, 'd'); idx >= 0 {
+		if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
+			return 0, fmt.Errorf("invalid duration")
+		}
+		dayPart := s[:idx]
+		rest := s[idx+1:]
+		if dayPart == "" {
+			return 0, fmt.Errorf("invalid duration")
+		}
+		days, err := strconv.ParseInt(dayPart, 10, 64)
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("invalid duration")
+		}
+		const maxDays = math.MaxInt64 / int64(24*time.Hour)
+		if days > maxDays {
+			return 0, fmt.Errorf("duration overflows")
+		}
+		total := time.Duration(days) * 24 * time.Hour
+		if rest != "" {
+			if strings.HasPrefix(rest, "-") || strings.HasPrefix(rest, "+") {
+				return 0, fmt.Errorf("invalid duration")
+			}
+			sub, err := time.ParseDuration(rest)
+			if err != nil || sub < 0 {
+				return 0, fmt.Errorf("invalid duration")
+			}
+			if int64(sub) > math.MaxInt64-int64(total) {
+				return 0, fmt.Errorf("duration overflows")
+			}
+			total += sub
+		}
+		return total, nil
+	}
+	return time.ParseDuration(s)
 }
 
 func fetchAllServices(ctx context.Context, ports Ports, projectID string) ([]api.ServiceSummaryView, json.RawMessage, int, error) {
@@ -637,10 +764,13 @@ func fetchAllServices(ctx context.Context, ports Ports, projectID string) ([]api
 	)
 }
 
-func lookupServiceVersion(ctx context.Context, config Config, ports Ports, deps CommandDeps, projectFlag, serviceID, label string) (uint64, int) {
-	projectID := resolveProject(projectFlag, config, deps)
-	if projectID == "" {
-		return 0, usage(ports.Err, fmt.Sprintf("%s requires --expected-version <n> or --project <id> / KODEMA_PROJECT to look up version", label))
+func lookupServiceVersion(ctx context.Context, config Config, ports Ports, deps CommandDeps, projectFlag string, tenantWide bool, serviceID, label string) (uint64, int) {
+	var projectID string
+	if !tenantWide {
+		projectID = resolveProject(projectFlag, config, deps)
+		if projectID == "" {
+			return 0, usage(ports.Err, fmt.Sprintf("%s requires --expected-version <n>, --project <id> / KODEMA_PROJECT, or --tenant-wide to look up version", label))
+		}
 	}
 	services, _, _, err := fetchAllServices(ctx, ports, projectID)
 	if err != nil {
@@ -653,6 +783,9 @@ func lookupServiceVersion(ctx context.Context, config Config, ports Ports, deps 
 			}
 			return svc.Version, ExitSuccess
 		}
+	}
+	if tenantWide {
+		return 0, failure(ports.Err, fmt.Errorf("service %q not found in tenant", serviceID))
 	}
 	return 0, failure(ports.Err, fmt.Errorf("service %q not found in project %q", serviceID, projectID))
 }

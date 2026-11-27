@@ -7,9 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/optimiware/kodema/internal/control/identity"
 	"github.com/optimiware/kodema/internal/control/secret"
 	"github.com/optimiware/kodema/internal/control/tenancy"
+	"github.com/optimiware/kodema/internal/control/token"
 	"github.com/optimiware/kodema/internal/id"
 	"github.com/optimiware/kodema/internal/installation"
 	shellapp "github.com/optimiware/kodema/internal/server"
@@ -99,6 +102,10 @@ type serverOptions struct {
 	// selects the profile default (one second); the value is bounded by
 	// resolvedLoopInterval before any adapter is built.
 	LoopInterval time.Duration
+	// ServiceCredentialMaxTTL optionally overrides the maximum TTL for issued
+	// or rotated `kodsvc.` service credentials (default 30d). Zero selects the
+	// default; execution credentials (`kodex.`) stay capped at 8h per S05.
+	ServiceCredentialMaxTTL time.Duration
 	// GitStorageRoot is the mounted tenant Git storage root. When set the
 	// durable profiles reconcile retained-commit keep refs for every
 	// repository under each tenant directory of this root. An empty value
@@ -208,6 +215,11 @@ func applyServerEnv(options serverOptions) (serverOptions, error) {
 		return serverOptions{}, err
 	}
 	options.LoopInterval = interval
+	serviceMaxTTL, err := envDurationWithDaysStrict("KODEMA_SERVICE_CREDENTIAL_MAX_TTL", options.ServiceCredentialMaxTTL)
+	if err != nil {
+		return serverOptions{}, err
+	}
+	options.ServiceCredentialMaxTTL = serviceMaxTTL
 	if tokens := envList("KODEMA_DEV_TOKEN"); len(tokens) > 0 {
 		options.DevTokens = tokens
 	}
@@ -278,35 +290,135 @@ func envDurationStrict(name string, fallback time.Duration) (time.Duration, erro
 	return parsed, nil
 }
 
+// envDurationWithDaysStrict reads one optional positive duration setting
+// accepting Go durations or day-prefixed durations (e.g. "24h", "7d", "30d").
+// The diagnostic names the setting, never its value.
+func envDurationWithDaysStrict(name string, fallback time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := parseDurationWithDays(value)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration such as 24h, 7d, or 30d", name)
+	}
+	return parsed, nil
+}
+
+// parseDurationWithDays parses a Go duration or a day-prefixed duration such as
+// "7d", "30d", or "1d12h".
+func parseDurationWithDays(raw string) (time.Duration, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, fmt.Errorf("duration is empty")
+	}
+	if idx := strings.IndexByte(s, 'd'); idx >= 0 {
+		if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
+			return 0, fmt.Errorf("invalid duration")
+		}
+		dayPart := s[:idx]
+		rest := s[idx+1:]
+		if dayPart == "" {
+			return 0, fmt.Errorf("invalid duration")
+		}
+		days, err := strconv.ParseInt(dayPart, 10, 64)
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("invalid duration")
+		}
+		const maxDays = math.MaxInt64 / int64(24*time.Hour)
+		if days > maxDays {
+			return 0, fmt.Errorf("duration overflows")
+		}
+		total := time.Duration(days) * 24 * time.Hour
+		if rest != "" {
+			if strings.HasPrefix(rest, "-") || strings.HasPrefix(rest, "+") {
+				return 0, fmt.Errorf("invalid duration")
+			}
+			sub, err := time.ParseDuration(rest)
+			if err != nil || sub < 0 {
+				return 0, fmt.Errorf("invalid duration")
+			}
+			if int64(sub) > math.MaxInt64-int64(total) {
+				return 0, fmt.Errorf("duration overflows")
+			}
+			total += sub
+		}
+		return total, nil
+	}
+	return time.ParseDuration(s)
+}
+
+// dayDurationFlag parses a positive Go or day-prefixed duration for server flags.
+type dayDurationFlag struct {
+	target *time.Duration
+}
+
+func (f dayDurationFlag) String() string {
+	if f.target == nil || *f.target == 0 {
+		return ""
+	}
+	return f.target.String()
+}
+
+func (f dayDurationFlag) Set(value string) error {
+	parsed, err := parseDurationWithDays(value)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("must be a positive duration such as 24h, 7d, or 30d")
+	}
+	*f.target = parsed
+	return nil
+}
+
+// resolveServiceCredentialMaxTTL resolves and validates the optional service
+// credential max TTL from flags/options or the injected environment. Zero means
+// use token.DefaultBounds.ServiceMaxTTL (30 days).
+func resolveServiceCredentialMaxTTL(options serverOptions, getenv productionEnv) (time.Duration, error) {
+	ttl := options.ServiceCredentialMaxTTL
+	if ttl == 0 && getenv != nil {
+		if raw := strings.TrimSpace(getenv("KODEMA_SERVICE_CREDENTIAL_MAX_TTL")); raw != "" {
+			parsed, err := parseDurationWithDays(raw)
+			if err != nil || parsed <= 0 {
+				return 0, fmt.Errorf("KODEMA_SERVICE_CREDENTIAL_MAX_TTL must be a positive duration such as 24h, 7d, or 30d")
+			}
+			ttl = parsed
+		}
+	}
+	if ttl < 0 || (ttl > 0 && ttl < token.DefaultBounds.MinTTL) {
+		return 0, fmt.Errorf("service credential max ttl must be at least %s", token.DefaultBounds.MinTTL)
+	}
+	return ttl, nil
+}
+
 // serverFile is the optional JSON configuration file shape.
 type serverFile struct {
-	Profile           string               `json:"profile"`
-	Address           string               `json:"address"`
-	DataDir           string               `json:"data_dir"`
-	InstallationID    string               `json:"installation_id"`
-	PublicURL         string               `json:"public_url"`
-	WorkloadURL       string               `json:"workload_url"`
-	WorkloadCAFile    string               `json:"workload_ca_file"`
-	WorkloadGitURL    string               `json:"workload_git_url"`
-	ToolboxFile       string               `json:"toolbox_file"`
-	WorkloadMemory    string               `json:"workload_memory"`
-	WorkloadCPUs      string               `json:"workload_cpus"`
-	WorkloadMaxMemory string               `json:"workload_max_memory"`
-	WorkloadMaxCPUs   string               `json:"workload_max_cpus"`
-	MCPPath           string               `json:"mcp_path"`
-	LoopInterval      string               `json:"loop_interval"`
-	GitStorageRoot    string               `json:"git_storage_root"`
-	DevTokens         []string             `json:"dev_tokens"`
-	DevPrincipal      string               `json:"dev_principal"`
-	DevTenant         string               `json:"dev_tenant"`
-	DevProject        string               `json:"dev_project"`
-	DevRoles          string               `json:"dev_roles"`
-	DevExpiry         string               `json:"dev_expiry"`
-	Discovery         *serverDiscoveryFile `json:"discovery"`
-	ModelsFile        string               `json:"models_file"`
-	LLMProviders      []string             `json:"llm_providers"`
-	ToolProxyFile     string               `json:"tool_proxy_file"`
-	SecretRulesFile   string               `json:"secret_rules_file"`
+	Profile                 string               `json:"profile"`
+	Address                 string               `json:"address"`
+	DataDir                 string               `json:"data_dir"`
+	InstallationID          string               `json:"installation_id"`
+	PublicURL               string               `json:"public_url"`
+	WorkloadURL             string               `json:"workload_url"`
+	WorkloadCAFile          string               `json:"workload_ca_file"`
+	WorkloadGitURL          string               `json:"workload_git_url"`
+	ToolboxFile             string               `json:"toolbox_file"`
+	WorkloadMemory          string               `json:"workload_memory"`
+	WorkloadCPUs            string               `json:"workload_cpus"`
+	WorkloadMaxMemory       string               `json:"workload_max_memory"`
+	WorkloadMaxCPUs         string               `json:"workload_max_cpus"`
+	MCPPath                 string               `json:"mcp_path"`
+	LoopInterval            string               `json:"loop_interval"`
+	ServiceCredentialMaxTTL string               `json:"service_credential_max_ttl"`
+	GitStorageRoot          string               `json:"git_storage_root"`
+	DevTokens               []string             `json:"dev_tokens"`
+	DevPrincipal            string               `json:"dev_principal"`
+	DevTenant               string               `json:"dev_tenant"`
+	DevProject              string               `json:"dev_project"`
+	DevRoles                string               `json:"dev_roles"`
+	DevExpiry               string               `json:"dev_expiry"`
+	Discovery               *serverDiscoveryFile `json:"discovery"`
+	ModelsFile              string               `json:"models_file"`
+	LLMProviders            []string             `json:"llm_providers"`
+	ToolProxyFile           string               `json:"tool_proxy_file"`
+	SecretRulesFile         string               `json:"secret_rules_file"`
 }
 
 // serverDiscoveryFile is the optional public discovery configuration nested as
@@ -376,6 +488,7 @@ func parseServerOptions(args []string, stderr io.Writer) (serverOptions, int) {
 	flags.StringVar(&options.WorkloadMaxCPUs, "workload-max-cpus", options.WorkloadMaxCPUs, "test profile: maximum CPU limit a pipeline action may request (e.g. 4, 8)")
 	flags.StringVar(&options.MCPPath, "mcp-path", options.MCPPath, "MCP JSON-RPC path")
 	flags.DurationVar(&options.LoopInterval, "loop-interval", options.LoopInterval, "durable profiles' background scan interval (default 1s, 100ms to 1m)")
+	flags.Var(dayDurationFlag{target: &options.ServiceCredentialMaxTTL}, "service-credential-max-ttl", "maximum TTL for kodsvc. service credentials (default 30d, e.g. 24h, 7d, 30d; kodex. stays capped at 8h)")
 	flags.StringVar(&options.GitStorageRoot, "git-storage-root", options.GitStorageRoot, "mounted tenant Git storage root for retained-commit keep refs")
 	flags.StringVar(&options.ModelsFile, "models-file", options.ModelsFile, "trusted JSON file configuring model gateway and LLM proxy providers")
 	var llmProviders stringList
@@ -500,6 +613,13 @@ func mergeServerFile(file serverFile, options serverOptions) (serverOptions, err
 			return serverOptions{}, fmt.Errorf("server configuration loop_interval must be a Go duration such as 250ms or 5s")
 		}
 		options.LoopInterval = parsed
+	}
+	if file.ServiceCredentialMaxTTL != "" {
+		parsed, err := parseDurationWithDays(file.ServiceCredentialMaxTTL)
+		if err != nil || parsed <= 0 {
+			return serverOptions{}, fmt.Errorf("server configuration service_credential_max_ttl must be a positive duration such as 24h, 7d, or 30d")
+		}
+		options.ServiceCredentialMaxTTL = parsed
 	}
 	if file.GitStorageRoot != "" {
 		options.GitStorageRoot = file.GitStorageRoot
@@ -678,6 +798,10 @@ func (options serverOptions) config() (shellapp.Config, error) {
 	if options.DevExpiry <= 0 {
 		return shellapp.Config{}, fmt.Errorf("server requires a positive --dev-expiry")
 	}
+	serviceMaxTTL, err := resolveServiceCredentialMaxTTL(options, nil)
+	if err != nil {
+		return shellapp.Config{}, err
+	}
 	roles, err := parseRoles(options.DevRoles)
 	if err != nil {
 		return shellapp.Config{}, err
@@ -732,17 +856,18 @@ func (options serverOptions) config() (shellapp.Config, error) {
 			Keys:        installation.KeyEphemeral,
 			PublicURL:   options.PublicURL,
 		},
-		InstallationID:       options.InstallationID,
-		DataDir:              options.DataDir,
-		DefaultActionTimeout: 5 * time.Minute,
-		LoopInterval:         20 * time.Millisecond,
-		MCPPath:              options.MCPPath,
-		ServerVersion:        version,
-		Discovery:            discovery,
-		SecretRules:          secretRules,
-		Models:               models,
-		WorkloadURL:          options.WorkloadURL,
-		ToolProxy:            toolProxy,
+		InstallationID:          options.InstallationID,
+		DataDir:                 options.DataDir,
+		DefaultActionTimeout:    5 * time.Minute,
+		LoopInterval:            20 * time.Millisecond,
+		ServiceCredentialMaxTTL: serviceMaxTTL,
+		MCPPath:                 options.MCPPath,
+		ServerVersion:           version,
+		Discovery:               discovery,
+		SecretRules:             secretRules,
+		Models:                  models,
+		WorkloadURL:             options.WorkloadURL,
+		ToolProxy:               toolProxy,
 		Dev: &shellapp.DevelopmentConfig{
 			Tokens: tokens,
 			Bootstrap: &shellapp.Bootstrap{

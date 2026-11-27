@@ -173,6 +173,12 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	if bounds.MaxTTL < bounds.MinTTL {
 		return nil, fault.New(fault.InvalidInput, "credential bounds maximum ttl is below the minimum")
 	}
+	if bounds.ServiceMaxTTL < 0 {
+		return nil, fault.New(fault.InvalidInput, "credential bounds service maximum ttl must not be negative")
+	}
+	if bounds.ServiceMaxTTL > 0 && bounds.ServiceMaxTTL < bounds.MinTTL {
+		return nil, fault.New(fault.InvalidInput, "credential bounds service maximum ttl is below the minimum")
+	}
 	return &Manager{
 		keys:          config.Keys,
 		resolver:      config.Resolver,
@@ -729,8 +735,19 @@ func (manager *Manager) mutate(ctx context.Context, request IssueRequest, kind M
 }
 
 func (manager *Manager) expiry(now time.Time, request IssueRequest) (time.Time, error) {
-	if !manager.bounds.ValidTTL(request.TTL) {
-		return time.Time{}, fault.New(fault.InvalidInput, "credential ttl is outside the allowed bounds")
+	if request.ServiceID != "" {
+		maxTTL := manager.bounds.EffectiveServiceMaxTTL()
+		if !manager.bounds.ValidServiceTTL(request.TTL) {
+			return time.Time{}, fault.New(fault.InvalidInput, fmt.Sprintf(
+				"service credential ttl is outside the allowed bounds [%s, %s]",
+				manager.bounds.MinTTL, maxTTL))
+		}
+	} else {
+		if !manager.bounds.ValidTTL(request.TTL) {
+			return time.Time{}, fault.New(fault.InvalidInput, fmt.Sprintf(
+				"execution credential ttl is outside the allowed bounds [%s, %s]",
+				manager.bounds.MinTTL, manager.bounds.MaxTTL))
+		}
 	}
 	expiry := now.Add(request.TTL)
 	if !request.Deadline.IsZero() {

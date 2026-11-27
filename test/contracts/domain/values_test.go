@@ -370,6 +370,19 @@ func TestTokenEncodingGoldenVectors(t *testing.T) {
 	if bounds.MaxTTL > 8*time.Hour {
 		t.Fatalf("MaxTTL = %s; S05 caps execution credentials at 8 hours", bounds.MaxTTL)
 	}
+	if bounds.ServiceMaxTTL != 30*24*time.Hour {
+		t.Fatalf("ServiceMaxTTL = %s; want 30 days", bounds.ServiceMaxTTL)
+	}
+	if !bounds.ValidServiceTTL(bounds.ServiceMaxTTL) || bounds.ValidServiceTTL(bounds.ServiceMaxTTL+time.Nanosecond) {
+		t.Fatalf("ServiceMaxTTL boundary is not inclusive/exclusive: %+v", bounds)
+	}
+	if !bounds.ValidServiceTTL(bounds.MinTTL) || bounds.ValidServiceTTL(bounds.MinTTL-time.Nanosecond) {
+		t.Fatalf("ServiceMaxTTL MinTTL boundary is not inclusive: %+v", bounds)
+	}
+	zeroServiceBounds := token.Bounds{MinNonceBytes: 32, MinTTL: time.Minute, MaxTTL: 2 * time.Hour}
+	if !zeroServiceBounds.ValidServiceTTL(2*time.Hour) || zeroServiceBounds.ValidServiceTTL(2*time.Hour+time.Nanosecond) {
+		t.Fatalf("zero ServiceMaxTTL did not fall back to MaxTTL: %+v", zeroServiceBounds)
+	}
 }
 
 func TestTokenCredentialState(t *testing.T) {
