@@ -333,10 +333,12 @@ gitService:
 #
 # Each entry runs one adapter kind in the release namespace with its own
 # service credential from an existing Secret and a NetworkPolicy that allows
-# egress only to the Kodema API and cluster DNS and denies all ingress: the
-# adapter opens no listener and both probes are exec-based. The merge_coordinator
-# kind is refused; the accepted kinds are webhook, email, timer
-# and responder. A timer entry requires a positive duration schedule. An email
+# egress only to the Kodema API, cluster DNS, and (for merge_coordinator) the
+# tenant's Git service, and denies all ingress: the adapter opens no listener
+# and both probes are exec-based. The accepted kinds are webhook, email, timer,
+# responder and merge_coordinator. A timer entry requires a positive duration
+# schedule. A merge_coordinator entry requires gitURL, mounts /var/lib/kodema/merge
+# (from an optional storage PVC or an emptyDir), and passes --ca-file. An email
 # entry may reference a mailbox credential Secret; the file is mounted
 # read-only and exposed only through KODEMA_MAILBOX_CREDENTIAL_FILE.
 services:
@@ -374,6 +376,19 @@ services:
   #     mailboxCredential:
   #       existingSecret: kodema-email-mailbox
   #       key: password
+  #   - name: merge-coordinator
+  #     kind: merge_coordinator
+  #     service: merge-coordinator
+  #     tenant: tenant-a
+  #     project: project-a
+  #     gitURL: https://kodema-git-tenant-a.kodema-system.svc:8443
+  #     storage:
+  #       storageClass: ""
+  #       size: 1Gi
+  #       accessMode: ReadWriteOnce
+  #     credential:
+  #       existingSecret: kodema-service-merge-coordinator
+  #       key: token
 
 # Optional per-project OpenCode service NetworkPolicies (Option 2:
 # sandbox mode). Off by default: with opencodeSandbox.enabled false the

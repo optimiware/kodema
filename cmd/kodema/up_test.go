@@ -147,6 +147,14 @@ func TestUpDownStatusCLICommands(t *testing.T) {
 	if code := runUpEntry(context.Background(), []string{"--name", "demo", "--workload-max-memory", "1Gi"}, &out, &errBuf); code != 2 {
 		t.Fatalf("env default > max memory exit = %d; want 2", code)
 	}
+	t.Setenv("KODEMA_WORKLOAD_MEMORY_LIMIT", "")
+	errBuf.Reset()
+	if code := runUpEntry(context.Background(), []string{"--name", "demo", "--merge-coordinator"}, &out, &errBuf); code != 0 {
+		t.Fatalf("runUpEntry --merge-coordinator exit = %d: %s", code, errBuf.String())
+	}
+	if !capturedUp.MergeCoordinator {
+		t.Fatal("capturedUp.MergeCoordinator = false; want true with --merge-coordinator")
+	}
 }
 
 func TestUpCLISecretRuleFlags(t *testing.T) {

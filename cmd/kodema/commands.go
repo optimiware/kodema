@@ -333,6 +333,8 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 	rescan := flags.Duration("rescan", envDuration("KODEMA_SERVICE_RESCAN", 30*time.Second), "rescan interval")
 	stateDir := flags.String("state-dir", envOr("KODEMA_SERVICE_STATE_DIR", ""), "durable local state directory")
 	gitURL := flags.String("git-url", envOr("KODEMA_SERVICE_GIT_URL", ""), "Git base URL")
+	defaultRebaseOnMovedBase, rebaseOnMovedBaseEnvErr := envBoolStrict("KODEMA_MERGE_REBASE_ON_MOVED_BASE", true)
+	rebaseOnMovedBase := flags.Bool("rebase-on-moved-base", defaultRebaseOnMovedBase, "rebase candidate onto moved target ref using disjoint-rebase push options (merge_coordinator only)")
 	opencodeURL := flags.String("opencode-url", envOr("KODEMA_OPENCODE_URL", ""), "opencode serve HTTP URL")
 	opencodePassword := flags.String("opencode-password", "", "optional OpenCode server password for HTTP Basic Auth (or KODEMA_OPENCODE_PASSWORD / OPENCODE_PASSWORD; prefer --opencode-password-file)")
 	opencodePasswordFile := flags.String("opencode-password-file", envOr("KODEMA_OPENCODE_PASSWORD_FILE", ""), "file containing the OpenCode server password for HTTP Basic Auth (recommended over --opencode-password)")
@@ -377,20 +379,27 @@ func runServicesEntry(ctx context.Context, args []string, stdout, stderr io.Writ
 		return 2
 	}
 	if servicekit.ServiceKind(*kind) == servicekit.KindMergeCoordinator {
+		setFlags := make(map[string]bool)
+		flags.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+		if !setFlags["rebase-on-moved-base"] && rebaseOnMovedBaseEnvErr != nil {
+			usage(stderr, rebaseOnMovedBaseEnvErr.Error())
+			return 2
+		}
 		if strings.TrimSpace(*stateDir) == "" || strings.TrimSpace(*gitURL) == "" {
 			usage(stderr, "merge coordinator requires --state-dir and --git-url")
 			return 2
 		}
 		config := mergeapp.MergeConfig{
-			ServiceID:      id.PrincipalID(*service),
-			TenantID:       id.TenantID(*tenant),
-			ProjectID:      id.ProjectID(*project),
-			StateDirectory: *stateDir,
-			GitURL:         *gitURL,
-			CredentialFile: *credentialFile,
-			CAFile:         strings.TrimSpace(*caFile),
-			RescanInterval: *rescan,
-			Transport:      transport,
+			ServiceID:                id.PrincipalID(*service),
+			TenantID:                 id.TenantID(*tenant),
+			ProjectID:                id.ProjectID(*project),
+			StateDirectory:           *stateDir,
+			GitURL:                   *gitURL,
+			CredentialFile:           *credentialFile,
+			CAFile:                   strings.TrimSpace(*caFile),
+			RescanInterval:           *rescan,
+			DisableRebaseOnMovedBase: !*rebaseOnMovedBase,
+			Transport:                transport,
 		}
 		if err := runMergeCoordinator(ctx, config); err != nil {
 			fmt.Fprintf(stderr, "kodema: %v\n", err)

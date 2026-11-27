@@ -1148,7 +1148,7 @@
       ]
     },
     "services": {
-      "description": "Optional independent Userland service adapter Deployments. Off by default; merge_coordinator is refused.",
+      "description": "Optional independent Userland service adapter Deployments. Off by default.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -1181,13 +1181,14 @@
                 "pattern": "^[a-z0-9]([a-z0-9-]{0,47}[a-z0-9])?$"
               },
               "kind": {
-                "description": "One real `kodema services --kind` adapter. merge_coordinator is refused.",
+                "description": "One real `kodema services --kind` adapter.",
                 "type": "string",
                 "enum": [
                   "webhook",
                   "email",
                   "timer",
-                  "responder"
+                  "responder",
+                  "merge_coordinator"
                 ]
               },
               "service": {
@@ -1215,6 +1216,37 @@
                 "minLength": 2,
                 "maxLength": 32,
                 "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$"
+              },
+              "gitURL": {
+                "description": "Git base URL for the merge_coordinator kind (passed as --git-url); refused for every other kind.",
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^https?://[^\\s@?#]+$"
+              },
+              "storage": {
+                "description": "Optional PersistentVolumeClaim backing /var/lib/kodema/merge for merge_coordinator entries (defaults to emptyDir when omitted); refused for every other kind.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "size"
+                ],
+                "properties": {
+                  "storageClass": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$"
+                  },
+                  "accessMode": {
+                    "type": "string",
+                    "enum": [
+                      "ReadWriteOnce",
+                      "ReadOnlyMany",
+                      "ReadWriteMany"
+                    ]
+                  }
+                }
               },
               "credential": {
                 "type": "object",
@@ -1285,7 +1317,8 @@
                       "enum": [
                         "webhook",
                         "email",
-                        "responder"
+                        "responder",
+                        "merge_coordinator"
                       ]
                     }
                   },
@@ -1299,6 +1332,60 @@
                       "schedule"
                     ]
                   }
+                }
+              },
+              {
+                "description": "A merge_coordinator needs gitURL.",
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "merge_coordinator"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "gitURL"
+                  ]
+                }
+              },
+              {
+                "description": "Only merge_coordinator takes gitURL or storage.",
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "webhook",
+                        "email",
+                        "timer",
+                        "responder"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "allOf": [
+                    {
+                      "not": {
+                        "required": [
+                          "gitURL"
+                        ]
+                      }
+                    },
+                    {
+                      "not": {
+                        "required": [
+                          "storage"
+                        ]
+                      }
+                    }
+                  ]
                 }
               }
             ]

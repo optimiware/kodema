@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/client"
 	"github.com/optimiware/kodema/internal/apps/kit/servicekit"
 	"github.com/optimiware/kodema/internal/id"
 )
@@ -23,6 +24,7 @@ type AdapterConfig struct {
 	ProjectID      id.ProjectID
 	Handler        api.Handler
 	Events         servicekit.EventSource
+	Stream         client.EventStreamer
 	Clock          servicekit.Clock
 	RescanInterval time.Duration
 	Merges         MergeRunner
@@ -56,6 +58,7 @@ func NewAdapter(config AdapterConfig) (*Adapter, error) {
 		ProjectID:      config.ProjectID,
 		Handler:        config.Handler,
 		Events:         config.Events,
+		Stream:         config.Stream,
 		Clock:          config.Clock,
 		RescanInterval: config.RescanInterval,
 		SkipExpired:    true,
@@ -80,14 +83,17 @@ func (adapter *Adapter) Run(ctx context.Context) error { return adapter.base.Run
 func (adapter *Adapter) RunOnce(ctx context.Context) error { return adapter.base.RunOnce(ctx) }
 
 // considerMerge performs one assignment-keyed merge and answers the request with
-// exactly the declared observations. The durable assignment is released only
-// after the resolution converged.
+// exactly the declared observations. On a confirmed not_started permanent merge
+// refusal (base moved, conflict, or verified remote pre-receive rejection), it
+// resolves the request as `fail` with a sanitized diagnostic note and settles
+// the assignment immediately so subsequent merges for `(repo, ref)` are not
+// blocked. Uncertain outcomes are never answered or settled here.
 func (adapter *Adapter) considerMerge(
 	ctx context.Context,
 	scanned api.InboxItem,
 	_ api.ExecutionInspectResult,
 	_ api.ExecutionAction,
-	resolve servicekit.RequestResolveFunc,
+	resolve servicekit.RequestResolver,
 ) error {
 	if adapter.merges == nil {
 		return fmt.Errorf("merge coordinator dependency is required")
@@ -114,13 +120,19 @@ func (adapter *Adapter) considerMerge(
 	}
 	result, err := adapter.merges.Merge(ctx, request)
 	if err != nil {
+		if result.State == EffectNotStarted && IsConfirmedNotStartedFailure(err) {
+			if failErr := resolve.Fail(ctx, servicekit.SanitizeDiagnosticNote(err.Error())); failErr != nil {
+				return failErr
+			}
+			return adapter.merges.Settle(ctx, request, EffectNotStarted)
+		}
 		return err
 	}
 	outputs, err := MergeOutputValues(result, scanned.Outputs)
 	if err != nil {
 		return err
 	}
-	if err := resolve(ctx, outputs); err != nil {
+	if err := resolve.Pass(ctx, outputs); err != nil {
 		return err
 	}
 	return adapter.merges.Settle(ctx, request, result.State)

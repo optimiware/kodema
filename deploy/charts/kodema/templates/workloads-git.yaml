@@ -404,6 +404,25 @@ spec:
         - protocol: TCP
           port: {{ $port }}
     {{- end }}
+    {{- if and $.Values.services $.Values.services.enabled }}
+    {{- range $svc := $.Values.services.entries }}
+    {{- if and (eq (toString $svc.kind) "merge_coordinator") (eq (toString $svc.tenant) $tenant) }}
+    # Allow this tenant's merge_coordinator adapter to fetch and push repositories.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Release.Namespace | quote }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kodema
+              app.kubernetes.io/component: service
+              kodema.dev/service: {{ toString $svc.name | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
   egress:
     # Cluster DNS stays reachable so service names resolve.
     - to:

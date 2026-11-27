@@ -869,3 +869,69 @@ func TestCoordinatorRefusesInvalidKey(t *testing.T) {
 		t.Fatal("an invalid merge key reached the store")
 	}
 }
+
+func TestCoordinatorConfirmedNotStartedFailureAllowsImmediateSettle(t *testing.T) {
+	confirmedErrors := map[string]error{
+		"base moved": merge.ErrMergeBaseMoved,
+		"conflict":   merge.ErrMergeConflict,
+		"rejected":   merge.ErrMergeRejected,
+	}
+	for name, refusal := range confirmedErrors {
+		t.Run(name, func(t *testing.T) {
+			log := &callLog{}
+			store := newFakeCoordinationStore(log)
+			clock := &fakeClock{now: testNow}
+			effects := &fakeMergeEffects{log: log}
+			effects.executeFunc = func(merge.MergeOperation) (merge.MergeObservation, error) {
+				return merge.MergeObservation{State: merge.EffectNotStarted}, refusal
+			}
+			coordinator := newCoordinator(t, store, effects, clock, "merge-worker-1")
+			request := validMergeRequest()
+
+			result, err := coordinator.Merge(context.Background(), request)
+			if !errors.Is(err, refusal) {
+				t.Fatalf("Merge error = %v; want %v", err, refusal)
+			}
+			if errors.Is(err, merge.ErrUncertain) {
+				t.Fatalf("confirmed not_started refusal was wrapped in ErrUncertain: %v", err)
+			}
+			if result.State != merge.EffectNotStarted {
+				t.Fatalf("result state = %q; want not_started", result.State)
+			}
+			stored, ok := store.record(t, testTenant, request.Key)
+			if !ok || stored.State != merge.EffectNotStarted || !stored.Reconciled || stored.Released {
+				t.Fatalf("stored = %+v; want reconciled, unreleased not_started record", stored)
+			}
+			if err := coordinator.Settle(context.Background(), request, merge.EffectNotStarted); err != nil {
+				t.Fatalf("Settle(not_started): %v", err)
+			}
+			released, _ := store.record(t, testTenant, request.Key)
+			if !released.Released {
+				t.Fatal("Settle did not release confirmed not_started record")
+			}
+		})
+	}
+
+	t.Run("unknown error stays EffectUncertain and refuses Settle", func(t *testing.T) {
+		log := &callLog{}
+		store := newFakeCoordinationStore(log)
+		clock := &fakeClock{now: testNow}
+		effects := &fakeMergeEffects{log: log}
+		effects.executeFunc = func(merge.MergeOperation) (merge.MergeObservation, error) {
+			return merge.MergeObservation{State: merge.EffectNotStarted}, errors.New("transient 503 error")
+		}
+		coordinator := newCoordinator(t, store, effects, clock, "merge-worker-1")
+		request := validMergeRequest()
+
+		result, err := coordinator.Merge(context.Background(), request)
+		if !errors.Is(err, merge.ErrUncertain) {
+			t.Fatalf("Merge error = %v; want ErrUncertain", err)
+		}
+		if result.State != merge.EffectUncertain {
+			t.Fatalf("result state = %q; want uncertain", result.State)
+		}
+		if err := coordinator.Settle(context.Background(), request, merge.EffectNotStarted); !errors.Is(err, merge.ErrOperationConflict) {
+			t.Fatalf("Settle on uncertain record error = %v; want ErrOperationConflict", err)
+		}
+	})
+}

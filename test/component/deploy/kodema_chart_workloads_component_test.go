@@ -1144,10 +1144,41 @@ func TestKodemaChartWorkloadSchemaRefusals(t *testing.T) {
 			},
 		},
 		{
-			name: "merge coordinator kind",
+			name: "merge coordinator without gitURL",
 			mutate: func(values workloadValues) {
 				entry := workloadMap(workloadList(workloadMap(values["services"])["entries"])[0])
 				entry["kind"] = "merge_coordinator"
+			},
+		},
+		{
+			name: "merge coordinator with invalid gitURL userinfo",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["services"])["entries"])[0])
+				entry["kind"] = "merge_coordinator"
+				entry["gitURL"] = "https://user:pass@kodema-git-tenant-a.kodema-system.svc:8443"
+			},
+		},
+		{
+			name: "merge coordinator with schedule",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["services"])["entries"])[0])
+				entry["kind"] = "merge_coordinator"
+				entry["gitURL"] = "https://kodema-git-tenant-a.kodema-system.svc:8443"
+				entry["schedule"] = "30s"
+			},
+		},
+		{
+			name: "non-merge coordinator with gitURL",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["services"])["entries"])[0])
+				entry["gitURL"] = "https://kodema-git-tenant-a.kodema-system.svc:8443"
+			},
+		},
+		{
+			name: "non-merge coordinator with storage",
+			mutate: func(values workloadValues) {
+				entry := workloadMap(workloadList(workloadMap(values["services"])["entries"])[0])
+				entry["storage"] = map[string]any{"size": "1Gi"}
 			},
 		},
 		{
@@ -1412,5 +1443,165 @@ func TestKodemaChartGitServiceDynamicRepositoriesAndProvisionToken(t *testing.T)
 	}
 	if !strings.Contains(badOut, "provisionToken.key") {
 		t.Errorf("template refusal for invalid provisionToken.key does not mention provisionToken.key:\n%s", badOut)
+	}
+}
+
+// TestKodemaChartMergeCoordinatorServiceDeployment proves that
+// `services.entries[].kind = merge_coordinator` renders cleanly with:
+//   - hardened Deployment args (`--kind=merge_coordinator`, `--git-url`,
+//     `--state-dir=/var/lib/kodema/merge`, `--ca-file=/etc/kodema/api-ca/ca.crt`),
+//   - CA mount + `KODEMA_CA_FILE` and `SSL_CERT_FILE`,
+//   - `/var/lib/kodema/merge` backed by emptyDir (default) or a PVC when
+//     `storage` is configured,
+//   - NetworkPolicy egress to DNS, control-plane API, and the matching tenant's
+//     `git-service` pod on gitService.port, plus matching ingress on that
+//     tenant's Git NetworkPolicy without widening other tenants, and
+//   - template guards refusing missing gitURL under --skip-schema-validation.
+func TestKodemaChartMergeCoordinatorServiceDeployment(t *testing.T) {
+	helm, charts := stagedCharts(t)
+	chart := filepath.Join(charts, "kodema")
+
+	values := cloneWorkloadValues(baseWorkloadValues())
+	entries := workloadList(workloadMap(values["services"])["entries"])
+	entries = append(entries,
+		map[string]any{
+			"name":    "merge-pvc",
+			"kind":    "merge_coordinator",
+			"service": "merge-coordinator",
+			"tenant":  "tenant-a",
+			"project": "project-a",
+			"gitURL":  "https://kodema-git-tenant-a.kodema-system.svc:8443",
+			"storage": map[string]any{
+				"storageClass": "sbs-default",
+				"size":         "1Gi",
+				"accessMode":   "ReadWriteOnce",
+			},
+			"credential": map[string]any{
+				"existingSecret": "kodema-service-merge-pvc",
+				"key":            "token",
+			},
+		},
+		map[string]any{
+			"name":    "merge-ephemeral",
+			"kind":    "merge_coordinator",
+			"service": "merge-coordinator-b",
+			"tenant":  "tenant-b",
+			"project": "project-b",
+			"gitURL":  "https://kodema-git-tenant-b.kodema-system.svc:8443",
+			"credential": map[string]any{
+				"existingSecret": "kodema-service-merge-ephemeral",
+				"key":            "token",
+			},
+		},
+	)
+	workloadMap(values["services"])["entries"] = entries
+
+	rendered, err := renderWorkloadValues(t, helm, chart, values)
+	if err != nil {
+		t.Fatalf("helm template kodema with merge_coordinator: %v\n%s", err, rendered)
+	}
+
+	// Verify PVC-backed merge_coordinator on tenant-a.
+	pvcDep := renderedObjectNamed(t, rendered, "Deployment", "kodema-service-merge-pvc")
+	assertPodHardened(t, pvcDep)
+	pvcContainer := workloadContainer(t, pvcDep, "service")
+	assertContainerHardened(t, pvcDep, pvcContainer)
+	assertWorkloadAPICertificate(t, pvcDep, "service")
+	assertProbesPresent(t, pvcContainer)
+	pvcArgs := containerArgs(t, pvcContainer)
+	for _, want := range []string{
+		"services",
+		"--kind=merge_coordinator",
+		"--service=merge-coordinator",
+		"--tenant=tenant-a",
+		"--project=project-a",
+		"--base-url=https://kodema.example.test:8443",
+		"--credential-file=/etc/kodema/service/credential",
+		"--ca-file=/etc/kodema/api-ca/ca.crt",
+		"--git-url=https://kodema-git-tenant-a.kodema-system.svc:8443",
+		"--state-dir=/var/lib/kodema/merge",
+	} {
+		if !containsArg(pvcArgs, want) {
+			t.Errorf("merge-pvc args %v missing %q", pvcArgs, want)
+		}
+	}
+	if entry := renderedEnvEntry(t, pvcDep, "KODEMA_CA_FILE"); stringAtKey(t, entry, "value") != "/etc/kodema/api-ca/ca.crt" {
+		t.Errorf("merge-pvc KODEMA_CA_FILE = %v; want /etc/kodema/api-ca/ca.crt", entry)
+	}
+	stateMount := findVolumeMount(t, pvcContainer, "state")
+	if got := stringAtKey(t, stateMount, "mountPath"); got != "/var/lib/kodema/merge" {
+		t.Errorf("merge-pvc state mountPath = %q; want /var/lib/kodema/merge", got)
+	}
+	stateVol := renderedVolume(t, pvcDep, "state")
+	pvcRef := objectAtKey(t, stateVol, "persistentVolumeClaim")
+	if got := stringAtKey(t, pvcRef, "claimName"); got != "kodema-service-merge-pvc-state" {
+		t.Errorf("merge-pvc state claimName = %q; want kodema-service-merge-pvc-state", got)
+	}
+	pvcObj := renderedObjectNamed(t, rendered, "PersistentVolumeClaim", "kodema-service-merge-pvc-state")
+	pvcSpec := objectAtKey(t, pvcObj, "spec")
+	if got := stringAtKey(t, pvcSpec, "storageClassName"); got != "sbs-default" {
+		t.Errorf("merge-pvc PVC storageClassName = %q; want sbs-default", got)
+	}
+
+	// Verify emptyDir-backed merge_coordinator on tenant-b.
+	ephDep := renderedObjectNamed(t, rendered, "Deployment", "kodema-service-merge-ephemeral")
+	assertPodHardened(t, ephDep)
+	ephVol := renderedVolume(t, ephDep, "state")
+	if _, ok := ephVol["emptyDir"]; !ok {
+		t.Errorf("merge-ephemeral state volume = %v; want emptyDir", ephVol)
+	}
+
+	// Verify merge_coordinator NetworkPolicy allows egress to DNS, control-plane,
+	// and tenant-a's git-service on port 8443.
+	mergeNP := renderedObjectNamed(t, rendered, "NetworkPolicy", "kodema-service-merge-pvc")
+	mergeSpec := objectAtKey(t, mergeNP, "spec")
+	mergeEgress := sliceAtKey(t, mergeSpec, "egress")
+	if len(mergeEgress) != 3 {
+		t.Fatalf("merge-pvc NetworkPolicy egress count = %d; want 3 (DNS, API, Git)", len(mergeEgress))
+	}
+	gitRule := mergeEgress[2].(map[string]any)
+	gitPeer := gitRule["to"].([]any)[0].(map[string]any)
+	gitPodLabels := objectAtKey(t, objectAtKey(t, gitPeer, "podSelector"), "matchLabels")
+	if got := stringAtKey(t, gitPodLabels, "app.kubernetes.io/component"); got != "git-service" {
+		t.Errorf("merge-pvc Git egress component = %q; want git-service", got)
+	}
+	if got := stringAtKey(t, gitPodLabels, "kodema.dev/tenant"); got != "tenant-a" {
+		t.Errorf("merge-pvc Git egress tenant = %q; want tenant-a", got)
+	}
+
+	// Verify kodema-git-tenant-a NetworkPolicy admits merge-pvc and NOT merge-ephemeral.
+	gitNPA := renderedObjectNamed(t, rendered, "NetworkPolicy", "kodema-git-tenant-a")
+	ingressA := sliceAtKey(t, objectAtKey(t, gitNPA, "spec"), "ingress")
+	foundMergePvc := false
+	for _, rawRule := range ingressA {
+		rule := rawRule.(map[string]any)
+		for _, rawPeer := range rule["from"].([]any) {
+			peer := rawPeer.(map[string]any)
+			ps, ok := peer["podSelector"].(map[string]any)
+			if !ok {
+				continue
+			}
+			ml, ok := ps["matchLabels"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if ml["kodema.dev/service"] == "merge-pvc" {
+				foundMergePvc = true
+			}
+			if ml["kodema.dev/service"] == "merge-ephemeral" {
+				t.Fatal("kodema-git-tenant-a admitted tenant-b's merge-ephemeral service")
+			}
+		}
+	}
+	if !foundMergePvc {
+		t.Fatal("kodema-git-tenant-a NetworkPolicy did not admit merge-pvc")
+	}
+
+	// Template guard refuses missing gitURL even with --skip-schema-validation.
+	bad := cloneWorkloadValues(values)
+	badEntries := workloadList(workloadMap(bad["services"])["entries"])
+	delete(workloadMap(badEntries[len(badEntries)-1]), "gitURL")
+	if badOut, badErr := renderWorkloadValuesWithArgs(t, helm, chart, bad, "--skip-schema-validation"); badErr == nil {
+		t.Fatalf("--skip-schema-validation accepted merge_coordinator without gitURL:\n%s", badOut)
 	}
 }

@@ -30,6 +30,10 @@ type Config struct {
 	// Events is the optional retained-notification source. A nil value uses
 	// the public event.read edge.
 	Events EventSource
+	// Stream is the optional live SSE project event stream used to wake scans
+	// without waiting for RescanInterval. When nil and Transport implements
+	// client.EventStreamer, Transport is used automatically.
+	Stream client.EventStreamer
 	// Clock is the injected time boundary.
 	Clock Clock
 }
@@ -62,6 +66,12 @@ func Run(ctx context.Context, config Config) error {
 		}
 		events = built
 	}
+	stream := config.Stream
+	if stream == nil && config.Transport != nil {
+		if streamer, ok := config.Transport.(client.EventStreamer); ok {
+			stream = streamer
+		}
+	}
 	clock := config.Clock
 	if clock == nil {
 		clock = SystemClock{}
@@ -73,6 +83,7 @@ func Run(ctx context.Context, config Config) error {
 		ProjectID:      config.ProjectID,
 		Handler:        handler,
 		Events:         events,
+		Stream:         stream,
 		Clock:          clock,
 		Schedule:       config.Schedule,
 		RescanInterval: config.RescanInterval,

@@ -4,15 +4,17 @@ Optional independent Userland service adapters.
 Everything is gated on services.enabled (default false). Each entry runs one
 real `kodema services --kind <kind>` adapter with the exact flags the command
 reads: --kind, --service, --tenant, --project, --base-url,
---credential-file and, for the timer kind only, --schedule. The service
-credential is an existing Secret mounted read-only. An email entry may mount a
-mailbox credential Secret as well; the file is referenced only through
-KODEMA_MAILBOX_CREDENTIAL_FILE and is never a value.
+--credential-file, --schedule (for timer only), and --git-url, --state-dir,
+--ca-file (for merge_coordinator only). The service credential is an existing
+Secret mounted read-only. An email entry may mount a mailbox credential Secret
+as well; the file is referenced only through KODEMA_MAILBOX_CREDENTIAL_FILE and
+is never a value.
 
-The merge_coordinator kind is refused; the schema lists the four accepted
-kinds. Adapters reach Kodema only through the public
-API Service and cluster DNS, so the rendered NetworkPolicy isolates ingress with
-no allowed peer and has exactly those two egress peers.
+Accepted kinds are webhook, email, timer, responder and merge_coordinator.
+Adapters open no listener and both probes are exec-based, so the rendered
+NetworkPolicy isolates ingress with no allowed peer and allows egress only to
+cluster DNS, the Kodema API Service, and (for merge_coordinator) the tenant's
+Git service.
 */ -}}
 {{- if .Values.services }}
 {{- if .Values.services.enabled }}
@@ -20,6 +22,8 @@ no allowed peer and has exactly those two egress peers.
 {{- $baseURL := $services.baseURL | default .Values.config.publicURL }}
 {{- $service := .Values.service | default dict }}
 {{- $apiPort := int ($service.targetPort | default 8443) }}
+{{- $gitService := .Values.gitService | default dict }}
+{{- $gitPort := int ($gitService.port | default 8443) }}
 {{- if not (and .Values.secrets .Values.secrets.tls .Values.secrets.tls.existingSecret) }}
 {{- fail "services.enabled requires secrets.tls.existingSecret: the API certificate is issued by the private installation CA and SSL_CERT_FILE must trust it" }}
 {{- end }}
@@ -34,8 +38,8 @@ no allowed peer and has exactly those two egress peers.
 {{- fail (printf "services repeats entry name %q; two Deployments would claim the same name" $name) }}
 {{- end }}
 {{- $_ := set $seenNames $name true }}
-{{- if not (has $kind (list "webhook" "email" "timer" "responder")) }}
-{{- fail (printf "services entry %q has kind %q; the chart refuses merge_coordinator and unknown kinds" $name $kind) }}
+{{- if not (has $kind (list "webhook" "email" "timer" "responder" "merge_coordinator")) }}
+{{- fail (printf "services entry %q has unknown kind %q" $name $kind) }}
 {{- end }}
 {{- if not (has (toString $entry.tenant) $.Values.tenants) }}
 {{- fail (printf "services entry %q names tenant %q, which is not in values.tenants" $name (toString $entry.tenant)) }}
@@ -46,6 +50,53 @@ no allowed peer and has exactly those two egress peers.
 {{- end }}
 {{- else if $entry.schedule }}
 {{- fail (printf "services entry %q is kind %q, not timer; --schedule is refused" $name $kind) }}
+{{- end }}
+{{- if eq $kind "merge_coordinator" }}
+{{- if not (and $entry.gitURL (kindIs "string" $entry.gitURL) (regexMatch "^(?i)https?://[^[:space:]@?#]+$" $entry.gitURL) (not (regexMatch "://[^/@]*:[^@]*@" $entry.gitURL))) }}
+{{- fail (printf "services entry %q of kind merge_coordinator requires gitURL as an absolute http:// or https:// URL without userinfo, query or fragment" $name) }}
+{{- end }}
+{{- if $entry.storage }}
+{{- if not (kindIs "map" $entry.storage) }}
+{{- fail (printf "services entry %q storage must be an object" $name) }}
+{{- end }}
+{{- if not (and (hasKey $entry.storage "size") (kindIs "string" $entry.storage.size) (regexMatch "^[1-9][0-9]*(Mi|Gi|Ti)$" $entry.storage.size)) }}
+{{- fail (printf "services entry %q storage.size must be a positive Mi/Gi/Ti quantity" $name) }}
+{{- end }}
+{{- if and (hasKey $entry.storage "accessMode") $entry.storage.accessMode (not (has (toString $entry.storage.accessMode) (list "ReadWriteOnce" "ReadOnlyMany" "ReadWriteMany"))) }}
+{{- fail (printf "services entry %q storage.accessMode %q is unsupported" $name (toString $entry.storage.accessMode)) }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- if $entry.gitURL }}
+{{- fail (printf "services entry %q is kind %q, not merge_coordinator; gitURL is refused" $name $kind) }}
+{{- end }}
+{{- if $entry.storage }}
+{{- fail (printf "services entry %q is kind %q, not merge_coordinator; storage is refused" $name $kind) }}
+{{- end }}
+{{- end }}
+{{- if and (eq $kind "merge_coordinator") $entry.storage }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kodema-service-{{ $name }}-state
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kodema
+    app.kubernetes.io/component: service
+    kodema.dev/service: {{ $name | quote }}
+  annotations:
+    # Coordination records protect active merge reconciliation across restarts.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - {{ $entry.storage.accessMode | default "ReadWriteOnce" }}
+  {{- if $entry.storage.storageClass }}
+  storageClassName: {{ $entry.storage.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $entry.storage.size }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -100,6 +151,11 @@ spec:
             {{- if eq $kind "timer" }}
             - --schedule={{ $entry.schedule }}
             {{- end }}
+            {{- if eq $kind "merge_coordinator" }}
+            - --ca-file=/etc/kodema/api-ca/ca.crt
+            - --git-url={{ $entry.gitURL }}
+            - --state-dir=/var/lib/kodema/merge
+            {{- end }}
           env:
             - name: KODEMA_BASE_URL
               value: {{ $baseURL | quote }}
@@ -107,6 +163,10 @@ spec:
               value: "/etc/kodema/service/credential"
             - name: SSL_CERT_FILE
               value: "/etc/kodema/api-ca/ca.crt"
+            {{- if eq $kind "merge_coordinator" }}
+            - name: KODEMA_CA_FILE
+              value: "/etc/kodema/api-ca/ca.crt"
+            {{- end }}
             {{- if $entry.mailboxCredential }}
             - name: KODEMA_MAILBOX_CREDENTIAL_FILE
               value: "/etc/kodema/service/mailbox/{{ $entry.mailboxCredential.key }}"
@@ -152,6 +212,10 @@ spec:
               mountPath: /etc/kodema/service/mailbox
               readOnly: true
             {{- end }}
+            {{- if eq $kind "merge_coordinator" }}
+            - name: state
+              mountPath: /var/lib/kodema/merge
+            {{- end }}
             - name: tmp
               mountPath: /tmp
       volumes:
@@ -174,6 +238,15 @@ spec:
             items:
               - key: {{ $entry.mailboxCredential.key | quote }}
                 path: {{ $entry.mailboxCredential.key | quote }}
+        {{- end }}
+        {{- if eq $kind "merge_coordinator" }}
+        - name: state
+          {{- if $entry.storage }}
+          persistentVolumeClaim:
+            claimName: kodema-service-{{ $name }}-state
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
         {{- end }}
         - name: tmp
           emptyDir: {}
@@ -222,6 +295,20 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $apiPort }}
+    {{- if eq $kind "merge_coordinator" }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Release.Namespace | quote }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kodema
+              app.kubernetes.io/component: git-service
+              kodema.dev/tenant: {{ $entry.tenant | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ $gitPort }}
+    {{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

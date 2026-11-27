@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/client"
 	"github.com/optimiware/kodema/internal/id"
 )
 
@@ -76,6 +78,8 @@ func NewAdapter(config AdapterConfig) (*Adapter, error) {
 		project:       config.ProjectID,
 		handler:       config.Handler,
 		events:        config.Events,
+		stream:        config.Stream,
+		wakeCh:        make(chan struct{}, 1),
 		clock:         config.Clock,
 		schedule:      config.Schedule,
 		rescan:        rescan,
@@ -88,11 +92,15 @@ func NewAdapter(config AdapterConfig) (*Adapter, error) {
 // Kind reports the adapter kind.
 func (adapter *Adapter) Kind() ServiceKind { return adapter.kind }
 
-// Run performs a startup scan and then rescans periodically until ctx is done.
+// Run performs a startup scan and then rescans periodically (and immediately on
+// live SSE project event hints when Stream is configured) until ctx is done.
 // Cancellation is a clean stop and returns nil. A startup scan failure is
 // returned; a notification-drain failure is non-fatal because notifications are
 // only hints, so Run keeps scanning while the event source is unavailable.
 func (adapter *Adapter) Run(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := adapter.RunOnce(ctx); err != nil {
 		if ctx.Err() != nil {
 			return nil
@@ -102,16 +110,97 @@ func (adapter *Adapter) Run(ctx context.Context) error {
 			return err
 		}
 	}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	var streamWG sync.WaitGroup
+	if adapter.stream != nil {
+		streamWG.Add(1)
+		go func() {
+			defer streamWG.Done()
+			adapter.runEventStreamLoop(runCtx)
+		}()
+	}
+	defer func() {
+		cancelRun()
+		streamWG.Wait()
+	}()
 	ticker := time.NewTicker(adapter.rescan)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return nil
+		case <-adapter.wakeCh:
+			// Events are hints only: wake and perform a normal authoritative
+			// inbox scan and revalidation pass.
+			_ = adapter.RunOnce(runCtx)
 		case <-ticker.C:
 			// A periodic failure is retried by the next pass with the same
 			// stable key; notifications are only hints.
-			_ = adapter.RunOnce(ctx)
+			_ = adapter.RunOnce(runCtx)
+		}
+	}
+}
+
+func (adapter *Adapter) triggerWake() {
+	if adapter.wakeCh == nil {
+		return
+	}
+	select {
+	case adapter.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+// runEventStreamLoop maintains a live SSE subscription with reconnect backoff
+// and Last-Event-ID resume. Every received event is treated strictly as a hint
+// that wakes the periodic inbox scan loop; events never grant authority.
+func (adapter *Adapter) runEventStreamLoop(ctx context.Context) {
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	var lastCursor string
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		stream, err := adapter.stream.StreamEvents(ctx, client.EventStreamRequest{
+			ProjectID: string(adapter.project),
+			Since:     lastCursor,
+			Types: []string{
+				"action.requested",
+				"action.transition",
+				"request.resolved",
+				"execution.cancelled",
+			},
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
+		backoff = 100 * time.Millisecond
+		// Reconcile once upon (re)connect in case requests arrived during a gap.
+		adapter.triggerWake()
+
+		for {
+			evt, nextErr := stream.Next(ctx)
+			if nextErr != nil {
+				_ = stream.Close()
+				break
+			}
+			if evt.Cursor != "" {
+				lastCursor = evt.Cursor
+			}
+			adapter.triggerWake()
 		}
 	}
 }
@@ -284,11 +373,16 @@ func (adapter *Adapter) consider(ctx context.Context, scanned api.InboxItem) err
 		return fmt.Errorf("%w: current action version %d is behind scanned version %d", ErrStaleVersion, action.Version, scanned.Version)
 	}
 	if adapter.handleRequest != nil {
-		return adapter.handleRequest(ctx, scanned, current, action, func(resolveCtx context.Context, outputs map[string]string) error {
-			return adapter.resolve(resolveCtx, scanned, current, action, outputs)
+		return adapter.handleRequest(ctx, scanned, current, action, RequestResolver{
+			Pass: func(resolveCtx context.Context, outputs map[string]string) error {
+				return adapter.resolve(resolveCtx, scanned, current, action, DecisionPass, outputs, "")
+			},
+			Fail: func(resolveCtx context.Context, note string) error {
+				return adapter.resolve(resolveCtx, scanned, current, action, DecisionFail, nil, SanitizeDiagnosticNote(note))
+			},
 		})
 	}
-	return adapter.resolve(ctx, scanned, current, action, nil)
+	return adapter.resolve(ctx, scanned, current, action, DecisionPass, nil, "")
 }
 
 // CurrentAction returns the inspected action with the exact scanned identity.
@@ -321,15 +415,26 @@ func InspectExecution(ctx context.Context, handler api.Handler, executionID stri
 // action-only body and the current execution version in the shared envelope.
 // The responder and email adapters submit no response outputs: choosing their
 // values is an explicit service-supplied response policy that is a separately
-// specified decision boundary. Custom handlers supply exactly the observed
-// values their assignment declared; both paths never infer an output value.
-func (adapter *Adapter) resolve(ctx context.Context, scanned api.InboxItem, current api.ExecutionInspectResult, action api.ExecutionAction, outputs map[string]string) error {
+// specified decision boundary. Custom handlers supply either a passing decision
+// with exactly the observed values their assignment declared, or a failing
+// decision carrying a sanitized diagnostic note and no downstream outputs.
+func (adapter *Adapter) resolve(ctx context.Context, scanned api.InboxItem, current api.ExecutionInspectResult, action api.ExecutionAction, decision string, outputs map[string]string, note string) error {
+	switch decision {
+	case DecisionPass:
+		note = ""
+	case DecisionFail:
+		outputs = nil
+		note = SanitizeDiagnosticNote(note)
+	default:
+		return fmt.Errorf("unsupported service request decision %q", decision)
+	}
 	request := api.ExecutionRequestResolveRequest{
 		ExecutionID:           scanned.ExecutionID,
 		ActionID:              scanned.ActionID,
 		ExpectedActionVersion: action.Version,
-		Decision:              DecisionPass,
+		Decision:              decision,
 		Outputs:               outputs,
+		Note:                  note,
 	}
 	expected := current.Version
 	_, err := InvokePublicOperation(ctx, adapter.handler, OperationResolve, request, &expected, adapter.idempotencyKey(scanned, current, action))

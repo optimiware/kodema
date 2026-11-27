@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/optimiware/kodema/api"
+	"github.com/optimiware/kodema/client"
 	"github.com/optimiware/kodema/internal/id"
 )
 
@@ -237,12 +238,13 @@ type EventSource interface {
 	Poll(context.Context, string) (NotificationPage, error)
 }
 
-// Public operations and the single service decision used by the adapters.
+// Public operations and service decisions used by the adapters.
 const (
 	OperationInbox   = "task.inbox"
 	OperationInspect = "execution.inspect"
 	OperationResolve = "execution.request.resolve"
 	DecisionPass     = "pass"
+	DecisionFail     = "fail"
 )
 
 // The adapter wire types are aliases of the served public declarations, never
@@ -264,8 +266,20 @@ type (
 )
 
 // RequestResolveFunc settles the currently revalidated request with the
-// adapter's observed versions and idempotency key.
+// adapter's observed versions and idempotency key as a passing decision.
 type RequestResolveFunc func(ctx context.Context, outputs map[string]string) error
+
+// RequestFailFunc settles the currently revalidated request with the adapter's
+// observed versions and idempotency key as a failing decision carrying a
+// sanitized diagnostic note and no downstream outputs.
+type RequestFailFunc func(ctx context.Context, note string) error
+
+// RequestResolver settles one currently revalidated request as either pass or
+// fail using the adapter's observed versions and idempotency key.
+type RequestResolver struct {
+	Pass RequestResolveFunc
+	Fail RequestFailFunc
+}
 
 // RequestHandlerFunc overrides the default output-free resolution for an
 // in-scope, revalidated running request.
@@ -274,7 +288,7 @@ type RequestHandlerFunc func(
 	scanned api.InboxItem,
 	current api.ExecutionInspectResult,
 	action api.ExecutionAction,
-	resolve RequestResolveFunc,
+	resolve RequestResolver,
 ) error
 
 // AdapterConfig is the complete independent-service adapter configuration.
@@ -285,6 +299,7 @@ type AdapterConfig struct {
 	ProjectID      id.ProjectID
 	Handler        api.Handler
 	Events         EventSource
+	Stream         client.EventStreamer
 	Clock          Clock
 	Schedule       time.Duration
 	RescanInterval time.Duration
@@ -308,6 +323,8 @@ type Adapter struct {
 	project       id.ProjectID
 	handler       api.Handler
 	events        EventSource
+	stream        client.EventStreamer
+	wakeCh        chan struct{}
 	clock         Clock
 	schedule      time.Duration
 	rescan        time.Duration
